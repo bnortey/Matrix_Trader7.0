@@ -9,7 +9,13 @@ import pandas as pd
 from flask import Flask, jsonify, render_template
 from dotenv import load_dotenv
 
-from lib.indicators import rsi as calc_rsi, atr as calc_atr, atr_pct as calc_atr_pct, volatility_regime
+from lib.indicators import (
+    rsi as calc_rsi,
+    ema as calc_ema,
+    atr as calc_atr,
+    atr_pct as calc_atr_pct,
+    volatility_regime,
+)
 from lib.laddering import generate_ladders
 
 load_dotenv()
@@ -76,6 +82,7 @@ def score_ticker(ticker: dict) -> dict | None:
         volume = float(
             ticker.get("volume24") or ticker.get("vol24h") or ticker.get("amount24") or 0
         )
+        open_interest = float(ticker.get("holdVol") or 0)
 
         if price <= 0 or not symbol:
             return None
@@ -146,6 +153,7 @@ def score_ticker(ticker: dict) -> dict | None:
             "change_24h_pct": round(change_pct, 4),
             "funding_rate": funding,
             "volume_24h": volume,
+            "open_interest": open_interest,
             "tags": tags,
         }
     except Exception as e:
@@ -215,6 +223,27 @@ def enrich_signal(base: dict) -> dict | None:
         if len(df) < 16:
             return None
 
+        # --- Momentum: 1h and 4h price change ---
+        # change_1h_pct: open→close on the most recent completed candle.
+        # Using open rather than close[-2] because MEXC sometimes delivers the
+        # current live candle as the last row — open/close of that row reflects
+        # the in-progress move, which is still useful directional signal.
+        try:
+            last_open = float(df["open"].iloc[-1])
+            last_close = float(df["close"].iloc[-1])
+            change_1h_pct = round((last_close - last_open) / last_open * 100, 4) if last_open > 0 else 0.0
+        except Exception:
+            change_1h_pct = 0.0
+
+        # change_4h_pct: close now vs close 4 candles ago (= 4 hours at Min60).
+        # iloc[-5] is the close 4 periods back: [-1]=now, [-2]=1h, [-3]=2h, [-4]=3h, [-5]=4h.
+        # We already require len(df) >= 16 so iloc[-5] is always safe.
+        try:
+            close_4h_ago = float(df["close"].iloc[-5])
+            change_4h_pct = round((last_close - close_4h_ago) / close_4h_ago * 100, 4) if close_4h_ago > 0 else 0.0
+        except Exception:
+            change_4h_pct = 0.0
+
         # --- Indicators ---
         rsi_series = calc_rsi(df, period=14)
         rsi_clean = rsi_series.dropna()
@@ -228,6 +257,39 @@ def enrich_signal(base: dict) -> dict | None:
 
         atr_pct_val = calc_atr_pct(df, price, period=14)
         vol_regime = volatility_regime(atr_pct_val)
+
+        # --- Trend score: EMA20/EMA50 alignment ---
+        # EWM never produces NaN with adjust=False, but dropna() guards against
+        # a column of NaNs from a degenerate input series.
+        try:
+            ema20_last = float(calc_ema(df, period=20).dropna().iloc[-1])
+            ema50_last = float(calc_ema(df, period=50).dropna().iloc[-1])
+            # Amplify the EMA gap 10× so a 1% gap → 10 pts, 10% gap → 100 pts (full range).
+            raw = (ema20_last - ema50_last) / ema50_last * 100 * 10
+            raw = max(-100.0, min(100.0, raw))
+            # Price position bonus: +20 if price above both EMAs (bullish structure),
+            # -20 if below both (bearish). No bonus if price is between the two.
+            if price > ema20_last and price > ema50_last:
+                raw += 20
+            elif price < ema20_last and price < ema50_last:
+                raw -= 20
+            trend_score = int(max(-100, min(100, raw)))
+        except Exception:
+            trend_score = 0
+
+        # --- Next funding settlement ---
+        # One extra API call per enriched symbol (top 30 only). The endpoint
+        # returns nextSettleTime as a Unix millisecond timestamp.
+        next_funding_minutes = None
+        try:
+            fr_data = fetch_mexc(f"/contract/funding_rate/{symbol}")
+            if fr_data and isinstance(fr_data, dict):
+                next_settle_ms = fr_data.get("nextSettleTime")
+                if next_settle_ms:
+                    minutes_left = (int(next_settle_ms) / 1000 - time.time()) / 60
+                    next_funding_minutes = max(0, int(round(minutes_left)))
+        except Exception:
+            next_funding_minutes = None
 
         # --- Orderbook imbalance ---
         imbalance = 0.5  # neutral default if depth fetch fails
@@ -289,11 +351,21 @@ def enrich_signal(base: dict) -> dict | None:
             "entries": [round(e, 8) for e in entries],
             "exits": [round(e, 8) for e in exits],
             "stop_loss": round(stop_loss, 8),
+            # Momentum
             "change_24h_pct": base["change_24h_pct"],
+            "change_4h_pct": change_4h_pct,
+            "change_1h_pct": change_1h_pct,
+            # Funding / open interest
             "funding_rate": base["funding_rate"],
+            "open_interest": base["open_interest"],
+            "next_funding_minutes": next_funding_minutes,
+            # Volume
             "volume_24h": base["volume_24h"],
+            # Technical
             "atr_pct": round(atr_pct_val, 4),
             "volatility": vol_regime,
+            "rsi_1h": round(last_rsi, 2),
+            "trend_score": trend_score,
             "tags": list(dict.fromkeys(tags)),  # deduplicate, preserve order
             "basis_pct": None,   # reserved for P1.5
             "ai_report": None,   # reserved for P2
