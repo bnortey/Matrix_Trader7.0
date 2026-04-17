@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pandas as pd
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 from dotenv import load_dotenv
 
 from lib.indicators import (
@@ -23,7 +23,7 @@ load_dotenv()
 app = Flask(__name__)
 
 MEXC_BASE = "https://contract.mexc.com/api/v1"
-PORT = int(os.getenv("MATRIX_PORT", "5000"))
+PORT = int(os.getenv("MATRIX_PORT", "8080"))
 CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
@@ -379,7 +379,7 @@ def enrich_signal(base: dict) -> dict | None:
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def run_scan() -> list[dict]:
+def run_scan(threshold: int = CONVICTION_THRESHOLD) -> tuple[list[dict], int]:
     """
     Two-stage scan across all MEXC perpetual tickers.
 
@@ -388,11 +388,14 @@ def run_scan() -> list[dict]:
     Stage 2: Enrich the top N concurrently — fetches klines + depth per symbol,
              runs indicators, builds ladders.
 
-    Returns signals with conviction >= CONVICTION_THRESHOLD, sorted descending.
+    Returns (signals, total_pairs) where total_pairs is the raw ticker count.
+    Signals have conviction >= threshold, sorted descending.
     """
     tickers = fetch_mexc("/contract/ticker")
     if not tickers or not isinstance(tickers, list):
-        return []
+        return [], 0
+
+    total_pairs = len(tickers)
 
     # Stage 1
     base_signals: list[dict] = []
@@ -408,11 +411,11 @@ def run_scan() -> list[dict]:
     signals: list[dict] = []
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as executor:
         for sig in executor.map(enrich_signal, top):
-            if sig and sig["conviction"] >= CONVICTION_THRESHOLD:
+            if sig and sig["conviction"] >= threshold:
                 signals.append(sig)
 
     signals.sort(key=lambda s: s["conviction"], reverse=True)
-    return signals
+    return signals, total_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +430,9 @@ def index():
 @app.route("/api/scan")
 def api_scan():
     try:
-        signals = run_scan()
-        return jsonify({"success": True, "signals": signals, "count": len(signals)})
+        threshold = request.args.get("threshold", CONVICTION_THRESHOLD, type=int)
+        signals, total_pairs = run_scan(threshold=threshold)
+        return jsonify({"success": True, "signals": signals, "count": len(signals), "total_pairs": total_pairs})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
