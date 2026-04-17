@@ -437,6 +437,25 @@ def api_scan():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/market")
+def api_market():
+    try:
+        tickers = fetch_mexc("/contract/ticker")
+        if not tickers or not isinstance(tickers, list):
+            return jsonify({"success": False, "error": "MEXC unavailable"}), 502
+
+        pairs = []
+        for t in tickers:
+            scored = score_ticker(t)
+            if scored:
+                pairs.append(scored)
+
+        pairs.sort(key=lambda p: p["conviction_base"], reverse=True)
+        return jsonify({"success": True, "pairs": pairs, "count": len(pairs)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/signal/<symbol>")
 def api_signal(symbol: str):
     """
