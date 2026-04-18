@@ -147,6 +147,7 @@ def score_ticker(ticker: dict) -> dict | None:
 
         return {
             "symbol": symbol,
+            "exchange": "MEXC",
             "direction": direction,
             "conviction_base": conviction_base,
             "price": price,
@@ -345,6 +346,7 @@ def enrich_signal(base: dict) -> dict | None:
 
         return {
             "symbol": symbol,
+            "exchange": "MEXC",
             "direction": direction,
             "conviction": conviction,
             "price": price,

@@ -363,6 +363,19 @@
     .ai-gen-btn:hover { background: rgba(255,255,255,0.1); color: var(--text); }
     .ai-tip { margin-top: 8px; font-size: 11px; color: var(--amber); }
 
+    /* TradingView timeframe buttons */
+    .tv-tf-btn {
+      font-size: 9px; font-weight: 700;
+      padding: 2px 6px; border-radius: 3px;
+      color: var(--text3);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      transition: all 120ms; cursor: pointer;
+      letter-spacing: 0.04em;
+    }
+    .tv-tf-btn.active { background: rgba(255,255,255,0.1); color: var(--text); border-color: rgba(255,255,255,0.14); }
+    .tv-tf-btn:hover:not(.active) { color: var(--text2); }
+
     /* Panel close button (mobile only) */
     .d-close {
       display: none; position: absolute; top: 10px; right: 10px;
@@ -409,6 +422,7 @@
         grid-template-columns: 1fr 56px 44px 70px 82px 70px;
       }
       .mkt-oi, .mkt-oi-lbl { display: none; }
+      #tv-chart-container { height: 220px !important; }
     }
   </style>
 </head>
@@ -613,6 +627,8 @@ const M = {
    TAB STATE
    ============================================================ */
 let currentTab = 'signals';
+let currentTVSymbol   = null;
+let currentTVInterval = '60';
 
 function switchTab(tab) {
   currentTab = tab;
@@ -686,6 +702,72 @@ function esc(s) {
 function toggle(id, show) {
   const el = $(id);
   if (el) el.classList.toggle('hidden', !show);
+}
+
+/* ============================================================
+   TRADINGVIEW CHART
+   ============================================================ */
+function toTVSymbol(mexcSymbol, exchange) {
+  exchange = exchange || 'MEXC';
+  const map = {
+    'MEXC':        s => 'MEXC:'        + s.replace('_', '')         + '.P',
+    'BINANCE':     s => 'BINANCE:'     + s.replace('_USDT', 'USDT') + '.PERP',
+    'BYBIT':       s => 'BYBIT:'       + s.replace('_', '')         + '.P',
+    'HYPERLIQUID': s => 'HYPERLIQUID:' + s.split('_')[0]            + 'USDT.P',
+  };
+  return (map[exchange] || map['MEXC'])(mexcSymbol);
+}
+
+function loadTVChart(mexcSymbol, exchange, interval) {
+  interval = interval || currentTVInterval;
+  currentTVInterval = interval;
+  currentTVSymbol   = mexcSymbol;
+
+  const container = $('tv-chart-container');
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'tradingview-widget-container';
+  wrap.style.height = '100%';
+
+  const inner = document.createElement('div');
+  inner.className = 'tradingview-widget-container__widget';
+  inner.style.height = '100%';
+  wrap.appendChild(inner);
+
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.async = true;
+  script.textContent = JSON.stringify({
+    autosize: true,
+    symbol: toTVSymbol(mexcSymbol, exchange || 'MEXC'),
+    interval: interval,
+    timezone: 'Etc/UTC',
+    theme: 'dark',
+    style: '1',
+    locale: 'en',
+    backgroundColor: 'rgba(11, 13, 18, 1)',
+    gridColor: 'rgba(255, 255, 255, 0.04)',
+    withdateranges: true,
+    hide_side_toolbar: true,
+    allow_symbol_change: false,
+    save_image: false,
+    studies: ['STD;EMA', 'STD;RSI', 'STD;VWAP'],
+    support_host: 'https://www.tradingview.com'
+  });
+  wrap.appendChild(script);
+  container.appendChild(wrap);
+}
+
+function setTVInterval(interval) {
+  if (!currentTVSymbol) return;
+  document.querySelectorAll('.tv-tf-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.interval === interval);
+  });
+  loadTVChart(currentTVSymbol, null, interval);
 }
 
 /* ============================================================
@@ -792,6 +874,17 @@ function renderDetail(sig) {
     ${ladderHTML(sig)}
   </div>
   <div class="d-section">
+    <div class="d-lbl" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Chart</span>
+      <span style="display:flex;gap:4px">
+        <button class="tv-tf-btn${currentTVInterval==='15'?' active':''}"  data-interval="15"  onclick="setTVInterval('15')">15m</button>
+        <button class="tv-tf-btn${currentTVInterval==='60'?' active':''}"  data-interval="60"  onclick="setTVInterval('60')">1h</button>
+        <button class="tv-tf-btn${currentTVInterval==='240'?' active':''}" data-interval="240" onclick="setTVInterval('240')">4h</button>
+      </span>
+    </div>
+    <div id="tv-chart-container" style="height:300px;border-radius:6px;overflow:hidden;border:1px solid rgba(255,255,255,0.07);margin-top:8px"></div>
+  </div>
+  <div class="d-section">
     <div class="d-lbl">Context</div>
     ${contextHTML(sig)}
   </div>
@@ -814,6 +907,7 @@ function renderDetail(sig) {
   </div>
 </div>`;
 
+  loadTVChart(sig.symbol, sig.exchange || 'MEXC', currentTVInterval);
   if (window.innerWidth >= 768) panel.classList.remove('hidden');
 }
 
@@ -1238,6 +1332,7 @@ async function enrichMarketPair(symbol, rowIdx) {
     // Tag as live analysis so renderDetail adds the amber badge
     data.signal._liveAnalysis = true;
     renderDetail(data.signal);
+    loadTVChart(data.signal.symbol, data.signal.exchange || 'MEXC', currentTVInterval);
 
   } catch (e) {
     if (rowEl) rowEl.classList.remove('mkt-loading');
