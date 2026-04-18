@@ -268,17 +268,25 @@
 
     /* Market table */
     #mkt-table { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-    .mkt-col-def { grid-template-columns: 1fr 56px 44px 70px 82px 70px 68px; }
     .mkt-hdr {
-      display: grid; grid-template-columns: 1fr 56px 44px 70px 82px 70px 68px;
+      display: grid; grid-template-columns: 1fr 88px 52px 40px 68px 82px 70px 72px;
       padding: 5px 12px;
       border-bottom: 1px solid var(--border);
       background: var(--bg3); flex-shrink: 0;
     }
     .mkt-col-lbl { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text3); font-weight: 600; }
+    .mkt-col-btn {
+      background: none; border: none; color: var(--text3);
+      font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em;
+      font-weight: 600; cursor: pointer; padding: 0; text-align: left;
+      transition: color 120ms; white-space: nowrap;
+    }
+    .mkt-col-btn:hover { color: var(--text2); }
+    .mkt-col-btn.active { color: var(--text); }
+    .sort-indicator { color: var(--green); }
     #mkt-rows { flex: 1; overflow-y: auto; }
     .mkt-row {
-      display: grid; grid-template-columns: 1fr 56px 44px 70px 82px 70px 68px;
+      display: grid; grid-template-columns: 1fr 88px 52px 40px 68px 82px 70px 72px;
       align-items: center;
       padding: 0 12px; height: 44px;
       border-bottom: 1px solid var(--border);
@@ -296,23 +304,39 @@
     .mkt-dir-pill.long  { background: var(--green); color: #000; }
     .mkt-dir-pill.short { background: var(--red);   color: #fff; }
 
-    /* Market pagination */
-    #mkt-pagination {
-      display: flex; align-items: center; gap: 10px;
-      padding: 8px 12px;
+    /* Market scroll footer */
+    #mkt-scroll-footer {
+      padding: 12px;
+      text-align: center;
+      font-size: 11px;
+      color: var(--text3);
       border-top: 1px solid var(--border);
-      background: var(--bg2); flex-shrink: 0;
-      font-size: 11px; color: var(--text2);
     }
-    #mkt-page-info { flex: 1; text-align: center; }
-    .pg-btn {
-      padding: 4px 10px;
+
+    /* ── Chart modal ── */
+    #chart-modal {
+      position: fixed; inset: 0; z-index: 200;
+      background: rgba(0,0,0,0.75);
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }
+    #chart-modal-inner {
+      background: var(--bg2);
       border: 1px solid var(--border);
-      border-radius: 4px; font-size: 11px; color: var(--text2);
-      transition: all 150ms; min-height: 26px;
+      border-radius: 10px;
+      width: 100%; max-width: 1100px;
+      height: 80vh; max-height: 700px;
+      display: flex; flex-direction: column;
+      overflow: hidden;
     }
-    .pg-btn:hover:not(:disabled) { border-color: rgba(255,255,255,0.18); color: var(--text); }
-    .pg-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    #chart-modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      font-size: 13px; font-weight: 600;
+    }
+    #chart-modal-body { flex: 1; min-height: 0; }
 
     /* ── Shared detail panel ── */
     #detail-panel {
@@ -417,12 +441,13 @@
       #app { overflow: auto; height: auto; min-height: 100vh; }
       #main { overflow: visible; }
       #list-col, #mkt-rows { overflow: visible; }
-      /* Hide OI column on mobile — too cramped */
+      /* Hide Price and OI columns on mobile — too cramped */
       .mkt-row, .mkt-hdr {
-        grid-template-columns: 1fr 56px 44px 70px 82px 70px;
+        grid-template-columns: 1fr 52px 40px 68px 82px 70px;
       }
+      .mkt-price-col, .mkt-price-lbl { display: none; }
       .mkt-oi, .mkt-oi-lbl { display: none; }
-      #tv-chart-container { height: 220px !important; }
+      #tv-chart-container { height: 160px !important; }
     }
   </style>
 </head>
@@ -559,22 +584,16 @@
         <!-- Table -->
         <div id="mkt-table">
           <div class="mkt-hdr">
-            <span class="mkt-col-lbl">Symbol / Price</span>
-            <span class="mkt-col-lbl">Dir</span>
-            <span class="mkt-col-lbl">Score</span>
-            <span class="mkt-col-lbl">24h</span>
-            <span class="mkt-col-lbl">Funding</span>
-            <span class="mkt-col-lbl">Volume</span>
-            <span class="mkt-col-lbl mkt-oi-lbl">Open Int.</span>
+            <button class="mkt-col-btn" onclick="mktSortBy('symbol')">Symbol <span class="sort-indicator" id="si-symbol"></span></button>
+            <button class="mkt-col-btn mkt-price-lbl" onclick="mktSortBy('price')">Price <span class="sort-indicator" id="si-price"></span></button>
+            <button class="mkt-col-btn" onclick="mktSortBy('direction')">Dir <span class="sort-indicator" id="si-direction"></span></button>
+            <button class="mkt-col-btn active" onclick="mktSortBy('conviction_base')">Score <span class="sort-indicator" id="si-conviction_base"></span></button>
+            <button class="mkt-col-btn" onclick="mktSortBy('change_24h_pct')">24h% <span class="sort-indicator" id="si-change_24h_pct"></span></button>
+            <button class="mkt-col-btn" onclick="mktSortBy('funding_rate')">Funding <span class="sort-indicator" id="si-funding_rate"></span></button>
+            <button class="mkt-col-btn" onclick="mktSortBy('volume_24h')">Volume <span class="sort-indicator" id="si-volume_24h"></span></button>
+            <button class="mkt-col-btn mkt-oi-lbl" onclick="mktSortBy('open_interest')">Open Int. <span class="sort-indicator" id="si-open_interest"></span></button>
           </div>
           <div id="mkt-rows"></div>
-        </div>
-
-        <!-- Pagination -->
-        <div id="mkt-pagination">
-          <button class="pg-btn" id="mkt-prev" onclick="mktPrev()">← Prev</button>
-          <span id="mkt-page-info"></span>
-          <button class="pg-btn" id="mkt-next" onclick="mktNext()">Next →</button>
         </div>
 
       </div><!-- /mkt-ready -->
@@ -591,6 +610,23 @@
 
 <!-- Mobile overlay -->
 <div id="overlay" onclick="closePanel()"></div>
+
+<!-- Chart modal -->
+<div id="chart-modal" class="hidden" onclick="closeChartModal(event)">
+  <div id="chart-modal-inner">
+    <div id="chart-modal-header">
+      <span id="chart-modal-title"></span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="tv-tf-btn" data-interval="15"  onclick="setTVInterval('15')">15m</button>
+        <button class="tv-tf-btn" data-interval="60"  onclick="setTVInterval('60')">1h</button>
+        <button class="tv-tf-btn" data-interval="240" onclick="setTVInterval('240')">4h</button>
+        <button class="tv-tf-btn" data-interval="D"   onclick="setTVInterval('D')">1D</button>
+        <button onclick="closeChartModal()" style="color:var(--text2);font-size:18px;padding:0 4px">✕</button>
+      </div>
+    </div>
+    <div id="chart-modal-body"></div>
+  </div>
+</div>
 
 <script>
 /* ============================================================
@@ -613,14 +649,16 @@ const S = {
    MARKET STATE  (M)  — never touched by signals code
    ============================================================ */
 const M = {
-  phase:    'idle',   // idle | loading | ready | error
-  pairs:    [],       // all pairs from /api/market
-  filtered: [],       // after search + dir filter + sort
-  dir:      'all',
-  sort:     'conviction_base',
-  search:   '',
-  page:     0,
-  pageSize: 50,
+  phase:        'idle',   // idle | loading | ready | error
+  pairs:        [],       // all pairs from /api/market
+  filtered:     [],       // after search + dir filter + sort
+  dir:          'all',
+  sort:         'conviction_base',
+  search:       '',
+  page:         0,
+  pageSize:     50,
+  renderedCount: 0,
+  sortDir:      'desc',
 };
 
 /* ============================================================
@@ -692,6 +730,24 @@ function trendColor(v) {
 function volColor(v) {
   return { low: 'var(--green)', medium: 'var(--text)', high: 'var(--amber)', extreme: 'var(--red)' }[v] || 'var(--text)';
 }
+function heatBg(value, maxAbsVal, positiveIsGood) {
+  if (value == null || maxAbsVal === 0) return '';
+  const intensity = Math.min(Math.abs(value) / maxAbsVal, 1);
+  const alpha = (0.06 + intensity * 0.32).toFixed(2);
+  if (value > 0) {
+    return positiveIsGood ? `rgba(0,230,118,${alpha})` : `rgba(255,82,82,${alpha})`;
+  } else {
+    return positiveIsGood ? `rgba(255,82,82,${alpha})` : `rgba(0,230,118,${alpha})`;
+  }
+}
+function _computeHeatMaxes(batch) {
+  return {
+    change:  Math.max(...batch.map(p => Math.abs(p.change_24h_pct ?? 0)), 1),
+    funding: Math.max(...batch.map(p => Math.abs(p.funding_rate  ?? 0)), 0.0001),
+    volume:  Math.max(...batch.map(p => p.volume_24h             ?? 0), 1),
+    oi:      Math.max(...batch.map(p => p.open_interest          ?? 0), 1),
+  };
+}
 function splitSym(sym) {
   const i = sym.lastIndexOf('_USDT');
   return i > -1 ? [sym.slice(0, i), '_USDT'] : [sym, ''];
@@ -718,25 +774,19 @@ function toTVSymbol(mexcSymbol, exchange) {
   return (map[exchange] || map['MEXC'])(mexcSymbol);
 }
 
-function loadTVChart(mexcSymbol, exchange, interval) {
-  interval = interval || currentTVInterval;
-  currentTVInterval = interval;
-  currentTVSymbol   = mexcSymbol;
-
+function loadTVChart(mexcSymbol, exchange) {
+  currentTVSymbol = mexcSymbol;
   const container = $('tv-chart-container');
   if (!container) return;
-
   container.innerHTML = '';
 
   const wrap = document.createElement('div');
   wrap.className = 'tradingview-widget-container';
   wrap.style.height = '100%';
-
   const inner = document.createElement('div');
   inner.className = 'tradingview-widget-container__widget';
   inner.style.height = '100%';
   wrap.appendChild(inner);
-
   const script = document.createElement('script');
   script.type = 'text/javascript';
   script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
@@ -744,7 +794,58 @@ function loadTVChart(mexcSymbol, exchange, interval) {
   script.textContent = JSON.stringify({
     autosize: true,
     symbol: toTVSymbol(mexcSymbol, exchange || 'MEXC'),
-    interval: interval,
+    interval: '60',
+    timezone: 'Etc/UTC',
+    theme: 'dark',
+    style: '1',
+    locale: 'en',
+    backgroundColor: 'rgba(11, 13, 18, 1)',
+    gridColor: 'rgba(255, 255, 255, 0.04)',
+    withdateranges: false,
+    hide_side_toolbar: true,
+    hide_top_toolbar: true,
+    allow_symbol_change: false,
+    save_image: false,
+    studies: ['STD;EMA', 'STD;VWAP'],
+    support_host: 'https://www.tradingview.com'
+  });
+  wrap.appendChild(script);
+  container.appendChild(wrap);
+
+  const snapSymbol = mexcSymbol;
+  setTimeout(() => {
+    if (currentTVSymbol !== snapSymbol) return;
+    if (container && !container.querySelector('iframe')) {
+      const tvSym = toTVSymbol(snapSymbol, exchange || 'MEXC');
+      container.innerHTML = `<div style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--text2);font-size:12px;text-align:center;padding:16px">
+        <div style="color:var(--text3);font-size:11px">Chart unavailable on TradingView for this pair</div>
+        <a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSym)}" target="_blank"
+           style="color:var(--green);font-size:11px;text-decoration:none">Open on TradingView →</a>
+        <div style="color:var(--text3);font-size:10px;margin-top:4px">This pair may be too new or thinly traded</div>
+      </div>`;
+    }
+  }, 5000);
+}
+
+function _loadModalChart() {
+  const body = $('chart-modal-body');
+  if (!body || !currentTVSymbol) return;
+  body.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'tradingview-widget-container';
+  wrap.style.height = '100%';
+  const inner = document.createElement('div');
+  inner.className = 'tradingview-widget-container__widget';
+  inner.style.height = '100%';
+  wrap.appendChild(inner);
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.async = true;
+  script.textContent = JSON.stringify({
+    autosize: true,
+    symbol: toTVSymbol(currentTVSymbol, 'MEXC'),
+    interval: currentTVInterval,
     timezone: 'Etc/UTC',
     theme: 'dark',
     style: '1',
@@ -752,22 +853,56 @@ function loadTVChart(mexcSymbol, exchange, interval) {
     backgroundColor: 'rgba(11, 13, 18, 1)',
     gridColor: 'rgba(255, 255, 255, 0.04)',
     withdateranges: true,
-    hide_side_toolbar: true,
+    hide_side_toolbar: false,
     allow_symbol_change: false,
     save_image: false,
     studies: ['STD;EMA', 'STD;RSI', 'STD;VWAP'],
     support_host: 'https://www.tradingview.com'
   });
   wrap.appendChild(script);
-  container.appendChild(wrap);
+  body.appendChild(wrap);
+
+  const snapSymbol = currentTVSymbol;
+  setTimeout(() => {
+    if (currentTVSymbol !== snapSymbol) return;
+    if (body && !body.querySelector('iframe')) {
+      const tvSym = toTVSymbol(snapSymbol, 'MEXC');
+      body.innerHTML = `<div style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--text2);font-size:12px;text-align:center;padding:16px">
+        <div style="color:var(--text3);font-size:11px">Chart unavailable on TradingView for this pair</div>
+        <a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSym)}" target="_blank"
+           style="color:var(--green);font-size:11px;text-decoration:none">Open on TradingView →</a>
+        <div style="color:var(--text3);font-size:10px;margin-top:4px">This pair may be too new or thinly traded</div>
+      </div>`;
+    }
+  }, 5000);
+}
+
+function openChartModal() {
+  if (!currentTVSymbol) return;
+  const modal = $('chart-modal');
+  $('chart-modal-title').textContent = currentTVSymbol;
+  modal.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+  document.querySelectorAll('#chart-modal-header .tv-tf-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.interval === currentTVInterval);
+  });
+  _loadModalChart();
+}
+
+function closeChartModal(event) {
+  if (event && event.target !== $('chart-modal')) return;
+  $('chart-modal').classList.add('hidden');
+  $('chart-modal-body').innerHTML = '';
+  document.body.style.overflow = '';
 }
 
 function setTVInterval(interval) {
-  if (!currentTVSymbol) return;
-  document.querySelectorAll('.tv-tf-btn').forEach(b => {
+  currentTVInterval = interval;
+  document.querySelectorAll('#chart-modal-header .tv-tf-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.interval === interval);
   });
-  loadTVChart(currentTVSymbol, null, interval);
+  if (!currentTVSymbol) return;
+  _loadModalChart();
 }
 
 /* ============================================================
@@ -876,13 +1011,9 @@ function renderDetail(sig) {
   <div class="d-section">
     <div class="d-lbl" style="display:flex;align-items:center;justify-content:space-between">
       <span>Chart</span>
-      <span style="display:flex;gap:4px">
-        <button class="tv-tf-btn${currentTVInterval==='15'?' active':''}"  data-interval="15"  onclick="setTVInterval('15')">15m</button>
-        <button class="tv-tf-btn${currentTVInterval==='60'?' active':''}"  data-interval="60"  onclick="setTVInterval('60')">1h</button>
-        <button class="tv-tf-btn${currentTVInterval==='240'?' active':''}" data-interval="240" onclick="setTVInterval('240')">4h</button>
-      </span>
+      <button onclick="openChartModal()" style="font-size:10px;color:var(--green);background:none;border:none;cursor:pointer;padding:0;letter-spacing:0.02em">Full chart →</button>
     </div>
-    <div id="tv-chart-container" style="height:300px;border-radius:6px;overflow:hidden;border:1px solid rgba(255,255,255,0.07);margin-top:8px"></div>
+    <div id="tv-chart-container" style="height:160px;border-radius:6px;overflow:hidden;border:1px solid rgba(255,255,255,0.07);margin-top:8px"></div>
   </div>
   <div class="d-section">
     <div class="d-lbl">Context</div>
@@ -907,7 +1038,7 @@ function renderDetail(sig) {
   </div>
 </div>`;
 
-  loadTVChart(sig.symbol, sig.exchange || 'MEXC', currentTVInterval);
+  loadTVChart(sig.symbol, sig.exchange || 'MEXC');
   if (window.innerWidth >= 768) panel.classList.remove('hidden');
 }
 
@@ -1145,6 +1276,8 @@ function setMktPhase(phase) {
 /* ============================================================
    MARKET: load
    ============================================================ */
+let _mktScrollBound = false;
+
 async function loadMarket() {
   setMktPhase('loading');
   try {
@@ -1154,10 +1287,19 @@ async function loadMarket() {
     if (!data.success) throw new Error(data.error || 'Unknown error');
 
     M.pairs = data.pairs || [];
-    // Update tab label with actual count
     $('tab-market').textContent = `Market (${M.pairs.length})`;
     setMktPhase('ready');
     mktFilterAndSort();
+
+    if (!_mktScrollBound) {
+      _mktScrollBound = true;
+      $('mkt-rows').addEventListener('scroll', function() {
+        if (M.renderedCount >= M.filtered.length) return;
+        if (this.scrollTop + this.clientHeight >= this.scrollHeight - 200) {
+          _appendMktRows();
+        }
+      }, { passive: true });
+    }
 
   } catch (e) {
     console.error('Market load error:', e);
@@ -1183,19 +1325,43 @@ function mktFilterAndSort() {
   }
 
   // Sort
-  if (M.sort === 'direction') {
-    // LONG first, then SHORT
+  if (M.sort === 'symbol') {
+    result.sort((a, b) => {
+      const cmp = a.symbol.localeCompare(b.symbol);
+      return M.sortDir === 'asc' ? cmp : -cmp;
+    });
+  } else if (M.sort === 'direction') {
     result.sort((a, b) => {
       if (a.direction === b.direction) return 0;
-      return a.direction === 'LONG' ? -1 : 1;
+      const longFirst = a.direction === 'LONG' ? -1 : 1;
+      return M.sortDir === 'desc' ? longFirst : -longFirst;
     });
   } else {
-    result.sort((a, b) => (b[M.sort] ?? -Infinity) - (a[M.sort] ?? -Infinity));
+    result.sort((a, b) => {
+      const av = a[M.sort] ?? (M.sortDir === 'desc' ? -Infinity : Infinity);
+      const bv = b[M.sort] ?? (M.sortDir === 'desc' ? -Infinity : Infinity);
+      return M.sortDir === 'desc' ? bv - av : av - bv;
+    });
   }
 
   M.filtered = result;
-  M.page = 0; // always reset to page 1 after any filter/sort change
   renderMktRows();
+}
+
+function mktSortBy(field) {
+  if (M.sort === field) {
+    M.sortDir = M.sortDir === 'desc' ? 'asc' : 'desc';
+  } else {
+    M.sort    = field;
+    M.sortDir = 'desc';
+  }
+  document.querySelectorAll('.mkt-col-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.sort-indicator').forEach(el => el.textContent = '');
+  const btn = document.querySelector(`[onclick="mktSortBy('${field}')"]`);
+  if (btn) btn.classList.add('active');
+  const si = document.getElementById('si-' + field);
+  if (si) si.textContent = M.sortDir === 'desc' ? ' ↓' : ' ↑';
+  mktFilterAndSort();
 }
 
 function mktSetDir(dir) {
@@ -1214,7 +1380,6 @@ function mktSetSort(val) {
 
 function mktSearch(val) {
   M.search = val.trim().toLowerCase();
-  M.page   = 0;
   toggle('mkt-clear', M.search.length > 0);
   mktFilterAndSort();
 }
@@ -1225,64 +1390,67 @@ function mktClearSearch() {
 }
 
 /* ============================================================
-   MARKET: render rows + pagination
+   MARKET: render rows (infinite scroll)
    ============================================================ */
 function renderMktRows() {
   const rows = $('mkt-rows');
-
   if (!M.filtered.length) {
     rows.innerHTML = '<div class="state-msg"><p>No pairs match the current filter.</p></div>';
-    toggle('mkt-pagination', false);
     return;
   }
-
-  const start  = M.page * M.pageSize;
-  const page   = M.filtered.slice(start, start + M.pageSize);
-  rows.innerHTML = page.map((pair, i) => mktRowHTML(pair, start + i)).join('');
-
-  toggle('mkt-pagination', true);
-  renderMktPagination();
+  rows.innerHTML = '';
+  M.renderedCount = 0;
+  _appendMktRows();
 }
 
-function mktRowHTML(pair, globalIdx) {
+function _appendMktRows() {
+  const rows = $('mkt-rows');
+  const batch = M.filtered.slice(M.renderedCount, M.renderedCount + M.pageSize);
+  if (!batch.length) return;
+
+  const oldFooter = $('mkt-scroll-footer');
+  if (oldFooter) oldFooter.remove();
+
+  const maxes = _computeHeatMaxes(batch);
+  const frag = document.createDocumentFragment();
+  batch.forEach((pair, i) => {
+    const div = document.createElement('div');
+    div.innerHTML = mktRowHTML(pair, M.renderedCount + i, maxes);
+    frag.appendChild(div.firstChild);
+  });
+  M.renderedCount += batch.length;
+  rows.appendChild(frag);
+
+  const footer = document.createElement('div');
+  footer.id = 'mkt-scroll-footer';
+  footer.textContent = `Showing ${M.renderedCount} of ${M.filtered.length} pairs`;
+  rows.appendChild(footer);
+}
+
+function mktRowHTML(pair, globalIdx, maxes) {
   const [base, suffix] = splitSym(pair.symbol);
   const isLong = pair.direction === 'LONG';
-  const cc = pctColor(pair.change_24h_pct);
-  const fc = fundColor(pair.funding_rate);
+  const cc  = pctColor(pair.change_24h_pct);
+  const fc  = fundColor(pair.funding_rate);
+  const bgChange  = maxes ? heatBg(pair.change_24h_pct, maxes.change,  true)  : '';
+  const bgFunding = maxes ? heatBg(pair.funding_rate,   maxes.funding, false) : '';
+  const bgVolume  = maxes ? heatBg(pair.volume_24h,     maxes.volume,  true)  : '';
+  const bgOi      = maxes ? heatBg(pair.open_interest,  maxes.oi,      true)  : '';
 
   return `<div class="mkt-row" id="mr-${globalIdx}"
                onclick="enrichMarketPair('${esc(pair.symbol)}',${globalIdx})"
                role="button" tabindex="0">
   <div class="mkt-sym-cell">
     <div class="mkt-base">${esc(base)}<span style="color:var(--text3);font-size:9px">${esc(suffix)}</span></div>
-    <div class="mkt-price-sm">${fmtPrice(pair.price)}</div>
   </div>
+  <div class="mkt-val-sm mkt-price-col" style="font-family:var(--mono);text-align:right;color:var(--text2)">${fmtPrice(pair.price)}</div>
   <div><span class="mkt-dir-pill ${isLong ? 'long' : 'short'}">${pair.direction}</span></div>
   <div class="mkt-score">${pair.conviction_base}</div>
-  <div class="mkt-val" style="color:${cc}">${fmtPct(pair.change_24h_pct)}</div>
-  <div class="mkt-val-sm" style="color:${fc}">${fmtFunding(pair.funding_rate)}</div>
-  <div class="mkt-val-sm">${fmtBig(pair.volume_24h)}</div>
-  <div class="mkt-val-sm mkt-oi">${fmtBig(pair.open_interest)}</div>
+  <div class="mkt-val" style="color:${cc};background:${bgChange}">${fmtPct(pair.change_24h_pct)}</div>
+  <div class="mkt-val-sm" style="color:${fc};background:${bgFunding}">${fmtFunding(pair.funding_rate)}</div>
+  <div class="mkt-val-sm" style="background:${bgVolume}">${fmtBig(pair.volume_24h)}</div>
+  <div class="mkt-val-sm mkt-oi" style="background:${bgOi}">${fmtBig(pair.open_interest)}</div>
 </div>`;
-}
-
-function renderMktPagination() {
-  const total      = M.filtered.length;
-  const start      = M.page * M.pageSize + 1;
-  const end        = Math.min((M.page + 1) * M.pageSize, total);
-  const totalPages = Math.ceil(total / M.pageSize);
-
-  $('mkt-page-info').textContent = `Showing ${start}–${end} of ${total} pairs`;
-  $('mkt-prev').disabled = M.page === 0;
-  $('mkt-next').disabled = M.page >= totalPages - 1;
-}
-
-function mktPrev() { if (M.page > 0) { M.page--; renderMktRows(); } }
-function mktNext() {
-  if (M.page < Math.ceil(M.filtered.length / M.pageSize) - 1) {
-    M.page++;
-    renderMktRows();
-  }
 }
 
 /* ============================================================
@@ -1332,7 +1500,7 @@ async function enrichMarketPair(symbol, rowIdx) {
     // Tag as live analysis so renderDetail adds the amber badge
     data.signal._liveAnalysis = true;
     renderDetail(data.signal);
-    loadTVChart(data.signal.symbol, data.signal.exchange || 'MEXC', currentTVInterval);
+    loadTVChart(data.signal.symbol, data.signal.exchange || 'MEXC');
 
   } catch (e) {
     if (rowEl) rowEl.classList.remove('mkt-loading');
@@ -1356,6 +1524,9 @@ function toggleAiTip(btn) { btn.nextElementSibling.classList.toggle('hidden'); }
    ============================================================ */
 setPhase('idle');
 setMktPhase('idle');
+// Set initial sort indicator
+const initSi = document.getElementById('si-conviction_base');
+if (initSi) initSi.textContent = ' ↓';
 </script>
 </body>
 </html>
