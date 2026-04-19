@@ -413,6 +413,52 @@
     .d-analyzing { padding: 24px 14px; text-align: center; color: var(--text2); font-size: 12px; }
     .d-analyzing .spinner { margin: 0 auto 10px; }
 
+    /* ── Tools section ── */
+    #tools-section { flex: 1; overflow-y: auto; }
+    #tools-inner { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
+    .tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .tool-card {
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 20px;
+    }
+    .tool-title { font-size: 13px; font-weight: 700; margin-bottom: 4px; letter-spacing: 0.02em; }
+    .tool-subtitle { font-size: 11px; color: var(--text2); margin-bottom: 20px; }
+    .field-group { margin-bottom: 14px; }
+    .field-lbl {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text3); font-weight: 600; display: block; margin-bottom: 5px;
+    }
+    .field-input {
+      width: 100%; background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 7px 10px; font-size: 13px; font-family: var(--mono);
+      color: var(--text); outline: none; transition: border-color 150ms;
+    }
+    .field-input:focus { border-color: rgba(255,255,255,0.2); }
+    .result-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+    .result-item {
+      background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+      border-radius: 5px; padding: 10px 12px;
+    }
+    .result-lbl { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text3); display: block; margin-bottom: 4px; }
+    .result-val { font-family: var(--mono); font-size: 16px; font-weight: 700; }
+    .divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+    .milestone-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+      font-size: 12px;
+    }
+    .milestone-row:last-child { border-bottom: none; }
+    .milestone-day { color: var(--text2); font-size: 11px; }
+    .milestone-bal { font-family: var(--mono); font-weight: 600; }
+    .warning-box {
+      background: rgba(255,171,64,0.08); border: 1px solid rgba(255,171,64,0.2);
+      border-radius: 5px; padding: 10px 12px; font-size: 11px;
+      color: var(--amber); margin-top: 12px; line-height: 1.6;
+    }
+    .chart-wrap { margin-top: 16px; height: 120px; position: relative; }
+    canvas#compound-chart { width: 100%; height: 100%; }
+
     /* ── Mobile overlay ── */
     #overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 99; }
     #overlay.on { display: block; }
@@ -448,6 +494,7 @@
       .mkt-price-col, .mkt-price-lbl { display: none; }
       .mkt-oi, .mkt-oi-lbl { display: none; }
       #tv-chart-container { height: 160px !important; }
+      .tool-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -469,6 +516,7 @@
   <div id="tab-bar">
     <button id="tab-signals" class="tab-btn active" onclick="switchTab('signals')">Signals</button>
     <button id="tab-market"  class="tab-btn"        onclick="switchTab('market')">Market</button>
+    <button id="tab-tools"   class="tab-btn"        onclick="switchTab('tools')">Tools</button>
   </div>
 
   <!-- ── MAIN (shared flex row) ── -->
@@ -600,6 +648,80 @@
 
     </div><!-- /market-section -->
 
+    <!-- ════ TOOLS SECTION ════ -->
+    <div id="tools-section" class="hidden">
+      <div id="tools-inner">
+        <div class="tool-grid">
+
+          <!-- Risk Calculator -->
+          <div class="tool-card">
+            <div class="tool-title">Risk Calculator</div>
+            <div class="tool-subtitle">Position sizing based on your risk tolerance</div>
+            <div class="field-group">
+              <label class="field-lbl">Account Balance (USD)</label>
+              <input class="field-input" id="rc-balance" type="number" value="200" min="1" oninput="calcRisk()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Risk Per Trade (%)</label>
+              <input class="field-input" id="rc-risk-pct" type="number" value="1" min="0.1" max="10" step="0.1" oninput="calcRisk()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Entry Price</label>
+              <input class="field-input" id="rc-entry" type="number" placeholder="From signal" oninput="calcRisk()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Stop Loss Price</label>
+              <input class="field-input" id="rc-stop" type="number" placeholder="From signal" oninput="calcRisk()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Take Profit Price (TP1)</label>
+              <input class="field-input" id="rc-tp" type="number" placeholder="Optional" oninput="calcRisk()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Leverage</label>
+              <input class="field-input" id="rc-leverage" type="number" value="10" min="1" max="100" oninput="calcRisk()">
+            </div>
+            <hr class="divider">
+            <div class="result-grid" id="rc-results"></div>
+            <div id="rc-warning" class="hidden"></div>
+          </div>
+
+          <!-- Compound Planner -->
+          <div class="tool-card">
+            <div class="tool-title">Compound Planner</div>
+            <div class="tool-subtitle">Project account growth from consistent execution</div>
+            <div class="field-group">
+              <label class="field-lbl">Starting Balance (USD)</label>
+              <input class="field-input" id="cp-balance" type="number" value="200" oninput="calcCompound()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Win Rate (%)</label>
+              <input class="field-input" id="cp-winrate" type="number" value="55" min="1" max="99" oninput="calcCompound()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Average R:R (e.g. 2 means 2:1)</label>
+              <input class="field-input" id="cp-rr" type="number" value="2" min="0.5" step="0.1" oninput="calcCompound()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Risk Per Trade (%)</label>
+              <input class="field-input" id="cp-risk" type="number" value="1" min="0.1" max="10" step="0.1" oninput="calcCompound()">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl">Trades Per Day</label>
+              <input class="field-input" id="cp-trades" type="number" value="3" min="1" max="20" oninput="calcCompound()">
+            </div>
+            <hr class="divider">
+            <div id="cp-milestones"></div>
+            <div class="chart-wrap">
+              <canvas id="compound-chart"></canvas>
+            </div>
+            <div id="cp-warning" class="hidden"></div>
+          </div>
+
+        </div><!-- /tool-grid -->
+      </div><!-- /tools-inner -->
+    </div><!-- /tools-section -->
+
     <!-- ════ SHARED DETAIL PANEL ════ -->
     <aside id="detail-panel" class="hidden">
       <!-- populated by renderDetail() or enrichMarketPair() -->
@@ -672,8 +794,10 @@ function switchTab(tab) {
   currentTab = tab;
   toggle('signals-section', tab === 'signals');
   toggle('market-section',  tab === 'market');
+  toggle('tools-section',   tab === 'tools');
   $('tab-signals').classList.toggle('active', tab === 'signals');
   $('tab-market').classList.toggle('active',  tab === 'market');
+  $('tab-tools').classList.toggle('active',   tab === 'tools');
 }
 
 /* ============================================================
@@ -1040,6 +1164,12 @@ function renderDetail(sig) {
 
   loadTVChart(sig.symbol, sig.exchange || 'MEXC');
   if (window.innerWidth >= 768) panel.classList.remove('hidden');
+
+  // Auto-fill risk calculator from signal levels
+  if (sig.entries && sig.entries[0]) $('rc-entry').value = sig.entries[0];
+  if (sig.stop_loss)                 $('rc-stop').value  = sig.stop_loss;
+  if (sig.exits && sig.exits[0])     $('rc-tp').value    = sig.exits[0];
+  calcRisk();
 }
 
 function ladderHTML(sig) {
@@ -1520,6 +1650,184 @@ async function enrichMarketPair(symbol, rowIdx) {
 function toggleAiTip(btn) { btn.nextElementSibling.classList.toggle('hidden'); }
 
 /* ============================================================
+   TOOLS: Risk Calculator
+   ============================================================ */
+function calcRisk() {
+  const balance  = parseFloat($('rc-balance').value)  || 0;
+  const riskPct  = parseFloat($('rc-risk-pct').value) || 1;
+  const entry    = parseFloat($('rc-entry').value)    || 0;
+  const stop     = parseFloat($('rc-stop').value)     || 0;
+  const tp       = parseFloat($('rc-tp').value)       || 0;
+  const leverage = parseFloat($('rc-leverage').value) || 10;
+
+  const container = $('rc-results');
+  const warning   = $('rc-warning');
+
+  if (!entry || !stop || entry === stop) {
+    container.innerHTML = '<div style="color:var(--text3);font-size:12px;grid-column:1/-1;padding:8px 0">Enter entry and stop loss prices to calculate.</div>';
+    warning.classList.add('hidden');
+    return;
+  }
+
+  const dollarRisk      = balance * (riskPct / 100);
+  const stopDistancePct = Math.abs(entry - stop) / entry;
+  const positionSize    = dollarRisk / stopDistancePct;
+  const contracts       = positionSize / entry;
+  const marginRequired  = positionSize / leverage;
+  const isLong          = entry > stop;
+  const liqPrice        = isLong
+    ? entry * (1 - (1 / leverage) * 0.9)
+    : entry * (1 + (1 / leverage) * 0.9);
+  const rr = tp ? Math.abs(tp - entry) / Math.abs(stop - entry) : null;
+
+  const warnings = [];
+  if (marginRequired > balance * 0.5) warnings.push('⚠ Margin required exceeds 50% of account — consider reducing position size or leverage.');
+  if (riskPct > 2) warnings.push('⚠ Risking more than 2% per trade is aggressive. Most professional traders risk 0.5–1%.');
+  if (leverage > 20) warnings.push('⚠ Leverage above 20× amplifies liquidation risk significantly.');
+  if (rr !== null && rr < 1.5) warnings.push('⚠ R:R below 1.5:1 — this setup pays less than 1.5× what you risk.');
+  if (isLong && stop > entry) warnings.push('⚠ Stop is above entry for a LONG — check your inputs.');
+  if (!isLong && stop < entry) warnings.push('⚠ Stop is below entry for a SHORT — check your inputs.');
+
+  const rrColor = rr === null ? 'var(--text3)' : rr >= 2 ? 'var(--green)' : rr >= 1.5 ? 'var(--amber)' : 'var(--red)';
+
+  container.innerHTML = [
+    { lbl: 'Dollar Risk',       val: `$${dollarRisk.toFixed(2)}`,     color: 'var(--red)'  },
+    { lbl: 'Position Size',     val: `$${positionSize.toFixed(2)}`,   color: null          },
+    { lbl: 'Contracts',         val: contracts.toFixed(4),            color: null          },
+    { lbl: 'Margin Required',   val: `$${marginRequired.toFixed(2)}`, color: null          },
+    { lbl: 'Liquidation Price', val: fmtPrice(liqPrice),              color: 'var(--red)'  },
+    { lbl: 'R:R Ratio',         val: rr ? `${rr.toFixed(2)}:1` : '—', color: rrColor      },
+  ].map(r => `
+    <div class="result-item">
+      <span class="result-lbl">${r.lbl}</span>
+      <span class="result-val"${r.color ? ` style="color:${r.color}"` : ''}>${r.val}</span>
+    </div>`).join('');
+
+  if (warnings.length) {
+    warning.className = 'warning-box';
+    warning.innerHTML = warnings.join('<br>');
+  } else {
+    warning.className = 'hidden';
+  }
+}
+
+/* ============================================================
+   TOOLS: Compound Planner
+   ============================================================ */
+function calcCompound() {
+  const balance   = parseFloat($('cp-balance').value)  || 200;
+  const winRate   = (parseFloat($('cp-winrate').value) || 55) / 100;
+  const rr        = parseFloat($('cp-rr').value)       || 2;
+  const riskPct   = (parseFloat($('cp-risk').value)    || 1) / 100;
+  const tradesDay = parseInt($('cp-trades').value)     || 3;
+
+  const expectedPerTrade = (winRate * riskPct * rr) - ((1 - winRate) * riskPct);
+  const expectedPerDay   = expectedPerTrade * tradesDay;
+
+  const days = 90;
+  const balances = [balance];
+  for (let d = 1; d <= days; d++) {
+    balances.push(balances[d - 1] * (1 + expectedPerDay));
+  }
+
+  const maxConsecLosses = Math.ceil(Math.log(0.01) / Math.log(1 - winRate));
+  const worstDrawdown   = (1 - Math.pow(1 - riskPct, maxConsecLosses)) * 100;
+
+  const milestonesEl = $('cp-milestones');
+  milestonesEl.innerHTML = [7, 14, 30, 60, 90].map(d => {
+    const bal  = balances[d];
+    const gain = (bal - balance) / balance * 100;
+    const color = gain > 0 ? 'var(--green)' : 'var(--red)';
+    return `<div class="milestone-row">
+      <span class="milestone-day">Day ${d}</span>
+      <span class="milestone-bal" style="color:${color}">$${bal.toFixed(2)} <span style="font-size:10px;font-weight:400">(${gain > 0 ? '+' : ''}${gain.toFixed(1)}%)</span></span>
+    </div>`;
+  }).join('');
+
+  milestonesEl.innerHTML += `<div class="milestone-row" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">
+    <span class="milestone-day" style="color:var(--text3)">Worst streak (99% confidence)</span>
+    <span class="milestone-bal" style="color:var(--amber);font-size:12px">${maxConsecLosses} losses / −${worstDrawdown.toFixed(1)}%</span>
+  </div>`;
+
+  const warnings = [];
+  if (expectedPerDay > 0.05) warnings.push(`⚠ ${(expectedPerDay * 100).toFixed(1)}% daily expected return is extremely high. Real trading has variance — treat this as a ceiling, not a plan.`);
+  if (winRate > 0.70) warnings.push('⚠ Win rates above 70% are rare in live trading. Consider using 55–60% for realistic planning.');
+  if (tradesDay > 10) warnings.push('⚠ Taking 10+ trades per day is overtrading territory for most strategies.');
+  if (rr < 1.5) warnings.push('⚠ R:R below 1.5:1 requires a very high win rate to be profitable long-term.');
+
+  const warnEl = $('cp-warning');
+  if (warnings.length) {
+    warnEl.className = 'warning-box';
+    warnEl.innerHTML = warnings.join('<br>');
+  } else {
+    warnEl.className = 'hidden';
+  }
+
+  drawCompoundChart(balances);
+}
+
+function drawCompoundChart(balances) {
+  const canvas = document.getElementById('compound-chart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth || 300;
+  const H = canvas.offsetHeight || 120;
+  canvas.width  = W;
+  canvas.height = H;
+
+  const min   = Math.min(...balances);
+  const max   = Math.max(...balances);
+  const range = max - min || 1;
+  const pad   = { t: 8, r: 8, b: 20, l: 48 };
+  const chartW = W - pad.l - pad.r;
+  const chartH = H - pad.t - pad.b;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Horizontal grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 2; i++) {
+    const y = pad.t + (chartH * i / 2);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + chartW, y); ctx.stroke();
+    const val = max - (range * i / 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('$' + val.toFixed(0), pad.l - 4, y + 3);
+  }
+
+  const toX = d => pad.l + (d / (balances.length - 1)) * chartW;
+  const toY = v => pad.t + chartH - ((v - min) / range) * chartH;
+
+  // Fill under line
+  ctx.beginPath();
+  ctx.moveTo(toX(0), toY(balances[0]));
+  balances.forEach((b, d) => ctx.lineTo(toX(d), toY(b)));
+  ctx.lineTo(toX(balances.length - 1), pad.t + chartH);
+  ctx.lineTo(toX(0), pad.t + chartH);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(0,230,118,0.07)';
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  ctx.moveTo(toX(0), toY(balances[0]));
+  balances.forEach((b, d) => ctx.lineTo(toX(d), toY(b)));
+  ctx.strokeStyle = '#00e676';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // X axis labels
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  [0, 30, 60, 90].forEach(d => {
+    ctx.fillText('D' + d, toX(d), H - 5);
+  });
+}
+
+/* ============================================================
    INIT
    ============================================================ */
 setPhase('idle');
@@ -1527,6 +1835,9 @@ setMktPhase('idle');
 // Set initial sort indicator
 const initSi = document.getElementById('si-conviction_base');
 if (initSi) initSi.textContent = ' ↓';
+// Render tools with default values
+calcRisk();
+calcCompound();
 </script>
 </body>
 </html>
