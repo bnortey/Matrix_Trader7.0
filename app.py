@@ -3,6 +3,7 @@ import sys
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import requests
 import pandas as pd
@@ -28,6 +29,87 @@ CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
 ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
+
+# ---------------------------------------------------------------------------
+# Strategy registry
+# ---------------------------------------------------------------------------
+# Each strategy is a self-contained scoring profile. Weights scale the raw
+# points awarded in score_ticker(); filters gate which tickers even enter
+# stage 2; leverage_cap and min_conviction are applied at run_scan() time.
+#
+# Weight proportions are preserved from the Balanced defaults:
+#   momentum strong : weak  = 1 : 0.5
+#   funding  strong : weak  = 1 : 0.4
+#   basis           = full weight or nothing (no weak tier)
+
+STRATEGIES: dict = {
+    "balanced": {
+        "name": "Balanced",
+        "description": "All-market scanner, default settings",
+        "risk_level": "medium",
+        "weights": {
+            "momentum":    30,
+            "funding":     25,
+            "basis":       15,
+            "volume_mult": 1.1,
+        },
+        "leverage_cap":    20,
+        "min_conviction":  55,
+        "filters":         {},
+    },
+    "funding_arb": {
+        "name": "Funding Arb",
+        "description": "Funding rate extremes in ranging markets",
+        "risk_level": "low",
+        "weights": {
+            "momentum":    10,
+            "funding":     50,
+            "basis":       20,
+            "volume_mult": 1.0,
+        },
+        "leverage_cap":    10,
+        "min_conviction":  60,
+        "filters": {
+            # Only fire if absolute funding rate exceeds 0.03%
+            "min_funding_abs": 0.0003,
+        },
+    },
+    "momentum_breakout": {
+        "name": "Momentum Breakout",
+        "description": "Trending markets with volume expansion",
+        "risk_level": "high",
+        "weights": {
+            "momentum":    50,
+            "funding":     10,
+            "basis":        5,
+            "volume_mult": 1.2,
+        },
+        "leverage_cap":    25,
+        "min_conviction":  55,
+        "filters": {
+            # Only fire if 24h change exceeds ±3% (stored as percent, e.g. 3.0 = 3%)
+            "min_24h_change_pct": 3.0,
+        },
+    },
+    "mean_reversion": {
+        "name": "Mean Reversion",
+        "description": "Overbought/oversold after extended moves",
+        "risk_level": "medium",
+        "weights": {
+            "momentum":     5,
+            "funding":     30,
+            "basis":       30,
+            "volume_mult": 1.0,
+        },
+        "leverage_cap":    15,
+        "min_conviction":  65,
+        "filters": {
+            # RSI extremes required — applied in stage 2 after klines are available
+            "rsi_long_max":   35,   # LONG only if RSI < 35
+            "rsi_short_min":  65,   # SHORT only if RSI > 65
+        },
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -59,20 +141,25 @@ def fetch_mexc(path: str, params: dict | None = None) -> dict | list | None:
 # Stage 1: lightweight ticker scoring
 # ---------------------------------------------------------------------------
 
-def score_ticker(ticker: dict) -> dict | None:
+def score_ticker(ticker: dict, strategy: dict | None = None) -> dict | None:
     """
     Score a single ticker using only the fields available in the /contract/ticker
     response. No additional API calls. Returns a base signal dict or None if
-    the ticker is unusable (zero price, missing symbol, parse error).
+    the ticker is unusable (zero price, missing symbol, parse error), or if
+    it fails the strategy's stage-1 filters.
 
-    Scoring inputs:
-      - riseFallRate: 24h price change (high weight, 0–30 pts)
-      - fundingRate:  negative = shorts paying longs, bullish (high weight, 0–25 pts)
-      - price vs fairPrice: basis spread (medium weight, 0–15 pts)
-      - volume24:     high volume multiplies conviction by 1.1 (low weight)
+    Scoring inputs (weights scale with active strategy):
+      - riseFallRate: 24h price change
+      - fundingRate:  negative = shorts paying longs, bullish
+      - price vs fairPrice: basis spread
+      - volume24:     multiplier when volume > $10M
 
     Direction is whichever side accumulates more points. Ties go to LONG.
     """
+    strat = strategy or STRATEGIES["balanced"]
+    w = strat["weights"]
+    filters = strat.get("filters", {})
+
     try:
         symbol = ticker.get("symbol", "")
         price = float(ticker.get("lastPrice") or 0)
@@ -87,54 +174,63 @@ def score_ticker(ticker: dict) -> dict | None:
         if price <= 0 or not symbol:
             return None
 
+        # Stage-1 filters: applied before any scoring to avoid wasting enrichment quota
+        if "min_funding_abs" in filters and abs(funding) < filters["min_funding_abs"]:
+            return None
+        if "min_24h_change_pct" in filters and abs(change_pct) < filters["min_24h_change_pct"]:
+            return None
+
         long_score = 0
         short_score = 0
         tags: list[str] = []
 
-        # 24h momentum — high weight (0–30 pts)
+        # 24h momentum
+        # strong tier = full weight, weak tier = half weight (preserves original proportions)
+        mom_strong = w["momentum"]
+        mom_weak   = w["momentum"] // 2
         if change_pct > 5:
-            long_score += 30
+            long_score += mom_strong
             tags.append("strong_momentum")
         elif change_pct > 2:
-            long_score += 15
+            long_score += mom_weak
             tags.append("momentum")
         elif change_pct < -5:
-            short_score += 30
+            short_score += mom_strong
             tags.append("strong_dump")
         elif change_pct < -2:
-            short_score += 15
+            short_score += mom_weak
             tags.append("dump")
 
-        # Funding rate — high weight (0–25 pts)
+        # Funding rate
         # Negative funding = shorts paying longs = short-squeeze setup
+        # strong tier = full weight, weak tier = 40% (original 10/25 ratio)
+        fund_strong = w["funding"]
+        fund_weak   = int(w["funding"] * 0.4)
         if funding < -0.001:
-            long_score += 25
+            long_score += fund_strong
             tags.append("short_squeeze")
         elif funding < 0:
-            long_score += 10
+            long_score += fund_weak
         elif funding > 0.001:
-            short_score += 25
+            short_score += fund_strong
             tags.append("long_squeeze")
         elif funding > 0:
-            short_score += 10
+            short_score += fund_weak
 
-        # Basis spread — medium weight (0–15 pts)
+        # Basis spread — full weight or nothing (no weak tier)
         # Premium (price > fair): longs paying more, bearish lean
         # Discount (price < fair): shorts paying more, bullish lean
         if fair_price > 0:
             basis_pct = (price - fair_price) / fair_price * 100
             if basis_pct > 0.1:
-                short_score += 15
+                short_score += w["basis"]
                 tags.append("premium")
             elif basis_pct < -0.1:
-                long_score += 15
+                long_score += w["basis"]
                 tags.append("discount")
 
-        # Volume — low weight, applied as a multiplier not additive points.
-        # A 1.1× multiplier on a 30-pt signal adds 3 pts; on a 5-pt signal adds 0.5.
-        # This rewards high-conviction signals in liquid markets without inflating
-        # weak signals just because the coin has large absolute volume.
-        vol_mult = 1.1 if volume > 10_000_000 else 1.0
+        # Volume multiplier: strategy-defined, only applied when volume > $10M
+        vol_mult = w["volume_mult"] if volume > 10_000_000 else 1.0
         if volume > 10_000_000:
             tags.append("high_volume")
 
@@ -181,7 +277,7 @@ def _parse_depth_volume(levels: list) -> float:
     return total
 
 
-def enrich_signal(base: dict) -> dict | None:
+def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
     """
     Stage 2: fetch klines and depth for one symbol, run RSI/ATR indicators,
     compute orderbook imbalance, adjust conviction, and generate entry/TP/SL
@@ -193,11 +289,16 @@ def enrich_signal(base: dict) -> dict | None:
       +10 if orderbook imbalance aligns with direction
       ×0.85 in extreme volatility regime (5%+ ATR) — risky, reduce confidence
 
+    Strategy-specific stage-2 filters (applied after RSI is computed):
+      mean_reversion: discard if LONG and RSI >= rsi_long_max, or
+                              if SHORT and RSI <= rsi_short_min
+
     Falls back gracefully at every step:
       - If klines are missing or too short: return None (skip the signal)
       - If depth is unavailable: use 0.5 (neutral) imbalance
       - If ATR is zero: fall back to 1% of price so generate_ladders never errors
     """
+    strat = strategy or STRATEGIES["balanced"]
     symbol = base["symbol"]
     price = base["price"]
     direction = base["direction"]
@@ -304,6 +405,17 @@ def enrich_signal(base: dict) -> dict | None:
             if total > 0:
                 imbalance = bid_vol / total
 
+        # --- Strategy stage-2 filter: RSI extremes (mean_reversion only) ---
+        # Applied after RSI is computed but before any conviction adjustment.
+        # Mean reversion only makes sense when price is already stretched.
+        strat_filters = strat.get("filters", {})
+        if "rsi_long_max" in strat_filters and direction == "LONG":
+            if last_rsi >= strat_filters["rsi_long_max"]:
+                return None
+        if "rsi_short_min" in strat_filters and direction == "SHORT":
+            if last_rsi <= strat_filters["rsi_short_min"]:
+                return None
+
         # --- Conviction adjustments ---
         conviction = base["conviction_base"]
 
@@ -369,8 +481,11 @@ def enrich_signal(base: dict) -> dict | None:
             "rsi_1h": round(last_rsi, 2),
             "trend_score": trend_score,
             "tags": list(dict.fromkeys(tags)),  # deduplicate, preserve order
-            "basis_pct": None,   # reserved for P1.5
-            "ai_report": None,   # reserved for P2
+            "basis_pct": None,      # reserved for P1.5
+            "ai_report": None,      # reserved for P2
+            # Strategy context — surfaced in the UI
+            "strategy": strat["name"],
+            "leverage_cap": strat["leverage_cap"],
         }
     except Exception as e:
         print(f"enrich_signal error [{symbol}]: {e}", file=sys.stderr)
@@ -381,39 +496,50 @@ def enrich_signal(base: dict) -> dict | None:
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def run_scan(threshold: int = CONVICTION_THRESHOLD) -> tuple[list[dict], int]:
+def run_scan(
+    threshold: int = CONVICTION_THRESHOLD,
+    strategy_key: str = "balanced",
+) -> tuple[list[dict], int]:
     """
     Two-stage scan across all MEXC perpetual tickers.
 
-    Stage 1: Fetch all 800+ tickers, score each with score_ticker(), discard
-             anything with conviction_base < 20, take the top ENRICH_TOP_N.
+    Stage 1: Fetch all 800+ tickers, score each with score_ticker() using the
+             active strategy's weights and stage-1 filters. Discard anything
+             with conviction_base < 20, take the top ENRICH_TOP_N.
     Stage 2: Enrich the top N concurrently — fetches klines + depth per symbol,
-             runs indicators, builds ladders.
+             runs indicators, applies stage-2 strategy filters, builds ladders.
+
+    The effective conviction floor is max(threshold, strategy.min_conviction)
+    so each strategy's minimum bar is always respected.
 
     Returns (signals, total_pairs) where total_pairs is the raw ticker count.
-    Signals have conviction >= threshold, sorted descending.
+    Signals have conviction >= effective_threshold, sorted descending.
     """
+    strat = STRATEGIES.get(strategy_key, STRATEGIES["balanced"])
+    effective_threshold = max(threshold, strat["min_conviction"])
+
     tickers = fetch_mexc("/contract/ticker")
     if not tickers or not isinstance(tickers, list):
         return [], 0
 
     total_pairs = len(tickers)
 
-    # Stage 1
+    # Stage 1 — strategy weights + stage-1 filters applied inside score_ticker
     base_signals: list[dict] = []
     for t in tickers:
-        scored = score_ticker(t)
+        scored = score_ticker(t, strategy=strat)
         if scored and scored["conviction_base"] >= 20:
             base_signals.append(scored)
 
     base_signals.sort(key=lambda s: s["conviction_base"], reverse=True)
     top = base_signals[:ENRICH_TOP_N]
 
-    # Stage 2 — concurrent enrichment
+    # Stage 2 — concurrent enrichment, strategy-aware
+    enrich = partial(enrich_signal, strategy=strat)
     signals: list[dict] = []
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as executor:
-        for sig in executor.map(enrich_signal, top):
-            if sig and sig["conviction"] >= threshold:
+        for sig in executor.map(enrich, top):
+            if sig and sig["conviction"] >= effective_threshold:
                 signals.append(sig)
 
     signals.sort(key=lambda s: s["conviction"], reverse=True)
@@ -432,9 +558,20 @@ def index():
 @app.route("/api/scan")
 def api_scan():
     try:
-        threshold = request.args.get("threshold", CONVICTION_THRESHOLD, type=int)
-        signals, total_pairs = run_scan(threshold=threshold)
-        return jsonify({"success": True, "signals": signals, "count": len(signals), "total_pairs": total_pairs})
+        threshold    = request.args.get("threshold", CONVICTION_THRESHOLD, type=int)
+        strategy_key = request.args.get("strategy", "balanced")
+        if strategy_key not in STRATEGIES:
+            strategy_key = "balanced"
+        signals, total_pairs = run_scan(threshold=threshold, strategy_key=strategy_key)
+        strat = STRATEGIES[strategy_key]
+        return jsonify({
+            "success":       True,
+            "signals":       signals,
+            "count":         len(signals),
+            "total_pairs":   total_pairs,
+            "strategy":      strategy_key,
+            "strategy_name": strat["name"],
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

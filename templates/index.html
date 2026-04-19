@@ -97,6 +97,32 @@
     /* ── Signals section ── */
     #signals-section { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
 
+    /* ── Strategy bar ── */
+    #strategy-bar {
+      display: flex; align-items: center; gap: 5px;
+      padding: 7px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg3); flex-shrink: 0;
+      overflow-x: auto; -webkit-overflow-scrolling: touch;
+    }
+    #strategy-bar::-webkit-scrollbar { display: none; }
+    .strat-btn {
+      padding: 4px 11px; border-radius: 4px;
+      font-size: 12px; font-weight: 600;
+      color: var(--text2);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      transition: all 150ms; min-height: 28px;
+      white-space: nowrap; flex-shrink: 0;
+    }
+    .strat-btn.active { background: rgba(255,255,255,0.1); color: var(--text); border-color: rgba(255,255,255,0.14); }
+    .strat-btn:hover:not(.active) { color: var(--text); background: rgba(255,255,255,0.07); }
+    #strat-lbl {
+      margin-left: auto; flex-shrink: 0;
+      font-size: 10px; color: var(--text3);
+      white-space: nowrap;
+    }
+
     /* ── Stat bar ── */
     #stat-bar { display: flex; background: var(--bg3); border-bottom: 1px solid var(--border); flex-shrink: 0; }
     .stat {
@@ -525,6 +551,15 @@
     <!-- ════ SIGNALS SECTION ════ -->
     <div id="signals-section">
 
+      <!-- Strategy selector — always visible, governs next scan -->
+      <div id="strategy-bar">
+        <button class="strat-btn active" data-strat="balanced"          onclick="setStrategy('balanced')">Balanced</button>
+        <button class="strat-btn"        data-strat="funding_arb"       onclick="setStrategy('funding_arb')">Funding Arb</button>
+        <button class="strat-btn"        data-strat="momentum_breakout" onclick="setStrategy('momentum_breakout')">Momentum</button>
+        <button class="strat-btn"        data-strat="mean_reversion"    onclick="setStrategy('mean_reversion')">Mean Rev</button>
+        <span id="strat-lbl"></span>
+      </div>
+
       <!-- Stat bar -->
       <div id="stat-bar" class="hidden">
         <div class="stat"><span class="stat-val" id="sv-pairs">—</span><span class="stat-lbl">Scanned</span></div>
@@ -761,6 +796,7 @@ const S = {
   selected: -1,
   dir:      'all',
   sort:     'conviction',
+  strategy: 'balanced',
   totalPairs: 0,
   scanTime:   null,
   timerId:    null,
@@ -1206,6 +1242,8 @@ function ladderHTML(sig) {
 function contextHTML(sig) {
   const nfVal    = sig.next_funding_minutes != null ? sig.next_funding_minutes + 'm' : '—';
   const trendVal = sig.trend_score != null ? (sig.trend_score > 0 ? '+' : '') + sig.trend_score : '—';
+  const capVal = sig.leverage_cap != null ? sig.leverage_cap + '×' : '—';
+  const stratVal = sig.strategy || '—';
   const items = [
     { lbl: '1h Change',    val: fmtPct(sig.change_1h_pct),  color: pctColor(sig.change_1h_pct) },
     { lbl: '4h Change',    val: fmtPct(sig.change_4h_pct),  color: pctColor(sig.change_4h_pct) },
@@ -1215,6 +1253,8 @@ function contextHTML(sig) {
     { lbl: 'Next Funding', val: nfVal,                       color: null, id: 'ctx-nf' },
     { lbl: 'Volume 24h',   val: fmtBig(sig.volume_24h),     color: null },
     { lbl: 'Volatility',   val: sig.volatility || '—',       color: volColor(sig.volatility) },
+    { lbl: 'Strategy',     val: stratVal,                    color: 'var(--text2)' },
+    { lbl: 'Max Leverage', val: capVal,                      color: sig.leverage_cap >= 20 ? 'var(--amber)' : null },
   ];
   return '<div class="ctx-grid">' + items.map(it =>
     `<div class="ctx-item">
@@ -1234,7 +1274,9 @@ async function scanSignals(threshold) {
   if (S.countdownId) clearInterval(S.countdownId);
 
   try {
-    const url  = threshold ? `/api/scan?threshold=${threshold}` : '/api/scan';
+    const params = new URLSearchParams({ strategy: S.strategy });
+    if (threshold) params.set('threshold', threshold);
+    const url  = `/api/scan?${params}`;
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
@@ -1286,6 +1328,23 @@ function closePanel() {
     S.selected = -1;
     renderRows();
   }
+}
+
+const STRAT_META = {
+  balanced:          { label: 'Balanced',          cap: 20,  desc: 'All-market defaults'                  },
+  funding_arb:       { label: 'Funding Arb',        cap: 10,  desc: '|funding| > 0.03% · ranging markets' },
+  momentum_breakout: { label: 'Momentum Breakout',  cap: 25,  desc: '|24h Δ| > 3% · trending + volume'    },
+  mean_reversion:    { label: 'Mean Reversion',     cap: 15,  desc: 'RSI extremes · counter-trend'         },
+};
+
+function setStrategy(key) {
+  S.strategy = key;
+  document.querySelectorAll('.strat-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.strat === key);
+  });
+  const meta = STRAT_META[key];
+  const lbl = $('strat-lbl');
+  if (lbl && meta) lbl.textContent = meta.desc + ' · max ' + meta.cap + '×';
 }
 
 function setDir(dir) {
@@ -1832,6 +1891,7 @@ function drawCompoundChart(balances) {
    ============================================================ */
 setPhase('idle');
 setMktPhase('idle');
+setStrategy('balanced');
 // Set initial sort indicator
 const initSi = document.getElementById('si-conviction_base');
 if (initSi) initSi.textContent = ' ↓';

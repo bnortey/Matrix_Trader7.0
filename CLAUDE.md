@@ -52,11 +52,11 @@ This is the 7th iteration. Versions 2–6 all failed. The MT6 codebase (`Matrix_
 
 - [ ] Port `lib/indicators.py` — RSI, EMA, VWAP, ATR from MT6 (clean pandas, no ARIMA)
 - [ ] Port `lib/laddering.py` — ATR-derived tiered entry/TP/SL generator
-- [ ] Wire indicators into per-signal scoring in `app.py`
-- [ ] Add entry/TP/SL to every signal card in the dashboard
+- [x] Wire indicators into per-signal scoring in `app.py`
+- [x] Add entry/TP/SL to every signal card in the dashboard
 - [x] Complete risk calculator (position sizing, max leverage, drawdown analysis)
 - [x] Complete compound planner (Monte Carlo, milestone projections)
-- [ ] Port `lib/mexc_stream.py` — WebSocket for live price refresh on watched pairs
+- [ ] Port `lib/mexc_stream.py` — WebSocket for live price refresh on watched pairs (deferred to P3)
 
 ---
 
@@ -221,8 +221,9 @@ Opens at `http://192.168.x.x:5000` on iPhone (same WiFi).
 | Phase | What | Status |
 |---|---|---|
 | P0 | Flask app running, MEXC ticker scan, basic scoring, web dashboard | ✅ Done |
-| P1 | Indicators integrated, entry/TP/SL on signals, risk calc, compound planner | 🔄 Current |
-| P2 | AI signal report, filtering, one-command installer, error hardening | Planned |
+| P1 | Indicators integrated, entry/TP/SL on signals, risk calc, compound planner | ✅ Done |
+| P2a | Strategy registry (Balanced/Funding Arb/Momentum/Mean Rev), pill UI | ✅ Done |
+| P2 | Template-based AI signal report, CoinGlass integration, error hardening | 🔄 Current |
 | P3 | 2-week internal alpha in live trading, signal history, outcome tracking | Planned |
 | P4 | README, GitHub publish, 5 external beta testers | Planned |
 
