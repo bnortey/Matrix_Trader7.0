@@ -54,8 +54,8 @@ This is the 7th iteration. Versions 2–6 all failed. The MT6 codebase (`Matrix_
 - [ ] Port `lib/laddering.py` — ATR-derived tiered entry/TP/SL generator
 - [ ] Wire indicators into per-signal scoring in `app.py`
 - [ ] Add entry/TP/SL to every signal card in the dashboard
-- [ ] Complete risk calculator (position sizing, max leverage, drawdown analysis)
-- [ ] Complete compound planner (Monte Carlo, milestone projections)
+- [x] Complete risk calculator (position sizing, max leverage, drawdown analysis)
+- [x] Complete compound planner (Monte Carlo, milestone projections)
 - [ ] Port `lib/mexc_stream.py` — WebSocket for live price refresh on watched pairs
 
 ---
