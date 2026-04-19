@@ -218,6 +218,37 @@
       color: var(--text3); background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 2px;
     }
 
+    /* ── Why line ── */
+    .row-why {
+      font-size: 11px; color: var(--text2); margin-top: 5px;
+      line-height: 1.4; font-style: italic;
+    }
+
+    /* ── Freshness dot ── */
+    .freshness-dot {
+      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+      flex-shrink: 0; margin-top: 1px;
+      background: var(--text3); /* default/stale */
+    }
+    .freshness-dot.fresh { background: var(--green); }
+    .freshness-dot.aging { background: var(--amber); }
+    .freshness-dot.stale { background: var(--text3); }
+
+    /* ── Invalidation callout (detail panel) ── */
+    .invalid-box {
+      margin-top: 8px;
+      padding: 7px 10px;
+      background: rgba(255,171,64,0.07);
+      border-radius: 5px;
+      font-size: 11px;
+      color: var(--amber);
+      line-height: 1.5;
+    }
+    .invalid-lbl {
+      font-size: 9px; text-transform: uppercase; letter-spacing: 0.07em;
+      color: rgba(255,171,64,0.55); font-weight: 700; display: block; margin-bottom: 2px;
+    }
+
     /* ── Empty / error states ── */
     .state-msg { padding: 40px 24px; text-align: center; }
     .state-msg p { color: var(--text2); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
@@ -1101,6 +1132,14 @@ function renderRows() {
   container.innerHTML = S.filtered.map((sig, i) => rowHTML(sig, i)).join('');
 }
 
+function getFreshnessClass() {
+  if (!S.scanTime) return 'stale';
+  const ageMs = Date.now() - S.scanTime;
+  if (ageMs < 5 * 60 * 1000)  return 'fresh';
+  if (ageMs < 15 * 60 * 1000) return 'aging';
+  return 'stale';
+}
+
 function rowHTML(sig, i) {
   const [base, suffix] = splitSym(sig.symbol);
   const tier   = getTier(sig.conviction);
@@ -1111,6 +1150,10 @@ function rowHTML(sig, i) {
   const tagsHtml = sig.tags.length
     ? `<div class="row-tags">${sig.tags.map(t => `<span class="tag">${esc(t.replace(/_/g,' '))}</span>`).join('')}</div>`
     : '';
+  const whyHtml = sig.signal_why
+    ? `<div class="row-why">${esc(sig.signal_why)}</div>`
+    : '';
+  const freshnessClass = getFreshnessClass();
   return `
 <div class="sig-row ${isLong ? 'long' : 'short'} ${active}"
      onclick="selectSignal(${i})" role="button" tabindex="0"
@@ -1130,8 +1173,10 @@ function rowHTML(sig, i) {
         <span class="row-chg" style="color:${cc}">${fmtPct(sig.change_24h_pct)}</span>
       </div>
       <span class="row-fund" style="color:${fc}">${fmtFunding(sig.funding_rate)}</span>
+      <span class="freshness-dot ${freshnessClass}" title="${freshnessClass}"></span>
     </div>
   </div>
+  ${whyHtml}
   ${tagsHtml}
 </div>`;
 }
@@ -1167,6 +1212,7 @@ function renderDetail(sig) {
   <div class="d-section">
     <div class="d-lbl">Trade Plan</div>
     ${ladderHTML(sig)}
+    ${invalidationHTML(sig)}
   </div>
   <div class="d-section">
     <div class="d-lbl" style="display:flex;align-items:center;justify-content:space-between">
@@ -1237,6 +1283,22 @@ function ladderHTML(sig) {
       ? `<div class="price-line">━━ ${fmtPrice(r.p)} ━━</div>`
       : `<div class="ldr-row ${r.cls}"><span class="ldr-lbl">${r.lbl}</span><span class="ldr-p">${fmtPrice(r.p)}</span></div>`
   ).join('') + '</div>';
+}
+
+function invalidationHTML(sig) {
+  // Requires entries[0], stop_loss, atr_pct, price, direction — all present on
+  // enriched signals. Falls back to an empty string if any field is missing so
+  // market-tab click-to-enrich (which may have no entries yet) doesn't break.
+  if (!sig.entries || !sig.entries[0] || !sig.stop_loss || !sig.atr_pct || !sig.price) return '';
+  const atrValue = (sig.atr_pct / 100) * sig.price;
+  if (atrValue <= 0) return '';
+  const distance = Math.abs(sig.entries[0] - sig.stop_loss);
+  const atrMult  = (distance / atrValue).toFixed(1);
+  const word     = sig.direction === 'LONG' ? 'below' : 'above';
+  return `<div class="invalid-box">
+  <span class="invalid-lbl">Invalidation</span>
+  Price closes ${word} ${fmtPrice(sig.stop_loss)} — ${atrMult}× ATR from Entry 1
+</div>`;
 }
 
 function contextHTML(sig) {
@@ -1438,6 +1500,13 @@ function updateTimestamp() {
   if (!S.scanTime) return;
   const meta = $('scan-meta');
   if (meta) meta.textContent = `${S.totalPairs} pairs · ${S.signals.length} signals · ${fmtAge(S.scanTime)}`;
+  // Update freshness dots in-place — no row re-render needed since all signals
+  // share the same scanTime and only the CSS class needs to change.
+  const fc = getFreshnessClass();
+  document.querySelectorAll('.freshness-dot').forEach(el => {
+    el.className = `freshness-dot ${fc}`;
+    el.title = fc;
+  });
 }
 function startCountdown(sig) {
   if (S.countdownId) clearInterval(S.countdownId);

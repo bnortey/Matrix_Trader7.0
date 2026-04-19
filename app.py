@@ -277,6 +277,78 @@ def _parse_depth_volume(levels: list) -> float:
     return total
 
 
+def why_signal(sig: dict) -> str:
+    """
+    Generate a plain-English one-liner explaining the primary reason a signal
+    fired, using the tags list assembled during scoring plus key numeric fields.
+
+    Priority waterfall: the first matching tag sets the primary clause.
+    A secondary clause is appended when extreme_vol is present, as a size-down
+    caution — this is the only modifier that overrides normal secondary text
+    because a 5%+ ATR candle can wipe a position regardless of setup quality.
+
+    Kept as a pure function (no side-effects, no I/O) so it can be unit-tested
+    or reused in P2c's template report without changes.
+    """
+    tags      = sig.get("tags", [])
+    direction = sig.get("direction", "LONG")
+    rsi       = sig.get("rsi_1h", 50.0)
+    funding   = sig.get("funding_rate", 0.0)
+    chg24     = sig.get("change_24h_pct", 0.0)
+    conviction = sig.get("conviction", 0)
+    is_extreme = "extreme_vol" in tags
+
+    # Format helpers local to this function so we don't import formatting deps
+    def _fmt_pct(v: float) -> str:
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.1f}%"
+
+    def _fmt_fund(v: float) -> str:
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v * 100:.3f}%"
+
+    # --- Primary clause: tag-priority waterfall ---
+    if "short_squeeze" in tags:
+        primary = f"Funding at {_fmt_fund(funding)} — shorts paying longs, squeeze setup"
+    elif "long_squeeze" in tags:
+        primary = f"Funding at {_fmt_fund(funding)} — longs overextended, squeeze building"
+    elif "strong_momentum" in tags:
+        primary = f"Surging {_fmt_pct(chg24)} in 24h"
+        if "high_volume" in tags:
+            primary += " with high volume"
+    elif "strong_dump" in tags:
+        primary = f"Dumping {_fmt_pct(chg24)} in 24h — bearish momentum in play"
+    elif "momentum" in tags:
+        primary = f"Bullish momentum, up {_fmt_pct(chg24)} in 24h"
+    elif "dump" in tags:
+        primary = f"Bearish pressure, down {_fmt_pct(chg24)} in 24h"
+    elif "oversold" in tags:
+        suffix = " with negative funding" if funding < -0.0001 else ""
+        primary = f"RSI at {rsi:.0f} — oversold{suffix}"
+    elif "overbought" in tags:
+        suffix = " with positive funding" if funding > 0.0001 else ""
+        primary = f"RSI at {rsi:.0f} — overbought{suffix}"
+    elif "overbought_risk" in tags:
+        primary = f"Momentum signal but RSI elevated at {rsi:.0f} — reduced conviction"
+    elif "oversold_risk" in tags:
+        primary = f"Short signal but RSI stretched down at {rsi:.0f} — reduced conviction"
+    elif "discount" in tags:
+        primary = "Basis discount — price trading below fair value"
+    elif "premium" in tags:
+        primary = "Basis premium — price trading above fair value"
+    elif "bid_heavy" in tags and direction == "LONG":
+        primary = "Orderbook bid-heavy — buy pressure dominates"
+    elif "ask_heavy" in tags and direction == "SHORT":
+        primary = "Orderbook ask-heavy — sell pressure dominates"
+    else:
+        primary = f"Score {conviction} — multiple factors aligned"
+
+    # --- Extreme volatility caution always appended ---
+    if is_extreme:
+        return primary + " · extreme volatility — size down"
+    return primary
+
+
 def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
     """
     Stage 2: fetch klines and depth for one symbol, run RSI/ATR indicators,
@@ -456,7 +528,10 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             direction=direction,
         )
 
-        return {
+        # Build the final signal dict before calling why_signal so we can
+        # pass it in with all fields populated (rsi, conviction, tags, etc.)
+        final_tags = list(dict.fromkeys(tags))  # deduplicate, preserve order
+        sig = {
             "symbol": symbol,
             "exchange": "MEXC",
             "direction": direction,
@@ -480,13 +555,15 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             "volatility": vol_regime,
             "rsi_1h": round(last_rsi, 2),
             "trend_score": trend_score,
-            "tags": list(dict.fromkeys(tags)),  # deduplicate, preserve order
+            "tags": final_tags,
             "basis_pct": None,      # reserved for P1.5
-            "ai_report": None,      # reserved for P2
+            "ai_report": None,      # reserved for P2c
             # Strategy context — surfaced in the UI
             "strategy": strat["name"],
             "leverage_cap": strat["leverage_cap"],
         }
+        sig["signal_why"] = why_signal(sig)
+        return sig
     except Exception as e:
         print(f"enrich_signal error [{symbol}]: {e}", file=sys.stderr)
         return None

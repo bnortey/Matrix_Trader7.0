@@ -223,7 +223,8 @@ Opens at `http://192.168.x.x:5000` on iPhone (same WiFi).
 | P0 | Flask app running, MEXC ticker scan, basic scoring, web dashboard | ✅ Done |
 | P1 | Indicators integrated, entry/TP/SL on signals, risk calc, compound planner | ✅ Done |
 | P2a | Strategy registry (Balanced/Funding Arb/Momentum/Mean Rev), pill UI | ✅ Done |
-| P2 | Template-based AI signal report, CoinGlass integration, error hardening | 🔄 Current |
+| P2b | Signal card why-line, freshness dot, invalidation condition | ✅ Done |
+| P2c | Template-based AI signal report in detail panel | 🔄 Next |
 | P3 | 2-week internal alpha in live trading, signal history, outcome tracking | Planned |
 | P4 | README, GitHub publish, 5 external beta testers | Planned |
 
