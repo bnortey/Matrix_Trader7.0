@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -349,6 +350,173 @@ def why_signal(sig: dict) -> str:
     return primary
 
 
+def generate_report(sig: dict) -> str:
+    """
+    Build a 4-section plain-English trade brief from a fully-populated signal dict.
+
+    Returns a JSON string: list of {label, text} dicts, one per section.
+    Pure function — no I/O, no side effects.
+
+    Section order:
+      §1  Setup      — what is driving the signal (strategy-aware)
+      §2  Structure  — entry zone, TP levels, stop loss
+      §3  Invalidation — ATR multiple (must match invalidationHTML formula exactly)
+      §4  Risk       — volatility, leverage cap, funding context
+
+    §1 special rule: when strategy is "Mean Reversion", lead with RSI regardless
+    of whether funding tags (short_squeeze, long_squeeze) are present. RSI extreme
+    is the thesis for that strategy; funding is secondary context.
+
+    ATR formula (must match invalidationHTML in index.html exactly):
+        atr_value = (atr_pct / 100) * price
+        distance  = abs(entries[0] - stop_loss)
+        atr_mult  = round(distance / atr_value, 1)
+    """
+    strategy_name  = sig.get("strategy", "Balanced")
+    direction      = sig.get("direction", "LONG")
+    rsi            = sig.get("rsi_1h", 50.0)
+    funding        = sig.get("funding_rate", 0.0)
+    chg_24h        = sig.get("change_24h_pct", 0.0)
+    chg_4h         = sig.get("change_4h_pct", 0.0)
+    chg_1h         = sig.get("change_1h_pct", 0.0)
+    atr_pct        = sig.get("atr_pct", 0.0)
+    price          = sig.get("price", 0.0)
+    vol_regime     = sig.get("volatility", "medium")
+    conviction     = sig.get("conviction", 0)
+    leverage_cap   = sig.get("leverage_cap", 20)
+    tags           = sig.get("tags", [])
+    entries        = sig.get("entries", [0.0, 0.0, 0.0])
+    exits          = sig.get("exits", [0.0, 0.0, 0.0])
+    stop_loss      = sig.get("stop_loss", 0.0)
+    nfm            = sig.get("next_funding_minutes")
+    trend_score    = sig.get("trend_score", 0)
+    symbol         = sig.get("symbol", "")
+
+    is_long = direction == "LONG"
+
+    def _pct(v: float) -> str:
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.1f}%"
+
+    def _fund(v: float) -> str:
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v * 100:.3f}%"
+
+    # --- §1 Setup ---
+    if strategy_name == "Mean Reversion":
+        rsi_label = "oversold" if is_long else "overbought"
+        s1 = (
+            f"RSI at {rsi:.0f} — {rsi_label} reading signals the thesis for this trade. "
+            f"{symbol} has extended and the setup is a {direction.lower()} reversion to mean. "
+        )
+        if abs(funding) > 0.0001:
+            paying = "longs" if funding > 0 else "shorts"
+            s1 += f"Funding at {_fund(funding)} supports the setup — {paying} are paying the carry."
+        elif trend_score != 0:
+            trend_word = "bullish" if trend_score > 0 else "bearish"
+            s1 += f"Trend score at {trend_score:+d} ({trend_word} EMA structure) is secondary context."
+    elif "short_squeeze" in tags:
+        s1 = (
+            f"Funding at {_fund(funding)} — shorts are paying longs. A squeeze setup is forming. "
+            f"24h change: {_pct(chg_24h)}. Negative funding combined with upward momentum "
+            f"creates a forced-unwind dynamic that can move quickly."
+        )
+    elif "long_squeeze" in tags:
+        s1 = (
+            f"Funding at {_fund(funding)} — longs are overextended and paying carry. "
+            f"24h change: {_pct(chg_24h)}. Elevated positive funding signals overcrowded longs "
+            f"and increases the risk of a liquidation cascade on any dip."
+        )
+    elif "strong_momentum" in tags or "momentum" in tags:
+        volume_note = " with above-average volume confirming the move" if "high_volume" in tags else ""
+        s1 = (
+            f"{symbol} is up {_pct(chg_24h)} in 24h{volume_note}. "
+            f"4h change: {_pct(chg_4h)}, 1h change: {_pct(chg_1h)}. "
+            f"Trend score {trend_score:+d} — EMA structure is {'aligned' if trend_score > 20 else 'weak'}. "
+            f"Momentum setup — price is breaking higher and buyers remain in control."
+        )
+    elif "strong_dump" in tags or "dump" in tags:
+        s1 = (
+            f"{symbol} is down {_pct(chg_24h)} in 24h. "
+            f"4h: {_pct(chg_4h)}, 1h: {_pct(chg_1h)}. "
+            f"Sellers are in control. Trend score {trend_score:+d}. "
+            f"Short momentum setup — continued downside is the higher-probability outcome."
+        )
+    elif "oversold" in tags:
+        s1 = (
+            f"RSI at {rsi:.0f} — oversold. Price may be reaching a local exhaustion point. "
+            f"Funding at {_fund(funding)}. "
+            f"Setup is a counter-trend long off stretched RSI — conviction at {conviction}."
+        )
+    elif "overbought" in tags:
+        s1 = (
+            f"RSI at {rsi:.0f} — overbought. "
+            f"Funding at {_fund(funding)}. "
+            f"Short setup off stretched RSI — conviction at {conviction}."
+        )
+    else:
+        s1 = (
+            f"Score {conviction} — multiple factors aligned for a {direction.lower()} setup. "
+            f"24h: {_pct(chg_24h)}, RSI: {rsi:.0f}, funding: {_fund(funding)}."
+        )
+
+    # --- §2 Structure ---
+    e1, e2, e3 = entries[0], entries[1], entries[2]
+    tp1, tp2, tp3 = exits[0], exits[1], exits[2]
+    direction_verb = "below" if is_long else "above"
+    s2 = (
+        f"Scale in across three entries: {e1:.8g} → {e2:.8g} → {e3:.8g}. "
+        f"Take partial profits at {tp1:.8g}, {tp2:.8g}, and {tp3:.8g}. "
+        f"Full stop at {stop_loss:.8g} ({direction_verb} all entries). "
+        f"Risk/reward on Entry 1 to TP 3: ~{abs(tp3 - e1) / max(abs(e1 - stop_loss), 1e-12):.1f}:1."
+    )
+
+    # --- §3 Invalidation (must use same formula as invalidationHTML) ---
+    atr_value = (atr_pct / 100) * price
+    if atr_value > 0:
+        distance = abs(entries[0] - stop_loss)
+        atr_mult = round(distance / atr_value, 1)
+        close_word = "below" if is_long else "above"
+        s3 = (
+            f"Trade invalidates on a close {close_word} {stop_loss:.8g}. "
+            f"That level is {atr_mult}× ATR from Entry 1 — "
+            f"the ATR ({atr_pct:.1f}% of price) defines the expected daily range. "
+            f"If price reaches the stop, the thesis is wrong and the full position must close."
+        )
+    else:
+        close_word = "below" if is_long else "above"
+        s3 = f"Trade invalidates on a close {close_word} {stop_loss:.8g}. Close the full position if reached."
+
+    # --- §4 Risk ---
+    regime_note = {
+        "low":     "Low volatility — tighter fills, lower slippage risk.",
+        "medium":  "Medium volatility — standard position sizing applies.",
+        "high":    "High volatility — consider reducing size by 25–50%.",
+        "extreme": "Extreme volatility (5%+ ATR) — reduce position size significantly, expect wider spreads.",
+    }.get(vol_regime, "")
+    fund_note = ""
+    if abs(funding) > 0.0001:
+        paying_side = "long" if funding > 0 else "short"
+        receiving_side = "short" if funding > 0 else "long"
+        fund_note = (
+            f" Funding at {_fund(funding)} per 8h — {paying_side}s pay, {receiving_side}s collect. "
+        )
+        if nfm is not None:
+            fund_note += f"Next settlement in {nfm}m."
+    s4 = (
+        f"Max leverage: {leverage_cap}×. ATR: {atr_pct:.1f}% of price. {regime_note}"
+        f"{fund_note}"
+    )
+
+    sections = [
+        {"label": "Setup",         "text": s1.strip()},
+        {"label": "Structure",     "text": s2.strip()},
+        {"label": "Invalidation",  "text": s3.strip()},
+        {"label": "Risk",          "text": s4.strip()},
+    ]
+    return json.dumps(sections)
+
+
 def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
     """
     Stage 2: fetch klines and depth for one symbol, run RSI/ATR indicators,
@@ -557,12 +725,13 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             "trend_score": trend_score,
             "tags": final_tags,
             "basis_pct": None,      # reserved for P1.5
-            "ai_report": None,      # reserved for P2c
+            "ai_report": None,      # populated below after sig is fully built
             # Strategy context — surfaced in the UI
             "strategy": strat["name"],
             "leverage_cap": strat["leverage_cap"],
         }
         sig["signal_why"] = why_signal(sig)
+        sig["ai_report"]  = generate_report(sig)
         return sig
     except Exception as e:
         print(f"enrich_signal error [{symbol}]: {e}", file=sys.stderr)

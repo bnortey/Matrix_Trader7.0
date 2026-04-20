@@ -436,13 +436,11 @@
     /* Tags */
     .tags-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
 
-    /* AI placeholder */
-    .ai-card { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 6px; padding: 14px; text-align: center; }
-    .ai-icon { font-size: 18px; color: var(--text3); margin-bottom: 5px; }
-    .ai-desc { font-size: 11px; color: var(--text3); margin-bottom: 10px; }
-    .ai-gen-btn { padding: 6px 14px; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; color: var(--text2); transition: all 150ms; }
-    .ai-gen-btn:hover { background: rgba(255,255,255,0.1); color: var(--text); }
-    .ai-tip { margin-top: 8px; font-size: 11px; color: var(--amber); }
+    /* AI report */
+    .report-block { display: flex; flex-direction: column; gap: 10px; }
+    .report-section { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+    .report-lbl { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text3); margin-bottom: 5px; }
+    .report-text { font-size: 12px; color: var(--text2); line-height: 1.55; }
 
     /* TradingView timeframe buttons */
     .tv-tf-btn {
@@ -1235,12 +1233,7 @@ function renderDetail(sig) {
   </div>
   <div class="d-section">
     <div class="d-lbl">AI Report</div>
-    <div class="ai-card">
-      <div class="ai-icon">✦</div>
-      <div class="ai-desc">Signal brief not yet generated</div>
-      <button class="ai-gen-btn" onclick="toggleAiTip(this)">Generate brief</button>
-      <div class="ai-tip hidden">Coming in P2</div>
-    </div>
+    ${reportHTML(sig)}
   </div>
 </div>`;
 
@@ -1299,6 +1292,18 @@ function invalidationHTML(sig) {
   <span class="invalid-lbl">Invalidation</span>
   Price closes ${word} ${fmtPrice(sig.stop_loss)} — ${atrMult}× ATR from Entry 1
 </div>`;
+}
+
+function reportHTML(sig) {
+  if (!sig.ai_report) return '<div style="font-size:12px;color:var(--text3);padding:4px 0">No report available.</div>';
+  let sections;
+  try { sections = JSON.parse(sig.ai_report); } catch (e) { return ''; }
+  if (!Array.isArray(sections) || !sections.length) return '';
+  return '<div class="report-block">' +
+    sections.map(s =>
+      `<div class="report-section"><div class="report-lbl">${esc(s.label)}</div><div class="report-text">${esc(s.text)}</div></div>`
+    ).join('') +
+    '</div>';
 }
 
 function contextHTML(sig) {
@@ -1771,11 +1776,6 @@ async function enrichMarketPair(symbol, rowIdx) {
 </div>`;
   }
 }
-
-/* ============================================================
-   AI BUTTON
-   ============================================================ */
-function toggleAiTip(btn) { btn.nextElementSibling.classList.toggle('hidden'); }
 
 /* ============================================================
    TOOLS: Risk Calculator
