@@ -129,20 +129,40 @@ def fetch_mexc(path: str, params: dict | None = None) -> dict | list | None:
     GET a MEXC contract API endpoint and unwrap the response envelope.
 
     All MEXC responses wrap their payload in {"success": true, "data": ...}.
-    This helper returns the value of "data" directly, or None on any failure
-    (network error, timeout, non-200, success=false). Callers treat None as
-    "skip this ticker/symbol".
+    Returns the value of "data" directly, or None on any failure.
+
+    Retry policy: up to 3 total attempts (2 retries) with 1s then 2s delays.
+    Retries on: ConnectionError, Timeout, HTTP 5xx.
+    Does NOT retry on 4xx — those are real client errors that won't change.
     """
-    try:
-        resp = requests.get(f"{MEXC_BASE}{path}", params=params, timeout=10)
-        resp.raise_for_status()
-        body = resp.json()
-        if not body.get("success"):
+    last_err: str = ""
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{MEXC_BASE}{path}", params=params, timeout=10)
+
+            # 5xx = server-side problem; retry after a delay. 4xx = our fault; bail.
+            if resp.status_code >= 500 and attempt < 2:
+                last_err = f"HTTP {resp.status_code}"
+                time.sleep(attempt + 1)
+                continue
+
+            resp.raise_for_status()
+            body = resp.json()
+            if not body.get("success"):
+                return None
+            return body.get("data")
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = str(e)
+            if attempt < 2:
+                time.sleep(attempt + 1)
+                continue
+        except Exception as e:
+            print(f"MEXC fetch error [{path}]: {e}", file=sys.stderr)
             return None
-        return body.get("data")
-    except Exception as e:
-        print(f"MEXC fetch error [{path}]: {e}", file=sys.stderr)
-        return None
+
+    print(f"MEXC fetch error [{path}]: {last_err} (gave up after 3 attempts)", file=sys.stderr)
+    return None
 
 
 def fetch_market_sentiment(mexc_symbol: str, price: float) -> dict:

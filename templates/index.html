@@ -139,6 +139,7 @@
       padding: 7px 12px;
       border-bottom: 1px solid var(--border);
       background: var(--bg2); flex-shrink: 0;
+      flex-wrap: wrap;
     }
     .dir-filters { display: flex; gap: 4px; }
     .dir-btn {
@@ -151,14 +152,23 @@
     }
     .dir-btn.active { background: rgba(255,255,255,0.1); color: var(--text); border-color: rgba(255,255,255,0.14); }
     .dir-btn:hover:not(.active) { color: var(--text); background: rgba(255,255,255,0.07); }
-    #sort-sel {
-      margin-left: auto;
+    .filter-right { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+    #sort-sel, #vol-sel {
       background: rgba(255,255,255,0.04);
       border: 1px solid var(--border);
       border-radius: 4px; padding: 4px 8px;
       font-size: 12px; outline: none; min-height: 28px; color: var(--text2);
     }
-    #sort-sel:focus { border-color: rgba(255,255,255,0.15); color: var(--text); }
+    #sort-sel:focus, #vol-sel:focus { border-color: rgba(255,255,255,0.15); color: var(--text); }
+    #min-vol-input {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: 4px; padding: 4px 8px;
+      font-size: 12px; outline: none; min-height: 28px; color: var(--text2);
+      width: 80px;
+    }
+    #min-vol-input:focus { border-color: rgba(255,255,255,0.15); color: var(--text); }
+    #min-vol-input::placeholder { color: var(--text3); }
 
     /* ── Signal list column ── */
     #list-col { flex: 1; overflow-y: auto; min-width: 0; }
@@ -604,19 +614,30 @@
           <button class="dir-btn"        data-dir="long"  onclick="setDir('long')">Long</button>
           <button class="dir-btn"        data-dir="short" onclick="setDir('short')">Short</button>
         </div>
-        <select id="sort-sel" onchange="setSort(this.value)">
-          <option value="conviction">Conviction</option>
-          <option value="change_24h_pct">24h Change</option>
-          <option value="change_4h_pct">4h Change</option>
-          <option value="change_1h_pct">1h Change</option>
-          <option value="volume_24h">Volume</option>
-          <option value="relative_volume">Relative Volume</option>
-          <option value="funding_rate">Funding Rate</option>
-          <option value="open_interest">Open Interest</option>
-          <option value="trend_score">Trend Score</option>
-          <option value="atr_pct">Volatility</option>
-          <option value="next_funding_minutes">Next Funding</option>
-        </select>
+        <div class="filter-right">
+          <select id="sort-sel" onchange="setSort(this.value)">
+            <option value="conviction">Conviction</option>
+            <option value="change_24h_pct">24h Change</option>
+            <option value="change_4h_pct">4h Change</option>
+            <option value="change_1h_pct">1h Change</option>
+            <option value="volume_24h">Volume</option>
+            <option value="relative_volume">Relative Volume</option>
+            <option value="funding_rate">Funding Rate</option>
+            <option value="open_interest">Open Interest</option>
+            <option value="trend_score">Trend Score</option>
+            <option value="atr_pct">Volatility</option>
+            <option value="next_funding_minutes">Next Funding</option>
+          </select>
+          <select id="vol-sel" onchange="setVolFilter(this.value)" title="Filter by volatility regime">
+            <option value="any">Any volatility</option>
+            <option value="low">Low only</option>
+            <option value="medium">Medium only</option>
+            <option value="high_extreme">High / Extreme</option>
+          </select>
+          <input id="min-vol-input" type="number" min="0" step="1000000"
+                 placeholder="$0 min vol" title="Minimum 24h volume (USD)"
+                 oninput="setMinVolume(this.value)">
+        </div>
       </div>
 
       <!-- Signal list -->
@@ -640,7 +661,7 @@
           </div>
         </div>
         <div id="error-state" class="hidden state-msg">
-          <p>Scan failed. Check your connection.</p>
+          <p id="error-msg">Scan failed. Check your connection.</p>
           <div class="state-actions"><button class="btn-green" onclick="scanSignals()">Retry</button></div>
         </div>
       </div>
@@ -830,6 +851,8 @@ const S = {
   scanTime:   null,
   timerId:    null,
   countdownId: null,
+  volFilter:  'any',    // any | low | medium | high_extreme
+  minVolume:  0,        // minimum 24h volume in USD (0 = no filter)
 };
 
 /* ============================================================
@@ -1413,6 +1436,8 @@ async function scanSignals(threshold) {
   } catch (e) {
     console.error('Scan error:', e);
     stopProgress();
+    const msg = e.message || 'Unknown error';
+    $('error-msg').textContent = `Scan failed: ${msg}`;
     setPhase('error');
   }
 }
@@ -1457,23 +1482,80 @@ function setStrategy(key) {
   if (lbl && meta) lbl.textContent = meta.desc + ' · max ' + meta.cap + '×';
 }
 
+function saveFilters() {
+  try {
+    localStorage.setItem('mt7_filters', JSON.stringify({
+      dir: S.dir, sort: S.sort, volFilter: S.volFilter, minVolume: S.minVolume,
+    }));
+  } catch (_) {}
+}
+
+function loadFilters() {
+  try {
+    const raw = localStorage.getItem('mt7_filters');
+    if (!raw) return;
+    const f = JSON.parse(raw);
+    if (f.dir)       S.dir       = f.dir;
+    if (f.sort)      S.sort      = f.sort;
+    if (f.volFilter) S.volFilter = f.volFilter;
+    if (f.minVolume != null) S.minVolume = Number(f.minVolume) || 0;
+    // Sync DOM — called during init before signals exist, so just set values
+    document.querySelectorAll('#filter-bar .dir-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.dir === S.dir);
+    });
+    const sortSel = $('sort-sel');
+    if (sortSel) sortSel.value = S.sort;
+    const volSel = $('vol-sel');
+    if (volSel) volSel.value = S.volFilter;
+    const volInput = $('min-vol-input');
+    if (volInput && S.minVolume > 0) volInput.value = S.minVolume;
+  } catch (_) {}
+}
+
 function setDir(dir) {
   S.dir = dir;
   // Scoped to #filter-bar to avoid touching market direction buttons
   document.querySelectorAll('#filter-bar .dir-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.dir === dir);
   });
+  saveFilters();
   filterAndSort(true);
 }
 
 function setSort(field) {
   S.sort = field;
+  saveFilters();
+  filterAndSort(true);
+}
+
+function setVolFilter(val) {
+  S.volFilter = val;
+  saveFilters();
+  filterAndSort(true);
+}
+
+function setMinVolume(val) {
+  S.minVolume = parseFloat(val) || 0;
+  saveFilters();
   filterAndSort(true);
 }
 
 function filterAndSort(autoSelect) {
   let filtered = [...S.signals];
+
+  // Direction filter
   if (S.dir !== 'all') filtered = filtered.filter(s => s.direction.toLowerCase() === S.dir);
+
+  // Volatility filter
+  if (S.volFilter !== 'any') {
+    filtered = filtered.filter(s => {
+      if (S.volFilter === 'high_extreme') return s.volatility === 'high' || s.volatility === 'extreme';
+      return s.volatility === S.volFilter;
+    });
+  }
+
+  // Minimum volume filter
+  if (S.minVolume > 0) filtered = filtered.filter(s => (s.volume_24h || 0) >= S.minVolume);
 
   filtered.sort((a, b) => {
     if (S.sort === 'next_funding_minutes') {
@@ -2001,6 +2083,7 @@ function drawCompoundChart(balances) {
 /* ============================================================
    INIT
    ============================================================ */
+loadFilters();
 setPhase('idle');
 setMktPhase('idle');
 setStrategy('balanced');
