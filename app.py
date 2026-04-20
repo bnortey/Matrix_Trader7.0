@@ -24,7 +24,14 @@ load_dotenv()
 
 app = Flask(__name__)
 
-MEXC_BASE = "https://contract.mexc.com/api/v1"
+MEXC_BASE    = "https://contract.mexc.com/api/v1"
+BINANCE_FAPI = "https://fapi.binance.com"
+BYBIT_BASE   = "https://api.bybit.com"
+
+# Major pairs that exist on Binance/Bybit futures — only these get sentiment calls.
+# MEXC has 800+ pairs; calling Binance/Bybit for obscure altcoins wastes time and hits 400s.
+SENTIMENT_PAIRS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"}
+
 PORT = int(os.getenv("MATRIX_PORT", "8080"))
 CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
@@ -136,6 +143,135 @@ def fetch_mexc(path: str, params: dict | None = None) -> dict | list | None:
     except Exception as e:
         print(f"MEXC fetch error [{path}]: {e}", file=sys.stderr)
         return None
+
+
+def fetch_market_sentiment(mexc_symbol: str, price: float) -> dict:
+    """
+    Fetch L/S ratio and open interest from Binance, Bybit, and OKX public APIs.
+    No API key required for any exchange.
+
+    Args:
+        mexc_symbol: MEXC contract symbol, e.g. "BTC_USDT".
+        price:       Current price in USD — used to convert base-asset OI to USD.
+
+    Returns:
+        Dict with keys:
+          binance_ls_long_pct — % of accounts long on Binance futures (0–100 float). None on failure.
+          binance_oi          — Binance futures OI in USD. None on failure.
+          bybit_oi            — Bybit linear futures OI in USD. None on failure.
+          okx_ls_long_pct     — % of accounts long on OKX futures (0–100 float). None on failure.
+          okx_oi              — OKX futures OI in USD. None on failure.
+
+    Only pairs in SENTIMENT_PAIRS are fetched — MEXC-specific altcoins return
+    all-None immediately (no API calls). Each of the five network calls is
+    independently wrapped in try/except.
+
+    OI unit note: all three exchanges return OI in base-asset units (e.g., BTC
+    quantity). Multiplying by `price` converts to USD.
+
+    Binance L/S: longAccount is a 0–1 decimal → × 100 = percentage.
+    OKX L/S: longShortRatio is longs:shorts ratio → ratio/(1+ratio) × 100 = percentage.
+    """
+    base = mexc_symbol.split("_")[0]        # "BTC_USDT" → "BTC"
+    result = {
+        "binance_ls_long_pct": None,
+        "binance_oi":          None,
+        "bybit_oi":            None,
+        "okx_ls_long_pct":     None,
+        "okx_oi":              None,
+    }
+
+    if base not in SENTIMENT_PAIRS:
+        return result
+
+    bn_sym  = mexc_symbol.replace("_", "")         # "BTC_USDT" → "BTCUSDT"
+    quote   = mexc_symbol.split("_")[-1]            # "BTC_USDT" → "USDT"
+    okx_sym = f"{base}-{quote}-SWAP"                # "BTC_USDT" → "BTC-USDT-SWAP"
+
+    # --- Binance: L/S ratio ---
+    try:
+        resp = requests.get(
+            f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio",
+            params={"symbol": bn_sym, "period": "1h", "limit": 1},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            long_account = float(data[0]["longAccount"])   # 0–1 decimal
+            result["binance_ls_long_pct"] = round(long_account * 100, 1)
+    except Exception as e:
+        print(f"Binance L/S error [{bn_sym}]: {e}", file=sys.stderr)
+
+    # --- Binance: open interest ---
+    try:
+        resp = requests.get(
+            f"{BINANCE_FAPI}/fapi/v1/openInterest",
+            params={"symbol": bn_sym},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        oi_base = float(data.get("openInterest", 0) or 0)
+        if oi_base > 0 and price > 0:
+            result["binance_oi"] = round(oi_base * price)
+    except Exception as e:
+        print(f"Binance OI error [{bn_sym}]: {e}", file=sys.stderr)
+
+    # --- Bybit: open interest ---
+    try:
+        resp = requests.get(
+            f"{BYBIT_BASE}/v5/market/open-interest",
+            params={"category": "linear", "symbol": bn_sym, "intervalTime": "1h", "limit": 1},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = (data.get("result") or {}).get("list") or []
+        if items and price > 0:
+            oi_base = float(items[0].get("openInterest", 0) or 0)
+            if oi_base > 0:
+                result["bybit_oi"] = round(oi_base * price)
+    except Exception as e:
+        print(f"Bybit OI error [{bn_sym}]: {e}", file=sys.stderr)
+
+    # --- OKX: L/S ratio ---
+    # Endpoint uses ccy (base currency), not instId.
+    # Response data is a list of [timestamp_ms, ratio_string] pairs, newest first.
+    # ratio is longs:shorts (e.g. "1.04" = 1.04 longs per 1 short).
+    # long_pct = ratio / (1 + ratio) × 100
+    try:
+        resp = requests.get(
+            "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio",
+            params={"ccy": base, "period": "1H"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data") or []
+        if data:
+            ratio = float(data[0][1])   # data[0] = [timestamp, ratio_string]
+            result["okx_ls_long_pct"] = round(ratio / (1 + ratio) * 100, 1)
+    except Exception as e:
+        print(f"OKX L/S error [{base}]: {e}", file=sys.stderr)
+
+    # --- OKX: open interest ---
+    # oiUsd is already in USD — no multiplication needed.
+    try:
+        resp = requests.get(
+            "https://www.okx.com/api/v5/public/open-interest",
+            params={"instType": "SWAP", "instId": okx_sym},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data") or []
+        if data:
+            oi_usd = float(data[0].get("oiUsd", 0) or 0)
+            if oi_usd > 0:
+                result["okx_oi"] = round(oi_usd)
+    except Exception as e:
+        print(f"OKX OI error [{okx_sym}]: {e}", file=sys.stderr)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -729,9 +865,23 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             # Strategy context — surfaced in the UI
             "strategy": strat["name"],
             "leverage_cap": strat["leverage_cap"],
+            # Market sentiment — populated below from Binance/Bybit/OKX public APIs
+            "binance_ls_long_pct": None,
+            "binance_oi":          None,
+            "bybit_oi":            None,
+            "okx_ls_long_pct":     None,
+            "okx_oi":              None,
+            # True when symbol is in SENTIMENT_PAIRS; False for MEXC-only altcoins.
+            # Used by the frontend to distinguish "geo-blocked" from "not tracked".
+            "sentiment_tracked": symbol.split("_")[0] in SENTIMENT_PAIRS,
         }
         sig["signal_why"] = why_signal(sig)
         sig["ai_report"]  = generate_report(sig)
+
+        # Sentiment enrichment — no API key needed; per-field failures are
+        # swallowed inside fetch_market_sentiment() so this never crashes a scan.
+        sig.update(fetch_market_sentiment(symbol, price))
+
         return sig
     except Exception as e:
         print(f"enrich_signal error [{symbol}]: {e}", file=sys.stderr)

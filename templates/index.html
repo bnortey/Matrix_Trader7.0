@@ -919,6 +919,18 @@ function trendColor(v) {
 function volColor(v) {
   return { low: 'var(--green)', medium: 'var(--text)', high: 'var(--amber)', extreme: 'var(--red)' }[v] || 'var(--text)';
 }
+function binanceLsFmt(longPct) {
+  // longPct is 0–100 (e.g. 68.2 = 68.2% long). Returns {val, color}.
+  // Contrarian read: <40% long = shorts crowded = squeeze setup (green).
+  //                  >70% long = longs crowded = liquidation risk (red).
+  //                  40–70%   = neutral (amber).
+  if (longPct == null) return { val: '—', color: null };
+  const lp = Number(longPct).toFixed(1);
+  const color = longPct < 40 ? 'var(--green)'
+              : longPct > 70 ? 'var(--red)'
+              : 'var(--amber)';
+  return { val: `${lp}% long`, color };
+}
 function heatBg(value, maxAbsVal, positiveIsGood) {
   if (value == null || maxAbsVal === 0) return '';
   const intensity = Math.min(Math.abs(value) / maxAbsVal, 1);
@@ -1311,7 +1323,9 @@ function contextHTML(sig) {
   const trendVal = sig.trend_score != null ? (sig.trend_score > 0 ? '+' : '') + sig.trend_score : '—';
   const capVal = sig.leverage_cap != null ? sig.leverage_cap + '×' : '—';
   const stratVal = sig.strategy || '—';
-  const items = [
+  const bnLsFmt  = binanceLsFmt(sig.binance_ls_long_pct);
+  const okxLsFmt = binanceLsFmt(sig.okx_ls_long_pct);
+  const baseItems = [
     { lbl: '1h Change',    val: fmtPct(sig.change_1h_pct),  color: pctColor(sig.change_1h_pct) },
     { lbl: '4h Change',    val: fmtPct(sig.change_4h_pct),  color: pctColor(sig.change_4h_pct) },
     { lbl: 'RSI 1h',       val: sig.rsi_1h != null ? Number(sig.rsi_1h).toFixed(1) : '—', color: rsiColor(sig.rsi_1h) },
@@ -1323,12 +1337,41 @@ function contextHTML(sig) {
     { lbl: 'Strategy',     val: stratVal,                    color: 'var(--text2)' },
     { lbl: 'Max Leverage', val: capVal,                      color: sig.leverage_cap >= 20 ? 'var(--amber)' : null },
   ];
-  return '<div class="ctx-grid">' + items.map(it =>
+
+  const gridRows = '<div class="ctx-grid">' + baseItems.map(it =>
     `<div class="ctx-item">
       <span class="ctx-lbl">${it.lbl}</span>
       <span class="ctx-val"${it.color ? ` style="color:${it.color}"` : ''}${it.id ? ` id="${it.id}"` : ''}>${it.val}</span>
     </div>`
   ).join('') + '</div>';
+
+  // Sentiment section — only for major pairs tracked across exchanges.
+  // If the pair isn't tracked (MEXC-specific altcoin), omit the section entirely.
+  // If tracked but all values are null (geo-restriction), show a single dim note.
+  let sentimentHTML = '';
+  if (sig.sentiment_tracked) {
+    const allNull = sig.binance_ls_long_pct == null && sig.binance_oi == null
+                 && sig.bybit_oi == null && sig.okx_ls_long_pct == null && sig.okx_oi == null;
+    if (allNull) {
+      sentimentHTML = '<div style="font-size:11px;color:var(--text3);padding:6px 2px">Sentiment data unavailable from this region</div>';
+    } else {
+      const sentItems = [
+        { lbl: 'Binance L/S', val: bnLsFmt.val,             color: bnLsFmt.color },
+        { lbl: 'Binance OI',  val: fmtBig(sig.binance_oi),  color: null },
+        { lbl: 'Bybit OI',    val: fmtBig(sig.bybit_oi),    color: null },
+        { lbl: 'OKX L/S',     val: okxLsFmt.val,            color: okxLsFmt.color },
+        { lbl: 'OKX OI',      val: fmtBig(sig.okx_oi),      color: null },
+      ];
+      sentimentHTML = '<div class="ctx-grid">' + sentItems.map(it =>
+        `<div class="ctx-item">
+          <span class="ctx-lbl">${it.lbl}</span>
+          <span class="ctx-val"${it.color ? ` style="color:${it.color}"` : ''}>${it.val}</span>
+        </div>`
+      ).join('') + '</div>';
+    }
+  }
+
+  return gridRows + sentimentHTML;
 }
 
 /* ============================================================
