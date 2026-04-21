@@ -2726,7 +2726,9 @@ function renderHistoryTable(sigs) {
       const sign  = rVal >= 0 ? '+' : '';
       rCell  = `<span style="color:${color}">${sign}${rVal.toFixed(1)}R</span>`;
       if (riskPerTrade > 0) {
-        const dollar = riskPerTrade * rVal;
+        const leverage = s.leverage_cap || STRATEGY_LEVERAGE[s.strategy] || 20;
+        const notional = riskPerTrade * leverage;
+        const dollar   = notional * rVal;
         pnlCell = `<span style="color:${color}">${sign}$${dollar.toFixed(2)}</span>`;
       }
     }
@@ -2901,6 +2903,19 @@ function buildStatusBarHTML(pos) {
     ? fmtAge((Date.now() - new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z')) / 3600000)
     : '—';
 
+  const acctSzBar  = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+  const levBar     = getLeverage(pos);
+  const notionalBar = acctSzBar > 0 ? getNotional(acctSzBar, 1, levBar) : null;
+  const liqPriceBar = current > 0 ? getLiqPrice(pos, current) : null;
+  const liqDistBar  = liqPriceBar && current > 0 ? Math.abs(current - liqPriceBar) / current * 100 : null;
+  const liqColorBar = liqDistBar !== null && liqDistBar < 15 ? 'var(--red)' : 'var(--text2)';
+
+  const leverageRow = `<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:10px;padding-top:8px;border-top:1px solid var(--border)">
+    <span style="color:var(--text3)">Leverage <span style="color:var(--text2);font-family:var(--mono)">${levBar}×</span></span>
+    <span style="color:var(--text3)">Notional <span style="color:var(--text2);font-family:var(--mono)">${notionalBar !== null ? '$' + notionalBar.toFixed(0) : '—'}</span></span>
+    <span style="color:var(--text3)">Liq <span style="color:${liqColorBar};font-family:var(--mono)">${liqPriceBar !== null ? fmtPrice(liqPriceBar) : '—'}</span></span>
+  </div>`;
+
   return `
   <div id="pos-status-bar" style="
     background:rgba(255,255,255,0.03);
@@ -2936,6 +2951,7 @@ function buildStatusBarHTML(pos) {
         <span>TP3 ${tp3 ? fmtPrice(tp3) : '—'}</span>
       </div>
     </div>
+    ${leverageRow}
     <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text3);margin-top:4px">
       <span>Open ${age}</span>
       <span>${esc(pos.strategy || '')} · ${pos.direction}</span>
@@ -2992,6 +3008,15 @@ function distStop(pos) {
   const current = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price || 0;
   return pos.stop_loss ? Math.abs(current - pos.stop_loss) / entry * 100 : 999;
 }
+const STRATEGY_LEVERAGE = { balanced: 20, funding_arb: 10, momentum_breakout: 25, mean_reversion: 15 };
+function getLeverage(pos) { return pos.leverage_cap || STRATEGY_LEVERAGE[pos.strategy] || 20; }
+function getLiqPrice(pos, currentPrice) {
+  const entry = pos.entry1 || currentPrice;
+  const lev   = getLeverage(pos);
+  return pos.direction === 'LONG' ? entry * (1 - 1 / lev) : entry * (1 + 1 / lev);
+}
+function getNotional(accountSize, riskPct, leverage) { return accountSize * (riskPct / 100) * leverage; }
+
 function distTp1(pos) {
   const entry   = pos.entry1 || pos.price || 1;
   const current = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price || 0;
@@ -3074,8 +3099,20 @@ function renderOpenPositions() {
     const sym       = esc((pos.symbol || '').replace('_USDT', ''));
     const dirCls    = pos.direction === 'LONG' ? 'hist-dir-long' : 'hist-dir-short';
     const activeCls = H.selectedPositionId === pos.id ? ' pos-row-active' : '';
-    // Strategy label — replace underscores with spaces, title case
     const stratLbl  = (pos.strategy || '—').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+    // Leverage-aware sizing
+    const acctSz   = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+    const lev      = getLeverage(pos);
+    const notional = acctSz > 0 ? getNotional(acctSz, 1, lev) : null;
+    const liqPrice = current > 0 ? getLiqPrice(pos, current) : null;
+    const liqDist  = liqPrice && current > 0 ? Math.abs(current - liqPrice) / current * 100 : null;
+    const liqCls   = liqDist !== null && liqDist < 10 ? ' pos-danger' : '';
+
+    const notionalCell = notional !== null ? `$${notional.toFixed(0)}` : '—';
+    const liqCell      = liqPrice !== null
+      ? `<span class="pos-mono${liqCls}">${fmtPrice(liqPrice)}</span>`
+      : '—';
 
     const btns = Object.keys(OUTCOME_LABELS).map(o =>
       `<button class="outcome-btn" onclick="event.stopPropagation();tagOutcome(${pos.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`
@@ -3090,6 +3127,8 @@ function renderOpenPositions() {
       <td class="pos-mono" style="color:${pnlColor};font-weight:700">${fmtPct(pnl_pct)}</td>
       <td class="pos-mono${stopCls}">${dist_stop !== null ? dist_stop.toFixed(1) + '%' : '—'}</td>
       <td class="pos-mono${tp1Cls}">${dist_tp1  !== null ? dist_tp1.toFixed(1)  + '%' : '—'}</td>
+      <td class="pos-mono">${notionalCell}</td>
+      <td>${liqCell}</td>
       <td class="pos-age">${fmtAge(age_hours)}</td>
       <td class="pos-age">${esc(stratLbl)}</td>
       <td><div class="outcome-group">${btns}</div></td>
@@ -3106,6 +3145,8 @@ function renderOpenPositions() {
         <th onclick="sortPositions('pnl')" style="text-align:right">P&amp;L% <span class="sort-indicator" data-col="pnl"></span></th>
         <th onclick="sortPositions('stop')">→Stop <span class="sort-indicator" data-col="stop"></span></th>
         <th onclick="sortPositions('tp1')">→TP1 <span class="sort-indicator" data-col="tp1"></span></th>
+        <th>Notional</th>
+        <th>Liq Price</th>
         <th onclick="sortPositions('age')">Age <span class="sort-indicator" data-col="age"></span></th>
         <th onclick="sortPositions('strategy')">Strategy <span class="sort-indicator" data-col="strategy"></span></th>
         <th>Outcome</th>
