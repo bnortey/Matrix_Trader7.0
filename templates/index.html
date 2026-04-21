@@ -2814,102 +2814,116 @@ async function fetchAndRenderPositions() {
   updatePosCounter();
   startPosTimers();  // reset 30s interval after each refresh
   updatePerfBanner(lastHistorySigs.filter(s => s.result !== null), H.openPositions);
+
+  // If a position detail panel is open, refresh it with latest prices
+  if (H.selectedPositionId) {
+    const selPos = H.openPositions.find(p => p.id === H.selectedPositionId);
+    if (selPos) showPositionDetail(selPos);
+  }
 }
 
 function buildStatusBarHTML(pos) {
-  const entry = pos.entry1 || pos.price || 0;
-  const live  = pos._livePrice || entry;
-  const tp1   = (pos.exits && pos.exits[0]) || pos.tp1 || 0;
-  const tp2   = (pos.exits && pos.exits[1]) || pos.tp2 || 0;
-  const tp3   = (pos.exits && pos.exits[2]) || pos.tp3 || 0;
-  const stop  = pos.stop_loss || 0;
-  const pnl   = pos._pnl_pct || 0;
-
-  let progress = 0;
-  if (pos.direction === 'LONG' && tp3 > stop) {
-    progress = (live - stop) / (tp3 - stop) * 100;
-  } else if (pos.direction === 'SHORT' && stop > tp3) {
-    progress = (stop - live) / (stop - tp3) * 100;
-  }
-  progress = Math.max(0, Math.min(100, progress));
-
+  const entry    = pos.entry1 || pos.price || 0;
+  const current  = pos._livePrice || entry;
+  const pnl      = pos._pnl_pct || 0;
   const pnlColor = pnl > 0 ? 'var(--green)' : pnl < 0 ? 'var(--red)' : 'var(--text3)';
-  const pnlSign  = pnl >= 0 ? '+' : '';
-  const dt       = new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z');
-  const ageHours = (Date.now() - dt) / 3600000;
-  const strat    = (STRAT_META[pos.strategy] && STRAT_META[pos.strategy].label) || esc(pos.strategy || '—');
+  const pnlSign  = pnl > 0 ? '+' : '';
 
-  return `<div id="pos-status-bar" style="
-    background:rgba(255,255,255,0.03);border:1px solid var(--border);
-    border-radius:8px;padding:12px 14px;margin-bottom:14px">
+  const isLong  = pos.direction === 'LONG';
+  const stop    = pos.stop_loss;
+  const tp1     = pos.tp1;
+  const tp2     = pos.tp2;
+  const tp3     = pos.tp3;
+
+  let progress = 50;
+  if (stop && tp3) {
+    const range       = isLong ? tp3 - stop : stop - tp3;
+    const posInRange  = isLong ? current - stop : stop - current;
+    progress = range > 0 ? Math.max(0, Math.min(100, posInRange / range * 100)) : 50;
+  }
+
+  const _tp1pct = stop && tp3 ? Math.max(0, Math.min(100,
+    (isLong ? tp1 - stop : stop - tp1) / (isLong ? tp3 - stop : stop - tp3) * 100)) : 33;
+  const _tp2pct = stop && tp3 ? Math.max(0, Math.min(100,
+    (isLong ? tp2 - stop : stop - tp2) / (isLong ? tp3 - stop : stop - tp3) * 100)) : 66;
+
+  const age = pos.logged_at
+    ? fmtAge((Date.now() - new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z')) / 3600000)
+    : '—';
+
+  return `
+  <div id="pos-status-bar" style="
+    background:rgba(255,255,255,0.03);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:14px;
+    margin-bottom:14px;
+  ">
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
-      <span style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Live P&amp;L</span>
-      <span style="font-size:20px;font-weight:700;color:${pnlColor}">${pnlSign}${pnl.toFixed(2)}%</span>
+      <span style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em">Live P&amp;L</span>
+      <span style="font-size:24px;font-weight:800;font-family:var(--mono);color:${pnlColor}">${pnlSign}${pnl.toFixed(2)}%</span>
     </div>
-    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:10px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:12px">
       <span style="color:var(--text3)">Entry <span style="color:var(--text2);font-family:var(--mono)">${fmtPrice(entry)}</span></span>
-      <span style="color:var(--text3)">Now <span style="color:var(--text2);font-family:var(--mono)">${fmtPrice(live)}</span></span>
+      <span style="color:var(--text3)">Now <span style="color:var(--text2);font-family:var(--mono)">${fmtPrice(current)}</span></span>
     </div>
-    <div style="margin-bottom:6px">
-      <div style="position:relative;height:6px;background:rgba(255,255,255,0.06);border-radius:3px">
-        <div style="position:absolute;left:0;top:0;height:100%;border-radius:3px;
-                    width:${progress}%;background:${pnlColor};opacity:0.7"></div>
-        <div style="position:absolute;top:-3px;width:12px;height:12px;border-radius:50%;
-                    background:${pnlColor};border:2px solid var(--bg);
-                    left:calc(${progress}% - 6px)"></div>
+    <div style="position:relative;margin-bottom:8px">
+      <div style="height:8px;background:rgba(255,255,255,0.06);border-radius:4px;position:relative;overflow:visible">
+        <div style="position:absolute;left:0;top:0;height:100%;border-radius:4px;
+                    width:${progress}%;background:${pnlColor};opacity:0.6;transition:width 0.3s"></div>
+        <div style="position:absolute;top:-3px;left:${_tp1pct}%;width:2px;height:14px;
+                    background:rgba(0,230,118,0.5);transform:translateX(-50%)"></div>
+        <div style="position:absolute;top:-3px;left:${_tp2pct}%;width:2px;height:14px;
+                    background:rgba(0,230,118,0.7);transform:translateX(-50%)"></div>
+        <div style="position:absolute;top:50%;left:${progress}%;width:14px;height:14px;
+                    border-radius:50%;background:${pnlColor};border:2px solid var(--bg);
+                    transform:translate(-50%,-50%);transition:left 0.3s"></div>
       </div>
-      <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-top:4px">
-        <span>Stop ${fmtPrice(stop)}</span>
-        <span>TP1 ${fmtPrice(tp1)}</span>
-        <span>TP2 ${fmtPrice(tp2)}</span>
-        <span>TP3 ${fmtPrice(tp3)}</span>
+      <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-top:6px">
+        <span>Stop ${stop ? fmtPrice(stop) : '—'}</span>
+        <span style="color:rgba(0,230,118,0.6)">TP1</span>
+        <span style="color:rgba(0,230,118,0.8)">TP2</span>
+        <span>TP3 ${tp3 ? fmtPrice(tp3) : '—'}</span>
       </div>
     </div>
-    <div style="font-size:10px;color:var(--text3);text-align:right">
-      Open ${fmtAge(ageHours)} · ${strat}
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text3);margin-top:4px">
+      <span>Open ${age}</span>
+      <span>${esc(pos.strategy || '')} · ${pos.direction}</span>
     </div>
   </div>`;
-}
-
-function refreshPositionStatusBar() {
-  const bar = $('pos-status-bar');
-  if (!bar || !H.selectedPositionId) return;
-  const pos = H.openPositions.find(p => p.id === H.selectedPositionId);
-  if (!pos) return;
-  pos._livePrice = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price;
-  const entry = pos.entry1 || pos.price || 0;
-  pos._pnl_pct = entry > 0
-    ? (pos.direction === 'LONG'
-        ? (pos._livePrice - entry) / entry * 100
-        : (entry - pos._livePrice) / entry * 100)
-    : 0;
-  bar.outerHTML = buildStatusBarHTML(pos);
 }
 
 function showPositionDetail(pos) {
   H.selectedPositionId = pos.id;
 
-  // Augment with live price and P&L before passing to renderDetail
-  pos._livePrice = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price;
-  const entry = pos.entry1 || pos.price || 0;
-  pos._pnl_pct = entry > 0
+  // Normalize: history signals from SQLite have flat entry1/tp1/tp2/tp3.
+  // Live scan signals have entries[]/exits[] arrays. renderDetail (ladderHTML)
+  // requires arrays; buildStatusBarHTML requires flat tp1/tp2/tp3. Ensure both.
+  if (!pos.entries) pos.entries = [pos.entry1, pos.entry2, pos.entry3];
+  if (!pos.exits)   pos.exits   = [pos.tp1,    pos.tp2,    pos.tp3   ];
+  if (pos.tp1 == null) pos.tp1 = pos.exits[0];
+  if (pos.tp2 == null) pos.tp2 = pos.exits[1];
+  if (pos.tp3 == null) pos.tp3 = pos.exits[2];
+
+  // Augment with live price and P&L
+  pos._livePrice = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price || 0;
+  pos._pnl_pct = pos.entry1 > 0
     ? (pos.direction === 'LONG'
-        ? (pos._livePrice - entry) / entry * 100
-        : (entry - pos._livePrice) / entry * 100)
+        ? (pos._livePrice - pos.entry1) / pos.entry1 * 100
+        : (pos.entry1 - pos._livePrice) / pos.entry1 * 100)
     : 0;
 
-  // Render the full detail panel (chart, trade plan, context, AI report)
+  // Full detail panel — chart, trade plan, context grid, AI report
   renderDetail(pos);
 
-  // Inject live status bar before the symbol row (close button is position:absolute so DOM order doesn't matter)
-  const panel  = $('detail-panel');
-  const symRow = panel.querySelector('.d-sym-row');
-  if (symRow) symRow.insertAdjacentHTML('beforebegin', buildStatusBarHTML(pos));
+  // Inject status bar at the very top of .d-inner (afterbegin puts it before all content)
+  const inner = document.querySelector('#detail-panel .d-inner');
+  if (inner) inner.insertAdjacentHTML('afterbegin', buildStatusBarHTML(pos));
 
   // Open panel on mobile (same as selectSignal)
   if (window.innerWidth < 768) {
     $('overlay').classList.add('on');
-    panel.classList.add('open');
+    $('detail-panel').classList.add('open');
     document.body.style.overflow = 'hidden';
   }
 }
@@ -2983,9 +2997,6 @@ function renderOpenPositions() {
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
-
-  // If a position detail is open, refresh just the status bar with latest prices
-  refreshPositionStatusBar();
 }
 
 async function requestAnalysis() {
