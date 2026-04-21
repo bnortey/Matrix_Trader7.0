@@ -1223,6 +1223,28 @@ def api_signals_history():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/prices")
+def api_prices():
+    """Batch price fetch: return current prices for multiple symbols from one MEXC ticker call.
+    Used by the open positions panel — avoids triggering full enrichment per symbol."""
+    try:
+        symbols_param = request.args.get("symbols", "")
+        if not symbols_param:
+            return jsonify({"success": True, "prices": {}})
+        want = {s.strip().upper() for s in symbols_param.split(",") if s.strip()}
+        tickers = fetch_mexc("/contract/ticker")
+        if not tickers:
+            return jsonify({"success": False, "error": "MEXC unavailable"}), 502
+        prices = {}
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if sym in want:
+                prices[sym] = float(t.get("lastPrice") or t.get("fairPrice") or 0)
+        return jsonify({"success": True, "prices": prices})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/analysis", methods=["POST"])
 def api_analysis():
     """AI strategy review: analyse tagged signal outcomes via Claude API."""

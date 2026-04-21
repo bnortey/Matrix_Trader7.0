@@ -592,6 +592,40 @@
     .hist-empty, .hist-loading {
       padding: 48px 24px; text-align: center; color: var(--text3); font-size: 12px;
     }
+    /* ── Open positions ── */
+    .hist-divider { border-top: 1px solid var(--border); margin: 20px 0; }
+    #open-positions-header {
+      display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap;
+    }
+    .pos-title {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--text2);
+    }
+    .pos-updated { font-size: 10px; color: var(--text3); }
+    .pos-refresh-btn {
+      font-size: 10px; font-weight: 600; letter-spacing: 0.03em;
+      padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
+      background: transparent; color: var(--text2); cursor: pointer;
+    }
+    .pos-refresh-btn:hover { border-color: var(--green); color: var(--green); }
+    #open-positions-body { overflow-x: auto; }
+    #pos-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    #pos-table th {
+      text-align: left; padding: 6px 10px;
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text3); font-weight: 600; border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    #pos-table td {
+      padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,0.04);
+      vertical-align: middle;
+    }
+    #pos-table tr:hover td { background: rgba(255,255,255,0.02); }
+    .pos-mono { font-family: var(--mono); font-size: 11px; }
+    .pos-age { color: var(--text3); font-size: 10px; white-space: nowrap; }
+    .pos-stale { color: var(--amber); font-size: 9px; margin-left: 2px; vertical-align: super; }
+    .pos-danger { background: rgba(255,82,82,0.08) !important; }
+    .pos-target { background: rgba(0,230,118,0.08) !important; }
     /* ── Strategy review ── */
     #analysis-wrap { margin-top: 20px; }
     #analysis-btn {
@@ -962,50 +996,69 @@
     <div id="history-section" class="hidden">
       <div id="hist-inner">
 
-        <!-- Summary bar — populated by renderHistorySummary() -->
-        <div id="hist-bar">
-          <span style="color:var(--text3);font-size:12px">Run a scan to start logging signals.</span>
+        <!-- Open positions monitoring -->
+        <div id="open-positions-section">
+          <div id="open-positions-header">
+            <span class="pos-title">OPEN POSITIONS (<span id="pos-count">—</span>)</span>
+            <span id="pos-status" class="pos-updated"></span>
+            <button class="pos-refresh-btn" onclick="fetchAndRenderPositions()">Refresh</button>
+          </div>
+          <div id="open-positions-body">
+            <div class="hist-loading">Switch to this tab after a scan to see open positions.</div>
+          </div>
         </div>
 
-        <!-- Filter controls -->
-        <div class="hist-filters">
-          <span class="hist-filter-lbl">Strategy</span>
-          <select id="hf-strategy" class="hist-filter-select" onchange="loadHistory()">
-            <option value="">All</option>
-            <option value="balanced">Balanced</option>
-            <option value="funding_arb">Funding Arb</option>
-            <option value="momentum_breakout">Momentum Breakout</option>
-            <option value="mean_reversion">Mean Reversion</option>
-          </select>
-          <span class="hist-filter-lbl" style="margin-left:6px">Direction</span>
-          <select id="hf-dir" class="hist-filter-select" onchange="loadHistory()">
-            <option value="">All</option>
-            <option value="LONG">Long</option>
-            <option value="SHORT">Short</option>
-          </select>
-          <span class="hist-filter-lbl" style="margin-left:6px">Result</span>
-          <select id="hf-result" class="hist-filter-select" onchange="loadHistory()">
-            <option value="">All</option>
-            <option value="WIN">Win</option>
-            <option value="LOSS">Loss</option>
-            <option value="PARTIAL">Partial</option>
-            <option value="EXPIRED">Expired</option>
-            <option value="SKIPPED">Skipped</option>
-          </select>
-        </div>
+        <div class="hist-divider"></div>
 
-        <!-- Table — populated by renderHistoryTable() -->
-        <div id="hist-table-wrap">
-          <div id="hist-body" class="hist-loading">Switch to this tab after a scan to see logged signals.</div>
-        </div>
+        <!-- Closed signals history -->
+        <div id="closed-signals-section">
 
-        <!-- Strategy Review -->
-        <div id="analysis-wrap">
-          <button id="analysis-btn" onclick="requestAnalysis()">Strategy Review</button>
-          <div id="analysis-cost-note">Each review call uses the Claude API (~$0.50–2.00 per call).</div>
-          <div id="analysis-error"></div>
-          <div id="analysis-output"></div>
-        </div>
+          <!-- Summary bar — populated by renderHistorySummary() -->
+          <div id="hist-bar">
+            <span style="color:var(--text3);font-size:12px">Run a scan to start logging signals.</span>
+          </div>
+
+          <!-- Filter controls -->
+          <div class="hist-filters">
+            <span class="hist-filter-lbl">Strategy</span>
+            <select id="hf-strategy" class="hist-filter-select" onchange="loadHistory()">
+              <option value="">All</option>
+              <option value="balanced">Balanced</option>
+              <option value="funding_arb">Funding Arb</option>
+              <option value="momentum_breakout">Momentum Breakout</option>
+              <option value="mean_reversion">Mean Reversion</option>
+            </select>
+            <span class="hist-filter-lbl" style="margin-left:6px">Direction</span>
+            <select id="hf-dir" class="hist-filter-select" onchange="loadHistory()">
+              <option value="">All</option>
+              <option value="LONG">Long</option>
+              <option value="SHORT">Short</option>
+            </select>
+            <span class="hist-filter-lbl" style="margin-left:6px">Result</span>
+            <select id="hf-result" class="hist-filter-select" onchange="loadHistory()">
+              <option value="">All</option>
+              <option value="WIN">Win</option>
+              <option value="LOSS">Loss</option>
+              <option value="PARTIAL">Partial</option>
+              <option value="EXPIRED">Expired</option>
+              <option value="SKIPPED">Skipped</option>
+            </select>
+          </div>
+
+          <!-- Table — populated by renderHistoryTable() -->
+          <div id="hist-table-wrap">
+            <div id="hist-body" class="hist-loading">Switch to this tab after a scan to see logged signals.</div>
+          </div>
+
+          <!-- Strategy Review -->
+          <div id="analysis-wrap">
+            <button id="analysis-btn" onclick="requestAnalysis()">Strategy Review</button>
+            <div id="analysis-cost-note">Each review call uses the Claude API (~$0.50–2.00 per call).</div>
+            <div id="analysis-error"></div>
+            <div id="analysis-output"></div>
+          </div>
+
+        </div><!-- /closed-signals-section -->
 
       </div>
     </div><!-- /history-section -->
@@ -1082,6 +1135,7 @@ let currentTVSymbol   = null;
 let currentTVInterval = '60';
 
 function switchTab(tab) {
+  if (tab !== 'history') stopPosTimers();  // stop refresh when leaving History tab
   currentTab = tab;
   toggle('signals-section', tab === 'signals');
   toggle('market-section',  tab === 'market');
@@ -2338,7 +2392,15 @@ function drawCompoundChart(balances) {
 /* ============================================================
    HISTORY TAB
    ============================================================ */
-const H = { loading: false };
+const H = {
+  loading:         false,   // guards concurrent loadHistory() calls
+  openPositions:   [],      // untagged signals (result === null)
+  priceCache:      {},      // symbol → {price, ts} from /api/prices
+  posRefreshTimer: null,    // setInterval handle — 30s price refresh
+  posCounterTimer: null,    // setInterval handle — per-second "Xs ago" counter
+  posLastRefresh:  null,    // Date.now() of last successful price fetch
+  posFetching:     false,   // guards concurrent fetchAndRenderPositions() calls
+};
 
 const OUTCOME_LABELS = {
   WIN: 'WIN', LOSS: 'LOSS', PARTIAL: 'PAR', EXPIRED: 'EXP', SKIPPED: 'SKP',
@@ -2352,31 +2414,44 @@ async function loadHistory() {
   if (H.loading) return;
   H.loading = true;
   $('hist-body').innerHTML = '<div class="hist-loading">Loading…</div>';
-
-  const strategy = $('hf-strategy').value;
-  const dir      = $('hf-dir').value;
-  const result   = $('hf-result').value;
-
-  const params = new URLSearchParams({ limit: 500 });
-  if (strategy) params.set('strategy', strategy);
-  if (result)   params.set('result',   result);
+  $('open-positions-body').innerHTML = '<div class="hist-loading">Loading…</div>';
 
   try {
-    const resp = await fetch('/api/signals/history?' + params);
+    // Fetch all signals — split client-side into open (null result) and closed.
+    // No server-side result filter so we get both in one call.
+    const resp = await fetch('/api/signals/history?limit=500');
     const data = await resp.json();
     H.loading = false;
     if (!data.success) {
       $('hist-body').innerHTML = '<div class="hist-empty">Error loading history.</div>';
+      $('open-positions-body').innerHTML = '<div class="hist-empty">Error loading positions.</div>';
       return;
     }
-    // Direction is not a backend filter — apply client-side
-    let sigs = data.signals || [];
-    if (dir) sigs = sigs.filter(s => s.direction === dir);
-    renderHistorySummary(sigs);
-    renderHistoryTable(sigs);
+
+    const all = data.signals || [];
+
+    // Split: open positions (untagged) vs closed signals (tagged)
+    H.openPositions = all.filter(s => s.result === null);
+    let closed = all.filter(s => s.result !== null);
+
+    // Apply closed-signals UI filters client-side
+    const strategy = $('hf-strategy').value;
+    const dir      = $('hf-dir').value;
+    const result   = $('hf-result').value;
+    if (strategy) closed = closed.filter(s => s.strategy === strategy);
+    if (dir)      closed = closed.filter(s => s.direction === dir);
+    if (result)   closed = closed.filter(s => s.result === result.toUpperCase());
+
+    renderHistorySummary(closed);
+    renderHistoryTable(closed);
+
+    // Kick off live price fetch for open positions (non-blocking)
+    fetchAndRenderPositions();
+
   } catch (e) {
     H.loading = false;
     $('hist-body').innerHTML = '<div class="hist-empty">Failed to load history.</div>';
+    $('open-positions-body').innerHTML = '<div class="hist-empty">Failed to load positions.</div>';
   }
 }
 
@@ -2477,10 +2552,139 @@ async function tagOutcome(id, result) {
       body:    JSON.stringify({ id, result }),
     });
     const data = await resp.json();
-    if (data.success) loadHistory();  // full reload — summary stats must update too
+    // Full reload so tagged signal moves from open positions to closed history
+    if (data.success) loadHistory();
   } catch (e) {
     console.error('tagOutcome error:', e);
   }
+}
+
+/* ============================================================
+   OPEN POSITIONS
+   ============================================================ */
+
+function fmtAge(hours) {
+  if (hours < 1)  return Math.round(hours * 60) + 'm';
+  if (hours < 24) return Math.round(hours) + 'h';
+  const d = Math.floor(hours / 24);
+  const h = Math.round(hours % 24);
+  return h > 0 ? `${d}d ${h}h` : `${d}d`;
+}
+
+function startPosTimers() {
+  stopPosTimers();
+  H.posRefreshTimer = setInterval(fetchAndRenderPositions, 30000);
+  H.posCounterTimer = setInterval(updatePosCounter, 1000);
+}
+
+function stopPosTimers() {
+  if (H.posRefreshTimer) { clearInterval(H.posRefreshTimer); H.posRefreshTimer = null; }
+  if (H.posCounterTimer) { clearInterval(H.posCounterTimer); H.posCounterTimer = null; }
+}
+
+function updatePosCounter() {
+  if (!H.posLastRefresh) return;
+  const secs = Math.round((Date.now() - H.posLastRefresh) / 1000);
+  const el = $('pos-status');
+  if (el) el.textContent = `Last updated: ${secs}s ago`;
+}
+
+async function fetchAndRenderPositions() {
+  if (H.posFetching) return;
+  H.posFetching = true;
+
+  const statusEl = $('pos-status');
+  if (statusEl) statusEl.textContent = 'Fetching prices…';
+
+  if (H.openPositions.length) {
+    const symbols = [...new Set(H.openPositions.map(p => p.symbol))].join(',');
+    try {
+      const resp = await fetch('/api/prices?symbols=' + encodeURIComponent(symbols));
+      const data = await resp.json();
+      if (data.success) {
+        const now = Date.now();
+        for (const [sym, price] of Object.entries(data.prices)) {
+          H.priceCache[sym] = { price, ts: now };
+        }
+      }
+    } catch (e) { /* use cached prices on failure */ }
+  }
+
+  H.posLastRefresh = Date.now();
+  H.posFetching = false;
+  renderOpenPositions();
+  updatePosCounter();
+  startPosTimers();  // reset 30s interval after each refresh
+}
+
+function renderOpenPositions() {
+  const body    = $('open-positions-body');
+  const countEl = $('pos-count');
+  if (!body) return;
+
+  if (!H.openPositions.length) {
+    if (countEl) countEl.textContent = '0';
+    body.innerHTML = '<div class="hist-empty">No open positions — hit Scan to log new signals.</div>';
+    return;
+  }
+
+  if (countEl) countEl.textContent = H.openPositions.length;
+
+  const rows = H.openPositions.map(pos => {
+    const entry   = pos.entry1 || pos.price || 0;
+    const cached  = H.priceCache[pos.symbol];
+    const current = cached ? cached.price : (pos.price || 0);
+    const stale   = !cached;
+
+    const pnl_pct = entry > 0
+      ? (pos.direction === 'LONG'
+          ? (current - entry) / entry * 100
+          : (entry - current) / entry * 100)
+      : 0;
+
+    const dist_stop = pos.stop_loss && entry > 0
+      ? Math.abs(current - pos.stop_loss) / entry * 100
+      : null;
+    const dist_tp1  = pos.tp1 && entry > 0
+      ? Math.abs(current - pos.tp1) / entry * 100
+      : null;
+
+    const dt        = new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z');
+    const age_hours = (Date.now() - dt) / 3600000;
+
+    const pnlColor  = pnl_pct > 0 ? 'var(--green)' : pnl_pct < 0 ? 'var(--red)' : 'var(--text3)';
+    const stopCls   = dist_stop !== null && dist_stop < 1 ? ' pos-danger' : '';
+    const tp1Cls    = dist_tp1  !== null && dist_tp1  < 1 ? ' pos-target' : '';
+    const staleMark = stale ? '<sup class="pos-stale" title="Using last known price">~</sup>' : '';
+
+    const sym    = esc((pos.symbol || '').replace('_USDT', ''));
+    const dirCls = pos.direction === 'LONG' ? 'hist-dir-long' : 'hist-dir-short';
+
+    const btns = Object.keys(OUTCOME_LABELS).map(o =>
+      `<button class="outcome-btn" onclick="tagOutcome(${pos.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`
+    ).join('');
+
+    return `<tr>
+      <td class="hist-symbol">${sym}${staleMark}</td>
+      <td class="${dirCls}">${pos.direction}</td>
+      <td class="pos-mono">${fmtPrice(entry)}</td>
+      <td class="pos-mono">${fmtPrice(current)}</td>
+      <td class="pos-mono" style="color:${pnlColor};font-weight:700">${fmtPct(pnl_pct)}</td>
+      <td class="pos-mono${stopCls}">${dist_stop !== null ? dist_stop.toFixed(1) + '%' : '—'}</td>
+      <td class="pos-mono${tp1Cls}">${dist_tp1  !== null ? dist_tp1.toFixed(1)  + '%' : '—'}</td>
+      <td class="pos-age">${fmtAge(age_hours)}</td>
+      <td><div class="outcome-group">${btns}</div></td>
+    </tr>`;
+  }).join('');
+
+  body.innerHTML = `
+    <table id="pos-table">
+      <thead><tr>
+        <th>Symbol</th><th>Dir</th><th>Entry</th><th>Current</th>
+        <th>P&amp;L%</th><th>→Stop</th><th>→TP1</th><th>Age</th><th>Outcome</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 async function requestAnalysis() {
