@@ -4,6 +4,7 @@ import json
 import socket
 import sqlite3
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from functools import partial
@@ -1554,6 +1555,22 @@ def find_free_port(preferred: int, max_tries: int = 5) -> int:
         except OSError:
             continue
     return preferred
+
+
+def _outcome_loop():
+    import time as _time
+    _time.sleep(60)  # wait 1 minute after startup
+    while True:
+        try:
+            with app.app_context():
+                api_outcomes_check()
+                print("Outcome checker ran automatically", file=sys.stderr)
+        except Exception as e:
+            print(f"Outcome checker error: {e}", file=sys.stderr)
+        _time.sleep(900)  # 15 minutes
+
+_outcome_thread = threading.Thread(target=_outcome_loop, daemon=True)
+_outcome_thread.start()
 
 
 if __name__ == "__main__":
