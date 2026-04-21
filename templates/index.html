@@ -1140,10 +1140,10 @@
             <span class="hist-filter-lbl">Strategy</span>
             <select id="hf-strategy" class="hist-filter-select" onchange="loadHistory()">
               <option value="">All</option>
-              <option value="balanced">Balanced</option>
-              <option value="funding_arb">Funding Arb</option>
-              <option value="momentum_breakout">Momentum Breakout</option>
-              <option value="mean_reversion">Mean Reversion</option>
+              <option value="Balanced">Balanced</option>
+              <option value="Funding Arb">Funding Arb</option>
+              <option value="Momentum Breakout">Momentum Breakout</option>
+              <option value="Mean Reversion">Mean Reversion</option>
             </select>
             <span class="hist-filter-lbl" style="margin-left:6px">Direction</span>
             <select id="hf-dir" class="hist-filter-select" onchange="loadHistory()">
@@ -2578,7 +2578,7 @@ async function loadHistory() {
     const dir      = $('hf-dir').value;
     const result   = $('hf-result').value;
     const allClosed = closed; // preserve full unfiltered array for banner stats
-    if (strategy) closed = closed.filter(s => (s.strategy || '').toLowerCase() === strategy.toLowerCase());
+    if (strategy) closed = closed.filter(s => s.strategy === strategy);
     if (dir)      closed = closed.filter(s => s.direction === dir);
     if (result)   closed = closed.filter(s => s.result === result.toUpperCase());
 
