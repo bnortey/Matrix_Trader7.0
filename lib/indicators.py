@@ -145,6 +145,72 @@ def volatility_regime(atr_pct_value: float) -> str:
         return "extreme"
 
 
+def daily_trend_direction(klines) -> str:
+    """
+    Determine daily trend direction from raw MEXC kline data.
+    Uses swing structure: 2 consecutive higher highs + higher lows = LONG,
+    2 consecutive lower highs + lower lows = SHORT, else NEUTRAL.
+
+    Args:
+        klines: MEXC kline response data — either:
+                - dict with "high" and "low" arrays (contract kline API format), or
+                - list of entries [timestamp_ms, open, close, high, low, volume, ...]
+                Expected at least 10 candles, sorted newest-first (MEXC default).
+
+    Returns: "LONG" | "SHORT" | "NEUTRAL"
+    """
+    try:
+        if isinstance(klines, dict):
+            highs = [float(x) for x in klines.get("high", [])]
+            lows  = [float(x) for x in klines.get("low",  [])]
+        elif isinstance(klines, list):
+            highs = [float(entry[3]) for entry in klines]
+            lows  = [float(entry[4]) for entry in klines]
+        else:
+            return "NEUTRAL"
+
+        if len(highs) < 10 or len(lows) < 10:
+            return "NEUTRAL"
+
+        # Reverse: MEXC returns newest-first, need chronological order for swing detection
+        highs = list(reversed(highs))
+        lows  = list(reversed(lows))
+
+        lookback = 2
+        n = len(highs)
+        swing_highs: list[float] = []
+        swing_lows:  list[float] = []
+
+        for i in range(lookback, n - lookback):
+            if (all(highs[i] > highs[j] for j in range(i - lookback, i)) and
+                    all(highs[i] > highs[j] for j in range(i + 1, i + lookback + 1))):
+                swing_highs.append(highs[i])
+            if (all(lows[i] < lows[j] for j in range(i - lookback, i)) and
+                    all(lows[i] < lows[j] for j in range(i + 1, i + lookback + 1))):
+                swing_lows.append(lows[i])
+
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return "NEUTRAL"
+
+        # Take last 4 swings; check if the final 2 are ascending or descending
+        last_2_highs = swing_highs[-4:][-2:]
+        last_2_lows  = swing_lows[-4:][-2:]
+
+        highs_up   = last_2_highs[1] > last_2_highs[0]
+        highs_down = last_2_highs[1] < last_2_highs[0]
+        lows_up    = last_2_lows[1]  > last_2_lows[0]
+        lows_down  = last_2_lows[1]  < last_2_lows[0]
+
+        if highs_up and lows_up:
+            return "LONG"
+        if highs_down and lows_down:
+            return "SHORT"
+        return "NEUTRAL"
+
+    except Exception:
+        return "NEUTRAL"
+
+
 if __name__ == "__main__":
     # Fake OHLCV: 30 candles drifting upward with realistic noise.
     # 30 rows ensures ATR (14-period) and RSI (14-period) both have

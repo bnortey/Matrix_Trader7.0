@@ -21,6 +21,7 @@ from lib.indicators import (
     atr as calc_atr,
     atr_pct as calc_atr_pct,
     volatility_regime,
+    daily_trend_direction,
 )
 from lib.laddering import generate_ladders
 
@@ -949,6 +950,23 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             direction=direction,
         )
 
+        # --- Daily trend direction ---
+        # Separate API call — failure must never abort enrichment.
+        daily_trend = None
+        daily_trend_aligned = None
+        try:
+            daily_klines = fetch_mexc(
+                f"/contract/kline/{symbol}",
+                params={"interval": "Day1", "limit": 15},
+            )
+            if daily_klines:
+                dt = daily_trend_direction(daily_klines)
+                daily_trend = dt
+                if dt != "NEUTRAL":
+                    daily_trend_aligned = (direction == dt)
+        except Exception:
+            pass
+
         # Build the final signal dict before calling why_signal so we can
         # pass it in with all fields populated (rsi, conviction, tags, etc.)
         final_tags = list(dict.fromkeys(tags))  # deduplicate, preserve order
@@ -977,8 +995,10 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             "rsi_1h": round(last_rsi, 2),
             "trend_score": trend_score,
             "tags": final_tags,
-            "basis_pct": None,      # reserved for P1.5
-            "ai_report": None,      # populated below after sig is fully built
+            "basis_pct": None,          # reserved for P1.5
+            "daily_trend": daily_trend,
+            "daily_trend_aligned": daily_trend_aligned,
+            "ai_report": None,          # populated below after sig is fully built
             # Strategy context — surfaced in the UI
             "strategy": strat["name"],
             "leverage_cap": strat["leverage_cap"],

@@ -1386,8 +1386,11 @@ function rowHTML(sig, i) {
   const active = S.selected === i ? 'active' : '';
   const cc = pctColor(sig.change_24h_pct);
   const fc = fundColor(sig.funding_rate);
-  const tagsHtml = sig.tags.length
-    ? `<div class="row-tags">${sig.tags.map(t => {
+  const tags = [...(sig.tags || [])];
+  if (sig.daily_trend_aligned === true)  tags.push('daily_aligned');
+  if (sig.daily_trend_aligned === false) tags.push('counter_trend');
+  const tagsHtml = tags.length
+    ? `<div class="row-tags">${tags.map(t => {
         const tip = TAG_TIPS[t] ? ` title="${esc(TAG_TIPS[t])}"` : '';
         return `<span class="tag"${tip}>${esc(t.replace(/_/g,' '))}</span>`;
       }).join('')}</div>`
@@ -1435,6 +1438,9 @@ function renderDetail(sig) {
   const liveBadge = sig._liveAnalysis
     ? '<span class="d-live">Live analysis</span>'
     : '';
+  const displayTags = [...(sig.tags || [])];
+  if (sig.daily_trend_aligned === true)  displayTags.push('daily_aligned');
+  if (sig.daily_trend_aligned === false) displayTags.push('counter_trend');
 
   panel.innerHTML = `
 <div class="d-inner" style="position:relative">
@@ -1470,8 +1476,8 @@ function renderDetail(sig) {
   <div class="d-section">
     <div class="d-lbl">Tags</div>
     <div class="tags-wrap">
-      ${sig.tags && sig.tags.length
-        ? sig.tags.map(t => {
+      ${displayTags.length
+        ? displayTags.map(t => {
             const tip = TAG_TIPS[t] ? ` title="${esc(TAG_TIPS[t])}"` : '';
             return `<span class="tag"${tip}>${esc(t.replace(/_/g,' '))}</span>`;
           }).join('')
@@ -1569,6 +1575,8 @@ function contextHTML(sig) {
     { lbl: 'Next Funding', val: nfVal,                       color: null, id: 'ctx-nf' },
     { lbl: 'Volume 24h',   val: fmtBig(sig.volume_24h),     color: null },
     { lbl: 'Volatility',   val: sig.volatility || '—',       color: volColor(sig.volatility) },
+    { lbl: 'Daily Trend',  val: sig.daily_trend || '—',
+      color: sig.daily_trend === 'LONG' ? 'var(--green)' : sig.daily_trend === 'SHORT' ? 'var(--red)' : 'var(--text3)' },
     { lbl: 'Strategy',     val: stratVal,                    color: 'var(--text2)' },
     { lbl: 'Max Leverage', val: capVal,                      color: sig.leverage_cap >= 20 ? 'var(--amber)' : null },
   ];
@@ -1713,6 +1721,8 @@ const TAG_TIPS = {
   'overbought':      'RSI above 65. Price may be overextended — potential for a pullback or reversal.',
   'oversold_risk':   'Short signal but RSI is stretched low — increased risk of a bounce against the position.',
   'overbought_risk': 'Long signal but RSI is elevated — increased risk of a pullback against the position.',
+  'daily_aligned':   'Signal direction matches the daily candle trend — historically higher win rate.',
+  'counter_trend':   'Signal fires against the daily trend direction — higher risk, lower historical win rate.',
 };
 
 function setStrategy(key) {
