@@ -1077,7 +1077,24 @@
             <div class="perf-val" id="pb-streak">—</div>
             <div class="perf-lbl">STREAK</div>
           </div>
+          <div class="perf-divider"></div>
+          <div class="perf-stat">
+            <div class="perf-val" id="pb-account">—</div>
+            <div class="perf-lbl">ACCOUNT</div>
+          </div>
+          <div class="perf-divider"></div>
+          <div class="perf-stat">
+            <div class="perf-val" id="pb-return">—</div>
+            <div class="perf-lbl">RETURN</div>
+          </div>
         </div>
+
+        <!-- Equity sparkline — populated by renderEquitySparkline() -->
+        <div id="equity-sparkline" style="
+          width:100%; margin-bottom:16px;
+          border-bottom:1px solid var(--border);
+          padding-bottom:8px;
+        "></div>
 
         <!-- Open positions monitoring -->
         <div id="open-positions-section">
@@ -2580,6 +2597,55 @@ async function loadHistory() {
 
 const RESULT_R = { WIN: 2.0, FULL_WIN: 3.0, PARTIAL: 1.0, LOSS: -1.0, EXPIRED: 0.0, SKIPPED: 0.0 };
 
+function calcEquityCurve(closedSigs, startingBalance) {
+  const sorted = [...closedSigs]
+    .filter(s => s.result && s.result !== 'SKIPPED')
+    .sort((a, b) => new Date(a.logged_at) - new Date(b.logged_at));
+
+  let balance = startingBalance;
+  const points = [{ balance, sig: null }];
+
+  for (const sig of sorted) {
+    const rVal     = RESULT_R[sig.result] ?? 0;
+    const leverage = sig.leverage_cap || STRATEGY_LEVERAGE[sig.strategy] || 20;
+    const risk     = balance * 0.01;
+    const pnl      = rVal * risk;
+    balance        = Math.max(0, balance + pnl);
+    points.push({ balance, sig, pnl, rVal });
+  }
+
+  return { points, finalBalance: balance, totalReturn: startingBalance > 0 ? (balance - startingBalance) / startingBalance * 100 : 0 };
+}
+
+function renderEquitySparkline(points, startingBalance) {
+  const el = $('equity-sparkline');
+  if (!el || points.length < 2) { if (el) el.innerHTML = ''; return; }
+
+  const W = el.clientWidth || 600;
+  const H = 48;
+  const balances = points.map(p => p.balance);
+  const minB = Math.min(...balances);
+  const maxB = Math.max(...balances);
+  const range = maxB - minB || 1;
+
+  const pts = points.map((p, i) => {
+    const x = (i / (points.length - 1)) * W;
+    const y = H - ((p.balance - minB) / range) * (H - 4) - 2;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  const isUp    = points[points.length - 1].balance >= startingBalance;
+  const color   = isUp ? 'var(--green)' : 'var(--red)';
+  const baselineY = (H - ((startingBalance - minB) / range) * (H - 4) - 2).toFixed(1);
+
+  el.innerHTML = `
+    <svg width="100%" height="${H}" style="display:block">
+      <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.8"/>
+      <line x1="0" y1="${baselineY}" x2="${W}" y2="${baselineY}"
+            stroke="rgba(255,255,255,0.1)" stroke-width="1" stroke-dasharray="4,4"/>
+    </svg>`;
+}
+
 function updatePerfBanner(closed, open) {
   const tagged  = closed.filter(s => s.result && s.result !== 'SKIPPED' && s.result !== 'EXPIRED');
   const wins    = tagged.filter(s => s.result === 'WIN' || s.result === 'FULL_WIN');
@@ -2625,6 +2691,25 @@ function updatePerfBanner(closed, open) {
     streak > 0 ? streak + streakType : '—',
     streakType === 'W' ? 'var(--green)' : streakType === 'L' ? 'var(--red)' : ''
   );
+
+  // Compounding equity curve stats
+  if (acct > 0) {
+    const curve = calcEquityCurve(closed, acct);
+    set('pb-account',
+      '$' + curve.finalBalance.toFixed(0),
+      curve.finalBalance >= acct ? 'var(--green)' : 'var(--red)'
+    );
+    set('pb-return',
+      (curve.totalReturn >= 0 ? '+' : '') + curve.totalReturn.toFixed(1) + '%',
+      curve.totalReturn >= 0 ? 'var(--green)' : 'var(--red)'
+    );
+    renderEquitySparkline(curve.points, acct);
+  } else {
+    set('pb-account', '—');
+    set('pb-return',  '—');
+    const el = $('equity-sparkline');
+    if (el) el.innerHTML = '';
+  }
 }
 
 function renderHistorySummary(sigs) {
@@ -2698,6 +2783,18 @@ function renderHistoryTable(sigs) {
   const acct         = parseFloat(localStorage.getItem('mt7_account_size') || '0');
   const riskPerTrade = acct > 0 ? acct * 0.01 : 0;
 
+  // Pre-compute running balance after each trade (chronological, compounding)
+  const balanceAfter = {};
+  if (acct > 0) {
+    const curve = calcEquityCurve(sigs, acct);
+    const chronoSigs = [...sigs]
+      .filter(s => s.result && s.result !== 'SKIPPED')
+      .sort((a, b) => new Date(a.logged_at) - new Date(b.logged_at));
+    chronoSigs.forEach((s, i) => {
+      if (curve.points[i + 1]) balanceAfter[s.id] = curve.points[i + 1].balance;
+    });
+  }
+
   const rows = sigs.map(s => {
     // Parse UTC timestamp — logged_at has no Z suffix from Python's isoformat()
     const dt  = new Date(s.logged_at.endsWith('Z') ? s.logged_at : s.logged_at + 'Z');
@@ -2733,6 +2830,10 @@ function renderHistoryTable(sigs) {
       }
     }
 
+    const balCell = balanceAfter[s.id] !== undefined
+      ? `<span style="color:var(--text3);font-size:11px">$${balanceAfter[s.id].toFixed(0)}</span>`
+      : '—';
+
     return `<tr>
       <td class="hist-time">${timeStr}</td>
       <td class="hist-symbol">${sym}</td>
@@ -2743,6 +2844,7 @@ function renderHistoryTable(sigs) {
       <td><div class="outcome-group">${btns}</div></td>
       <td style="text-align:right;font-size:12px;white-space:nowrap">${pnlCell}</td>
       <td style="text-align:right;font-size:12px;white-space:nowrap">${rCell}</td>
+      <td style="text-align:right">${balCell}</td>
     </tr>`;
   }).join('');
 
@@ -2752,6 +2854,7 @@ function renderHistoryTable(sigs) {
         <th>Time</th><th>Symbol</th><th>Dir</th>
         <th>Strategy</th><th>Conv</th><th>Why</th><th>Result</th>
         <th style="text-align:right">$P&L</th><th style="text-align:right">R</th>
+        <th style="text-align:right">Balance</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
@@ -3219,6 +3322,16 @@ if (initSi) initSi.textContent = ' ↓';
 calcRisk();
 calcCompound();
 showGuide();
+
+window.addEventListener('resize', () => {
+  if (currentTab === 'history' && lastHistorySigs.length) {
+    const acct   = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+    if (acct > 0) {
+      const curve = calcEquityCurve(lastHistorySigs, acct);
+      renderEquitySparkline(curve.points, acct);
+    }
+  }
+});
 </script>
 
 <div id="guide-overlay" class="hidden">
