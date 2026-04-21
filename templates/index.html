@@ -2402,6 +2402,8 @@ const H = {
   posFetching:     false,   // guards concurrent fetchAndRenderPositions() calls
 };
 
+let lastHistorySigs = [];
+
 const OUTCOME_LABELS = {
   WIN: 'WIN', LOSS: 'LOSS', PARTIAL: 'PAR', EXPIRED: 'EXP', SKIPPED: 'SKP',
 };
@@ -2455,6 +2457,8 @@ async function loadHistory() {
   }
 }
 
+const RESULT_R = { WIN: 2.0, FULL_WIN: 3.0, PARTIAL: 1.0, LOSS: -1.0, EXPIRED: 0.0, SKIPPED: 0.0 };
+
 function renderHistorySummary(sigs) {
   const total   = sigs.length;
   const tagged  = sigs.filter(s => s.result).length;
@@ -2468,6 +2472,20 @@ function renderHistorySummary(sigs) {
     : null;
   const avgW = avgC(wins);
   const avgL = avgC(losses);
+
+  const acctRaw  = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+  const acct     = acctRaw > 0 ? acctRaw : 0;
+  const riskPerTrade = acct * 0.01;
+  const totalR = sigs.reduce((sum, s) => {
+    const r = RESULT_R[s.result];
+    return r !== undefined ? sum + r : sum;
+  }, 0);
+  const totalDollar = riskPerTrade * totalR;
+  const pnlColor = totalDollar >= 0 ? 'var(--green)' : 'var(--red)';
+  const pnlSign  = totalDollar >= 0 ? '+' : '';
+  const pnlStr   = acct > 0
+    ? `<span style="color:${pnlColor}">${pnlSign}$${totalDollar.toFixed(2)}</span> <span style="color:var(--text3);font-size:11px">(1% risk/trade, $${acct} acct)</span>`
+    : `<span style="color:var(--text3)">—</span>`;
 
   $('hist-bar').innerHTML = `
     <div class="hist-stat">
@@ -2494,14 +2512,31 @@ function renderHistorySummary(sigs) {
       <span class="hist-stat-val">${avgL !== null ? avgL : '—'}</span>
       <span class="hist-stat-lbl">Avg Conv (L)</span>
     </div>
+    <div class="hist-stat">
+      <span class="hist-stat-lbl" style="margin-bottom:4px">Est. P&L</span>
+      <span class="hist-stat-val" style="font-size:13px">${pnlStr}</span>
+    </div>
+    <div style="margin-left:auto;display:flex;align-items:center;gap:6px;flex-shrink:0">
+      <label style="color:var(--text3);font-size:11px;white-space:nowrap">Acct $</label>
+      <input id="hist-account-size" type="number" min="0" step="100"
+        value="${acct > 0 ? acct : ''}"
+        placeholder="e.g. 500"
+        style="width:90px;background:var(--bg2);border:1px solid var(--border);color:var(--text1);padding:4px 6px;border-radius:4px;font-size:12px"
+        oninput="localStorage.setItem('mt7_account_size', this.value); renderHistoryTable(lastHistorySigs); renderHistorySummary(lastHistorySigs)">
+    </div>
   `;
 }
 
 function renderHistoryTable(sigs) {
+  lastHistorySigs = sigs;
+
   if (!sigs.length) {
     $('hist-body').innerHTML = '<div class="hist-empty">No signals match the current filters. Run a scan to log signals.</div>';
     return;
   }
+
+  const acct         = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+  const riskPerTrade = acct > 0 ? acct * 0.01 : 0;
 
   const rows = sigs.map(s => {
     // Parse UTC timestamp — logged_at has no Z suffix from Python's isoformat()
@@ -2523,6 +2558,19 @@ function renderHistoryTable(sigs) {
       return `<button class="outcome-btn${active}" onclick="tagOutcome(${s.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`;
     }).join('');
 
+    const rVal = RESULT_R[s.result];
+    const showPnl = rVal !== undefined && s.result !== 'EXPIRED' && s.result !== 'SKIPPED';
+    let rCell = '—', pnlCell = '—';
+    if (showPnl) {
+      const color = rVal >= 0 ? 'var(--green)' : 'var(--red)';
+      const sign  = rVal >= 0 ? '+' : '';
+      rCell  = `<span style="color:${color}">${sign}${rVal.toFixed(1)}R</span>`;
+      if (riskPerTrade > 0) {
+        const dollar = riskPerTrade * rVal;
+        pnlCell = `<span style="color:${color}">${sign}$${dollar.toFixed(2)}</span>`;
+      }
+    }
+
     return `<tr>
       <td class="hist-time">${timeStr}</td>
       <td class="hist-symbol">${sym}</td>
@@ -2531,6 +2579,8 @@ function renderHistoryTable(sigs) {
       <td class="hist-conv">${s.conviction}</td>
       <td><div class="hist-why" title="${why}">${why}</div></td>
       <td><div class="outcome-group">${btns}</div></td>
+      <td style="text-align:right;font-size:12px;white-space:nowrap">${pnlCell}</td>
+      <td style="text-align:right;font-size:12px;white-space:nowrap">${rCell}</td>
     </tr>`;
   }).join('');
 
@@ -2539,6 +2589,7 @@ function renderHistoryTable(sigs) {
       <thead><tr>
         <th>Time</th><th>Symbol</th><th>Dir</th>
         <th>Strategy</th><th>Conv</th><th>Why</th><th>Result</th>
+        <th style="text-align:right">$P&L</th><th style="text-align:right">R</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
