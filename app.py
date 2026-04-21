@@ -1223,6 +1223,153 @@ def api_signals_history():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def evaluate_outcome(sig: dict) -> tuple[str, str] | None:
+    """
+    Fetch Min15 klines since the signal was logged and determine if stop or TP was hit.
+
+    Returns (result, note) or None if no level was hit yet / insufficient data.
+
+    Evaluation rules (applied per candle in chronological order):
+      - Stop hit (LONG: low <= stop | SHORT: high >= stop) → LOSS (or PARTIAL if TP1 hit first)
+      - TP3 fully hit → WIN
+      - TP1 or TP2 hit, no stop → PARTIAL
+    If TP1 was hit in an earlier candle but stop was hit later, result is PARTIAL —
+    the trader would have taken partial profits before being stopped on the remainder.
+    """
+    symbol    = sig.get("symbol", "")
+    direction = sig.get("direction", "")
+    logged_at = sig.get("logged_at", "")
+    stop_loss = sig.get("stop_loss")
+    tp1       = sig.get("tp1")
+    tp2       = sig.get("tp2")
+    tp3       = sig.get("tp3")
+
+    if not symbol or not direction or not stop_loss or not tp1:
+        return None
+
+    try:
+        dt       = datetime.fromisoformat(logged_at)
+        start_ts = int(dt.timestamp())
+    except Exception:
+        return None
+
+    # Need at least one full 15-minute candle after the signal
+    if time.time() - start_ts < 900:
+        return None
+
+    klines = fetch_mexc(f"/contract/kline/{symbol}", params={
+        "interval": "Min15",
+        "start":    start_ts,
+        "limit":    300,   # 300 × 15min = ~75 hours of coverage
+    })
+    if not klines or not isinstance(klines, dict):
+        return None
+
+    raw_times = klines.get("time", [])
+    raw_highs = klines.get("high", [])
+    raw_lows  = klines.get("low",  [])
+    if not raw_times or not raw_highs or not raw_lows:
+        return None
+
+    # Build candle list — only candles that opened at or after signal time
+    candles: list[dict] = []
+    for i, t in enumerate(raw_times):
+        try:
+            if int(t) >= start_ts:
+                candles.append({"high": float(raw_highs[i]), "low": float(raw_lows[i])})
+        except (ValueError, IndexError):
+            pass
+
+    if not candles:
+        return None
+
+    stop_hit = False
+    best_tp  = 0   # highest TP tier reached before stop: 0=none, 1, 2, 3
+
+    for c in candles:
+        h, l = c["high"], c["low"]
+        if direction == "LONG":
+            if l <= stop_loss:
+                stop_hit = True
+                break
+            if tp3 and h >= tp3:
+                best_tp = max(best_tp, 3)
+            elif tp2 and h >= tp2:
+                best_tp = max(best_tp, 2)
+            elif tp1 and h >= tp1:
+                best_tp = max(best_tp, 1)
+        else:  # SHORT
+            if h >= stop_loss:
+                stop_hit = True
+                break
+            if tp3 and l <= tp3:
+                best_tp = max(best_tp, 3)
+            elif tp2 and l <= tp2:
+                best_tp = max(best_tp, 2)
+            elif tp1 and l <= tp1:
+                best_tp = max(best_tp, 1)
+
+    if stop_hit and best_tp == 0:
+        return ("LOSS",    f"Stop hit at {stop_loss}")
+    if stop_hit and best_tp > 0:
+        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}")
+    if best_tp == 3:
+        return ("WIN",     f"TP3 hit at {tp3}")
+    if best_tp == 2:
+        return ("PARTIAL", f"TP2 hit at {tp2}")
+    if best_tp == 1:
+        return ("PARTIAL", f"TP1 hit at {tp1}")
+    return None   # still open — no level hit yet
+
+
+@app.route("/api/outcomes/check", methods=["POST"])
+def api_outcomes_check():
+    """
+    Evaluate open positions against Min15 kline history and auto-tag any that
+    have hit their stop loss or take profit levels.
+
+    Returns a summary of how many signals were evaluated and tagged.
+    Safe to call repeatedly — already-tagged signals are skipped.
+    """
+    try:
+        con  = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM signals WHERE result IS NULL ORDER BY logged_at ASC"
+        ).fetchall()
+        con.close()
+
+        open_sigs = [dict(r) for r in rows]
+        tagged: list[dict] = []
+        skipped = 0
+
+        for sig in open_sigs:
+            outcome = evaluate_outcome(sig)
+            if outcome is None:
+                skipped += 1
+                continue
+            result, note = outcome
+            con = sqlite3.connect(DB_PATH)
+            con.execute(
+                "UPDATE signals SET result=?, result_note=?, result_at=? WHERE id=?",
+                (result, note, datetime.utcnow().isoformat(), sig["id"]),
+            )
+            con.commit()
+            con.close()
+            tagged.append({"id": sig["id"], "symbol": sig["symbol"],
+                           "direction": sig["direction"], "result": result, "note": note})
+
+        return jsonify({
+            "success": True,
+            "evaluated": len(open_sigs),
+            "tagged":    len(tagged),
+            "skipped":   skipped,
+            "results":   tagged,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/prices")
 def api_prices():
     """Batch price fetch: return current prices for multiple symbols from one MEXC ticker call.

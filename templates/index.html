@@ -2824,6 +2824,40 @@ async function fetchAndRenderPositions() {
     } catch (e) { /* use cached prices on failure */ }
   }
 
+  // Sync with server — pick up any positions auto-tagged by the outcome checker
+  // since the last refresh. This is what makes auto-closed positions disappear
+  // from the open table within 30 seconds of the outcome checker running.
+  try {
+    const histResp = await fetch('/api/signals/history?limit=500');
+    const histData = await histResp.json();
+    if (histData.success) {
+      const all          = histData.signals || [];
+      const prevOpenCount = H.openPositions.length;
+      H.openPositions    = all.filter(s => s.result === null);
+      lastHistorySigs    = all.filter(s => s.result !== null);
+
+      // If the outcome checker tagged any positions, refresh the closed table too
+      if (H.openPositions.length !== prevOpenCount) {
+        const strategy = $('hf-strategy') ? $('hf-strategy').value : '';
+        const dir      = $('hf-dir')      ? $('hf-dir').value      : '';
+        const result   = $('hf-result')   ? $('hf-result').value   : '';
+        let filtered = lastHistorySigs;
+        if (strategy) filtered = filtered.filter(s => s.strategy === strategy);
+        if (dir)      filtered = filtered.filter(s => s.direction === dir);
+        if (result)   filtered = filtered.filter(s => s.result === result.toUpperCase());
+        renderHistorySummary(filtered);
+        renderHistoryTable(filtered);
+
+        // If the selected position was auto-closed, close its detail panel
+        if (H.selectedPositionId &&
+            !H.openPositions.find(p => p.id === H.selectedPositionId)) {
+          H.selectedPositionId = null;
+          closePanel();
+        }
+      }
+    }
+  } catch (e) { /* keep existing H.openPositions on failure */ }
+
   H.posLastRefresh = Date.now();
   H.posFetching = false;
   renderOpenPositions();
