@@ -2591,8 +2591,9 @@ async function loadHistory() {
 
   } catch (e) {
     H.loading = false;
-    $('hist-body').innerHTML = '<div class="hist-empty">Failed to load history.</div>';
-    $('open-positions-body').innerHTML = '<div class="hist-empty">Failed to load positions.</div>';
+    console.error('loadHistory error:', e);
+    $('hist-body').innerHTML = '<div class="hist-empty">Failed to load history: ' + e.message + '</div>';
+    $('open-positions-body').innerHTML = '<div class="hist-empty">Failed to load positions: ' + e.message + '</div>';
   }
 }
 
@@ -2785,13 +2786,13 @@ function renderHistoryTable(sigs) {
   const riskPerTrade = acct > 0 ? acct * 0.01 : 0;
 
   // Pre-compute running balance after each trade (chronological, compounding)
-  const balanceAfter = {};
+  const balanceAfter  = {};
+  const balanceBefore = {};
   if (acct > 0) {
     const curve = calcEquityCurve(sigs, acct);
     const chronoSigs = [...sigs]
       .filter(s => s.result && s.result !== 'SKIPPED')
       .sort((a, b) => new Date(a.logged_at) - new Date(b.logged_at));
-    const balanceBefore = {};
     chronoSigs.forEach((s, i) => {
       balanceBefore[s.id] = curve.points[i].balance;
       if (curve.points[i + 1]) balanceAfter[s.id] = curve.points[i + 1].balance;
@@ -2964,7 +2965,10 @@ async function fetchAndRenderPositions() {
         }
       }
     }
-  } catch (e) { /* keep existing H.openPositions on failure */ }
+  } catch (e) {
+    console.error('fetchAndRenderPositions sync error:', e);
+    $('open-positions-body').innerHTML = '<div class="hist-empty">Failed to load positions: ' + e.message + '</div>';
+  }
 
   H.posLastRefresh = Date.now();
   H.posFetching = false;
