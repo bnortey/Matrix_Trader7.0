@@ -155,7 +155,7 @@ def daily_trend_direction(klines) -> str:
         klines: MEXC kline response data — either:
                 - dict with "high" and "low" arrays (contract kline API format), or
                 - list of entries [timestamp_ms, open, close, high, low, volume, ...]
-                Expected at least 10 candles, sorted newest-first (MEXC default).
+                Expected at least 6 candles, sorted oldest-first (MEXC default for contract klines).
 
     Returns: "LONG" | "SHORT" | "NEUTRAL"
     """
@@ -169,12 +169,11 @@ def daily_trend_direction(klines) -> str:
         else:
             return "NEUTRAL"
 
-        if len(highs) < 10 or len(lows) < 10:
+        if len(highs) < 6 or len(lows) < 6:
             return "NEUTRAL"
 
-        # Reverse: MEXC returns newest-first, need chronological order for swing detection
-        highs = list(reversed(highs))
-        lows  = list(reversed(lows))
+        # MEXC contract kline API returns candles oldest-first (ascending timestamps).
+        # No reversal needed — data is already in chronological order for swing detection.
 
         lookback = 2
         n = len(highs)

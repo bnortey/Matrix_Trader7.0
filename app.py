@@ -957,7 +957,7 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
         try:
             daily_klines = fetch_mexc(
                 f"/contract/kline/{symbol}",
-                params={"interval": "Day1", "limit": 15},
+                params={"interval": "Day1", "limit": 30},
             )
             if daily_klines:
                 dt = daily_trend_direction(daily_klines)
