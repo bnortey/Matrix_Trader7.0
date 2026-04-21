@@ -526,6 +526,73 @@
     .chart-wrap { margin-top: 16px; height: 120px; position: relative; }
     canvas#compound-chart { width: 100%; height: 100%; }
 
+    /* ── History section ── */
+    #history-section { flex: 1; overflow-y: auto; }
+    #hist-inner { max-width: 1100px; margin: 0 auto; padding: 20px 16px; }
+    #hist-bar {
+      display: flex; gap: 28px; align-items: center; flex-wrap: wrap;
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px 20px; margin-bottom: 14px;
+    }
+    .hist-stat { display: flex; flex-direction: column; gap: 2px; }
+    .hist-stat-val { font-size: 20px; font-weight: 700; font-family: var(--mono); }
+    .hist-stat-lbl { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.06em; }
+    .hist-filters {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .hist-filter-lbl {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text3); font-weight: 600;
+    }
+    .hist-filter-select {
+      background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+      border-radius: 4px; padding: 5px 8px; font-size: 11px;
+      color: var(--text); outline: none; cursor: pointer;
+    }
+    .hist-filter-select:focus { border-color: rgba(255,255,255,0.2); }
+    #hist-table-wrap { overflow-x: auto; }
+    #hist-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    #hist-table th {
+      text-align: left; padding: 6px 10px;
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text3); font-weight: 600; border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    #hist-table td {
+      padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,0.04);
+      vertical-align: middle;
+    }
+    #hist-table tr:hover td { background: rgba(255,255,255,0.02); }
+    .hist-dir-long  { color: var(--green); font-weight: 700; font-size: 10px; }
+    .hist-dir-short { color: var(--red);   font-weight: 700; font-size: 10px; }
+    .hist-symbol { font-weight: 600; font-size: 12px; }
+    .hist-conv { font-family: var(--mono); font-weight: 700; }
+    .hist-why {
+      max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; color: var(--text2);
+    }
+    .hist-time { color: var(--text3); white-space: nowrap; font-size: 10px; }
+    .hist-strat { color: var(--text2); font-size: 10px; }
+    /* Outcome buttons */
+    .outcome-group { display: flex; gap: 3px; }
+    .outcome-btn {
+      font-size: 9px; font-weight: 700; letter-spacing: 0.02em;
+      padding: 2px 5px; border-radius: 3px;
+      border: 1px solid var(--border); background: transparent;
+      color: var(--text3); cursor: pointer;
+      transition: background 100ms, color 100ms, border-color 100ms;
+    }
+    .outcome-btn:hover { border-color: rgba(255,255,255,0.25); color: var(--text); }
+    .outcome-win     { background: rgba(0,230,118,0.15);  border-color: var(--green); color: var(--green); }
+    .outcome-loss    { background: rgba(255,75,75,0.15);   border-color: var(--red);   color: var(--red); }
+    .outcome-partial { background: rgba(255,180,0,0.12);  border-color: #ffb400;       color: #ffb400; }
+    .outcome-expired { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.18); color: var(--text2); }
+    .outcome-skipped { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.18); color: var(--text2); }
+    .hist-empty, .hist-loading {
+      padding: 48px 24px; text-align: center; color: var(--text3); font-size: 12px;
+    }
+
     /* ── Mobile overlay ── */
     #overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 99; }
     #overlay.on { display: block; }
@@ -623,6 +690,9 @@
       #guide-modal { padding: 20px; }
       #guide-footer { flex-direction: column; align-items: stretch; }
       #guide-btn { text-align: center; }
+      #hist-bar { gap: 16px; padding: 12px 14px; }
+      .hist-stat-val { font-size: 16px; }
+      .hist-why { max-width: 140px; }
     }
   </style>
 </head>
@@ -645,6 +715,7 @@
     <button id="tab-signals" class="tab-btn active" onclick="switchTab('signals')">Signals</button>
     <button id="tab-market"  class="tab-btn"        onclick="switchTab('market')">Market</button>
     <button id="tab-tools"   class="tab-btn"        onclick="switchTab('tools')">Tools</button>
+    <button id="tab-history" class="tab-btn"        onclick="switchTab('history')">History</button>
   </div>
 
   <!-- ── MAIN (shared flex row) ── -->
@@ -870,6 +941,50 @@
       </div><!-- /tools-inner -->
     </div><!-- /tools-section -->
 
+    <!-- ════ HISTORY SECTION ════ -->
+    <div id="history-section" class="hidden">
+      <div id="hist-inner">
+
+        <!-- Summary bar — populated by renderHistorySummary() -->
+        <div id="hist-bar">
+          <span style="color:var(--text3);font-size:12px">Run a scan to start logging signals.</span>
+        </div>
+
+        <!-- Filter controls -->
+        <div class="hist-filters">
+          <span class="hist-filter-lbl">Strategy</span>
+          <select id="hf-strategy" class="hist-filter-select" onchange="loadHistory()">
+            <option value="">All</option>
+            <option value="balanced">Balanced</option>
+            <option value="funding_arb">Funding Arb</option>
+            <option value="momentum_breakout">Momentum Breakout</option>
+            <option value="mean_reversion">Mean Reversion</option>
+          </select>
+          <span class="hist-filter-lbl" style="margin-left:6px">Direction</span>
+          <select id="hf-dir" class="hist-filter-select" onchange="loadHistory()">
+            <option value="">All</option>
+            <option value="LONG">Long</option>
+            <option value="SHORT">Short</option>
+          </select>
+          <span class="hist-filter-lbl" style="margin-left:6px">Result</span>
+          <select id="hf-result" class="hist-filter-select" onchange="loadHistory()">
+            <option value="">All</option>
+            <option value="WIN">Win</option>
+            <option value="LOSS">Loss</option>
+            <option value="PARTIAL">Partial</option>
+            <option value="EXPIRED">Expired</option>
+            <option value="SKIPPED">Skipped</option>
+          </select>
+        </div>
+
+        <!-- Table — populated by renderHistoryTable() -->
+        <div id="hist-table-wrap">
+          <div id="hist-body" class="hist-loading">Switch to this tab after a scan to see logged signals.</div>
+        </div>
+
+      </div>
+    </div><!-- /history-section -->
+
     <!-- ════ SHARED DETAIL PANEL ════ -->
     <aside id="detail-panel" class="hidden">
       <!-- populated by renderDetail() or enrichMarketPair() -->
@@ -946,9 +1061,12 @@ function switchTab(tab) {
   toggle('signals-section', tab === 'signals');
   toggle('market-section',  tab === 'market');
   toggle('tools-section',   tab === 'tools');
+  toggle('history-section', tab === 'history');
   $('tab-signals').classList.toggle('active', tab === 'signals');
   $('tab-market').classList.toggle('active',  tab === 'market');
   $('tab-tools').classList.toggle('active',   tab === 'tools');
+  $('tab-history').classList.toggle('active', tab === 'history');
+  if (tab === 'history') loadHistory();
 }
 
 /* ============================================================
@@ -2180,6 +2298,154 @@ function drawCompoundChart(balances) {
   [0, 30, 60, 90].forEach(d => {
     ctx.fillText('D' + d, toX(d), H - 5);
   });
+}
+
+/* ============================================================
+   HISTORY TAB
+   ============================================================ */
+const H = { loading: false };
+
+const OUTCOME_LABELS = {
+  WIN: 'WIN', LOSS: 'LOSS', PARTIAL: 'PAR', EXPIRED: 'EXP', SKIPPED: 'SKP',
+};
+const OUTCOME_CSS = {
+  WIN: 'outcome-win', LOSS: 'outcome-loss', PARTIAL: 'outcome-partial',
+  EXPIRED: 'outcome-expired', SKIPPED: 'outcome-skipped',
+};
+
+async function loadHistory() {
+  if (H.loading) return;
+  H.loading = true;
+  $('hist-body').innerHTML = '<div class="hist-loading">Loading…</div>';
+
+  const strategy = $('hf-strategy').value;
+  const dir      = $('hf-dir').value;
+  const result   = $('hf-result').value;
+
+  const params = new URLSearchParams({ limit: 500 });
+  if (strategy) params.set('strategy', strategy);
+  if (result)   params.set('result',   result);
+
+  try {
+    const resp = await fetch('/api/signals/history?' + params);
+    const data = await resp.json();
+    H.loading = false;
+    if (!data.success) {
+      $('hist-body').innerHTML = '<div class="hist-empty">Error loading history.</div>';
+      return;
+    }
+    // Direction is not a backend filter — apply client-side
+    let sigs = data.signals || [];
+    if (dir) sigs = sigs.filter(s => s.direction === dir);
+    renderHistorySummary(sigs);
+    renderHistoryTable(sigs);
+  } catch (e) {
+    H.loading = false;
+    $('hist-body').innerHTML = '<div class="hist-empty">Failed to load history.</div>';
+  }
+}
+
+function renderHistorySummary(sigs) {
+  const total   = sigs.length;
+  const tagged  = sigs.filter(s => s.result).length;
+  const wins    = sigs.filter(s => s.result === 'WIN');
+  const losses  = sigs.filter(s => s.result === 'LOSS');
+  const partials= sigs.filter(s => s.result === 'PARTIAL');
+  const denom   = wins.length + losses.length + partials.length;
+  const winRate = denom > 0 ? Math.round(wins.length / denom * 100) : null;
+  const avgC = arr => arr.length
+    ? Math.round(arr.reduce((a, s) => a + s.conviction, 0) / arr.length)
+    : null;
+  const avgW = avgC(wins);
+  const avgL = avgC(losses);
+
+  $('hist-bar').innerHTML = `
+    <div class="hist-stat">
+      <span class="hist-stat-val">${total}</span>
+      <span class="hist-stat-lbl">Logged</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val">${tagged}</span>
+      <span class="hist-stat-lbl">Tagged</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val" style="color:var(--green)">${winRate !== null ? winRate + '%' : '—'}</span>
+      <span class="hist-stat-lbl">Win Rate</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val">${wins.length}W · ${losses.length}L · ${partials.length}P</span>
+      <span class="hist-stat-lbl">Outcomes</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val">${avgW !== null ? avgW : '—'}</span>
+      <span class="hist-stat-lbl">Avg Conv (W)</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val">${avgL !== null ? avgL : '—'}</span>
+      <span class="hist-stat-lbl">Avg Conv (L)</span>
+    </div>
+  `;
+}
+
+function renderHistoryTable(sigs) {
+  if (!sigs.length) {
+    $('hist-body').innerHTML = '<div class="hist-empty">No signals match the current filters. Run a scan to log signals.</div>';
+    return;
+  }
+
+  const rows = sigs.map(s => {
+    // Parse UTC timestamp — logged_at has no Z suffix from Python's isoformat()
+    const dt  = new Date(s.logged_at.endsWith('Z') ? s.logged_at : s.logged_at + 'Z');
+    const mon = dt.toLocaleString('en-US', { month: 'short' });
+    const day = dt.getDate();
+    const hh  = String(dt.getHours()).padStart(2, '0');
+    const mm  = String(dt.getMinutes()).padStart(2, '0');
+    const timeStr = `${mon} ${day} ${hh}:${mm}`;
+
+    const sym    = esc((s.symbol || '').replace('_USDT', ''));
+    const dirCls = s.direction === 'LONG' ? 'hist-dir-long' : 'hist-dir-short';
+    const dirLbl = s.direction === 'LONG' ? 'LONG' : 'SHORT';
+    const strat  = STRAT_META[s.strategy] ? STRAT_META[s.strategy].label : esc(s.strategy || '—');
+    const why    = esc(s.signal_why || '—');
+
+    const btns = Object.keys(OUTCOME_LABELS).map(o => {
+      const active = s.result === o ? ' ' + OUTCOME_CSS[o] : '';
+      return `<button class="outcome-btn${active}" onclick="tagOutcome(${s.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`;
+    }).join('');
+
+    return `<tr>
+      <td class="hist-time">${timeStr}</td>
+      <td class="hist-symbol">${sym}</td>
+      <td class="${dirCls}">${dirLbl}</td>
+      <td class="hist-strat">${strat}</td>
+      <td class="hist-conv">${s.conviction}</td>
+      <td><div class="hist-why" title="${why}">${why}</div></td>
+      <td><div class="outcome-group">${btns}</div></td>
+    </tr>`;
+  }).join('');
+
+  $('hist-body').innerHTML = `
+    <table id="hist-table">
+      <thead><tr>
+        <th>Time</th><th>Symbol</th><th>Dir</th>
+        <th>Strategy</th><th>Conv</th><th>Why</th><th>Result</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function tagOutcome(id, result) {
+  try {
+    const resp = await fetch('/api/signal/result', {
+      method:  'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ id, result }),
+    });
+    const data = await resp.json();
+    if (data.success) loadHistory();  // full reload — summary stats must update too
+  } catch (e) {
+    console.error('tagOutcome error:', e);
+  }
 }
 
 /* ============================================================
