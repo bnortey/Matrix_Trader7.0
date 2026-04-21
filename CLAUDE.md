@@ -42,21 +42,18 @@ This is the 7th iteration. Versions 2–6 all failed. The MT6 codebase (`Matrix_
 
 ---
 
-## Current Phase: P1 — Signal Quality
+## Current Phase: P3 — Signal History & Outcome Tracking
 
-**Phase 0 is complete.** The app runs, fetches real MEXC data, and renders a signal table.
+**P0 through P2e are complete.** The app scans live MEXC data, scores signals with 4 strategies, enriches them with RSI/ATR/ladders/sentiment, and shows a full AI trade brief in the detail panel.
 
-**P1 exit criterion:** Every signal card shows a specific entry zone, TP levels, and stop loss derived from ATR. The risk calculator is functional. The compound planner renders Monte Carlo output.
+### P3 Tasks (work through these in order)
 
-### P1 Tasks (work through these in order)
-
-- [ ] Port `lib/indicators.py` — RSI, EMA, VWAP, ATR from MT6 (clean pandas, no ARIMA)
-- [ ] Port `lib/laddering.py` — ATR-derived tiered entry/TP/SL generator
-- [x] Wire indicators into per-signal scoring in `app.py`
-- [x] Add entry/TP/SL to every signal card in the dashboard
-- [x] Complete risk calculator (position sizing, max leverage, drawdown analysis)
-- [x] Complete compound planner (Monte Carlo, milestone projections)
-- [ ] Port `lib/mexc_stream.py` — WebSocket for live price refresh on watched pairs (deferred to P3)
+- [x] Signal history storage — SQLite auto-write on every scan
+- [ ] Outcome tracking — manual WIN/LOSS/PARTIAL tagging
+- [ ] History tab UI — logged signals, outcome buttons, win rate stats
+- [ ] AI strategy review — Claude API analysis of outcome data, user-triggered
+- [ ] Paper trading system — automated position tracking
+- [ ] WebSocket live price refresh for watched pairs
 
 ---
 
@@ -175,6 +172,7 @@ MexcStreamAPI(on_kline, on_depth, on_funding)
 6. **Error handling is a feature.** Every API call is wrapped in try/except. App never crashes.
 7. **Signal quality over quantity.** 20 high-conviction signals beats 200 weak ones.
 8. **The tool is for trading, not for looking at.** Aesthetics serve the signal, not the other way around.
+9. **No databases for application state.** SQLite is acceptable for signal history logging and outcome tracking.
 
 ---
 
@@ -220,12 +218,16 @@ Opens at `http://192.168.x.x:5000` on iPhone (same WiFi).
 
 | Phase | What | Status |
 |---|---|---|
-| P0 | Flask app running, MEXC ticker scan, basic scoring, web dashboard | ✅ Done |
-| P1 | Indicators integrated, entry/TP/SL on signals, risk calc, compound planner | ✅ Done |
-| P2a | Strategy registry (Balanced/Funding Arb/Momentum/Mean Rev), pill UI | ✅ Done |
-| P2b | Signal card why-line, freshness dot, invalidation condition | ✅ Done |
-| P2c | Template-based AI signal report in detail panel | 🔄 Next |
-| P3 | 2-week internal alpha in live trading, signal history, outcome tracking | Planned |
+| P0 | Flask app, MEXC scan, basic scoring, web dashboard | ✅ Done |
+| P1 | Indicators, entry/TP/SL, market browser, charts, risk calc, compound planner | ✅ Done |
+| P2a | Strategy registry (Balanced/Funding Arb/Momentum/Mean Rev) | ✅ Done |
+| P2b | Why-line, freshness dot, invalidation condition | ✅ Done |
+| P2c | Template-based AI signal report | ✅ Done |
+| P2d | Market sentiment (OKX live, Binance/Bybit graceful fallback) | ✅ Done |
+| P2e | Error hardening, volatility/volume filters, localStorage | ✅ Done |
+| UX  | First-run guide, strategy tooltips, tag hover tooltips | ✅ Done |
+| Backtest | backtest.py with real MEXC funding rate history | ✅ Done |
+| P3 | Signal history, outcome tracking, AI strategy review, paper trading | 🔄 Current |
 | P4 | README, GitHub publish, 5 external beta testers | Planned |
 
 ---
@@ -233,7 +235,7 @@ Opens at `http://192.168.x.x:5000` on iPhone (same WiFi).
 ## When Starting a New Session
 
 1. Read this file (you just did)
-2. Check which P1 tasks are unchecked above
+2. Check which P3 tasks are unchecked above
 3. Look at the current state of `app.py` and `templates/index.html`
 4. Pick the next unchecked task and complete it fully before moving to the next
 5. Update the checkbox in this file when a task is done

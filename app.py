@@ -2,8 +2,10 @@ import os
 import sys
 import json
 import socket
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from functools import partial
 
 import requests
@@ -37,6 +39,99 @@ CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
 ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
+DB_PATH = "data/signals.db"
+
+# ---------------------------------------------------------------------------
+# Signal history — SQLite
+# ---------------------------------------------------------------------------
+
+def init_db() -> None:
+    """Create the signals history table if it doesn't exist."""
+    os.makedirs("data", exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at    TEXT NOT NULL,
+            symbol       TEXT NOT NULL,
+            exchange     TEXT NOT NULL,
+            direction    TEXT NOT NULL,
+            strategy     TEXT NOT NULL,
+            conviction   INTEGER NOT NULL,
+            price        REAL NOT NULL,
+            entry1       REAL,
+            entry2       REAL,
+            entry3       REAL,
+            tp1          REAL,
+            tp2          REAL,
+            tp3          REAL,
+            stop_loss    REAL,
+            atr_pct      REAL,
+            volatility   TEXT,
+            funding_rate REAL,
+            rsi_1h       REAL,
+            trend_score  INTEGER,
+            tags         TEXT,
+            signal_why   TEXT,
+            result       TEXT DEFAULT NULL,
+            result_note  TEXT DEFAULT NULL,
+            result_at    TEXT DEFAULT NULL
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+def log_signals(signals: list[dict]) -> None:
+    """
+    Append enriched signals to the history DB after every scan.
+    Failures are swallowed — logging must never crash the scan.
+    Duplicate guard: skip any signal already logged in the last 30 minutes
+    for the same symbol + strategy + direction combination.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cutoff = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
+        for sig in signals:
+            exists = con.execute("""
+                SELECT 1 FROM signals
+                WHERE symbol=? AND strategy=? AND direction=? AND logged_at > ?
+            """, (sig["symbol"], sig.get("strategy", ""), sig["direction"], cutoff)).fetchone()
+            if exists:
+                continue
+            entries = sig.get("entries") or [None, None, None]
+            exits   = sig.get("exits")   or [None, None, None]
+            con.execute("""
+                INSERT INTO signals
+                (logged_at, symbol, exchange, direction, strategy, conviction,
+                 price, entry1, entry2, entry3, tp1, tp2, tp3, stop_loss,
+                 atr_pct, volatility, funding_rate, rsi_1h, trend_score,
+                 tags, signal_why)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                datetime.utcnow().isoformat(),
+                sig["symbol"],
+                sig.get("exchange", "MEXC"),
+                sig["direction"],
+                sig.get("strategy", ""),
+                sig.get("conviction", 0),
+                sig.get("price", 0),
+                entries[0], entries[1], entries[2],
+                exits[0],   exits[1],   exits[2],
+                sig.get("stop_loss"),
+                sig.get("atr_pct"),
+                sig.get("volatility"),
+                sig.get("funding_rate"),
+                sig.get("rsi_1h"),
+                sig.get("trend_score"),
+                ",".join(sig.get("tags", [])),
+                sig.get("signal_why", ""),
+            ))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"log_signals error: {e}", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # Strategy registry
@@ -980,6 +1075,7 @@ def api_scan():
             strategy_key = "balanced"
         signals, total_pairs = run_scan(threshold=threshold, strategy_key=strategy_key)
         strat = STRATEGIES[strategy_key]
+        log_signals(signals)
         return jsonify({
             "success":       True,
             "signals":       signals,
@@ -1044,6 +1140,68 @@ def api_signal(symbol: str):
 
 
 # ---------------------------------------------------------------------------
+# Signal history routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/signal/result", methods=["PATCH"])
+def api_signal_result():
+    """Mark a logged signal with a trade outcome."""
+    try:
+        body   = request.get_json(force=True)
+        sig_id = int(body["id"])
+        result = body.get("result", "").upper()
+        note   = body.get("result_note", "")
+        valid  = {"WIN", "LOSS", "PARTIAL", "EXPIRED", "SKIPPED"}
+        if result not in valid:
+            return jsonify({"success": False, "error": f"result must be one of {valid}"}), 400
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            UPDATE signals
+            SET result=?, result_note=?, result_at=?
+            WHERE id=?
+        """, (result, note, datetime.utcnow().isoformat(), sig_id))
+        con.commit()
+        row = con.execute("SELECT * FROM signals WHERE id=?", (sig_id,)).fetchone()
+        con.close()
+        return jsonify({"success": True, "signal": row})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/signals/history")
+def api_signals_history():
+    """Return logged signal history with optional filters."""
+    try:
+        limit    = request.args.get("limit",    100,  type=int)
+        strategy = request.args.get("strategy", None)
+        result   = request.args.get("result",   None)
+        symbol   = request.args.get("symbol",   None)
+
+        query  = "SELECT * FROM signals WHERE 1=1"
+        params: list = []
+        if strategy:
+            query += " AND strategy=?"; params.append(strategy)
+        if result:
+            query += " AND result=?";   params.append(result.upper())
+        if symbol:
+            query += " AND symbol=?";   params.append(symbol.upper())
+        query += " ORDER BY logged_at DESC LIMIT ?"
+        params.append(limit)
+
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(query, params).fetchall()
+        con.close()
+        return jsonify({
+            "success": True,
+            "signals": [dict(r) for r in rows],
+            "count":   len(rows),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1086,4 +1244,5 @@ if __name__ == "__main__":
     print(f"  iPhone → http://{lan_ip}:{actual_port}")
     print("=" * 50)
 
+    init_db()
     app.run(host="0.0.0.0", port=actual_port, debug=False)
