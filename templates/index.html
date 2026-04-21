@@ -878,7 +878,33 @@
       <!-- Signal list -->
       <div id="list-col">
         <div id="idle-cta">
-          <p class="cta-text">Matrix Trader scans 800+ MEXC perpetual pairs.<br>Hit <strong>Scan</strong> to find high-conviction setups.</p>
+          <div style="text-align:center; max-width:480px; margin:0 auto; padding:40px 20px">
+            <div style="font-size:15px; font-weight:600; color:var(--text2); margin-bottom:12px">
+              Matrix Trader 7.0
+            </div>
+            <div style="font-size:13px; color:var(--text3); line-height:1.8; margin-bottom:24px">
+              Scans 800+ MEXC perpetual swap pairs in real time.<br>
+              Scores every pair across funding rate, momentum, orderbook pressure, RSI, and ATR.<br>
+              Surfaces the highest-conviction LONG and SHORT setups with entry zones, take profit levels, and stop losses derived from market structure.
+            </div>
+            <div style="display:flex; flex-direction:column; gap:8px; text-align:left; margin-bottom:28px">
+              <div style="font-size:11px; color:var(--text3)">
+                <span style="color:var(--text2); font-weight:600">Signals</span> — Ranked by conviction score. Click any signal for a full trade brief, chart, and AI analysis.
+              </div>
+              <div style="font-size:11px; color:var(--text3)">
+                <span style="color:var(--text2); font-weight:600">Market</span> — Browse all 870+ pairs. Search, sort, and click any pair to enrich it with full signal data.
+              </div>
+              <div style="font-size:11px; color:var(--text3)">
+                <span style="color:var(--text2); font-weight:600">Tools</span> — Position sizing calculator and compound growth planner with Monte Carlo simulation.
+              </div>
+              <div style="font-size:11px; color:var(--text3)">
+                <span style="color:var(--text2); font-weight:600">History</span> — Full paper trading simulation. Every signal is logged, tracked, and auto-evaluated against real MEXC price data.
+              </div>
+            </div>
+            <div style="font-size:12px; color:var(--text3)">
+              Hit <span style="color:var(--text2); font-weight:600">Scan</span> to begin.
+            </div>
+          </div>
         </div>
         <div id="scan-status" class="hidden">
           <div id="prog-track"><div id="prog-bar"></div></div>
@@ -2623,8 +2649,8 @@ function renderEquitySparkline(points, startingBalance) {
   const el = $('equity-sparkline');
   if (!el || points.length < 2) { if (el) el.innerHTML = ''; return; }
 
-  const W = el.clientWidth || 600;
-  const H = 48;
+  const W = el.offsetWidth || el.parentElement?.offsetWidth || 800;
+  const H = 60;
   const balances = points.map(p => p.balance);
   const minB = Math.min(...balances);
   const maxB = Math.max(...balances);
@@ -2632,20 +2658,75 @@ function renderEquitySparkline(points, startingBalance) {
 
   const pts = points.map((p, i) => {
     const x = (i / (points.length - 1)) * W;
-    const y = H - ((p.balance - minB) / range) * (H - 4) - 2;
+    const y = H - 12 - ((p.balance - minB) / range) * (H - 20);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
 
-  const isUp    = points[points.length - 1].balance >= startingBalance;
-  const color   = isUp ? 'var(--green)' : 'var(--red)';
-  const baselineY = (H - ((startingBalance - minB) / range) * (H - 4) - 2).toFixed(1);
+  const isUp      = points[points.length - 1].balance >= startingBalance;
+  const color     = isUp ? 'var(--green)' : 'var(--red)';
+  const baselineY = (H - 12 - ((startingBalance - minB) / range) * (H - 20)).toFixed(1);
 
   el.innerHTML = `
-    <svg width="100%" height="${H}" style="display:block">
-      <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.8"/>
-      <line x1="0" y1="${baselineY}" x2="${W}" y2="${baselineY}"
-            stroke="rgba(255,255,255,0.1)" stroke-width="1" stroke-dasharray="4,4"/>
-    </svg>`;
+    <div style="position:relative;width:100%">
+      <svg id="equity-svg" width="100%" height="${H}" style="display:block;cursor:crosshair">
+        <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.8"/>
+        <line x1="0" y1="${baselineY}" x2="${W}" y2="${baselineY}"
+              stroke="rgba(255,255,255,0.1)" stroke-width="1" stroke-dasharray="4,4"/>
+        <line id="equity-cursor" x1="0" y1="0" x2="0" y2="${H}"
+              stroke="rgba(255,255,255,0.2)" stroke-width="1" style="display:none"/>
+        <circle id="equity-dot" cx="0" cy="0" r="3"
+                fill="${color}" stroke="var(--bg)" stroke-width="2" style="display:none"/>
+      </svg>
+      <div id="equity-tooltip" style="
+        display:none; position:absolute; top:4px; left:0;
+        background:var(--bg2); border:1px solid var(--border);
+        border-radius:4px; padding:4px 8px; font-size:11px;
+        font-family:var(--mono); color:var(--text2);
+        pointer-events:none; white-space:nowrap; z-index:10;
+      "></div>
+    </div>`;
+
+  const svg    = document.getElementById('equity-svg');
+  const cursor = document.getElementById('equity-cursor');
+  const dot    = document.getElementById('equity-dot');
+  const tip    = document.getElementById('equity-tooltip');
+
+  svg.addEventListener('mousemove', (e) => {
+    const rect   = svg.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const idx    = Math.round((mouseX / rect.width) * (points.length - 1));
+    const i      = Math.max(0, Math.min(points.length - 1, idx));
+    const p      = points[i];
+
+    const x = (i / (points.length - 1)) * W;
+    const y = H - 12 - ((p.balance - minB) / range) * (H - 20);
+
+    cursor.setAttribute('x1', x); cursor.setAttribute('x2', x);
+    cursor.style.display = '';
+    dot.setAttribute('cx', x); dot.setAttribute('cy', y);
+    dot.style.display = '';
+
+    const dateStr = p.sig?.logged_at
+      ? new Date(p.sig.logged_at.endsWith('Z') ? p.sig.logged_at : p.sig.logged_at + 'Z')
+          .toLocaleDateString('en-GB', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' })
+      : 'Start';
+    const balStr  = '$' + p.balance.toFixed(0);
+    const chg     = p.balance - startingBalance;
+    const chgStr  = (chg >= 0 ? '+' : '') + '$' + chg.toFixed(0);
+    const chgColor = chg >= 0 ? 'var(--green)' : 'var(--red)';
+
+    tip.innerHTML = `<span style="color:var(--text3)">${dateStr}</span>&nbsp;&nbsp;<strong>${balStr}</strong>&nbsp;&nbsp;<span style="color:${chgColor}">${chgStr}</span>`;
+    tip.style.display = '';
+
+    const tipW = tip.offsetWidth || 160;
+    tip.style.left = Math.min(mouseX + 10, W - tipW - 4) + 'px';
+  });
+
+  svg.addEventListener('mouseleave', () => {
+    cursor.style.display = 'none';
+    dot.style.display    = 'none';
+    tip.style.display    = 'none';
+  });
 }
 
 function updatePerfBanner(closed, open) {
