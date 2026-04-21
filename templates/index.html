@@ -2791,7 +2791,9 @@ function renderHistoryTable(sigs) {
     const chronoSigs = [...sigs]
       .filter(s => s.result && s.result !== 'SKIPPED')
       .sort((a, b) => new Date(a.logged_at) - new Date(b.logged_at));
+    const balanceBefore = {};
     chronoSigs.forEach((s, i) => {
+      balanceBefore[s.id] = curve.points[i].balance;
       if (curve.points[i + 1]) balanceAfter[s.id] = curve.points[i + 1].balance;
     });
   }
@@ -2822,13 +2824,13 @@ function renderHistoryTable(sigs) {
     if (showPnl) {
       const color = rVal >= 0 ? 'var(--green)' : 'var(--red)';
       const sign  = rVal >= 0 ? '+' : '';
-      rCell  = `<span style="color:${color}">${sign}${rVal.toFixed(1)}R</span>`;
-      if (riskPerTrade > 0) {
-        const leverage = s.leverage_cap || STRATEGY_LEVERAGE[s.strategy] || 20;
-        const notional = riskPerTrade * leverage;
-        const dollar   = notional * rVal;
-        pnlCell = `<span style="color:${color}">${sign}$${dollar.toFixed(2)}</span>`;
-      }
+      rCell = `<span style="color:${color}">${sign}${rVal.toFixed(1)}R</span>`;
+    }
+    const dollarPnl = balanceAfter[s.id] !== undefined && balanceBefore[s.id] !== undefined
+      ? balanceAfter[s.id] - balanceBefore[s.id]
+      : null;
+    if (dollarPnl !== null) {
+      pnlCell = `<span style="color:${dollarPnl >= 0 ? 'var(--green)' : 'var(--red)'}">${dollarPnl >= 0 ? '+' : ''}$${Math.abs(dollarPnl).toFixed(2)}</span>`;
     }
 
     const balCell = balanceAfter[s.id] !== undefined
