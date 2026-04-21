@@ -5,16 +5,16 @@
 > writing a single line of code. This file was auto-generated from the
 > actual codebase — it reflects current state, not planned state.
 
-Last updated: 2026-04-19
-Last commit: b0ee1cc P2a: strategy registry — Balanced/Funding Arb/Momentum/Mean Reversion with pill UI
-app.py: 673 lines
-index.html: 1903 lines
+Last updated: 2026-04-21
+Last commit: 00a4d3f feat: VPS deployment to Hetzner — Matrix Trader live at 62.238.15.113:8080
+app.py: 1248 lines
+index.html: 2522 lines
 
 ---
 
 ## What This Project Is
 
-Matrix Trader 7.0 is a local web application for high-leverage crypto trading on MEXC perpetual swap markets. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders, and executes trades manually. It is not an auto-trading bot, not a price forecasting engine, and not a SaaS product. The AI layer (Claude API) is reserved and not yet called.
+Matrix Trader 7.0 is a local web application for high-leverage crypto trading on MEXC perpetual swap markets. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders derived from ATR, views a 4-section AI trade brief, and executes trades manually. Signal history is auto-logged to SQLite on every scan. It is not an auto-trading bot, not a price forecasting engine, and not a SaaS product.
 
 ---
 
@@ -46,6 +46,7 @@ Matrix Trader 7.0 is a local web application for high-leverage crypto trading on
 10. **No JS frameworks.** Vanilla JS only.
 11. **No glassmorphism, gradients, or drop shadows.** Dark flat UI only.
 12. **Read the actual files before writing a single line.** Do not assume state from memory or prior sessions.
+13. **No databases for application state.** SQLite is acceptable for signal history logging and outcome tracking only.
 
 ---
 
@@ -55,15 +56,19 @@ Matrix Trader 7.0 is a local web application for high-leverage crypto trading on
 Matrix_Trader_7.0/
 ├── CLAUDE.md              ← source of truth for Claude Code sessions
 ├── HANDOFF.md             ← this file (auto-generated)
-├── README.md              ← planned for P4
-├── .gitignore
+├── README.md              ← exists, minimal
+├── .gitignore             ← includes .env, __pycache__, data/
 ├── .env                   ← ANTHROPIC_API_KEY, MEXC_API_KEY (not committed)
 ├── requirements.txt
-├── app.py                 ← entire Flask backend, 673 lines
+├── app.py                 ← entire Flask backend, 1248 lines
+├── backtest.py            ← standalone backtest script, 4 strategies × 14 symbols
 ├── templates/
-│   └── index.html         ← entire frontend (CSS + HTML + JS), 1903 lines
+│   └── index.html         ← entire frontend (CSS + HTML + JS), 2522 lines
 ├── static/
 │   └── style.css          ← minimal overrides (most CSS is inline in index.html)
+├── data/                  ← gitignored; created at runtime
+│   ├── signals.db         ← SQLite signal history (auto-created by init_db())
+│   └── backtest_results.json ← written by backtest.py
 └── lib/                   ← pure utility functions, no Flask, no API calls
     ├── indicators.py      ← vwap, ema, rsi, atr, atr_pct, volatility_regime
     ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
@@ -86,14 +91,13 @@ python-dotenv>=1.0.0
 anthropic>=0.39.0
 ```
 
-Run with: `python3 app.py`
-Default port: **8080** (auto-increments if busy — avoids macOS AirPlay on 5000)
+SQLite3 is stdlib — no pip install needed. Used for `data/signals.db`.
 
 ---
 
 ## MEXC API Reference
 
-All public, no auth required:
+All public, no auth needed:
 
 ```
 Base URL: https://contract.mexc.com/api/v1
@@ -103,11 +107,17 @@ GET /contract/detail                    — contract specs (leverage, fees)
 GET /contract/kline/{symbol}            — OHLCV data
 GET /contract/depth/{symbol}            — orderbook
 GET /contract/funding_rate/{symbol}     — current funding rate
+GET /contract/funding_rate/history      — funding history (?symbol=X&page_num=N&page_size=N)
 
 Intervals: Min1, Min5, Min15, Min30, Min60, Hour4, Hour8, Day1
 ```
 
 Response wrapper: `{ "success": true, "data": [...] }`
+
+Sentiment APIs (no key needed):
+- OKX L/S: `https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=BTC&period=1H`
+- OKX OI:  `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP`
+- Binance and Bybit return 451/403 on US IPs — handled gracefully with None fallback.
 
 ---
 
@@ -115,79 +125,87 @@ Response wrapper: `{ "success": true, "data": [...] }`
 
 | Route | Method | Description |
 |---|---|---|
-| `/` | GET | Renders `templates/index.html` |
-| `/api/scan` | GET | Two-stage scan of all MEXC perps. Params: `threshold` (int, default 55), `strategy` (str, default "balanced"). Returns enriched signals. |
-| `/api/market` | GET | Returns all 800+ tickers scored at stage 1 (no klines). Used by market browser tab. |
-| `/api/signal/<symbol>` | GET | Enriches a single symbol on demand. Used by market tab click-to-enrich. |
+| `/` | GET | Serves index.html dashboard |
+| `/api/scan` | GET | Full scan: scores 800+ tickers, enriches top 30, returns signals array |
+| `/api/market` | GET | Returns all scored tickers for market browser (no enrichment) |
+| `/api/signal/<symbol>` | GET | Fully enriches a single symbol on demand |
+| `/api/signal/result` | PATCH | Tags a logged signal with WIN/LOSS/PARTIAL/EXPIRED/SKIPPED |
+| `/api/signals/history` | GET | Returns logged signal history; filters: strategy, result, symbol, limit |
+
+Query params for `/api/scan`: `threshold` (int, default 55), `strategy` (string, default "balanced").
+Query params for `/api/signals/history`: `limit` (int, default 100), `strategy`, `result`, `symbol`.
 
 ---
 
 ## Signal Data Shape
 
-Full dict returned by `enrich_signal()` in `app.py`:
+Full dict returned by `enrich_signal()` and sent to the frontend:
 
 ```python
 {
-    "symbol":               str,        # "BTC_USDT"
-    "exchange":             str,        # "MEXC"
-    "direction":            str,        # "LONG" | "SHORT"
-    "conviction":           int,        # 0–100 (stage 2 enriched)
-    "price":                float,
-    "entries":              [float, float, float],
-    "exits":                [float, float, float],
-    "stop_loss":            float,
-    "change_24h_pct":       float,
-    "change_4h_pct":        float,
-    "change_1h_pct":        float,
-    "funding_rate":         float,
-    "open_interest":        float,
-    "next_funding_minutes": int | None,
-    "volume_24h":           float,
-    "atr_pct":              float,
-    "volatility":           str,        # "low" | "medium" | "high" | "extreme"
-    "rsi_1h":               float,
-    "trend_score":          int,        # -100 to +100
-    "tags":                 [str],
-    "basis_pct":            None,       # reserved
-    "ai_report":            None,       # reserved for P2c
-    "strategy":             str,        # e.g. "Funding Arb"
-    "leverage_cap":         int,        # e.g. 10
+  # Identity
+  "symbol":               str,   # e.g. "BTC_USDT"
+  "exchange":             str,   # always "MEXC"
+  "direction":            str,   # "LONG" or "SHORT"
+  "strategy":             str,   # human name e.g. "Balanced"
+  "leverage_cap":         int,   # from strategy registry
+
+  # Conviction
+  "conviction":           int,   # 0–100 after stage-2 adjustments
+
+  # Price & ladders
+  "price":                float,
+  "entries":              list[float],  # [e1, e2, e3] nearest→farthest from price
+  "exits":                list[float],  # [tp1, tp2, tp3]
+  "stop_loss":            float,
+
+  # Momentum
+  "change_24h_pct":       float,
+  "change_4h_pct":        float,
+  "change_1h_pct":        float,
+
+  # Funding / OI
+  "funding_rate":         float,   # decimal (e.g. -0.0001)
+  "open_interest":        float,
+  "next_funding_minutes": int | None,
+
+  # Volume
+  "volume_24h":           float,
+
+  # Technicals
+  "atr_pct":              float,   # ATR as % of price
+  "volatility":           str,     # "low" | "medium" | "high" | "extreme"
+  "rsi_1h":               float,
+  "trend_score":          int,     # -100 to +100, EMA20/50 alignment
+  "basis_pct":            None,    # reserved
+
+  # Tags
+  "tags":                 list[str],  # e.g. ["short_squeeze", "high_volume"]
+
+  # Generated text
+  "signal_why":           str,     # one-line plain-English reason
+  "ai_report":            str,     # JSON string: [{label, text}, ...] 4 sections
+
+  # Market sentiment (from Binance/Bybit/OKX public APIs)
+  "binance_ls_long_pct":  float | None,  # % of accounts long on Binance
+  "binance_oi":           float | None,  # Binance OI in USD
+  "bybit_oi":             float | None,  # Bybit OI in USD
+  "okx_ls_long_pct":      float | None,  # % of accounts long on OKX
+  "okx_oi":               float | None,  # OKX OI in USD (oiUsd field, already USD)
+  "sentiment_tracked":    bool,   # False for MEXC-only altcoins, True for major pairs
 }
 ```
 
-`score_ticker()` (stage 1) returns a subset: `symbol`, `exchange`, `direction`, `conviction_base`, `price`, `change_24h_pct`, `funding_rate`, `volume_24h`, `open_interest`, `tags`.
-
----
-
-## Strategy Registry
-
-Four presets in `STRATEGIES` dict in `app.py`. Each has `weights`, `filters`, `leverage_cap`, `min_conviction`.
-
-| Key | Name | leverage_cap | min_conviction | Stage-1 filter | Stage-2 filter |
-|---|---|---|---|---|---|
-| `balanced` | Balanced | 20 | 55 | none | none |
-| `funding_arb` | Funding Arb | 10 | 60 | `\|funding\| > 0.0003` | none |
-| `momentum_breakout` | Momentum Breakout | 25 | 55 | `\|24h Δ\| > 3%` | none |
-| `mean_reversion` | Mean Reversion | 15 | 65 | none | RSI < 35 (LONG) or RSI > 65 (SHORT) |
-
-Scoring weights (strong / weak tier):
-
-| Strategy | Momentum | Funding | Basis | Vol mult |
-|---|---|---|---|---|
-| Balanced | 30 / 15 | 25 / 10 | 15 | 1.1× |
-| Funding Arb | 10 / 5 | 50 / 20 | 20 | 1.0× |
-| Momentum Breakout | 50 / 25 | 10 / 4 | 5 | 1.2× |
-| Mean Reversion | 5 / 2 | 30 / 12 | 30 | 1.0× |
-
-`run_scan()` enforces `effective_threshold = max(threshold, strat["min_conviction"])`.
+`ai_report` is a JSON string: `[{"label": "Setup", "text": "..."}, {"label": "Structure", ...}, ...]`
+Parse with `JSON.parse()` in the frontend. Four sections: Setup, Structure, Invalidation, Risk.
 
 ---
 
 ## JavaScript State Objects
 
-Exact code from `index.html`:
+Copied verbatim from index.html:
 
-```javascript
+```js
 const S = {
   phase:    'idle',
   signals:  [],
@@ -200,6 +218,8 @@ const S = {
   scanTime:   null,
   timerId:    null,
   countdownId: null,
+  volFilter:  'any',    // any | low | medium | high_extreme
+  minVolume:  0,        // minimum 24h volume in USD (0 = no filter)
 };
 
 const M = {
@@ -218,45 +238,45 @@ const M = {
 let currentTab = 'signals';
 let currentTVSymbol   = null;
 let currentTVInterval = '60';
+
+const H = { loading: false };   // History tab state — guards concurrent fetches
 ```
 
-`S` and `M` are completely isolated. Never read S from market code or M from signals code.
+`S` and `M` are completely isolated. Never cross-reference them.
+`H` is minimal — history data lives only in the DOM after render, not cached in state.
 
 ---
 
 ## Dashboard Structure
 
-Three tabs, three sections:
+Four tabs, four sections, one shared detail panel:
 
-| Tab button ID | Section ID | Description |
+| Tab button | Section div | Loaded by |
 |---|---|---|
-| `tab-signals` | `signals-section` | Strategy bar, stat bar, filter bar, signal rows, detail panel |
-| `tab-market` | `market-section` | 800+ pair browser with search, sort, heat coloring, click-to-enrich |
-| `tab-tools` | `tools-section` | Risk Calculator + Compound Planner |
+| `#tab-signals` | `#signals-section` | `scanSignals()` on button click |
+| `#tab-market` | `#market-section` | `loadMarket()` on tab switch |
+| `#tab-tools` | `#tools-section` | Static, rendered at init |
+| `#tab-history` | `#history-section` | `loadHistory()` on tab switch (auto) |
 
-**Signals section sub-elements:**
-- `#strategy-bar` — always visible pill buttons: Balanced / Funding Arb / Momentum / Mean Rev
-- `#stat-bar` — shown after scan: Scanned / Signals / Longs / Shorts
-- `#filter-bar` — shown after scan: All/Long/Short + sort dropdown (11 options)
-- `#list-col` — contains `#idle-cta`, `#scan-status` (progress bar + skeletons), `#sig-rows`, `#empty-state`, `#error-state`
-- `#detail-panel` (260px, right side) — trade plan ladder, compact TradingView chart (160px, 1h), context grid (10 items incl. Strategy + Max Leverage), tags, AI placeholder
+**Shared detail panel** (`#detail-panel`, `<aside>`): populated by `renderDetail(sig)` from either signals or market tab. Slides in from the right on desktop; slides up from bottom on mobile.
 
-**Market section sub-elements:**
-- `#mkt-idle`, `#mkt-loading`, `#mkt-error`, `#mkt-ready`
-- `#mkt-controls` — search input + sort select
-- `#mkt-table` — 8-column grid: Symbol / Price / Dir / Score / 24h% / Funding / Volume / OI
-- `#mkt-rows` — infinite scroll (50-row batches via DocumentFragment)
+**Strategy bar** (inside `#signals-section`): four pills (Balanced / Funding Arb / Momentum / Mean Rev) with native `title` tooltips. `setStrategy(key)` updates `S.strategy` and the `#strat-lbl` label.
 
-**Tools section sub-elements:**
-- Risk Calculator: dollar risk → position size, contracts, margin, liquidation price, R:R
-- Compound Planner: expected value over 90 days, milestone table, canvas chart, worst streak
+**Filter bar** (inside `#signals-section`): direction toggle, volatility filter select, min-volume input. State persisted to localStorage key `mt7_filters`.
+
+**History tab** (`#history-section`):
+- `#hist-bar` — summary stats: Logged, Tagged, Win Rate, W·L·P counts, Avg Conv (W/L)
+- `.hist-filters` — three selects: Strategy, Direction (client-side), Result
+- `#hist-table-wrap` / `#hist-body` — `<table id="hist-table">` rendered by JS
+- Outcome buttons: WIN / LOSS / PAR / EXP / SKP — PATCH `/api/signal/result` on click, full reload after success
 
 ---
 
 ## TradingView Integration
 
-```javascript
+```js
 function toTVSymbol(mexcSymbol, exchange) {
+  exchange = exchange || 'MEXC';
   const map = {
     'MEXC':        s => 'MEXC:'        + s.replace('_', '')         + '.P',
     'BINANCE':     s => 'BINANCE:'     + s.replace('_USDT', 'USDT') + '.PERP',
@@ -267,10 +287,7 @@ function toTVSymbol(mexcSymbol, exchange) {
 }
 ```
 
-- Compact preview: 160px height, 1h fixed, EMA + VWAP only, no toolbar
-- Full chart modal: 80vh / 700px max, 15m/1h/4h/1D toggle, RSI + EMA + VWAP, side toolbar
-- 5-second iframe fallback for unknown symbols
-- `currentTVSymbol` tracks active symbol to prevent stale loads
+Chart uses TradingView Advanced Chart widget (embed script from `s3.tradingview.com`). Config: `autosize: true`, `theme: 'dark'`, `style: '1'` (candles), `interval: '60'` (default 1h). Timeframe toggle buttons (15m / 1h / 4h) re-render the chart. Falls back to a "Chart unavailable" message + direct TV link if the symbol isn't found.
 
 ---
 
@@ -293,63 +310,60 @@ function toTVSymbol(mexcSymbol, exchange) {
 }
 ```
 
+No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
+
 ---
 
 ## Phase Status
 
 | Phase | What | Status |
 |---|---|---|
-| P0 | Flask app running, MEXC ticker scan, basic scoring, web dashboard | ✅ Done |
-| P1 | Indicators integrated, entry/TP/SL on signals, risk calc, compound planner | ✅ Done |
-| P2a | Strategy registry (Balanced/Funding Arb/Momentum/Mean Rev), pill UI | ✅ Done |
-| P2b | Signal card "Why" line, freshness indicator, invalidation condition | 🔄 Next |
-| P2c | Template-based AI signal report in detail panel | Planned |
-| P2d | CoinGlass free tier integration (OI, long/short ratio) | Planned |
-| P2e | Error hardening, volatility/volume filters, localStorage preferences | Planned |
-| P3 | Signal history logging, trade log, outcome tracking, WebSocket live prices | Planned |
-| P4 | README, GitHub publish, 5 external beta testers | Planned |
+| P0 | Flask app, MEXC scan, basic scoring, web dashboard | ✅ Done |
+| P1 | Indicators, entry/TP/SL, market browser, charts, risk calc, compound planner | ✅ Done |
+| P2a | Strategy registry (Balanced/Funding Arb/Momentum/Mean Rev) | ✅ Done |
+| P2b | Why-line, freshness dot, invalidation condition | ✅ Done |
+| P2c | Template-based AI signal report (4-section trade brief) | ✅ Done |
+| P2d | Market sentiment (OKX live, Binance/Bybit graceful fallback) | ✅ Done |
+| P2e | Retry logic, specific error messages, volatility/volume filters, localStorage | ✅ Done |
+| UX  | First-run guide, strategy tooltips, tag hover tooltips | ✅ Done |
+| Backtest | backtest.py — 14 symbols × 4 strategies, real funding rate history | ✅ Done |
+| P3a | SQLite signal history — auto-log on scan, PATCH outcome, GET history | ✅ Done |
+| P3b | History tab UI — summary bar, outcome buttons, filters, win rate | ✅ Done |
+| P3c | AI strategy review — Claude API analysis of outcome data | 🔲 Next |
+| P3d | Paper trading system — automated position tracking | 🔲 Planned |
+| P3e | WebSocket live price refresh for watched pairs | 🔲 Planned |
+| P4 | README, GitHub publish, 5 external beta testers | 🔲 Planned |
 
 ---
 
-## Current Task List (Priority Order)
+## Current Task List
 
-1. **P2b — Signal card redesign** (next)
-   - Add a "Why this signal" plain-English line on each signal row, generated from a Python string template using signal dict fields (e.g. "RSI oversold at 28 with negative funding — short squeeze setup")
-   - Add signal freshness indicator on each card showing age since scan: fresh (<5 min) / aging (5–15 min) / stale (>15 min) — driven by `S.scanTime`
-   - Add invalidation condition to the detail panel derived from `stop_loss` and `atr_pct` (e.g. "Invalidated if price closes above 42,150 — that's 1.4× ATR from entry")
+Next in priority order:
 
-2. **P2c — Template-based AI signal report**
-   - Python string template using signal dict fields, renders in detail panel `ai_report` placeholder
-   - No Anthropic API call — completely free
-   - Covers: thesis, entry timing, invalidation, risk note
-   - Optional: user-supplied API key for narrative upgrade
+1. **P3c — AI strategy review**: Add a "Review" button to the History tab. On click, send the last N tagged outcomes (WIN/LOSS/PARTIAL) to Claude API and display a strategy analysis: which setups are working, which aren't, what to adjust. Use `generate_report()`-style JSON response. Requires ANTHROPIC_API_KEY in `.env`.
 
-3. **P2d — CoinGlass integration**
-   - Free API key → `COINGLASS_API_KEY` in `.env`
-   - Aggregated OI and long/short ratio
-   - Add to context grid in detail panel
+2. **P3d — Paper trading system**: Let users open a "paper position" from a signal. Track entry price, direction, TP/SL. Auto-mark outcome when price is manually updated or refreshed. Separate from signal history — a position can exist without a logged signal.
 
-4. **P2e — Error hardening + filter improvements**
-   - Retry logic for MEXC rate limits
-   - Filter by volatility regime
-   - Filter by minimum volume threshold
-   - Save filter preferences to localStorage
+3. **P3e — WebSocket live price refresh**: Wire `lib/mexc_stream.py` to the frontend for real-time price updates on watched pairs. The library exists but is not connected to the UI or any Flask route.
+
+4. **CLAUDE.md update**: Mark P3a and P3b as done (currently P3a is checked but P3b is not).
 
 ---
 
 ## What NOT To Do
 
-- Do not add ARIMA, price prediction, or any forecasting logic
-- Do not create new files without a specific reason (no new routes file, no new config file)
-- Do not use React, Vue, or any JS framework — vanilla JS only
-- Do not add glassmorphism, gradients, or drop shadows to the UI
-- Do not commit `.env` or any API keys
-- Do not split `app.py` into multiple files — it stays flat until P2 is fully done
-- Do not call the Anthropic API — it is reserved and the key is in `.env` but not yet wired
-- Do not auto-trigger a new scan when the user switches strategy — let them click Scan
-- Do not share state between `S` (signals) and `M` (market) objects
-- Do not use `conviction_base` for display — always use `conviction` (the enriched value)
-- Do not modify `lib/` files with Flask routes or API calls — they are pure functions only
+- Do not call `enrich_signal()` from `backtest.py` — it makes live API calls (kline, depth, funding, sentiment). Use `lib/` functions directly.
+- Do not import from `app.py` in a way that triggers Flask server startup — `if __name__ == "__main__":` guard exists; all module-level code runs on import (including `load_dotenv()`).
+- Do not add new columns to the `signals` SQLite table without a migration — existing `data/signals.db` files on user machines won't have the column and will error. Add `ALTER TABLE` logic to `init_db()` if schema changes.
+- Do not use `datetime.now()` — always use `datetime.utcnow()` for consistency with existing logged timestamps. All stored timestamps are UTC ISO strings without Z suffix.
+- Do not use `con.row_factory = sqlite3.Row` in write paths — only needed for SELECT + `dict(r)` serialization.
+- Do not add JS frameworks. No React, Vue, jQuery, Alpine, or similar.
+- Do not add glassmorphism, gradients, or drop shadows to the UI.
+- Do not commit `.env`, `data/`, or `__pycache__/` — all in `.gitignore`.
+- Do not modify `S` state from market tab code or `M` state from signals tab code.
+- Do not run the full backtest during CI or import-time — it makes live MEXC API calls and takes several minutes.
+- Do not filter direction server-side in `/api/signals/history` — direction is filtered client-side in `loadHistory()`. If you add server-side direction filtering, remove the client-side filter to avoid double-filtering.
+- Do not use `title` attributes on mobile-only UI elements — native browser tooltips don't appear on touch devices.
 
 ---
 
@@ -357,25 +371,36 @@ function toTVSymbol(mexcSymbol, exchange) {
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env   # add ANTHROPIC_API_KEY
 python3 app.py
 ```
 
-- Mac: `http://localhost:8080`
-- iPhone (same WiFi): `http://192.168.x.x:8080`
-- Port auto-increments to 8081, 8082, etc. if 8080 is busy
-- Set `MATRIX_PORT` env var to override default
+Opens at `http://localhost:8080` (auto-increments if busy).
+Opens at `http://<LAN_IP>:8080` on iPhone (same WiFi).
+Port configurable via `MATRIX_PORT` env var.
+
+Run backtest separately (makes live MEXC API calls, takes ~5 min):
+```bash
+python3 backtest.py
+# Results saved to data/backtest_results.json
+```
 
 ---
 
 ## Task Framing Template
 
-When asking any AI to make a change, use this format:
+When asking any AI to make a change, frame it exactly like this:
 
 ```
-Read CLAUDE.md and HANDOFF.md before doing anything.
-We are working on [task name].
-[Describe exactly what to build — be specific about file names, function names, data fields.]
-Read the actual files before writing anything.
+Read CLAUDE.md and HANDOFF.md before touching anything.
+
+[Task description]
+
+Constraints:
+- No backend changes / No frontend changes (whichever applies)
+- Do not change [specific things to preserve]
+
+After writing: [verification steps]
 Explain every decision.
 ```
 
@@ -383,56 +408,53 @@ Explain every decision.
 
 ## Verification Checklist
 
-Before marking any task complete:
+Before reporting any task complete:
 
-- [ ] `python3 app.py` starts without errors
-- [ ] `/api/scan` returns valid JSON with signals array
-- [ ] Signal rows render in browser
-- [ ] Detail panel opens on signal click
-- [ ] Mobile layout works (test at 390px width or on actual iPhone)
-- [ ] No console errors in browser devtools
-- [ ] No secrets committed (check `git diff --staged`)
-- [ ] `lib/` files contain no Flask routes or imports
-- [ ] `app.py` still has a single flat structure (no classes, no blueprints)
-- [ ] All four strategy pills render and switch correctly
-- [ ] `/api/scan?strategy=funding_arb` returns signals with `leverage_cap: 10`
-- [ ] Strategy label updates in `#strat-lbl` when pill is clicked
-- [ ] New feature tested on both desktop and mobile layout
+- [ ] `python3 -c "import app; print('OK')"` exits clean
+- [ ] `GET /` returns 200
+- [ ] `GET /api/scan` returns JSON with `success: true`
+- [ ] `GET /api/signals/history` returns 200
+- [ ] Signal cards show entry/TP/SL in the detail panel
+- [ ] Strategy pills work and update `#strat-lbl`
+- [ ] History tab loads on click and shows table (or empty state)
+- [ ] Outcome buttons update `result` and reload the table
+- [ ] Mobile: UI fits on 375px screen without horizontal scroll (except history table which scrolls intentionally)
+- [ ] No `console.error` in browser on page load
+- [ ] No Python traceback on server start
+- [ ] localStorage key `mt7_filters` persists filter state across reloads
+- [ ] localStorage key `mt7_guide_seen` hides the first-run guide on return visits
 
 ---
 
-## Returning to Claude Code
+## Returning to Claude
 
-Open a new chat in this project and paste the exact prompt from the
-Current Task List section above. Claude Code has access to CLAUDE.md
-automatically — HANDOFF.md supplements it with richer context.
+Start every Claude Code session with:
+
+```
+Read CLAUDE.md and HANDOFF.md before touching anything.
+[Your task here]
+```
+
+Claude Code reads the actual files. It does not need the full HANDOFF.md pasted into the prompt — just the instruction to read it. For other AIs (ChatGPT, Gemini), paste this entire file.
 
 ---
 
 ## Session Notes
 
-### 2026-04-19 — P1 verified complete, P2a built
+### 2026-04-19 — Session summary
+Built: P2a strategy registry (Balanced/Funding Arb/Momentum/Mean Reversion), pill UI, STRAT_META object, setStrategy() wiring.
+Decided: Strategy profiles live in app.py as a dict; weights/filters/caps all in one place.
+Deferred: Strategy-specific UI differentiation beyond the label.
+Watch out for: STRAT_META in index.html must stay in sync with STRATEGIES dict in app.py — same keys, same names.
 
-Built:
-- Verified P1 complete against actual code: `lib/indicators.py` (RSI, EMA, VWAP, ATR, atr_pct, volatility_regime), `lib/laddering.py` (generate_ladders with LONG/SHORT), `lib/mexc_stream.py` (built, not wired), full `enrich_signal()` pipeline, Risk Calculator, Compound Planner
-- P2a Strategy Registry: `STRATEGIES` dict with 4 presets, `score_ticker()` and `enrich_signal()` accept `strategy` param, stage-1 filters (funding abs, 24h change pct), stage-2 RSI filter (mean reversion only), `run_scan()` with `strategy_key` param and `effective_threshold`, `/api/scan?strategy=X` route, `#strategy-bar` with 4 pill buttons always visible, `setStrategy()` JS, `S.strategy` state, `STRAT_META` display lookup, `leverage_cap` and `strategy` name in context grid
+### 2026-04-20 — Session summary
+Built: P2c AI trade brief (generate_report() — 4-section JSON, §1 strategy-aware, §3 ATR formula parity with JS). P2d market sentiment via OKX (live), Binance/Bybit (graceful 451/403 fallback). P2e error hardening (fetch_mexc() 3-attempt retry, specific error messages on scan fail, volatility/volume filters, localStorage persistence for filters). UX additions: first-run guide overlay, strategy pill tooltips (native title attr), tag hover tooltips (TAG_TIPS lookup). P3a SQLite signal history (init_db, log_signals, PATCH /api/signal/result, GET /api/signals/history). P3b History tab UI (summary bar with win rate stats, outcome button group WIN/LOSS/PAR/EXP/SKP, three filter selects). backtest.py standalone script (14 symbols × 4 strategies, sliding 100-candle window, real MEXC funding history, conviction band breakdown).
+Decided: Binance/Bybit geo-blocked on US IPs — fail gracefully with None, never retry. OKX uses ccy=BTC param (not instId), oiUsd field (already USD). Duplicate guard in log_signals uses 30-min window on symbol+strategy+direction. History direction filter is client-side (backend doesn't have it). Full reload after tagOutcome() so summary stats stay in sync.
+Deferred: P3c AI strategy review, P3d paper trading, P3e WebSocket live refresh.
+Watch out for: log_signals() must never raise — swallow all exceptions. init_db() creates data/ dir; data/ is gitignored. logged_at timestamps are UTC without Z suffix — append 'Z' in JS before passing to new Date(). OKX L/S response is [[timestamp_ms, ratio_string], ...] — access data[0][1]. The `sentiment_tracked` boolean distinguishes geo-blocked major pairs (True, all None) from untracked altcoins (False, never fetched).
 
-Decided:
-- Strategy bar is always visible (not gated on scan phase) so users select before scanning
-- Changing strategy does NOT auto-trigger rescan — user clicks Scan to apply
-- `/api/market` and `/api/signal/<symbol>` use Balanced defaults (strategy-agnostic)
-- `effective_threshold = max(threshold, strat["min_conviction"])` enforces each strategy's floor
-- `functools.partial` used to thread strategy through `ThreadPoolExecutor.map()`
-- Stage-1 filters return None before scoring to avoid wasting enrichment quota on ineligible tickers
-- Mean reversion RSI filter applied in stage 2 after klines are fetched (RSI requires OHLCV)
-
-Deferred:
-- `lib/mexc_stream.py` wiring to UI (P3)
-- `basis_pct` computation (requires spot price comparison)
-- `ai_report` generation (P2c)
-
-Watch out for:
-- `conviction_base` (stage 1) vs `conviction` (stage 2 enriched) — display always uses `conviction`
-- Mean reversion filter is STRICT: signals are discarded if RSI doesn't meet threshold, not penalized
-- `STRAT_META` in JS is display-only — authoritative strategy data lives in `STRATEGIES` in `app.py`
-- `#strategy-bar` uses `.strat-btn`; `#filter-bar` uses `.dir-btn` — do not mix selectors
+### 2026-04-21 — Session summary
+Built: P3b History tab (this session completed the UI — summary bar, outcome buttons, filter selects, win-rate stats). CLAUDE.md updated to reflect P3 current phase. VPS deployment to Hetzner at 62.238.15.113:8080.
+Decided: History tab auto-loads on switchTab('history') — no manual refresh button needed. H state object is minimal (loading flag only) — history data is not cached in JS state, always fetched fresh. Outcome button labels abbreviated (WIN/LOSS/PAR/EXP/SKP) to fit 375px iPhone screens; full word in title attr.
+Deferred: P3c AI strategy review (next task), P3d paper trading, P3e WebSocket.
+Watch out for: The history table intentionally scrolls horizontally on mobile — this is correct, not a bug. Do not remove overflow-x: auto from #hist-table-wrap. Direction filter in loadHistory() is client-side — if you move it server-side, remove the client-side filter or signals will be double-filtered.
