@@ -176,7 +176,7 @@
     /* ── Idle CTA ── */
     #idle-cta {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
-      height: 220px; padding: 32px 24px; text-align: center;
+      min-height: 220px; padding: 32px 24px; text-align: center; overflow-y: auto;
     }
     .cta-text { color: var(--text2); font-size: 13px; line-height: 1.7; max-width: 300px; }
 
@@ -2967,7 +2967,7 @@ async function tagOutcome(id, result) {
    OPEN POSITIONS
    ============================================================ */
 
-function fmtAge(hours) {
+function fmtHours(hours) {
   if (hours < 1)  return Math.round(hours * 60) + 'm';
   if (hours < 24) return Math.round(hours) + 'h';
   const d = Math.floor(hours / 24);
@@ -3091,7 +3091,7 @@ function buildStatusBarHTML(pos) {
     (isLong ? tp2 - stop : stop - tp2) / (isLong ? tp3 - stop : stop - tp3) * 100)) : 66;
 
   const age = pos.logged_at
-    ? fmtAge((Date.now() - new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z')) / 3600000)
+    ? fmtHours((Date.now() - new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z')) / 3600000)
     : '—';
 
   const acctSzBar  = parseFloat(localStorage.getItem('mt7_account_size') || '0');
@@ -3320,7 +3320,7 @@ function renderOpenPositions() {
       <td class="pos-mono${tp1Cls}">${dist_tp1  !== null ? dist_tp1.toFixed(1)  + '%' : '—'}</td>
       <td class="pos-mono">${notionalCell}</td>
       <td>${liqCell}</td>
-      <td class="pos-age">${fmtAge(age_hours)}</td>
+      <td class="pos-age">${fmtHours(age_hours)}</td>
       <td class="pos-age">${esc(stratLbl)}</td>
       <td><div class="outcome-group">${btns}</div></td>
     </tr>`;
