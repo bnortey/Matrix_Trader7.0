@@ -2577,13 +2577,14 @@ async function loadHistory() {
     const strategy = $('hf-strategy').value;
     const dir      = $('hf-dir').value;
     const result   = $('hf-result').value;
-    if (strategy) closed = closed.filter(s => s.strategy === strategy);
+    const allClosed = closed; // preserve full unfiltered array for banner stats
+    if (strategy) closed = closed.filter(s => (s.strategy || '').toLowerCase() === strategy.toLowerCase());
     if (dir)      closed = closed.filter(s => s.direction === dir);
     if (result)   closed = closed.filter(s => s.result === result.toUpperCase());
 
     renderHistorySummary(closed);
     renderHistoryTable(closed);
-    updatePerfBanner(closed, H.openPositions);
+    updatePerfBanner(allClosed, H.openPositions);
 
     // Kick off live price fetch for open positions (non-blocking)
     fetchAndRenderPositions();
