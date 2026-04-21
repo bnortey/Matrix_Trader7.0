@@ -227,6 +227,8 @@
       font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
       color: var(--text3); background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 2px;
     }
+    .tag[title] { cursor: help; }
+    .tag[title]:hover { background: rgba(255,255,255,0.08); color: var(--text2); }
 
     /* ── Why line ── */
     .row-why {
@@ -529,6 +531,64 @@
     #overlay.on { display: block; }
 
     /* ── Mobile ── */
+    /* ── First-run guide ── */
+    #guide-overlay {
+      position: fixed; inset: 0; z-index: 300;
+      background: rgba(0,0,0,0.85);
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }
+    #guide-modal {
+      background: var(--bg2);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      width: 100%; max-width: 460px;
+      padding: 28px;
+    }
+    #guide-header {
+      display: flex; align-items: center; gap: 14px;
+      margin-bottom: 28px;
+    }
+    #guide-logo {
+      width: 40px; height: 40px;
+      background: var(--green); color: #000;
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 20px; flex-shrink: 0;
+    }
+    #guide-title { font-size: 16px; font-weight: 700; }
+    #guide-sub   { font-size: 12px; color: var(--text2); margin-top: 2px; }
+    #guide-steps { display: flex; flex-direction: column; gap: 20px; margin-bottom: 28px; }
+    .guide-step  { display: flex; gap: 14px; align-items: flex-start; }
+    .guide-step-num {
+      width: 28px; height: 28px; flex-shrink: 0;
+      background: rgba(0,230,118,0.12);
+      border: 1px solid rgba(0,230,118,0.3);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; color: var(--green);
+    }
+    .guide-step-title { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+    .guide-step-desc  { font-size: 12px; color: var(--text2); line-height: 1.6; }
+    #guide-footer {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+    }
+    #guide-note {
+      font-size: 10px; color: var(--text3); line-height: 1.5; flex: 1;
+    }
+    #guide-btn {
+      background: var(--green); color: #000;
+      font-weight: 700; font-size: 13px;
+      padding: 9px 20px; border-radius: 6px;
+      border: none; cursor: pointer;
+      white-space: nowrap; flex-shrink: 0;
+      transition: opacity 150ms;
+    }
+    #guide-btn:hover { opacity: 0.85; }
+
     @media (max-width: 767px) {
       #detail-panel {
         position: fixed !important;
@@ -560,6 +620,9 @@
       .mkt-oi, .mkt-oi-lbl { display: none; }
       #tv-chart-container { height: 160px !important; }
       .tool-grid { grid-template-columns: 1fr; }
+      #guide-modal { padding: 20px; }
+      #guide-footer { flex-direction: column; align-items: stretch; }
+      #guide-btn { text-align: center; }
     }
   </style>
 </head>
@@ -1181,7 +1244,10 @@ function rowHTML(sig, i) {
   const cc = pctColor(sig.change_24h_pct);
   const fc = fundColor(sig.funding_rate);
   const tagsHtml = sig.tags.length
-    ? `<div class="row-tags">${sig.tags.map(t => `<span class="tag">${esc(t.replace(/_/g,' '))}</span>`).join('')}</div>`
+    ? `<div class="row-tags">${sig.tags.map(t => {
+        const tip = TAG_TIPS[t] ? ` title="${esc(TAG_TIPS[t])}"` : '';
+        return `<span class="tag"${tip}>${esc(t.replace(/_/g,' '))}</span>`;
+      }).join('')}</div>`
     : '';
   const whyHtml = sig.signal_why
     ? `<div class="row-why">${esc(sig.signal_why)}</div>`
@@ -1262,7 +1328,10 @@ function renderDetail(sig) {
     <div class="d-lbl">Tags</div>
     <div class="tags-wrap">
       ${sig.tags && sig.tags.length
-        ? sig.tags.map(t => `<span class="tag">${esc(t.replace(/_/g,' '))}</span>`).join('')
+        ? sig.tags.map(t => {
+            const tip = TAG_TIPS[t] ? ` title="${esc(TAG_TIPS[t])}"` : '';
+            return `<span class="tag"${tip}>${esc(t.replace(/_/g,' '))}</span>`;
+          }).join('')
         : '<span style="color:var(--text3);font-size:11px">none</span>'}
     </div>
   </div>
@@ -1466,20 +1535,53 @@ function closePanel() {
 }
 
 const STRAT_META = {
-  balanced:          { label: 'Balanced',          cap: 20,  desc: 'All-market defaults'                  },
-  funding_arb:       { label: 'Funding Arb',        cap: 10,  desc: '|funding| > 0.03% · ranging markets' },
-  momentum_breakout: { label: 'Momentum Breakout',  cap: 25,  desc: '|24h Δ| > 3% · trending + volume'    },
-  mean_reversion:    { label: 'Mean Reversion',     cap: 15,  desc: 'RSI extremes · counter-trend'         },
+  balanced: {
+    label: 'Balanced', cap: 20, desc: 'All-market defaults',
+    tooltip: 'Combines momentum, funding rate, and orderbook pressure. Works in most market conditions. Best starting point.',
+  },
+  funding_arb: {
+    label: 'Funding Arb', cap: 10, desc: '|funding| > 0.03% · ranging markets',
+    tooltip: 'Targets pairs where funding is extreme — shorts paying longs (long setup) or longs paying shorts (short setup). Works best in sideways markets. Low leverage cap.',
+  },
+  momentum_breakout: {
+    label: 'Momentum Breakout', cap: 25, desc: '|24h Δ| > 3% · trending + volume',
+    tooltip: 'Rides strong directional moves with volume confirmation. Only fires when 24h change exceeds 3%. Works best in trending markets. Higher leverage cap.',
+  },
+  mean_reversion: {
+    label: 'Mean Reversion', cap: 15, desc: 'RSI extremes · counter-trend',
+    tooltip: 'Fades exhausted moves. Only fires when RSI is below 35 (oversold long) or above 65 (overbought short). Counter-trend — requires higher conviction threshold.',
+  },
+};
+
+const TAG_TIPS = {
+  'strong_momentum': 'Price surged 5%+ in 24h. Strong directional trend — buyers in control.',
+  'momentum':        'Price up 2-5% in 24h. Moderate bullish momentum building.',
+  'strong_dump':     'Price dropped 5%+ in 24h. Strong selling pressure — bears in control.',
+  'dump':            'Price down 2-5% in 24h. Moderate bearish pressure.',
+  'short_squeeze':   'Funding is deeply negative — shorts are paying longs. Forced short covering can accelerate upside moves.',
+  'long_squeeze':    'Funding is highly positive — longs are paying shorts. Crowded long positions risk a liquidation cascade.',
+  'premium':         'Perp price is trading above fair/index price. Longs are paying a premium — bearish lean.',
+  'discount':        'Perp price is trading below fair/index price. Shorts are paying a discount — bullish lean.',
+  'high_volume':     'Volume exceeds $10M in 24h. Higher liquidity means tighter spreads and more reliable signals.',
+  'extreme_vol':     'ATR exceeds 5% of price. Extreme volatility — reduce position size significantly, expect wide spreads.',
+  'bid_heavy':       'Bid depth outweighs ask depth. More buy orders queued than sell orders — bullish orderbook pressure.',
+  'ask_heavy':       'Ask depth outweighs bid depth. More sell orders queued than buy orders — bearish orderbook pressure.',
+  'oversold':        'RSI below 35. Price may be reaching exhaustion — potential for a bounce or reversal.',
+  'overbought':      'RSI above 65. Price may be overextended — potential for a pullback or reversal.',
+  'oversold_risk':   'Short signal but RSI is stretched low — increased risk of a bounce against the position.',
+  'overbought_risk': 'Long signal but RSI is elevated — increased risk of a pullback against the position.',
 };
 
 function setStrategy(key) {
   S.strategy = key;
   document.querySelectorAll('.strat-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.strat === key);
+    const m = STRAT_META[b.dataset.strat];
+    if (m) b.title = m.tooltip;
   });
   const meta = STRAT_META[key];
   const lbl = $('strat-lbl');
-  if (lbl && meta) lbl.textContent = meta.desc + ' · max ' + meta.cap + '×';
+  if (lbl && meta) lbl.textContent = `Max leverage: ${meta.cap}×  ·  ${meta.desc}`;
 }
 
 function saveFilters() {
@@ -2081,6 +2183,22 @@ function drawCompoundChart(balances) {
 }
 
 /* ============================================================
+   FIRST-RUN GUIDE
+   ============================================================ */
+function showGuide() {
+  try {
+    if (!localStorage.getItem('mt7_guide_seen')) {
+      $('guide-overlay').classList.remove('hidden');
+    }
+  } catch (_) {}
+}
+
+function dismissGuide() {
+  try { localStorage.setItem('mt7_guide_seen', '1'); } catch (_) {}
+  $('guide-overlay').classList.add('hidden');
+}
+
+/* ============================================================
    INIT
    ============================================================ */
 loadFilters();
@@ -2093,6 +2211,46 @@ if (initSi) initSi.textContent = ' ↓';
 // Render tools with default values
 calcRisk();
 calcCompound();
+showGuide();
 </script>
+
+<div id="guide-overlay" class="hidden">
+  <div id="guide-modal">
+    <div id="guide-header">
+      <div id="guide-logo">M</div>
+      <div>
+        <div id="guide-title">Matrix Trader 7.0</div>
+        <div id="guide-sub">MEXC perpetual swap signal scanner</div>
+      </div>
+    </div>
+    <div id="guide-steps">
+      <div class="guide-step">
+        <div class="guide-step-num">1</div>
+        <div class="guide-step-body">
+          <div class="guide-step-title">Choose a strategy</div>
+          <div class="guide-step-desc">Each strategy targets different market conditions. Start with Balanced — it works in most environments.</div>
+        </div>
+      </div>
+      <div class="guide-step">
+        <div class="guide-step-num">2</div>
+        <div class="guide-step-body">
+          <div class="guide-step-title">Hit Scan</div>
+          <div class="guide-step-desc">Matrix Trader scans 800+ MEXC perpetual pairs, scores them using funding rate, momentum, and orderbook pressure, and ranks the highest-conviction setups.</div>
+        </div>
+      </div>
+      <div class="guide-step">
+        <div class="guide-step-num">3</div>
+        <div class="guide-step-body">
+          <div class="guide-step-title">Click a signal</div>
+          <div class="guide-step-desc">The detail panel shows your entry zone, take-profit levels, stop loss, and a plain-English explanation of why the signal fired. Use the Risk Calculator in Tools to size your position.</div>
+        </div>
+      </div>
+    </div>
+    <div id="guide-footer">
+      <div id="guide-note">Signals are for informational purposes only. Always manage your own risk.</div>
+      <button id="guide-btn" onclick="dismissGuide()">Start scanning →</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
