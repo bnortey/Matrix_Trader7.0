@@ -622,6 +622,9 @@
     }
     #pos-table tr:hover td { background: rgba(255,255,255,0.02); }
     .pos-row-active td { background: rgba(255,255,255,0.04) !important; }
+    #pos-table th { cursor: default; }
+    #pos-table th[onclick] { cursor: pointer; user-select: none; }
+    #pos-table th[onclick]:hover { color: var(--text2); }
     .pos-mono { font-family: var(--mono); font-size: 11px; }
     .pos-age { color: var(--text3); font-size: 10px; white-space: nowrap; }
     .pos-stale { color: var(--amber); font-size: 9px; margin-left: 2px; vertical-align: super; }
@@ -1089,6 +1092,16 @@
               oninput="onAccountSizeInput()"
               style="width:80px;background:rgba(255,255,255,0.04);border:1px solid var(--border);
                      color:var(--text2);padding:3px 6px;border-radius:4px;font-size:11px;outline:none">
+            <span class="pos-updated" style="margin-left:8px">Strategy</span>
+            <select id="pos-strat-filter" onchange="H.posStratFilter=this.value; renderOpenPositions()"
+              style="background:rgba(255,255,255,0.04);border:1px solid var(--border);color:var(--text2);
+                     padding:3px 6px;border-radius:4px;font-size:11px;outline:none">
+              <option value="">All</option>
+              <option value="balanced">Balanced</option>
+              <option value="funding_arb">Funding Arb</option>
+              <option value="momentum_breakout">Momentum</option>
+              <option value="mean_reversion">Mean Rev</option>
+            </select>
           </div>
           <div id="open-positions-body">
             <div class="hist-loading">Switch to this tab after a scan to see open positions.</div>
@@ -2504,6 +2517,9 @@ const H = {
   posLastRefresh:  null,    // Date.now() of last successful price fetch
   posFetching:        false,  // guards concurrent fetchAndRenderPositions() calls
   selectedPositionId: null,   // id of position whose detail panel is currently open
+  posSort:            'age',  // active sort column for open positions table
+  posSortDir:         'asc',  // 'asc' | 'desc'
+  posStratFilter:     '',     // '' = all strategies
 };
 
 let lastHistorySigs = [];
@@ -2928,37 +2944,90 @@ function showPositionDetail(pos) {
   }
 }
 
+function calcPnl(pos) {
+  const entry   = pos.entry1 || pos.price || 0;
+  const current = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price || 0;
+  return entry > 0
+    ? (pos.direction === 'LONG'
+        ? (current - entry) / entry * 100
+        : (entry - current) / entry * 100)
+    : 0;
+}
+function distStop(pos) {
+  const entry   = pos.entry1 || pos.price || 1;
+  const current = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price || 0;
+  return pos.stop_loss ? Math.abs(current - pos.stop_loss) / entry * 100 : 999;
+}
+function distTp1(pos) {
+  const entry   = pos.entry1 || pos.price || 1;
+  const current = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price || 0;
+  const tp      = pos.tp1 || (pos.exits && pos.exits[0]) || 0;
+  return tp ? Math.abs(current - tp) / entry * 100 : 999;
+}
+function sortPositions(col) {
+  if (H.posSort === col) {
+    H.posSortDir = H.posSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    H.posSort    = col;
+    H.posSortDir = col === 'pnl' ? 'desc' : 'asc';
+  }
+  renderOpenPositions();
+}
+
 function renderOpenPositions() {
   const body    = $('open-positions-body');
   const countEl = $('pos-count');
   if (!body) return;
 
-  if (!H.openPositions.length) {
-    if (countEl) countEl.textContent = '0';
-    body.innerHTML = '<div class="hist-empty">No open positions — hit Scan to log new signals.</div>';
+  // Apply strategy filter then sort
+  let positions = H.openPositions;
+  if (H.posStratFilter) positions = positions.filter(p => p.strategy === H.posStratFilter);
+
+  if (!positions.length) {
+    if (countEl) countEl.textContent = H.posStratFilter
+      ? `0/${H.openPositions.length}`
+      : '0';
+    body.innerHTML = H.openPositions.length
+      ? '<div class="hist-empty">No positions match the selected strategy.</div>'
+      : '<div class="hist-empty">No open positions — hit Scan to log new signals.</div>';
     return;
   }
 
-  if (countEl) countEl.textContent = H.openPositions.length;
+  if (countEl) countEl.textContent = H.posStratFilter
+    ? `${positions.length}/${H.openPositions.length}`
+    : H.openPositions.length;
 
-  const rows = H.openPositions.map((pos, i) => {
+  const sorted = [...positions].sort((a, b) => {
+    const dir = H.posSortDir === 'asc' ? 1 : -1;
+    switch (H.posSort) {
+      case 'symbol':   return dir * a.symbol.localeCompare(b.symbol);
+      case 'dir':      return dir * a.direction.localeCompare(b.direction);
+      case 'entry':    return dir * ((a.entry1 || 0) - (b.entry1 || 0));
+      case 'current': {
+        const ap = (H.priceCache[a.symbol] && H.priceCache[a.symbol].price) || a.price || 0;
+        const bp = (H.priceCache[b.symbol] && H.priceCache[b.symbol].price) || b.price || 0;
+        return dir * (ap - bp);
+      }
+      case 'pnl':      return dir * (calcPnl(a) - calcPnl(b));
+      case 'stop':     return dir * (distStop(a) - distStop(b));
+      case 'tp1':      return dir * (distTp1(a) - distTp1(b));
+      case 'age':      return dir * (new Date(a.logged_at) - new Date(b.logged_at));
+      case 'strategy': return dir * (a.strategy || '').localeCompare(b.strategy || '');
+      default:         return 0;
+    }
+  });
+
+  const rows = sorted.map(pos => {
     const entry   = pos.entry1 || pos.price || 0;
     const cached  = H.priceCache[pos.symbol];
     const current = cached ? cached.price : (pos.price || 0);
     const stale   = !cached;
 
-    const pnl_pct = entry > 0
-      ? (pos.direction === 'LONG'
-          ? (current - entry) / entry * 100
-          : (entry - current) / entry * 100)
-      : 0;
-
+    const pnl_pct   = calcPnl(pos);
     const dist_stop = pos.stop_loss && entry > 0
       ? Math.abs(current - pos.stop_loss) / entry * 100
       : null;
-    const dist_tp1  = (pos.exits && pos.exits[0] || pos.tp1) && entry > 0
-      ? Math.abs(current - (pos.exits && pos.exits[0] || pos.tp1)) / entry * 100
-      : null;
+    const dist_tp1  = distTp1(pos) < 999 ? distTp1(pos) : null;
 
     const dt        = new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z');
     const age_hours = (Date.now() - dt) / 3600000;
@@ -2971,12 +3040,15 @@ function renderOpenPositions() {
     const sym       = esc((pos.symbol || '').replace('_USDT', ''));
     const dirCls    = pos.direction === 'LONG' ? 'hist-dir-long' : 'hist-dir-short';
     const activeCls = H.selectedPositionId === pos.id ? ' pos-row-active' : '';
+    // Strategy label — replace underscores with spaces, title case
+    const stratLbl  = (pos.strategy || '—').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
     const btns = Object.keys(OUTCOME_LABELS).map(o =>
       `<button class="outcome-btn" onclick="event.stopPropagation();tagOutcome(${pos.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`
     ).join('');
 
-    return `<tr class="pos-row${activeCls}" style="cursor:pointer" onclick="showPositionDetail(H.openPositions[${i}])">
+    // Use pos.id lookup in onclick — index-based fails after sort reorders rows
+    return `<tr class="pos-row${activeCls}" style="cursor:pointer" onclick="showPositionDetail(H.openPositions.find(p=>p.id===${pos.id}))">
       <td class="hist-symbol">${sym}${staleMark}</td>
       <td class="${dirCls}">${pos.direction}</td>
       <td class="pos-mono">${fmtPrice(entry)}</td>
@@ -2985,6 +3057,7 @@ function renderOpenPositions() {
       <td class="pos-mono${stopCls}">${dist_stop !== null ? dist_stop.toFixed(1) + '%' : '—'}</td>
       <td class="pos-mono${tp1Cls}">${dist_tp1  !== null ? dist_tp1.toFixed(1)  + '%' : '—'}</td>
       <td class="pos-age">${fmtAge(age_hours)}</td>
+      <td class="pos-age">${esc(stratLbl)}</td>
       <td><div class="outcome-group">${btns}</div></td>
     </tr>`;
   }).join('');
@@ -2992,11 +3065,26 @@ function renderOpenPositions() {
   body.innerHTML = `
     <table id="pos-table">
       <thead><tr>
-        <th>Symbol</th><th>Dir</th><th>Entry</th><th>Current</th>
-        <th>P&amp;L%</th><th>→Stop</th><th>→TP1</th><th>Age</th><th>Outcome</th>
+        <th onclick="sortPositions('symbol')">Symbol <span class="sort-indicator" data-col="symbol"></span></th>
+        <th onclick="sortPositions('dir')">Dir <span class="sort-indicator" data-col="dir"></span></th>
+        <th onclick="sortPositions('entry')">Entry <span class="sort-indicator" data-col="entry"></span></th>
+        <th onclick="sortPositions('current')">Current <span class="sort-indicator" data-col="current"></span></th>
+        <th onclick="sortPositions('pnl')" style="text-align:right">P&amp;L% <span class="sort-indicator" data-col="pnl"></span></th>
+        <th onclick="sortPositions('stop')">→Stop <span class="sort-indicator" data-col="stop"></span></th>
+        <th onclick="sortPositions('tp1')">→TP1 <span class="sort-indicator" data-col="tp1"></span></th>
+        <th onclick="sortPositions('age')">Age <span class="sort-indicator" data-col="age"></span></th>
+        <th onclick="sortPositions('strategy')">Strategy <span class="sort-indicator" data-col="strategy"></span></th>
+        <th>Outcome</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+
+  // Update sort indicators — scoped to #pos-table to avoid touching market browser indicators
+  document.querySelectorAll('#pos-table .sort-indicator').forEach(el => {
+    el.textContent = el.dataset.col === H.posSort
+      ? (H.posSortDir === 'asc' ? ' ↑' : ' ↓')
+      : '';
+  });
 }
 
 async function requestAnalysis() {
