@@ -621,6 +621,7 @@
       vertical-align: middle;
     }
     #pos-table tr:hover td { background: rgba(255,255,255,0.02); }
+    .pos-row-active td { background: rgba(255,255,255,0.04) !important; }
     .pos-mono { font-family: var(--mono); font-size: 11px; }
     .pos-age { color: var(--text3); font-size: 10px; white-space: nowrap; }
     .pos-stale { color: var(--amber); font-size: 9px; margin-left: 2px; vertical-align: super; }
@@ -1002,6 +1003,13 @@
             <span class="pos-title">OPEN POSITIONS (<span id="pos-count">—</span>)</span>
             <span id="pos-status" class="pos-updated"></span>
             <button class="pos-refresh-btn" onclick="fetchAndRenderPositions()">Refresh</button>
+            <label style="color:var(--text3);font-size:11px;white-space:nowrap;margin-left:8px">Acct $</label>
+            <input id="hist-account-size" type="number" min="0" step="100"
+              placeholder="200"
+              title="Your account size — used to estimate dollar P&L"
+              oninput="onAccountSizeInput()"
+              style="width:80px;background:rgba(255,255,255,0.04);border:1px solid var(--border);
+                     color:var(--text2);padding:3px 6px;border-radius:4px;font-size:11px;outline:none">
           </div>
           <div id="open-positions-body">
             <div class="hist-loading">Switch to this tab after a scan to see open positions.</div>
@@ -1092,6 +1100,19 @@
 </div>
 
 <script>
+/* ── Utilities ── */
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+const onAccountSizeInput = debounce(() => {
+  const val = $('hist-account-size') ? $('hist-account-size').value : '';
+  localStorage.setItem('mt7_account_size', val);
+  renderOpenPositions();
+  renderHistoryTable(lastHistorySigs);
+  renderHistorySummary(lastHistorySigs);
+}, 500);
+
 /* ============================================================
    SIGNALS STATE  (S)  — never touched by market code
    ============================================================ */
@@ -1732,7 +1753,10 @@ function closePanel() {
   $('overlay').classList.remove('on');
   $('detail-panel').classList.remove('open');
   document.body.style.overflow = '';
-  // Only deselect / re-render signal rows when in signals tab
+  if (currentTab === 'history') {
+    H.selectedPositionId = null;
+    renderOpenPositions();  // clears active row highlight
+  }
   if (window.innerWidth < 768 && currentTab === 'signals') {
     S.selected = -1;
     renderRows();
@@ -2399,7 +2423,8 @@ const H = {
   posRefreshTimer: null,    // setInterval handle — 30s price refresh
   posCounterTimer: null,    // setInterval handle — per-second "Xs ago" counter
   posLastRefresh:  null,    // Date.now() of last successful price fetch
-  posFetching:     false,   // guards concurrent fetchAndRenderPositions() calls
+  posFetching:        false,  // guards concurrent fetchAndRenderPositions() calls
+  selectedPositionId: null,   // id of position whose detail panel is currently open
 };
 
 let lastHistorySigs = [];
@@ -2515,14 +2540,6 @@ function renderHistorySummary(sigs) {
     <div class="hist-stat">
       <span class="hist-stat-lbl" style="margin-bottom:4px">Est. P&L</span>
       <span class="hist-stat-val" style="font-size:13px">${pnlStr}</span>
-    </div>
-    <div style="margin-left:auto;display:flex;align-items:center;gap:6px;flex-shrink:0">
-      <label style="color:var(--text3);font-size:11px;white-space:nowrap">Acct $</label>
-      <input id="hist-account-size" type="number" min="0" step="100"
-        value="${acct > 0 ? acct : ''}"
-        placeholder="e.g. 500"
-        style="width:90px;background:var(--bg2);border:1px solid var(--border);color:var(--text1);padding:4px 6px;border-radius:4px;font-size:12px"
-        oninput="localStorage.setItem('mt7_account_size', this.value); renderHistoryTable(lastHistorySigs); renderHistorySummary(lastHistorySigs)">
     </div>
   `;
 }
@@ -2668,6 +2685,104 @@ async function fetchAndRenderPositions() {
   startPosTimers();  // reset 30s interval after each refresh
 }
 
+function buildStatusBarHTML(pos) {
+  const entry = pos.entry1 || pos.price || 0;
+  const live  = pos._livePrice || entry;
+  const tp1   = (pos.exits && pos.exits[0]) || pos.tp1 || 0;
+  const tp2   = (pos.exits && pos.exits[1]) || pos.tp2 || 0;
+  const tp3   = (pos.exits && pos.exits[2]) || pos.tp3 || 0;
+  const stop  = pos.stop_loss || 0;
+  const pnl   = pos._pnl_pct || 0;
+
+  let progress = 0;
+  if (pos.direction === 'LONG' && tp3 > stop) {
+    progress = (live - stop) / (tp3 - stop) * 100;
+  } else if (pos.direction === 'SHORT' && stop > tp3) {
+    progress = (stop - live) / (stop - tp3) * 100;
+  }
+  progress = Math.max(0, Math.min(100, progress));
+
+  const pnlColor = pnl > 0 ? 'var(--green)' : pnl < 0 ? 'var(--red)' : 'var(--text3)';
+  const pnlSign  = pnl >= 0 ? '+' : '';
+  const dt       = new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z');
+  const ageHours = (Date.now() - dt) / 3600000;
+  const strat    = (STRAT_META[pos.strategy] && STRAT_META[pos.strategy].label) || esc(pos.strategy || '—');
+
+  return `<div id="pos-status-bar" style="
+    background:rgba(255,255,255,0.03);border:1px solid var(--border);
+    border-radius:8px;padding:12px 14px;margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
+      <span style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Live P&amp;L</span>
+      <span style="font-size:20px;font-weight:700;color:${pnlColor}">${pnlSign}${pnl.toFixed(2)}%</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:10px">
+      <span style="color:var(--text3)">Entry <span style="color:var(--text2);font-family:var(--mono)">${fmtPrice(entry)}</span></span>
+      <span style="color:var(--text3)">Now <span style="color:var(--text2);font-family:var(--mono)">${fmtPrice(live)}</span></span>
+    </div>
+    <div style="margin-bottom:6px">
+      <div style="position:relative;height:6px;background:rgba(255,255,255,0.06);border-radius:3px">
+        <div style="position:absolute;left:0;top:0;height:100%;border-radius:3px;
+                    width:${progress}%;background:${pnlColor};opacity:0.7"></div>
+        <div style="position:absolute;top:-3px;width:12px;height:12px;border-radius:50%;
+                    background:${pnlColor};border:2px solid var(--bg);
+                    left:calc(${progress}% - 6px)"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-top:4px">
+        <span>Stop ${fmtPrice(stop)}</span>
+        <span>TP1 ${fmtPrice(tp1)}</span>
+        <span>TP2 ${fmtPrice(tp2)}</span>
+        <span>TP3 ${fmtPrice(tp3)}</span>
+      </div>
+    </div>
+    <div style="font-size:10px;color:var(--text3);text-align:right">
+      Open ${fmtAge(ageHours)} · ${strat}
+    </div>
+  </div>`;
+}
+
+function refreshPositionStatusBar() {
+  const bar = $('pos-status-bar');
+  if (!bar || !H.selectedPositionId) return;
+  const pos = H.openPositions.find(p => p.id === H.selectedPositionId);
+  if (!pos) return;
+  pos._livePrice = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price;
+  const entry = pos.entry1 || pos.price || 0;
+  pos._pnl_pct = entry > 0
+    ? (pos.direction === 'LONG'
+        ? (pos._livePrice - entry) / entry * 100
+        : (entry - pos._livePrice) / entry * 100)
+    : 0;
+  bar.outerHTML = buildStatusBarHTML(pos);
+}
+
+function showPositionDetail(pos) {
+  H.selectedPositionId = pos.id;
+
+  // Augment with live price and P&L before passing to renderDetail
+  pos._livePrice = (H.priceCache[pos.symbol] && H.priceCache[pos.symbol].price) || pos.price;
+  const entry = pos.entry1 || pos.price || 0;
+  pos._pnl_pct = entry > 0
+    ? (pos.direction === 'LONG'
+        ? (pos._livePrice - entry) / entry * 100
+        : (entry - pos._livePrice) / entry * 100)
+    : 0;
+
+  // Render the full detail panel (chart, trade plan, context, AI report)
+  renderDetail(pos);
+
+  // Inject live status bar before the symbol row (close button is position:absolute so DOM order doesn't matter)
+  const panel  = $('detail-panel');
+  const symRow = panel.querySelector('.d-sym-row');
+  if (symRow) symRow.insertAdjacentHTML('beforebegin', buildStatusBarHTML(pos));
+
+  // Open panel on mobile (same as selectSignal)
+  if (window.innerWidth < 768) {
+    $('overlay').classList.add('on');
+    panel.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+}
+
 function renderOpenPositions() {
   const body    = $('open-positions-body');
   const countEl = $('pos-count');
@@ -2681,7 +2796,7 @@ function renderOpenPositions() {
 
   if (countEl) countEl.textContent = H.openPositions.length;
 
-  const rows = H.openPositions.map(pos => {
+  const rows = H.openPositions.map((pos, i) => {
     const entry   = pos.entry1 || pos.price || 0;
     const cached  = H.priceCache[pos.symbol];
     const current = cached ? cached.price : (pos.price || 0);
@@ -2696,8 +2811,8 @@ function renderOpenPositions() {
     const dist_stop = pos.stop_loss && entry > 0
       ? Math.abs(current - pos.stop_loss) / entry * 100
       : null;
-    const dist_tp1  = pos.tp1 && entry > 0
-      ? Math.abs(current - pos.tp1) / entry * 100
+    const dist_tp1  = (pos.exits && pos.exits[0] || pos.tp1) && entry > 0
+      ? Math.abs(current - (pos.exits && pos.exits[0] || pos.tp1)) / entry * 100
       : null;
 
     const dt        = new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z');
@@ -2708,14 +2823,15 @@ function renderOpenPositions() {
     const tp1Cls    = dist_tp1  !== null && dist_tp1  < 1 ? ' pos-target' : '';
     const staleMark = stale ? '<sup class="pos-stale" title="Using last known price">~</sup>' : '';
 
-    const sym    = esc((pos.symbol || '').replace('_USDT', ''));
-    const dirCls = pos.direction === 'LONG' ? 'hist-dir-long' : 'hist-dir-short';
+    const sym       = esc((pos.symbol || '').replace('_USDT', ''));
+    const dirCls    = pos.direction === 'LONG' ? 'hist-dir-long' : 'hist-dir-short';
+    const activeCls = H.selectedPositionId === pos.id ? ' pos-row-active' : '';
 
     const btns = Object.keys(OUTCOME_LABELS).map(o =>
-      `<button class="outcome-btn" onclick="tagOutcome(${pos.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`
+      `<button class="outcome-btn" onclick="event.stopPropagation();tagOutcome(${pos.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`
     ).join('');
 
-    return `<tr>
+    return `<tr class="pos-row${activeCls}" style="cursor:pointer" onclick="showPositionDetail(H.openPositions[${i}])">
       <td class="hist-symbol">${sym}${staleMark}</td>
       <td class="${dirCls}">${pos.direction}</td>
       <td class="pos-mono">${fmtPrice(entry)}</td>
@@ -2736,6 +2852,9 @@ function renderOpenPositions() {
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+
+  // If a position detail is open, refresh just the status bar with latest prices
+  refreshPositionStatusBar();
 }
 
 async function requestAnalysis() {
@@ -2783,6 +2902,8 @@ function dismissGuide() {
    INIT
    ============================================================ */
 loadFilters();
+const savedAcct = localStorage.getItem('mt7_account_size');
+if (savedAcct && $('hist-account-size')) $('hist-account-size').value = savedAcct;
 setPhase('idle');
 setMktPhase('idle');
 setStrategy('balanced');
