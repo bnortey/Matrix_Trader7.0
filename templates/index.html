@@ -592,6 +592,23 @@
     .hist-empty, .hist-loading {
       padding: 48px 24px; text-align: center; color: var(--text3); font-size: 12px;
     }
+    /* ── Strategy review ── */
+    #analysis-wrap { margin-top: 20px; }
+    #analysis-btn {
+      background: var(--green); color: #000; border: none; border-radius: 6px;
+      padding: 0 20px; height: 40px; font-size: 13px; font-weight: 700;
+      cursor: pointer; letter-spacing: 0.02em;
+    }
+    #analysis-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #analysis-cost-note { font-size: 10px; color: var(--text3); margin-top: 6px; }
+    #analysis-error { margin-top: 10px; font-size: 12px; color: var(--amber); min-height: 0; }
+    #analysis-output {
+      display: none; margin-top: 14px; padding: 16px;
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+      font-family: var(--mono); font-size: 12px; color: var(--text2);
+      white-space: pre-wrap; line-height: 1.6;
+    }
+    #analysis-output.visible { display: block; }
 
     /* ── Mobile overlay ── */
     #overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 99; }
@@ -980,6 +997,14 @@
         <!-- Table — populated by renderHistoryTable() -->
         <div id="hist-table-wrap">
           <div id="hist-body" class="hist-loading">Switch to this tab after a scan to see logged signals.</div>
+        </div>
+
+        <!-- Strategy Review -->
+        <div id="analysis-wrap">
+          <button id="analysis-btn" onclick="requestAnalysis()">Strategy Review</button>
+          <div id="analysis-cost-note">Each review call uses the Claude API (~$0.50–2.00 per call).</div>
+          <div id="analysis-error"></div>
+          <div id="analysis-output"></div>
         </div>
 
       </div>
@@ -2445,6 +2470,31 @@ async function tagOutcome(id, result) {
     if (data.success) loadHistory();  // full reload — summary stats must update too
   } catch (e) {
     console.error('tagOutcome error:', e);
+  }
+}
+
+async function requestAnalysis() {
+  const btn = $('analysis-btn');
+  const out = $('analysis-output');
+  const err = $('analysis-error');
+  btn.disabled = true;
+  btn.textContent = 'Generating review…';
+  err.textContent = '';
+  out.classList.remove('visible');
+  try {
+    const resp = await fetch('/api/analysis', { method: 'POST' });
+    const data = await resp.json();
+    if (data.success) {
+      out.textContent = data.analysis;
+      out.classList.add('visible');
+    } else {
+      err.textContent = data.error || 'Unknown error';
+    }
+  } catch (e) {
+    err.textContent = 'Request failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Strategy Review';
   }
 }
 

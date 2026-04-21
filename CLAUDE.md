@@ -51,7 +51,7 @@ This is the 7th iteration. Versions 2–6 all failed. The MT6 codebase (`Matrix_
 - [x] Signal history storage — SQLite auto-write on every scan
 - [x] Outcome tracking — manual WIN/LOSS/PARTIAL tagging
 - [x] History tab UI — logged signals, outcome buttons, win rate stats
-- [ ] AI strategy review — Claude API analysis of outcome data, user-triggered
+- [x] AI strategy review — Claude API analysis of outcome data, user-triggered
 - [ ] Paper trading system — automated position tracking
 - [ ] WebSocket live price refresh for watched pairs
 

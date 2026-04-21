@@ -8,8 +8,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from functools import partial
 
+import anthropic
 import requests
 import pandas as pd
+from collections import defaultdict
 from flask import Flask, jsonify, render_template, request
 from dotenv import load_dotenv
 
@@ -1197,6 +1199,148 @@ def api_signals_history():
             "signals": [dict(r) for r in rows],
             "count":   len(rows),
         })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/analysis", methods=["POST"])
+def api_analysis():
+    """AI strategy review: analyse tagged signal outcomes via Claude API."""
+    print("AI strategy review requested", file=sys.stderr)
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return jsonify({"success": False, "error": "ANTHROPIC_API_KEY not configured"}), 400
+
+        # Load last 200 tagged signals
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM signals WHERE result IS NOT NULL ORDER BY logged_at DESC LIMIT 200"
+        ).fetchall()
+        con.close()
+        sigs = [dict(r) for r in rows]
+
+        if len(sigs) < 10:
+            return jsonify({
+                "success": False,
+                "error": "Not enough data — need at least 10 tagged outcomes to generate a review",
+            }), 400
+
+        # ── helper fns ──────────────────────────────────────────────────────
+        def win_rate_str(lst: list) -> str:
+            wins = sum(1 for s in lst if s["result"] == "WIN")
+            return f"{wins / len(lst) * 100:.0f}%" if lst else "n/a"
+
+        def avg_conv(lst: list) -> str:
+            return f"{sum(s['conviction'] for s in lst) / len(lst):.0f}" if lst else "n/a"
+
+        # ── by strategy ─────────────────────────────────────────────────────
+        by_strat: dict[str, list] = defaultdict(list)
+        for s in sigs:
+            by_strat[s["strategy"]].append(s)
+
+        strat_lines = []
+        for strat_name, ss in by_strat.items():
+            winners = [s for s in ss if s["result"] == "WIN"]
+            losers  = [s for s in ss if s["result"] == "LOSS"]
+            strat_lines.append(
+                f"  {strat_name}: {len(ss)} signals, {win_rate_str(ss)} win rate, "
+                f"avg conv winners={avg_conv(winners)} losers={avg_conv(losers)}"
+            )
+        strat_block = "\n".join(strat_lines) or "  (no data)"
+
+        # ── conviction bands ────────────────────────────────────────────────
+        band_55 = [s for s in sigs if 55 <= s["conviction"] < 65]
+        band_65 = [s for s in sigs if 65 <= s["conviction"] < 75]
+        band_75 = [s for s in sigs if s["conviction"] >= 75]
+
+        # ── tag analysis ────────────────────────────────────────────────────
+        tag_wins:  dict[str, int] = defaultdict(int)
+        tag_total: dict[str, int] = defaultdict(int)
+        for s in sigs:
+            for tag in [t.strip() for t in (s.get("tags") or "").split(",") if t.strip()]:
+                tag_total[tag] += 1
+                if s["result"] == "WIN":
+                    tag_wins[tag] += 1
+
+        tag_stats = sorted(
+            [(t, tag_wins[t], tag_total[t]) for t in tag_total if tag_total[t] >= 5],
+            key=lambda x: x[1] / x[2],
+            reverse=True,
+        )
+
+        def tag_line(t: str, w: int, n: int) -> str:
+            return f"  {t}: {w}/{n} ({w / n * 100:.0f}% win rate)"
+
+        best_tags_block  = "\n".join(tag_line(*x) for x in tag_stats[:5])  or "  (fewer than 5 signals per tag)"
+        worst_tags_block = "\n".join(tag_line(*x) for x in tag_stats[-5:]) or "  (fewer than 5 signals per tag)"
+
+        # ── symbol analysis ─────────────────────────────────────────────────
+        sym_wins:  dict[str, int] = defaultdict(int)
+        sym_total: dict[str, int] = defaultdict(int)
+        for s in sigs:
+            sym_total[s["symbol"]] += 1
+            if s["result"] == "WIN":
+                sym_wins[s["symbol"]] += 1
+
+        sym_stats = sorted(
+            [(sym, sym_wins[sym], sym_total[sym]) for sym in sym_total if sym_total[sym] >= 3],
+            key=lambda x: x[1] / x[2],
+            reverse=True,
+        )
+
+        def sym_line(sym: str, w: int, n: int) -> str:
+            return f"  {sym}: {w}/{n} ({w / n * 100:.0f}% win rate)"
+
+        best_syms_block  = "\n".join(sym_line(*x) for x in sym_stats[:5])  or "  (fewer than 3 signals per symbol)"
+        worst_syms_block = "\n".join(sym_line(*x) for x in sym_stats[-5:]) or "  (fewer than 3 signals per symbol)"
+
+        # ── full log (max 100 most recent) ───────────────────────────────────
+        log_lines = [
+            f"  {s['logged_at'][:16]} | {s['symbol']} | {s['direction']} | "
+            f"{s['strategy']} | conviction:{s['conviction']} | "
+            f"tags:[{s.get('tags', '')}] | result:{s['result']}"
+            for s in sigs[:100]
+        ]
+        log_block = "\n".join(log_lines)
+
+        # ── assemble user message ────────────────────────────────────────────
+        user_msg = (
+            f"Here is the signal performance data from the last {len(sigs)} tagged trades:\n\n"
+            f"SUMMARY BY STRATEGY:\n{strat_block}\n\n"
+            f"SUMMARY BY CONVICTION BAND:\n"
+            f"  55-64: {len(band_55)} signals, {win_rate_str(band_55)} win rate\n"
+            f"  65-74: {len(band_65)} signals, {win_rate_str(band_65)} win rate\n"
+            f"  75+:   {len(band_75)} signals, {win_rate_str(band_75)} win rate\n\n"
+            f"BEST PERFORMING TAGS (win rate across all signals containing this tag):\n{best_tags_block}\n\n"
+            f"WORST PERFORMING TAGS:\n{worst_tags_block}\n\n"
+            f"BEST PERFORMING SYMBOLS:\n{best_syms_block}\n\n"
+            f"WORST PERFORMING SYMBOLS:\n{worst_syms_block}\n\n"
+            f"FULL SIGNAL LOG (most recent first, max 100):\n{log_block}"
+        )
+
+        system_prompt = (
+            "You are a quantitative trading strategy analyst reviewing signal performance data "
+            "from a MEXC perpetual swap scanner called Matrix Trader. The scanner scores signals "
+            "using funding rate, momentum, orderbook pressure, RSI, and ATR. Your job is to "
+            "identify what is working, what is not, and give specific actionable recommendations "
+            "to improve the scoring weights and strategy parameters. Be direct and specific. "
+            "Reference actual numbers from the data. Flag any recommendation with fewer than 8 "
+            "supporting signals as low-confidence."
+        )
+
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        analysis_text = message.content[0].text
+
+        return jsonify({"success": True, "analysis": analysis_text})
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
