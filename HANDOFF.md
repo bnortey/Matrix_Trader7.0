@@ -5,10 +5,10 @@
 > writing a single line of code. This file was auto-generated from the
 > actual codebase — it reflects current state, not planned state.
 
-Last updated: 2026-04-21
-Last commit: 00a4d3f feat: VPS deployment to Hetzner — Matrix Trader live at 62.238.15.113:8080
-app.py: 1248 lines
-index.html: 2522 lines
+Last updated: 2026-04-23
+Last commit: 8037615 fix: fmtAge naming collision causing corrupted scan timestamp; fix idle-cta height clipping text
+app.py: 1576 lines
+index.html: 3464 lines
 
 ---
 
@@ -60,12 +60,15 @@ Matrix_Trader_7.0/
 ├── .gitignore             ← includes .env, __pycache__, data/
 ├── .env                   ← ANTHROPIC_API_KEY, MEXC_API_KEY (not committed)
 ├── requirements.txt
-├── app.py                 ← entire Flask backend, 1248 lines
+├── app.py                 ← entire Flask backend, 1576 lines
 ├── backtest.py            ← standalone backtest script, 4 strategies × 14 symbols
 ├── templates/
-│   └── index.html         ← entire frontend (CSS + HTML + JS), 2522 lines
+│   └── index.html         ← entire frontend (CSS + HTML + JS), 3464 lines
 ├── static/
 │   └── style.css          ← minimal overrides (most CSS is inline in index.html)
+├── docs/
+│   ├── design-brief.md    ← original design document
+│   └── project-status.md  ← human-readable status overview
 ├── data/                  ← gitignored; created at runtime
 │   ├── signals.db         ← SQLite signal history (auto-created by init_db())
 │   └── backtest_results.json ← written by backtest.py
@@ -126,14 +129,20 @@ Sentiment APIs (no key needed):
 | Route | Method | Description |
 |---|---|---|
 | `/` | GET | Serves index.html dashboard |
-| `/api/scan` | GET | Full scan: scores 800+ tickers, enriches top 30, returns signals array |
+| `/api/scan` | GET | Full scan: scores 800+ tickers, enriches top 30, logs to DB, returns signals array |
 | `/api/market` | GET | Returns all scored tickers for market browser (no enrichment) |
 | `/api/signal/<symbol>` | GET | Fully enriches a single symbol on demand |
 | `/api/signal/result` | PATCH | Tags a logged signal with WIN/LOSS/PARTIAL/EXPIRED/SKIPPED |
 | `/api/signals/history` | GET | Returns logged signal history; filters: strategy, result, symbol, limit |
+| `/api/outcomes/check` | POST | Evaluates all open (untagged) signals against Min15 klines; auto-tags hits |
+| `/api/prices` | GET | Batch price fetch for multiple symbols — used by open positions panel |
+| `/api/analysis` | POST | AI strategy review: sends last 200 tagged outcomes to Claude API |
 
 Query params for `/api/scan`: `threshold` (int, default 55), `strategy` (string, default "balanced").
 Query params for `/api/signals/history`: `limit` (int, default 100), `strategy`, `result`, `symbol`.
+Query params for `/api/prices`: `symbols` (comma-separated string of symbol names).
+
+Background thread `_outcome_loop` runs `api_outcomes_check()` every 15 minutes automatically (daemon thread, starts on import, 1-minute startup delay).
 
 ---
 
@@ -176,8 +185,12 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
   "atr_pct":              float,   # ATR as % of price
   "volatility":           str,     # "low" | "medium" | "high" | "extreme"
   "rsi_1h":               float,
-  "trend_score":          int,     # -100 to +100, EMA20/50 alignment
+  "trend_score":          int,     # -100 to +100, EMA20/50 alignment + price position bonus
   "basis_pct":            None,    # reserved
+
+  # Daily trend
+  "daily_trend":          str | None,   # "LONG" | "SHORT" | "NEUTRAL" | None
+  "daily_trend_aligned":  bool | None,  # True if signal direction matches daily trend
 
   # Tags
   "tags":                 list[str],  # e.g. ["short_squeeze", "high_volume"]
@@ -187,11 +200,11 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
   "ai_report":            str,     # JSON string: [{label, text}, ...] 4 sections
 
   # Market sentiment (from Binance/Bybit/OKX public APIs)
-  "binance_ls_long_pct":  float | None,  # % of accounts long on Binance
-  "binance_oi":           float | None,  # Binance OI in USD
-  "bybit_oi":             float | None,  # Bybit OI in USD
-  "okx_ls_long_pct":      float | None,  # % of accounts long on OKX
-  "okx_oi":               float | None,  # OKX OI in USD (oiUsd field, already USD)
+  "binance_ls_long_pct":  float | None,
+  "binance_oi":           float | None,
+  "bybit_oi":             float | None,
+  "okx_ls_long_pct":      float | None,
+  "okx_oi":               float | None,
   "sentiment_tracked":    bool,   # False for MEXC-only altcoins, True for major pairs
 }
 ```
@@ -239,17 +252,33 @@ let currentTab = 'signals';
 let currentTVSymbol   = null;
 let currentTVInterval = '60';
 
-const H = { loading: false };   // History tab state — guards concurrent fetches
+const H = {
+  loading:         false,   // guards concurrent loadHistory() calls
+  openPositions:   [],      // untagged signals (result === null)
+  priceCache:      {},      // symbol → {price, ts} from /api/prices
+  posRefreshTimer: null,    // setInterval handle — 30s price refresh
+  posCounterTimer: null,    // setInterval handle — per-second "Xs ago" counter
+  posLastRefresh:  null,    // Date.now() of last successful price fetch
+  posFetching:        false,  // guards concurrent fetchAndRenderPositions() calls
+  selectedPositionId: null,   // id of position whose detail panel is currently open
+  posSort:            'age',  // active sort column for open positions table
+  posSortDir:         'asc',  // 'asc' | 'desc'
+  posStratFilter:     '',     // '' = all strategies
+};
+
+let lastHistorySigs = [];
+
+const STRATEGY_LEVERAGE = { balanced: 20, funding_arb: 10, momentum_breakout: 25, mean_reversion: 15 };
 ```
 
 `S` and `M` are completely isolated. Never cross-reference them.
-`H` is minimal — history data lives only in the DOM after render, not cached in state.
+`H` manages history tab state — open positions list, price cache, timer handles, sort/filter state.
 
 ---
 
 ## Dashboard Structure
 
-Four tabs, four sections, one shared detail panel:
+Four tabs, one shared detail panel:
 
 | Tab button | Section div | Loaded by |
 |---|---|---|
@@ -258,17 +287,28 @@ Four tabs, four sections, one shared detail panel:
 | `#tab-tools` | `#tools-section` | Static, rendered at init |
 | `#tab-history` | `#history-section` | `loadHistory()` on tab switch (auto) |
 
-**Shared detail panel** (`#detail-panel`, `<aside>`): populated by `renderDetail(sig)` from either signals or market tab. Slides in from the right on desktop; slides up from bottom on mobile.
+**History tab sub-sections:**
+- `#open-positions-section` — live open positions (untagged signals) with P&L tracking, 30s price refresh
+- `#closed-signals-section` — tagged signals with outcome buttons, equity curve, strategy review
 
-**Strategy bar** (inside `#signals-section`): four pills (Balanced / Funding Arb / Momentum / Mean Rev) with native `title` tooltips. `setStrategy(key)` updates `S.strategy` and the `#strat-lbl` label.
+**Shared detail panel** (`#detail-panel`, `<aside>`): populated by `renderDetail(sig)` from signals or market tab. Slides in from right on desktop; slides up from bottom on mobile.
+
+**Strategy bar** (inside `#signals-section`): four pills (Balanced / Funding Arb / Momentum / Mean Rev).
 
 **Filter bar** (inside `#signals-section`): direction toggle, volatility filter select, min-volume input. State persisted to localStorage key `mt7_filters`.
 
-**History tab** (`#history-section`):
-- `#hist-bar` — summary stats: Logged, Tagged, Win Rate, W·L·P counts, Avg Conv (W/L)
-- `.hist-filters` — three selects: Strategy, Direction (client-side), Result
-- `#hist-table-wrap` / `#hist-body` — `<table id="hist-table">` rendered by JS
-- Outcome buttons: WIN / LOSS / PAR / EXP / SKP — PATCH `/api/signal/result` on click, full reload after success
+**Open positions panel** (`#open-positions-section`):
+- `#open-positions-header` — account size input, live performance banner (signals, win rate, P&L, open, best trade, streak)
+- `#open-positions-body` — sortable table (age, symbol, direction, entry, current price, P&L, leverage)
+- Click a position row → live P&L status bar, progress bar to TP3, TP markers, 30s auto-refresh detail
+- Positions auto-sync with server-side outcome checker on every `loadHistory()` call
+
+**Closed signals panel** (`#closed-signals-section`):
+- Summary stats bar: Logged · Tagged · Win Rate · W/L/P counts · Avg Conviction (wins vs losses)
+- Equity curve: sparkline chart of account growth over time, with hover tooltip (crosshair, date, balance, change)
+- Outcome buttons: WIN / LOSS / PAR / EXP / SKP — PATCH `/api/signal/result`, full reload after
+- Three filter selects: Strategy · Direction (client-side) · Result
+- Strategy Review button → `requestAnalysis()` → POST `/api/analysis`
 
 ---
 
@@ -287,7 +327,7 @@ function toTVSymbol(mexcSymbol, exchange) {
 }
 ```
 
-Chart uses TradingView Advanced Chart widget (embed script from `s3.tradingview.com`). Config: `autosize: true`, `theme: 'dark'`, `style: '1'` (candles), `interval: '60'` (default 1h). Timeframe toggle buttons (15m / 1h / 4h) re-render the chart. Falls back to a "Chart unavailable" message + direct TV link if the symbol isn't found.
+Chart uses TradingView Advanced Chart widget. Config: `autosize: true`, `theme: 'dark'`, `style: '1'` (candles), `interval: '60'` (default 1h). Timeframe toggle buttons (15m / 1h / 4h) re-render the chart.
 
 ---
 
@@ -329,9 +369,9 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | Backtest | backtest.py — 14 symbols × 4 strategies, real funding rate history | ✅ Done |
 | P3a | SQLite signal history — auto-log on scan, PATCH outcome, GET history | ✅ Done |
 | P3b | History tab UI — summary bar, outcome buttons, filters, win rate | ✅ Done |
-| P3c | AI strategy review — Claude API analysis of outcome data | 🔲 Next |
-| P3d | Paper trading system — automated position tracking | 🔲 Planned |
-| P3e | WebSocket live price refresh for watched pairs | 🔲 Planned |
+| P3c | AI strategy review — POST /api/analysis, Claude API, History tab button | ✅ Done |
+| P3d | Open positions panel — live P&L, 30s refresh, auto-tagging, equity curve | ✅ Done |
+| P3e | WebSocket live price refresh for watched pairs | 🔲 Next |
 | P4 | README, GitHub publish, 5 external beta testers | 🔲 Planned |
 
 ---
@@ -340,13 +380,9 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 
 Next in priority order:
 
-1. **P3c — AI strategy review**: Add a "Review" button to the History tab. On click, send the last N tagged outcomes (WIN/LOSS/PARTIAL) to Claude API and display a strategy analysis: which setups are working, which aren't, what to adjust. Use `generate_report()`-style JSON response. Requires ANTHROPIC_API_KEY in `.env`.
+1. **P3e — WebSocket live price refresh**: Wire `lib/mexc_stream.py` to the frontend for real-time price updates on open positions and watched pairs. The library exists and is complete but is not connected to any Flask route or UI. Approach: add a Server-Sent Events (SSE) endpoint in `app.py` that streams price updates; frontend subscribes on History tab entry and unsubscribes on tab leave. This replaces/augments the current 30s polling via `GET /api/prices`.
 
-2. **P3d — Paper trading system**: Let users open a "paper position" from a signal. Track entry price, direction, TP/SL. Auto-mark outcome when price is manually updated or refreshed. Separate from signal history — a position can exist without a logged signal.
-
-3. **P3e — WebSocket live price refresh**: Wire `lib/mexc_stream.py` to the frontend for real-time price updates on watched pairs. The library exists but is not connected to the UI or any Flask route.
-
-4. **CLAUDE.md update**: Mark P3a and P3b as done (currently P3a is checked but P3b is not).
+2. **P4 — Public release**: Write external-facing `README.md` with full setup instructions (currently minimal). Push to GitHub. Recruit 5 external beta testers.
 
 ---
 
@@ -364,6 +400,9 @@ Next in priority order:
 - Do not run the full backtest during CI or import-time — it makes live MEXC API calls and takes several minutes.
 - Do not filter direction server-side in `/api/signals/history` — direction is filtered client-side in `loadHistory()`. If you add server-side direction filtering, remove the client-side filter to avoid double-filtering.
 - Do not use `title` attributes on mobile-only UI elements — native browser tooltips don't appear on touch devices.
+- Do not rename `fmtAge` — a naming collision between the history tab helper and a stale global caused corrupted scan timestamps (fixed in commit 8037615). The function name is intentional.
+- Do not touch the equity sparkline's mousemove/crosshair logic without testing hover on mobile — canvas mouse events behave differently on touch.
+- Do not change strategy filter option values in the history tab — they must match the DB strings exactly: "Balanced", "Funding Arb", "Momentum Breakout". A mismatch causes silent empty results.
 
 ---
 
@@ -414,10 +453,14 @@ Before reporting any task complete:
 - [ ] `GET /` returns 200
 - [ ] `GET /api/scan` returns JSON with `success: true`
 - [ ] `GET /api/signals/history` returns 200
+- [ ] `POST /api/outcomes/check` returns 200
+- [ ] `GET /api/prices?symbols=BTC_USDT` returns 200
 - [ ] Signal cards show entry/TP/SL in the detail panel
 - [ ] Strategy pills work and update `#strat-lbl`
 - [ ] History tab loads on click and shows table (or empty state)
+- [ ] Open positions panel shows untagged signals with live prices
 - [ ] Outcome buttons update `result` and reload the table
+- [ ] Equity sparkline renders and hover tooltip shows date/balance/change
 - [ ] Mobile: UI fits on 375px screen without horizontal scroll (except history table which scrolls intentionally)
 - [ ] No `console.error` in browser on page load
 - [ ] No Python traceback on server start
@@ -458,3 +501,9 @@ Built: P3b History tab (this session completed the UI — summary bar, outcome b
 Decided: History tab auto-loads on switchTab('history') — no manual refresh button needed. H state object is minimal (loading flag only) — history data is not cached in JS state, always fetched fresh. Outcome button labels abbreviated (WIN/LOSS/PAR/EXP/SKP) to fit 375px iPhone screens; full word in title attr.
 Deferred: P3c AI strategy review (next task), P3d paper trading, P3e WebSocket.
 Watch out for: The history table intentionally scrolls horizontally on mobile — this is correct, not a bug. Do not remove overflow-x: auto from #hist-table-wrap. Direction filter in loadHistory() is client-side — if you move it server-side, remove the client-side filter or signals will be double-filtered.
+
+### 2026-04-23 — Session summary
+Built: P3c AI strategy review (POST /api/analysis — Claude API call, last 200 tagged outcomes, min 10 required, strategy/direction breakdown, tag and symbol analysis). P3d open positions panel — full live tracking: 30s price refresh, per-position P&L, leverage-aware notional sizing, liquidation price, dollar P&L from equity curve, equity sparkline with hover tooltip (crosshair, date, balance, change), live performance banner (signals, win rate, P&L, open positions, best trade, streak), sortable columns, strategy filter, autonomous outcome checker background thread (every 15 min), evaluate_outcome() against Min15 klines (stop/TP detection with partial credit for TP1 hit before stop), daily trend direction tag.
+Decided: Dollar P&L derived from equity curve so it correlates exactly with the Balance column. Equity curve uses account size input in positions header as the starting balance. Background outcome thread sleeps 1 min on startup then runs every 15 min. evaluate_outcome() uses pessimistic ambiguity rule — if TP1 was hit but stop was later hit, result is PARTIAL. 0.1% slippage applied to entry prices.
+Deferred: P3e WebSocket live price refresh (lib/mexc_stream.py exists but not wired to UI).
+Watch out for: fmtAge naming collision — a local function in history tab clashed with a stale global, corrupting scan timestamp display (fixed in 8037615). Equity sparkline canvas mousemove handler uses clientX/clientY offset calculations — do not simplify without testing hover accuracy. Strategy filter option values must match DB strings exactly (Balanced, Funding Arb, Momentum Breakout) — mismatch causes silent empty results.
