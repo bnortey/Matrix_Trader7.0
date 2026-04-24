@@ -223,6 +223,15 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
 }
 ```
 
+**DB-only columns** (not in the enrich_signal dict — set by the outcome system, never returned by the scan):
+
+| Column | Type | Set by |
+|---|---|---|
+| `result` | TEXT \| NULL | `PATCH /api/signal/result` (manual) or `evaluate_outcome()` (auto) |
+| `result_note` | TEXT \| NULL | `evaluate_outcome()` — describes which level was hit |
+| `result_at` | TEXT \| NULL | UTC ISO timestamp when result was written |
+| `exit_price` | REAL \| NULL | `evaluate_outcome()` only — close price of the triggering candle; NULL for manual tags and EXPIRED/SKIPPED |
+
 `ai_report` is a JSON string: `[{"label": "Setup", "text": "..."}, {"label": "Structure", ...}, ...]`
 Parse with `JSON.parse()` in the frontend. Four sections: Setup, Structure, Invalidation, Risk.
 
@@ -419,6 +428,7 @@ Next in priority order:
 - Do not rename `fmtAge` — a naming collision between the history tab helper and a stale global caused corrupted scan timestamps (fixed in commit 8037615). The function name is intentional.
 - Do not touch the equity sparkline's mousemove/crosshair logic without testing hover on mobile — canvas mouse events behave differently on touch.
 - Do not change strategy filter option values in the history tab — they must match the DB strings exactly: "Balanced", "Funding Arb", "Momentum Breakout". A mismatch causes silent empty results.
+- Do not set `exit_price` to 0 when unknown — use NULL so it can be distinguished from a genuine zero-price edge case. Only `evaluate_outcome()` writes `exit_price`; manual tags via `PATCH /api/signal/result` leave it NULL.
 - Do not use `display: none` on `:nth-child()` td/th cells to hide columns in a `table-layout: fixed` JS-generated table — the column slot still exists in the layout algorithm and the table overflows. Use conditional JS rendering instead (skip rendering hidden cells in the template literal).
 - Do not mark a task complete without adding its verification items to the checklist at the bottom of this file. If the task added a new localStorage key, new route, new UI element, or new persistent behavior — it gets a checklist item.
 
@@ -567,6 +577,12 @@ Built: Draggable resize handle on left edge of #detail-panel. Width persists to 
 Decided: `panel.innerHTML = ` writes to `$('panel-body').innerHTML` instead — introduced `#panel-body` wrapper div inside the aside so the handle element (position: absolute) is never wiped by content renders. `#detail-panel` changed from `overflow-y: auto` to `overflow: hidden; position: relative; display: flex; flex-direction: column`. Mobile media query `display: block !important` changed to `display: flex !important; flex-direction: column !important` to keep panel-body flex: 1 working on mobile.
 Deferred: nothing.
 Watch out for: All four innerHTML write sites (renderDetail, enrichMarketPair ×3) now target `$('panel-body')` not `$('detail-panel')`. If a future change adds a fifth write site to the panel, it must use `$('panel-body')` too. The `panel.classList` calls in renderDetail, selectSignal, enrichMarketPair, closePanel still correctly target `$('detail-panel')` — do not change those.
+
+### 2026-04-23 — Session summary (exit_price capture)
+Built: `exit_price REAL DEFAULT NULL` column added to signals table via `ALTER TABLE` migration in `init_db()` (wrapped in try/except OperationalError for idempotency). `evaluate_outcome()` now fetches `close` from klines alongside `high`/`low`, tracks `exit_close` at the triggering candle, and returns a 3-tuple `(result, note, exit_price)`. `api_outcomes_check()` updated to unpack the 3-tuple and write `exit_price` in the UPDATE. Manual tagging via `PATCH /api/signal/result` leaves `exit_price` NULL — only auto-evaluation sets it.
+Decided: exit_price = close of the candle where TP or SL was hit. For PARTIAL-via-stop, use the stop candle close (pessimistic). For WIN/PARTIAL-via-TP-only, use the close of the highest-TP candle. NULL for EXPIRED, SKIPPED, and any manually tagged result.
+Deferred: displaying exit_price in the history tab UI (P3e+ scope).
+Watch out for: `init_db()` is only called under `__main__` — calling it via `import app` in a script requires `app.init_db()` explicitly. The ALTER TABLE is idempotent; running twice is safe. `evaluate_outcome()` return type is now `tuple[str, str, float | None] | None` — any future caller that unpacks as `result, note = outcome` will raise a ValueError.
 
 ### 2026-04-23 — Session summary (mobile history table, v2 — JS fix)
 Built: History table truly fits 375px with zero horizontal scroll. Previous CSS-only fix was replaced — `display: none` on `:nth-child()` cells is unreliable with `table-layout: fixed` on JS-generated tables; hidden column slots still exist in the layout algorithm. Fix: `renderHistoryTable()` now checks `window.innerWidth < 768` (`isMobile`) and conditionally skips rendering Strategy/Conv/Why/R/Balance cells entirely. CSS changed from `display: none` rules to clean 5-column widths (Time=52px, Symbol=60px, Dir=44px, Result=auto, $P&L=70px). Time format shortened on mobile to "Apr 23" (no hours/minutes).

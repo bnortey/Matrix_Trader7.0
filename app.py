@@ -83,6 +83,11 @@ def init_db() -> None:
         )
     """)
     con.commit()
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN exit_price REAL DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     con.close()
 
 
@@ -1224,7 +1229,7 @@ def api_signals_history():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-def evaluate_outcome(sig: dict) -> tuple[str, str] | None:
+def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
     """
     Fetch Min15 klines since the signal was logged and determine if stop or TP was hit.
 
@@ -1266,10 +1271,11 @@ def evaluate_outcome(sig: dict) -> tuple[str, str] | None:
     if not klines or not isinstance(klines, dict):
         return None
 
-    raw_times = klines.get("time", [])
-    raw_highs = klines.get("high", [])
-    raw_lows  = klines.get("low",  [])
-    if not raw_times or not raw_highs or not raw_lows:
+    raw_times  = klines.get("time",  [])
+    raw_highs  = klines.get("high",  [])
+    raw_lows   = klines.get("low",   [])
+    raw_closes = klines.get("close", [])
+    if not raw_times or not raw_highs or not raw_lows or not raw_closes:
         return None
 
     # Build candle list — only candles that opened at or after signal time
@@ -1277,49 +1283,62 @@ def evaluate_outcome(sig: dict) -> tuple[str, str] | None:
     for i, t in enumerate(raw_times):
         try:
             if int(t) >= start_ts:
-                candles.append({"high": float(raw_highs[i]), "low": float(raw_lows[i])})
+                candles.append({
+                    "high":  float(raw_highs[i]),
+                    "low":   float(raw_lows[i]),
+                    "close": float(raw_closes[i]),
+                })
         except (ValueError, IndexError):
             pass
 
     if not candles:
         return None
 
-    stop_hit = False
-    best_tp  = 0   # highest TP tier reached before stop: 0=none, 1, 2, 3
+    stop_hit   = False
+    best_tp    = 0              # highest TP tier reached before stop: 0=none, 1, 2, 3
+    exit_close: float | None = None  # close of candle where result was determined
 
     for c in candles:
-        h, l = c["high"], c["low"]
+        h, l, cl = c["high"], c["low"], c["close"]
         if direction == "LONG":
             if l <= stop_loss:
-                stop_hit = True
+                stop_hit   = True
+                exit_close = cl  # stop candle close (pessimistic for PARTIAL too)
                 break
+            prev_tp = best_tp
             if tp3 and h >= tp3:
                 best_tp = max(best_tp, 3)
             elif tp2 and h >= tp2:
                 best_tp = max(best_tp, 2)
             elif tp1 and h >= tp1:
                 best_tp = max(best_tp, 1)
+            if best_tp > prev_tp:
+                exit_close = cl  # update to close of highest-TP candle reached so far
         else:  # SHORT
             if h >= stop_loss:
-                stop_hit = True
+                stop_hit   = True
+                exit_close = cl
                 break
+            prev_tp = best_tp
             if tp3 and l <= tp3:
                 best_tp = max(best_tp, 3)
             elif tp2 and l <= tp2:
                 best_tp = max(best_tp, 2)
             elif tp1 and l <= tp1:
                 best_tp = max(best_tp, 1)
+            if best_tp > prev_tp:
+                exit_close = cl
 
     if stop_hit and best_tp == 0:
-        return ("LOSS",    f"Stop hit at {stop_loss}")
+        return ("LOSS",    f"Stop hit at {stop_loss}",              exit_close)
     if stop_hit and best_tp > 0:
-        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}")
+        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}", exit_close)
     if best_tp == 3:
-        return ("WIN",     f"TP3 hit at {tp3}")
+        return ("WIN",     f"TP3 hit at {tp3}",                    exit_close)
     if best_tp == 2:
-        return ("PARTIAL", f"TP2 hit at {tp2}")
+        return ("PARTIAL", f"TP2 hit at {tp2}",                    exit_close)
     if best_tp == 1:
-        return ("PARTIAL", f"TP1 hit at {tp1}")
+        return ("PARTIAL", f"TP1 hit at {tp1}",                    exit_close)
     return None   # still open — no level hit yet
 
 
@@ -1349,11 +1368,11 @@ def api_outcomes_check():
             if outcome is None:
                 skipped += 1
                 continue
-            result, note = outcome
+            result, note, exit_price = outcome
             con = sqlite3.connect(DB_PATH)
             con.execute(
-                "UPDATE signals SET result=?, result_note=?, result_at=? WHERE id=?",
-                (result, note, datetime.utcnow().isoformat(), sig["id"]),
+                "UPDATE signals SET result=?, result_note=?, result_at=?, exit_price=? WHERE id=?",
+                (result, note, datetime.utcnow().isoformat(), exit_price, sig["id"]),
             )
             con.commit()
             con.close()
@@ -1539,24 +1558,6 @@ def api_analysis():
 # Entry point
 # ---------------------------------------------------------------------------
 
-def find_free_port(preferred: int, max_tries: int = 5) -> int:
-    """
-    Return the first available port starting at preferred, trying up to
-    max_tries consecutive ports. Binds to 0.0.0.0 to match Flask's binding
-    behavior — a port that's free on loopback only could still fail when Flask
-    binds to all interfaces. Returns preferred if none are free (Flask will
-    then surface its own error).
-    """
-    for port in range(preferred, preferred + max_tries):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("0.0.0.0", port))
-            return port
-        except OSError:
-            continue
-    return preferred
-
-
 def _outcome_loop():
     import time as _time
     _time.sleep(60)  # wait 1 minute after startup
@@ -1584,15 +1585,11 @@ if __name__ == "__main__":
     except Exception:
         lan_ip = "127.0.0.1"
 
-    actual_port = find_free_port(PORT)
-    if actual_port != PORT:
-        print(f"Note: port {PORT} was busy, using {actual_port} instead.")
-
     print("=" * 50)
     print("  Matrix Trader 7.0")
-    print(f"  Local  → http://localhost:{actual_port}")
-    print(f"  iPhone → http://{lan_ip}:{actual_port}")
+    print(f"  Local  → http://localhost:{PORT}")
+    print(f"  iPhone → http://{lan_ip}:{PORT}")
     print("=" * 50)
 
     init_db()
-    app.run(host="0.0.0.0", port=actual_port, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
