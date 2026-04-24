@@ -561,6 +561,12 @@
       border-radius: 4px; padding: 5px 8px; font-size: 11px;
       color: var(--text); outline: none; cursor: pointer;
     }
+    .hist-filter-input {
+      background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+      border-radius: 4px; padding: 5px 8px; font-size: 11px;
+      color: var(--text); outline: none; min-width: 130px;
+    }
+    .hist-filter-input:focus,
     .hist-filter-select:focus { border-color: rgba(255,255,255,0.2); }
     #hist-table-wrap { overflow-x: auto; }
     #hist-table { width: 100%; border-collapse: collapse; font-size: 11px; }
@@ -570,6 +576,9 @@
       color: var(--text3); font-weight: 600; border-bottom: 1px solid var(--border);
       white-space: nowrap;
     }
+    #hist-table th.hist-sortable { cursor: pointer; user-select: none; }
+    #hist-table th.hist-sortable:hover { color: var(--text2); }
+    .hist-sort-indicator { color: var(--green); font-size: 9px; }
     #hist-table td {
       padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,0.04);
       vertical-align: middle;
@@ -1188,7 +1197,7 @@
           <!-- Filter controls -->
           <div class="hist-filters">
             <span class="hist-filter-lbl">Strategy</span>
-            <select id="hf-strategy" class="hist-filter-select" onchange="loadHistory()">
+            <select id="hf-strategy" class="hist-filter-select" onchange="filterClosedHistory()">
               <option value="">All</option>
               <option value="Balanced">Balanced</option>
               <option value="Funding Arb">Funding Arb</option>
@@ -1196,13 +1205,13 @@
               <option value="Mean Reversion">Mean Reversion</option>
             </select>
             <span class="hist-filter-lbl" style="margin-left:6px">Direction</span>
-            <select id="hf-dir" class="hist-filter-select" onchange="loadHistory()">
+            <select id="hf-dir" class="hist-filter-select" onchange="filterClosedHistory()">
               <option value="">All</option>
               <option value="LONG">Long</option>
               <option value="SHORT">Short</option>
             </select>
             <span class="hist-filter-lbl" style="margin-left:6px">Result</span>
-            <select id="hf-result" class="hist-filter-select" onchange="loadHistory()">
+            <select id="hf-result" class="hist-filter-select" onchange="filterClosedHistory()">
               <option value="">All</option>
               <option value="WIN">Win</option>
               <option value="LOSS">Loss</option>
@@ -1210,6 +1219,9 @@
               <option value="EXPIRED">Expired</option>
               <option value="SKIPPED">Skipped</option>
             </select>
+            <span class="hist-filter-lbl" style="margin-left:6px">Symbol</span>
+            <input id="hf-symbol" class="hist-filter-input" type="search"
+                   placeholder="Search symbol" oninput="filterClosedHistory()">
           </div>
 
           <!-- Table — populated by renderHistoryTable() -->
@@ -1355,6 +1367,16 @@ function fmtBig(n) {
 function fmtFunding(f) {
   if (f == null) return '—';
   return (f * 100).toFixed(4) + '%';
+}
+function fmtFundingCountdown(totalSeconds) {
+  if (totalSeconds == null) return '—';
+  const sec = Math.max(0, Math.round(totalSeconds));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+  if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
+  return `${s}s`;
 }
 function fmtAge(date) {
   const s = Math.floor((Date.now() - date) / 1000);
@@ -1739,6 +1761,7 @@ function renderDetail(sig) {
   if (sig.stop_loss)                 $('rc-stop').value  = sig.stop_loss;
   if (sig.exits && sig.exits[0])     $('rc-tp').value    = sig.exits[0];
   calcRisk();
+  startCountdown(sig);
 }
 
 function ladderHTML(sig) {
@@ -1801,7 +1824,9 @@ function reportHTML(sig) {
 }
 
 function contextHTML(sig) {
-  const nfVal    = sig.next_funding_minutes != null ? sig.next_funding_minutes + 'm' : '—';
+  const fundingVal = fmtFunding(sig.funding_rate);
+  const nfSeconds = sig.next_funding_minutes != null ? Number(sig.next_funding_minutes) * 60 : null;
+  const nfVal    = nfSeconds != null ? fmtFundingCountdown(nfSeconds) : '—';
   const trendVal = sig.trend_score != null ? (sig.trend_score > 0 ? '+' : '') + sig.trend_score : '—';
   const capVal = sig.leverage_cap != null ? sig.leverage_cap + '×' : '—';
   const stratVal = sig.strategy || '—';
@@ -1813,8 +1838,9 @@ function contextHTML(sig) {
     { lbl: 'RSI 1h',       val: sig.rsi_1h != null ? Number(sig.rsi_1h).toFixed(1) : '—', color: rsiColor(sig.rsi_1h) },
     { lbl: 'Trend',        val: trendVal,                    color: trendColor(sig.trend_score) },
     { lbl: 'Open Int.',    val: fmtBig(sig.open_interest),  color: null },
-    { lbl: 'Next Funding', val: nfVal,                       color: null, id: 'ctx-nf' },
+    { lbl: 'Funding Rate', val: fundingVal,                   color: fundColor(sig.funding_rate) },
     { lbl: 'Volume 24h',   val: fmtBig(sig.volume_24h),     color: null },
+    { lbl: 'Next Funding', val: nfVal,                       color: null, id: 'ctx-nf' },
     { lbl: 'Volatility',   val: sig.volatility || '—',       color: volColor(sig.volatility) },
     { lbl: 'Daily Trend',  val: sig.daily_trend || '—',
       color: sig.daily_trend === 'LONG' ? 'var(--green)' : sig.daily_trend === 'SHORT' ? 'var(--red)' : 'var(--text3)' },
@@ -1919,6 +1945,7 @@ function closePanel() {
   $('overlay').classList.remove('on');
   $('detail-panel').classList.remove('open');
   document.body.style.overflow = '';
+  if (S.countdownId) { clearInterval(S.countdownId); S.countdownId = null; }
   if (currentTab === 'history') {
     H.selectedPositionId = null;
     renderOpenPositions();  // clears active row highlight
@@ -2139,14 +2166,23 @@ function updateTimestamp() {
 }
 function startCountdown(sig) {
   if (S.countdownId) clearInterval(S.countdownId);
+  S.countdownId = null;
   if (sig?.next_funding_minutes == null) return;
-  let mins = sig.next_funding_minutes;
-  S.countdownId = setInterval(() => {
-    mins = Math.max(0, mins - 1);
+  let seconds = Math.max(0, Math.round(Number(sig.next_funding_minutes) * 60));
+  const tick = () => {
     const el = $('ctx-nf');
-    if (el) el.textContent = mins + 'm';
-    if (mins === 0) clearInterval(S.countdownId);
-  }, 60000);
+    if (el) el.textContent = fmtFundingCountdown(seconds);
+    if (seconds <= 0) {
+      clearInterval(S.countdownId);
+      S.countdownId = null;
+      return;
+    }
+    seconds -= 1;
+  };
+  tick();
+  S.countdownId = setInterval(() => {
+    tick();
+  }, 1000);
 }
 
 /* ============================================================
@@ -2594,6 +2630,9 @@ const H = {
   posSort:            'age',  // active sort column for open positions table
   posSortDir:         'asc',  // 'asc' | 'desc'
   posStratFilter:     '',     // '' = all strategies
+  closedAll:          [],     // all tagged signals before closed-table filters
+  closedSort:         'logged_at',
+  closedSortDir:      'desc',
 };
 
 let lastHistorySigs = [];
@@ -2616,7 +2655,24 @@ function hydrateHistorySignal(row) {
   if (sig.tp1 == null && sig.exits) sig.tp1 = sig.exits[0];
   if (sig.tp2 == null && sig.exits) sig.tp2 = sig.exits[1];
   if (sig.tp3 == null && sig.exits) sig.tp3 = sig.exits[2];
+  if (sig.leverage_cap == null) sig.leverage_cap = STRATEGY_LEVERAGE[sig.strategy] || null;
   return sig;
+}
+
+function mergeLiveContext(pos, liveSig) {
+  if (!liveSig) return pos;
+  const contextKeys = [
+    'change_1h_pct', 'change_4h_pct', 'open_interest', 'next_funding_minutes',
+    'volume_24h', 'daily_trend', 'daily_trend_aligned', 'leverage_cap',
+    'funding_rate', 'rsi_1h', 'trend_score', 'volatility', 'atr_pct',
+    'binance_ls_long_pct', 'binance_oi', 'bybit_oi', 'okx_ls_long_pct',
+    'okx_oi', 'sentiment_tracked'
+  ];
+  for (const key of contextKeys) {
+    if (liveSig[key] !== undefined) pos[key] = liveSig[key];
+  }
+  pos._liveAnalysis = true;
+  return pos;
 }
 
 const OUTCOME_LABELS = {
@@ -2649,20 +2705,9 @@ async function loadHistory() {
 
     // Split: open positions (untagged) vs closed signals (tagged)
     H.openPositions = all.filter(s => s.result === null);
-    let closed = all.filter(s => s.result !== null);
-
-    // Apply closed-signals UI filters client-side
-    const strategy = $('hf-strategy').value;
-    const dir      = $('hf-dir').value;
-    const result   = $('hf-result').value;
-    const allClosed = closed; // preserve full unfiltered array for banner stats
-    if (strategy) closed = closed.filter(s => s.strategy === strategy);
-    if (dir)      closed = closed.filter(s => s.direction === dir);
-    if (result)   closed = closed.filter(s => s.result === result.toUpperCase());
-
-    renderHistorySummary(closed);
-    renderHistoryTable(closed);
-    updatePerfBanner(allClosed, H.openPositions);
+    H.closedAll = all.filter(s => s.result !== null);
+    filterClosedHistory();
+    updatePerfBanner(H.closedAll, H.openPositions);
 
     // Kick off live price fetch for open positions (non-blocking)
     fetchAndRenderPositions();
@@ -2676,6 +2721,59 @@ async function loadHistory() {
 }
 
 const RESULT_R = { WIN: 2.0, FULL_WIN: 3.0, PARTIAL: 1.0, LOSS: -1.0, EXPIRED: 0.0, SKIPPED: 0.0 };
+
+function closedSortValue(sig, key) {
+  switch (key) {
+    case 'logged_at': return new Date(sig.logged_at || 0).getTime() || 0;
+    case 'symbol':    return (sig.symbol || '').replace(/_USD[TC]$/, '');
+    case 'direction': return sig.direction || '';
+    case 'strategy':  return sig.strategy || '';
+    case 'conviction': return Number(sig.conviction) || 0;
+    case 'result':    return sig.result || '';
+    case 'pnl':       return RESULT_R[sig.result] ?? 0;
+    case 'r':         return RESULT_R[sig.result] ?? 0;
+    case 'balance':   return new Date(sig.logged_at || 0).getTime() || 0;
+    default:          return sig[key] ?? '';
+  }
+}
+
+function sortClosedHistory(col) {
+  if (H.closedSort === col) {
+    H.closedSortDir = H.closedSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    H.closedSort = col;
+    H.closedSortDir = ['symbol', 'direction', 'strategy', 'result'].includes(col) ? 'asc' : 'desc';
+  }
+  filterClosedHistory();
+}
+
+function filterClosedHistory() {
+  const strategy = $('hf-strategy') ? $('hf-strategy').value : '';
+  const dir      = $('hf-dir')      ? $('hf-dir').value      : '';
+  const result   = $('hf-result')   ? $('hf-result').value   : '';
+  const symbolQ  = ($('hf-symbol')  ? $('hf-symbol').value   : '').trim().toUpperCase();
+
+  let closed = [...H.closedAll];
+  if (strategy) closed = closed.filter(s => s.strategy === strategy);
+  if (dir)      closed = closed.filter(s => s.direction === dir);
+  if (result)   closed = closed.filter(s => s.result === result.toUpperCase());
+  if (symbolQ) {
+    closed = closed.filter(s =>
+      (s.symbol || '').toUpperCase().replace(/_USD[TC]$/, '').includes(symbolQ)
+    );
+  }
+
+  const dirMult = H.closedSortDir === 'asc' ? 1 : -1;
+  closed.sort((a, b) => {
+    const av = closedSortValue(a, H.closedSort);
+    const bv = closedSortValue(b, H.closedSort);
+    if (typeof av === 'number' && typeof bv === 'number') return dirMult * (av - bv);
+    return dirMult * String(av).localeCompare(String(bv));
+  });
+
+  renderHistorySummary(closed);
+  renderHistoryTable(closed);
+}
 
 function calcEquityCurve(closedSigs, startingBalance) {
   const sorted = [...closedSigs]
@@ -2918,6 +3016,12 @@ function renderHistoryTable(sigs) {
   const acct         = parseFloat(localStorage.getItem('mt7_account_size') || '0');
   const riskPerTrade = acct > 0 ? acct * 0.01 : 0;
   const isMobile     = window.innerWidth < 768;
+  const sortTh = (key, label, align = '') => {
+    const active = H.closedSort === key;
+    const arrow  = active ? (H.closedSortDir === 'asc' ? '↑' : '↓') : '';
+    const style  = align ? ` style="text-align:${align}"` : '';
+    return `<th class="hist-sortable" onclick="sortClosedHistory('${key}')"${style}>${label} <span class="hist-sort-indicator">${arrow}</span></th>`;
+  };
 
   // Pre-compute running balance after each trade (chronological, compounding)
   const balanceAfter  = {};
@@ -2989,11 +3093,11 @@ function renderHistoryTable(sigs) {
   $('hist-body').innerHTML = `
     <table id="hist-table">
       <thead><tr>
-        <th>Time</th><th>Symbol</th><th>Dir</th>
-        ${isMobile ? '' : '<th>Strategy</th><th>Conv</th><th>Why</th>'}
-        <th>Result</th>
-        <th style="text-align:right">$P&L</th>
-        ${isMobile ? '' : '<th style="text-align:right">R</th><th style="text-align:right">Balance</th>'}
+        ${sortTh('logged_at', 'Time')}${sortTh('symbol', 'Symbol')}${sortTh('direction', 'Dir')}
+        ${isMobile ? '' : `${sortTh('strategy', 'Strategy')}${sortTh('conviction', 'Conv')}<th>Why</th>`}
+        ${sortTh('result', 'Result')}
+        ${sortTh('pnl', '$P&L', 'right')}
+        ${isMobile ? '' : `${sortTh('r', 'R', 'right')}${sortTh('balance', 'Balance', 'right')}`}
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
@@ -3007,11 +3111,11 @@ async function tagOutcome(id, result) {
       body:    JSON.stringify({ id, result }),
     });
     const data = await resp.json();
-    // Full reload so tagged signal moves from open positions to closed history
-    if (data.success) {
-      updatePerfBanner(lastHistorySigs.filter(s => s.result !== null), H.openPositions);
-      loadHistory();
-    }
+	    // Full reload so tagged signal moves from open positions to closed history
+	    if (data.success) {
+	      updatePerfBanner(H.closedAll, H.openPositions);
+	      loadHistory();
+	    }
   } catch (e) {
     console.error('tagOutcome error:', e);
   }
@@ -3145,22 +3249,14 @@ async function fetchAndRenderPositions() {
     const histResp = await fetch('/api/signals/history?limit=500');
     const histData = await histResp.json();
     if (histData.success) {
-      const all          = (histData.signals || []).map(hydrateHistorySignal);
-      const prevOpenCount = H.openPositions.length;
-      H.openPositions    = all.filter(s => s.result === null);
-      lastHistorySigs    = all.filter(s => s.result !== null);
+	      const all          = (histData.signals || []).map(hydrateHistorySignal);
+	      const prevOpenCount = H.openPositions.length;
+	      H.openPositions    = all.filter(s => s.result === null);
+	      H.closedAll        = all.filter(s => s.result !== null);
 
-      // If the outcome checker tagged any positions, refresh the closed table too
-      if (H.openPositions.length !== prevOpenCount) {
-        const strategy = $('hf-strategy') ? $('hf-strategy').value : '';
-        const dir      = $('hf-dir')      ? $('hf-dir').value      : '';
-        const result   = $('hf-result')   ? $('hf-result').value   : '';
-        let filtered = lastHistorySigs;
-        if (strategy) filtered = filtered.filter(s => s.strategy === strategy);
-        if (dir)      filtered = filtered.filter(s => s.direction === dir);
-        if (result)   filtered = filtered.filter(s => s.result === result.toUpperCase());
-        renderHistorySummary(filtered);
-        renderHistoryTable(filtered);
+	      // If the outcome checker tagged any positions, refresh the closed table too
+	      if (H.openPositions.length !== prevOpenCount) {
+	        filterClosedHistory();
 
         // If the selected position was auto-closed, close its detail panel
         if (H.selectedPositionId &&
@@ -3179,8 +3275,8 @@ async function fetchAndRenderPositions() {
   H.posFetching = false;
   renderOpenPositions();
   updatePosCounter();
-  startPosTimers();  // reset 30s interval after each refresh
-  updatePerfBanner(lastHistorySigs.filter(s => s.result !== null), H.openPositions);
+	  startPosTimers();  // reset 30s interval after each refresh
+	  updatePerfBanner(H.closedAll, H.openPositions);
 
   // If a position detail panel is open, refresh it with latest prices
   if (H.selectedPositionId) {
@@ -3274,7 +3370,7 @@ function buildStatusBarHTML(pos) {
   </div>`;
 }
 
-function showPositionDetail(pos) {
+async function showPositionDetail(pos) {
   H.selectedPositionId = pos.id;
 
   // Normalize: history signals from SQLite have flat entry1/tp1/tp2/tp3.
@@ -3306,6 +3402,23 @@ function showPositionDetail(pos) {
     $('overlay').classList.add('on');
     $('detail-panel').classList.add('open');
     document.body.style.overflow = 'hidden';
+  }
+
+  try {
+    const resp = await fetch(`/api/signal/${encodeURIComponent(pos.symbol)}`);
+    const data = await resp.json();
+    if (!data.success || !data.signal) return;
+    mergeLiveContext(pos, data.signal);
+
+    // Keep the original paper-trade structure intact. The live enrichment is
+    // only for current context, not for rewriting the logged trade plan.
+    pos.entries = [pos.entry1, pos.entry2, pos.entry3];
+    pos.exits   = [pos.tp1,    pos.tp2,    pos.tp3   ];
+    renderDetail(pos);
+    const refreshedInner = document.querySelector('#detail-panel .d-inner');
+    if (refreshedInner) refreshedInner.insertAdjacentHTML('afterbegin', buildStatusBarHTML(pos));
+  } catch (e) {
+    console.warn('live context refresh failed:', e);
   }
 }
 
