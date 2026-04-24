@@ -1229,6 +1229,105 @@ def api_signals_history():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/signal/detail/<int:signal_id>")
+def api_signal_detail(signal_id: int):
+    """Return full trade detail + short AI coach review for a closed signal."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
+        con.close()
+
+        if not row:
+            return jsonify({"success": False, "error": "not found"}), 404
+
+        sig = dict(row)
+
+        # Duration in minutes (both timestamps are UTC ISO without Z)
+        duration_minutes = None
+        if sig.get("logged_at") and sig.get("result_at"):
+            try:
+                t0 = datetime.fromisoformat(sig["logged_at"])
+                t1 = datetime.fromisoformat(sig["result_at"])
+                duration_minutes = int((t1 - t0).total_seconds() / 60)
+            except Exception:
+                pass
+
+        # P&L %
+        pnl_pct    = None
+        entry1     = sig.get("entry1")
+        exit_price = sig.get("exit_price")
+        direction  = sig.get("direction", "")
+        if entry1 and exit_price and entry1 != 0:
+            if direction == "LONG":
+                pnl_pct = round((exit_price - entry1) / entry1 * 100, 2)
+            else:
+                pnl_pct = round((entry1 - exit_price) / entry1 * 100, 2)
+
+        # Tags stored as comma-separated string → list
+        tags_raw  = sig.get("tags") or ""
+        tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
+
+        # AI trade coach review — gracefully skipped if key absent or call fails
+        ai_analysis = None
+        try:
+            api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            if api_key:
+                user_msg = (
+                    f"Trade review:\n"
+                    f"Symbol: {sig.get('symbol')} | Direction: {direction} | Strategy: {sig.get('strategy')}\n"
+                    f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Result: {sig.get('result')}\n"
+                    f"Stop: {sig.get('stop_loss')} | TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
+                    f"Duration: {duration_minutes or 'unknown'} minutes\n"
+                    f"Signal reason: {sig.get('signal_why')}\n"
+                    f"Tags: {tags_raw}\n"
+                    f"Result note: {sig.get('result_note')}\n\n"
+                    f"In 3-4 sentences: what likely happened in this trade, what the signal "
+                    f"got right or wrong, and one specific thing to watch for next time on "
+                    f"this type of setup."
+                )
+                client = anthropic.Anthropic(api_key=api_key)
+                message = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=512,
+                    system=(
+                        "You are a trading coach reviewing a completed trade. "
+                        "Be direct and specific. No fluff. 3-4 sentences maximum."
+                    ),
+                    messages=[{"role": "user", "content": user_msg}],
+                )
+                ai_analysis = message.content[0].text
+        except Exception:
+            pass  # ai_analysis stays None; do not crash
+
+        return jsonify({
+            "success":          True,
+            "id":               sig["id"],
+            "symbol":           sig.get("symbol"),
+            "direction":        direction,
+            "strategy":         sig.get("strategy"),
+            "conviction":       sig.get("conviction"),
+            "entry_price":      entry1,
+            "exit_price":       exit_price,
+            "stop_loss":        sig.get("stop_loss"),
+            "tp1":              sig.get("tp1"),
+            "tp2":              sig.get("tp2"),
+            "tp3":              sig.get("tp3"),
+            "result":           sig.get("result"),
+            "result_note":      sig.get("result_note"),
+            "logged_at":        sig.get("logged_at"),
+            "result_at":        sig.get("result_at"),
+            "duration_minutes": duration_minutes,
+            "pnl_pct":          pnl_pct,
+            "signal_why":       sig.get("signal_why"),
+            "tags":             tags_list,
+            "volatility":       sig.get("volatility"),
+            "ai_analysis":      ai_analysis,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
     """
     Fetch Min15 klines since the signal was logged and determine if stop or TP was hit.
@@ -1541,7 +1640,7 @@ def api_analysis():
 
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2000,
             system=system_prompt,
             messages=[{"role": "user", "content": user_msg}],
