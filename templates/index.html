@@ -116,12 +116,57 @@
       white-space: nowrap; flex-shrink: 0;
     }
     .strat-btn.active { background: rgba(255,255,255,0.1); color: var(--text); border-color: rgba(255,255,255,0.14); }
+    .strat-btn.custom { border-color: rgba(68,138,255,0.25); }
     .strat-btn:hover:not(.active) { color: var(--text); background: rgba(255,255,255,0.07); }
     #strat-lbl {
       margin-left: auto; flex-shrink: 0;
       font-size: 10px; color: var(--text3);
       white-space: nowrap;
     }
+
+    /* ── Strategy explainer ── */
+    #strategy-explainer { display:none; padding:12px 14px; border-bottom:1px solid var(--border); background:var(--bg2); flex-shrink:0; }
+    .sx-header { display:flex; align-items:center; gap:8px; margin-bottom:5px; }
+    .sx-name { font-size:13px; font-weight:600; color:var(--text); }
+    .sx-regime { font-size:10px; padding:2px 7px; border-radius:3px; border:1px solid; text-transform:uppercase; letter-spacing:0.4px; }
+    .sx-desc { font-size:11px; color:var(--text2); margin:0 0 10px; line-height:1.5; }
+    .sx-section { margin-bottom:10px; }
+    .sx-section-lbl { font-size:10px; color:var(--text3); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:5px; }
+    .sx-bar-row { margin-bottom:5px; }
+    .sx-bar-meta { display:flex; justify-content:space-between; font-size:11px; color:var(--text2); margin-bottom:2px; }
+    .sx-bar-val { color:var(--text); font-weight:600; }
+    .sx-bar-track { background:rgba(255,255,255,0.06); border-radius:2px; height:4px; }
+    .sx-bar-fill { height:4px; border-radius:2px; background:var(--blue); }
+    .sx-params { display:flex; flex-wrap:wrap; gap:14px; font-size:11px; color:var(--text2); }
+    .sx-param-val { color:var(--text); font-weight:600; }
+    .sx-filter-row { font-size:11px; color:var(--text2); margin-bottom:3px; }
+    .sx-filter-val { color:var(--amber); font-weight:600; }
+    .sx-perf { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+    .sx-perf-lbl { font-size:10px; color:var(--text3); margin-bottom:2px; }
+    .sx-perf-val { font-size:12px; font-weight:600; color:var(--text); }
+    .sx-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+    .sx-action {
+      min-height:28px; padding:4px 10px; border:1px solid var(--border); border-radius:4px;
+      background:rgba(255,255,255,0.04); color:var(--text2); font-size:11px; font-weight:600;
+    }
+    .sx-action:hover { color:var(--text); background:rgba(255,255,255,0.07); }
+    .sx-action.danger { color:var(--red); }
+    .sx-custom-badge { font-size:10px; padding:2px 6px; border-radius:3px; background:rgba(68,138,255,0.12); color:var(--blue); font-weight:700; text-transform:uppercase; }
+    .sx-editor { margin-top:12px; padding-top:12px; border-top:1px solid var(--border); }
+    .sx-editor-grid { display:grid; grid-template-columns:repeat(4, minmax(80px,1fr)); gap:8px; }
+    .sx-field { display:flex; flex-direction:column; gap:3px; }
+    .sx-field label { font-size:9px; color:var(--text3); text-transform:uppercase; letter-spacing:0.05em; }
+    .sx-field input, .sx-field select, .sx-field textarea {
+      width:100%; min-height:30px; border:1px solid var(--border); border-radius:4px;
+      background:rgba(255,255,255,0.04); color:var(--text); padding:5px 7px; font-size:12px; outline:none;
+    }
+    .sx-field textarea { min-height:58px; resize:vertical; grid-column:span 4; }
+    .sx-field input:focus, .sx-field select:focus, .sx-field textarea:focus { border-color:rgba(255,255,255,0.18); }
+    .sx-editor-msg { min-height:16px; margin-top:7px; font-size:11px; color:var(--text3); }
+    .sx-editor-msg.error { color:var(--red); }
+    .sx-editor-msg.ok { color:var(--green); }
+    @media (max-width:720px) { .sx-editor-grid { grid-template-columns:repeat(2, minmax(80px,1fr)); } .sx-field textarea { grid-column:span 2; } }
+    @media (max-width:480px) { .sx-perf { grid-template-columns:repeat(2,1fr); } }
 
     /* ── Stat bar ── */
     #stat-bar { display: flex; background: var(--bg3); border-bottom: 1px solid var(--border); flex-shrink: 0; }
@@ -858,14 +903,13 @@
     <!-- ════ SIGNALS SECTION ════ -->
     <div id="signals-section">
 
-      <!-- Strategy selector — always visible, governs next scan -->
+      <!-- Strategy selector — always visible, governs next scan; populated by renderStrategyButtons() -->
       <div id="strategy-bar">
-        <button class="strat-btn active" data-strat="balanced"          onclick="setStrategy('balanced')">Balanced</button>
-        <button class="strat-btn"        data-strat="funding_arb"       onclick="setStrategy('funding_arb')">Funding Arb</button>
-        <button class="strat-btn"        data-strat="momentum_breakout" onclick="setStrategy('momentum_breakout')">Momentum</button>
-        <button class="strat-btn"        data-strat="mean_reversion"    onclick="setStrategy('mean_reversion')">Mean Rev</button>
         <span id="strat-lbl"></span>
       </div>
+
+      <!-- Strategy explainer — shown/hidden by setStrategy(); populated from H.strategies -->
+      <div id="strategy-explainer"></div>
 
       <!-- Stat bar -->
       <div id="stat-bar" class="hidden">
@@ -1199,10 +1243,6 @@
             <span class="hist-filter-lbl">Strategy</span>
             <select id="hf-strategy" class="hist-filter-select" onchange="filterClosedHistory()">
               <option value="">All</option>
-              <option value="Balanced">Balanced</option>
-              <option value="Funding Arb">Funding Arb</option>
-              <option value="Momentum Breakout">Momentum Breakout</option>
-              <option value="Mean Reversion">Mean Reversion</option>
             </select>
             <span class="hist-filter-lbl" style="margin-left:6px">Direction</span>
             <select id="hf-dir" class="hist-filter-select" onchange="filterClosedHistory()">
@@ -1302,6 +1342,8 @@ const S = {
   countdownId: null,
   volFilter:  'any',    // any | low | medium | high_extreme
   minVolume:  0,        // minimum 24h volume in USD (0 = no filter)
+  explainerOpen: false, // true when #strategy-explainer is visible
+  editingStrategy: null, // strategy key currently loaded in custom editor
 };
 
 /* ============================================================
@@ -1996,7 +2038,61 @@ const TAG_TIPS = {
   'counter_trend':   'Signal fires against the daily trend direction — higher risk, lower historical win rate.',
 };
 
-function setStrategy(key) {
+async function loadStrategies() {
+  if (H.strategies) return H.strategies;
+  const resp = await fetch('/api/strategies');
+  const data = await resp.json();
+  if (!data.success || !data.strategies) throw new Error('Failed to load strategies');
+  H.strategies = data.strategies;
+  return H.strategies;
+}
+
+async function refreshStrategies() {
+  H.strategies = null;
+  return await loadStrategies();
+}
+
+async function renderStrategyButtons() {
+  try {
+    const strategies = await loadStrategies();
+
+    const bar = $('strategy-bar');
+    const lbl = $('strat-lbl');
+    bar.querySelectorAll('.strat-btn').forEach(btn => btn.remove());
+    // Insert buttons before the label span
+    strategies.forEach(strat => {
+      const btn = document.createElement('button');
+      btn.className = 'strat-btn' + (strat.key === S.strategy ? ' active' : '') + (strat.is_custom ? ' custom' : '');
+      btn.dataset.strat = strat.key;
+      btn.onclick = () => setStrategy(strat.key, true);
+      btn.textContent = strat.name;
+      const meta = STRAT_META[strat.key];
+      btn.title = meta ? meta.tooltip : `${strat.name} · custom strategy`;
+      bar.insertBefore(btn, lbl);
+    });
+
+    // Populate closed-history strategy filter with display names (must match DB strings)
+    const sel = $('hf-strategy');
+    if (sel) {
+      sel.querySelectorAll('option:not([value=""])').forEach(opt => opt.remove());
+      strategies.forEach(strat => {
+        const opt = document.createElement('option');
+        opt.value = strat.name;
+        opt.textContent = strat.name;
+        sel.appendChild(opt);
+      });
+    }
+
+    // Re-apply active state and label now that buttons exist
+    setStrategy(S.strategy);
+  } catch (e) {
+    console.warn('strategy metadata load failed:', e);
+  }
+}
+
+async function setStrategy(key, fromUser = false) {
+  fromUser = fromUser || (window.event && window.event.currentTarget && window.event.currentTarget.classList.contains('strat-btn'));
+  const wasSelected = key === S.strategy;
   S.strategy = key;
   document.querySelectorAll('.strat-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.strat === key);
@@ -2006,6 +2102,257 @@ function setStrategy(key) {
   const meta = STRAT_META[key];
   const lbl = $('strat-lbl');
   if (lbl && meta) lbl.textContent = `Max leverage: ${meta.cap}×  ·  ${meta.desc}`;
+
+  if (!fromUser) return;
+  let strategies = H.strategies;
+  if (!strategies) {
+    try {
+      strategies = await loadStrategies();
+    } catch (e) {
+      console.warn('strategy explainer unavailable:', e);
+      return;
+    }
+  }
+  const strat = strategies.find(s => s.key === key);
+  if (!strat) return;
+  if (lbl && !meta) lbl.textContent = `Max leverage: ${strat.max_leverage}×  ·  ${strat.is_custom ? 'custom' : (strat.risk_level || 'strategy')} strategy`;
+  const panel = $('strategy-explainer');
+  if (!panel) return;
+  if (wasSelected && S.explainerOpen) {
+    panel.style.display = 'none';
+    S.explainerOpen = false;
+  } else {
+    populateExplainer(strat);
+    panel.style.display = 'block';
+    S.explainerOpen = true;
+  }
+}
+
+function populateExplainer(strat) {
+  const REGIME_COLOR = { bull: 'var(--green)', bear: 'var(--red)', neutral: 'var(--amber)', any: 'var(--text3)' };
+  const FILTER_LABELS = {
+    min_funding_abs:    'Min |funding rate|',
+    min_24h_change_pct: 'Min |24h move|',
+    rsi_long_max:       'RSI long max (LONG only if RSI <)',
+    rsi_short_min:      'RSI short min (SHORT only if RSI >)',
+  };
+  const regimeColor = REGIME_COLOR[strat.regime] || 'var(--text3)';
+  const p = strat.performance || {};
+  const wr = p.win_rate != null ? (p.win_rate * 100).toFixed(1) + '%' : null;
+  const avgConv = p.avg_conviction != null ? p.avg_conviction.toFixed(1) : null;
+  const customBadge = strat.is_custom ? '<span class="sx-custom-badge">Custom</span>' : '';
+  const baseMeta = strat.is_custom ? `<span>Base <span class="sx-param-val">${esc(strat.base_key || 'balanced')}</span></span>` : '';
+  const actionsHTML = `
+    <div class="sx-actions">
+      <button class="sx-action" onclick="showStrategyEditor('${esc(strat.key)}','clone')">Clone</button>
+      ${strat.is_custom ? `<button class="sx-action" onclick="showStrategyEditor('${esc(strat.key)}','edit')">Edit</button>
+      <button class="sx-action" onclick="toggleCustomStrategy('${esc(strat.key)}', ${strat.enabled ? 'false' : 'true'})">${strat.enabled ? 'Disable' : 'Enable'}</button>
+      <button class="sx-action danger" onclick="deleteCustomStrategy('${esc(strat.key)}')">Delete</button>` : ''}
+    </div>`;
+
+  // Weights bars (momentum / funding / basis only — volume_mult is a different scale)
+  const wKeys = ['momentum', 'funding', 'basis'];
+  const maxW = Math.max(...wKeys.map(k => strat.weights[k] || 0)) || 1;
+  const barsHTML = wKeys.map(k => {
+    const v = strat.weights[k] || 0;
+    const pct = Math.round(v / maxW * 100);
+    return `<div class="sx-bar-row">
+      <div class="sx-bar-meta"><span>${k.charAt(0).toUpperCase() + k.slice(1)}</span><span class="sx-bar-val">${v}</span></div>
+      <div class="sx-bar-track"><div class="sx-bar-fill" style="width:${pct}%"></div></div>
+    </div>`;
+  }).join('');
+
+  // Filters
+  const filterEntries = Object.entries(strat.filters || {});
+  const filtersHTML = filterEntries.length
+    ? filterEntries.map(([k, v]) => {
+        const lbl = FILTER_LABELS[k] || k;
+        return `<div class="sx-filter-row">${lbl}: <span class="sx-filter-val">${v}</span></div>`;
+      }).join('')
+    : '<div class="sx-filter-row" style="color:var(--text3)">None — fires on all qualifying pairs</div>';
+
+  $('strategy-explainer').innerHTML = `
+    <div class="sx-header">
+      <span class="sx-name">${strat.name}</span>
+      ${customBadge}
+      <span class="sx-regime" style="color:${regimeColor};border-color:${regimeColor}">${strat.regime}</span>
+    </div>
+    <p class="sx-desc">${strat.description}</p>
+    <div class="sx-section">
+      <div class="sx-section-lbl">Weights</div>
+      ${barsHTML}
+    </div>
+    <div class="sx-section">
+      <div class="sx-section-lbl">Gates</div>
+      ${filtersHTML}
+    </div>
+    <div class="sx-section">
+      <div class="sx-section-lbl">Parameters</div>
+      <div class="sx-params">
+        <span>Min conviction <span class="sx-param-val">${strat.min_conviction}</span></span>
+        <span>Max leverage <span class="sx-param-val">${strat.max_leverage}×</span></span>
+        <span>Volume boost <span class="sx-param-val">${strat.weights.volume}×</span></span>
+        ${baseMeta}
+      </div>
+    </div>
+    <div class="sx-section" style="margin-bottom:0">
+      <div class="sx-section-lbl">Performance</div>
+      ${p.total_signals === 0 ? '<div style="font-size:11px;color:var(--text3)">No signals logged yet</div>' : `
+      <div class="sx-perf">
+        <div><div class="sx-perf-lbl">Signals</div><div class="sx-perf-val">${p.total_signals}</div></div>
+        <div><div class="sx-perf-lbl">Win rate</div><div class="sx-perf-val" style="color:${wr ? 'var(--green)' : 'var(--text)'}">${wr ?? 'No closed signals yet'}</div></div>
+        <div><div class="sx-perf-lbl">Avg conviction</div><div class="sx-perf-val">${avgConv ?? '—'}</div></div>
+        <div><div class="sx-perf-lbl">Top symbol</div><div class="sx-perf-val">${p.top_symbol ?? '—'}</div></div>
+      </div>`}
+    </div>
+    ${actionsHTML}
+    <div id="strategy-editor"></div>`;
+}
+
+function defaultCloneKey(strat) {
+  const base = (strat.key || strat.name || 'strategy').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return ('custom_' + base + '_copy').slice(0, 64);
+}
+
+function showStrategyEditor(strategyKey, mode = 'clone') {
+  const strat = (H.strategies || []).find(s => s.key === strategyKey);
+  if (!strat) return;
+  const isEdit = mode === 'edit' && strat.is_custom;
+  S.editingStrategy = strategyKey;
+  const target = $('strategy-editor');
+  if (!target) return;
+  const w = strat.weights || {};
+  const f = strat.filters || {};
+  target.innerHTML = `
+    <div class="sx-editor">
+      <div class="sx-section-lbl">${isEdit ? 'Edit Custom Strategy' : 'Clone Strategy'}</div>
+      <div class="sx-editor-grid">
+        <div class="sx-field"><label>Name</label><input id="sx-ed-name" value="${esc(isEdit ? strat.name : strat.name + ' Copy')}"></div>
+        <div class="sx-field"><label>Key</label><input id="sx-ed-key" value="${esc(isEdit ? strat.key : defaultCloneKey(strat))}" ${isEdit ? 'disabled' : ''}></div>
+        <div class="sx-field"><label>Base</label><select id="sx-ed-base" ${isEdit ? 'disabled' : ''}>
+          ${['balanced','funding_arb','momentum_breakout','mean_reversion'].map(k => `<option value="${k}" ${((strat.base_key || strat.key) === k) ? 'selected' : ''}>${k.replace(/_/g, ' ')}</option>`).join('')}
+        </select></div>
+        <div class="sx-field"><label>Regime</label><select id="sx-ed-regime">
+          ${['any','bull','bear','neutral'].map(k => `<option value="${k}" ${strat.regime === k ? 'selected' : ''}>${k}</option>`).join('')}
+        </select></div>
+        <div class="sx-field"><label>Momentum</label><input id="sx-ed-momentum" type="number" min="0" max="100" value="${w.momentum ?? 0}"></div>
+        <div class="sx-field"><label>Funding</label><input id="sx-ed-funding" type="number" min="0" max="100" value="${w.funding ?? 0}"></div>
+        <div class="sx-field"><label>Basis</label><input id="sx-ed-basis" type="number" min="0" max="100" value="${w.basis ?? 0}"></div>
+        <div class="sx-field"><label>Volume</label><input id="sx-ed-volume" type="number" min="0.5" max="2" step="0.1" value="${w.volume ?? 1}"></div>
+        <div class="sx-field"><label>Min Conviction</label><input id="sx-ed-min-conv" type="number" min="0" max="100" value="${strat.min_conviction ?? 55}"></div>
+        <div class="sx-field"><label>Max Lev</label><input id="sx-ed-lev" type="number" min="1" max="50" value="${strat.max_leverage ?? 10}"></div>
+        <div class="sx-field"><label>Min Funding</label><input id="sx-ed-min-funding" type="number" min="0" max="0.01" step="0.0001" value="${f.min_funding_abs ?? ''}"></div>
+        <div class="sx-field"><label>Min 24h %</label><input id="sx-ed-min-move" type="number" min="0" max="50" step="0.1" value="${f.min_24h_change_pct ?? ''}"></div>
+        <div class="sx-field"><label>RSI Long Max</label><input id="sx-ed-rsi-long" type="number" min="1" max="99" value="${f.rsi_long_max ?? ''}"></div>
+        <div class="sx-field"><label>RSI Short Min</label><input id="sx-ed-rsi-short" type="number" min="1" max="99" value="${f.rsi_short_min ?? ''}"></div>
+        <div class="sx-field"><label>Risk</label><select id="sx-ed-risk">
+          ${['low','medium','high'].map(k => `<option value="${k}" ${(strat.risk_level || 'medium') === k ? 'selected' : ''}>${k}</option>`).join('')}
+        </select></div>
+        <div class="sx-field"><label>Enabled</label><select id="sx-ed-enabled">
+          <option value="true" ${strat.enabled !== false ? 'selected' : ''}>yes</option>
+          <option value="false" ${strat.enabled === false ? 'selected' : ''}>no</option>
+        </select></div>
+        <div class="sx-field" style="grid-column:1/-1"><label>Description</label><textarea id="sx-ed-desc">${esc(strat.description || '')}</textarea></div>
+      </div>
+      <div class="sx-actions">
+        <button class="sx-action" onclick="saveStrategyEditor('${mode}','${esc(isEdit ? strat.key : '')}')">${isEdit ? 'Save' : 'Create'}</button>
+        <button class="sx-action" onclick="$('strategy-editor').innerHTML=''">Cancel</button>
+      </div>
+      <div id="sx-editor-msg" class="sx-editor-msg"></div>
+    </div>`;
+}
+
+function editorNumber(id, fallback = null) {
+  const el = $(id);
+  if (!el || el.value === '') return fallback;
+  const n = Number(el.value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function buildEditorPayload() {
+  const filters = {};
+  const minFunding = editorNumber('sx-ed-min-funding');
+  const minMove = editorNumber('sx-ed-min-move');
+  const rsiLong = editorNumber('sx-ed-rsi-long');
+  const rsiShort = editorNumber('sx-ed-rsi-short');
+  if (minFunding !== null) filters.min_funding_abs = minFunding;
+  if (minMove !== null) filters.min_24h_change_pct = minMove;
+  if (rsiLong !== null) filters.rsi_long_max = rsiLong;
+  if (rsiShort !== null) filters.rsi_short_min = rsiShort;
+  return {
+    name: $('sx-ed-name').value.trim(),
+    key: $('sx-ed-key').value.trim(),
+    base_key: $('sx-ed-base').value,
+    regime: $('sx-ed-regime').value,
+    risk_level: $('sx-ed-risk').value,
+    enabled: $('sx-ed-enabled').value === 'true',
+    description: $('sx-ed-desc').value.trim(),
+    weights: {
+      momentum: editorNumber('sx-ed-momentum', 0),
+      funding: editorNumber('sx-ed-funding', 0),
+      basis: editorNumber('sx-ed-basis', 0),
+      volume: editorNumber('sx-ed-volume', 1),
+    },
+    filters,
+    min_conviction: editorNumber('sx-ed-min-conv', 55),
+    leverage_cap: editorNumber('sx-ed-lev', 10),
+  };
+}
+
+async function saveStrategyEditor(mode, existingKey = '') {
+  const msg = $('sx-editor-msg');
+  if (msg) { msg.className = 'sx-editor-msg'; msg.textContent = 'Saving...'; }
+  const payload = buildEditorPayload();
+  const isEdit = mode === 'edit' && existingKey;
+  try {
+    const resp = await fetch(isEdit ? `/api/strategies/custom/${encodeURIComponent(existingKey)}` : '/api/strategies/custom', {
+      method: isEdit ? 'PATCH' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || 'Save failed');
+    await refreshStrategies();
+    await renderStrategyButtons();
+    S.explainerOpen = false;
+    await setStrategy(data.strategy.key, true);
+    if (msg) { msg.className = 'sx-editor-msg ok'; msg.textContent = 'Saved'; }
+  } catch (e) {
+    if (msg) { msg.className = 'sx-editor-msg error'; msg.textContent = e.message; }
+  }
+}
+
+async function toggleCustomStrategy(key, enabled) {
+  try {
+    const resp = await fetch(`/api/strategies/custom/${encodeURIComponent(key)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || 'Update failed');
+    await refreshStrategies();
+    await renderStrategyButtons();
+    if (!enabled && S.strategy === key) { S.explainerOpen = false; await setStrategy('balanced', true); }
+    else populateExplainer(data.strategy);
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function deleteCustomStrategy(key) {
+  if (!confirm('Delete this custom strategy? Historical signals stay in history.')) return;
+  try {
+    const resp = await fetch(`/api/strategies/custom/${encodeURIComponent(key)}`, { method: 'DELETE' });
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || 'Delete failed');
+    await refreshStrategies();
+    await renderStrategyButtons();
+    S.explainerOpen = false;
+    await setStrategy('balanced', true);
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 function saveFilters() {
@@ -2634,6 +2981,7 @@ const H = {
   closedSort:         'logged_at',
   closedSortDir:      'desc',
   priceStream:        null,   // EventSource handle for SSE price stream (/api/stream/prices)
+  strategies:         null,   // array from GET /api/strategies — populated on page load
 };
 
 let lastHistorySigs = [];
@@ -3709,6 +4057,7 @@ if (savedAcct && $('hist-account-size')) $('hist-account-size').value = savedAcc
 setPhase('idle');
 setMktPhase('idle');
 setStrategy('balanced');
+renderStrategyButtons();  // async: fetches /api/strategies, renders buttons + populates history filter
 // Set initial sort indicator
 const initSi = document.getElementById('si-conviction_base');
 if (initSi) initSi.textContent = ' ↓';

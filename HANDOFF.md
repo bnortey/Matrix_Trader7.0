@@ -7,8 +7,9 @@
 
 Last updated: 2026-04-24
 Last commit: b8abdb2 feat: capture exit_price in evaluate_outcome() — close price of triggering candle
-app.py: 1775 lines
-index.html: 3770 lines
+app.py: 2411 lines
+index.html: 4119 lines
+HANDOFF.md: 745 lines
 
 ---
 
@@ -60,10 +61,10 @@ Matrix_Trader_7.0/
 ├── .gitignore             ← covers .env, __pycache__, data/
 ├── .env                   ← ANTHROPIC_API_KEY, MATRIX_PORT (not committed; never touch)
 ├── requirements.txt       ← all deps installed; add packages here if needed
-├── app.py                 ← entire Flask backend, 1694 lines; keep flat, one file
+├── app.py                 ← entire Flask backend, 2269 lines; keep flat, one file
 ├── backtest.py            ← standalone script; do NOT import from app.py
 ├── templates/
-│   └── index.html         ← entire frontend: HTML + CSS + JS, 3604 lines; one file
+│   └── index.html         ← entire frontend: HTML + CSS + JS, 4119 lines; one file
 ├── static/                ← directory exists; no style.css — all CSS is inline in index.html
 ├── docs/
 │   ├── design-brief.md    ← original design doc; read-only reference
@@ -153,6 +154,10 @@ Sentiment APIs (no key needed):
 | `/api/outcomes/check` | POST | Evaluates all open (untagged) signals against Min15 klines; auto-tags hits |
 | `/api/prices` | GET | Batch price fetch for multiple symbols — used by open positions panel |
 | `/api/stream/prices` | GET | SSE stream: price updates every 3s for `?symbols=` (comma-sep); replaces 30s polling when History tab is active |
+| `/api/strategies` | GET | Returns built-in + enabled custom strategy configs; `?include_disabled=1` includes disabled custom strategies |
+| `/api/strategies/custom` | POST | Creates a custom strategy from a built-in base with validated weights/filters/risk settings |
+| `/api/strategies/custom/<strategy_key>` | PATCH | Updates a custom strategy; supports enable/disable and config edits |
+| `/api/strategies/custom/<strategy_key>` | DELETE | Deletes a custom strategy definition; historical signals remain intact |
 | `/api/analysis` | POST | AI strategy review: sends last 200 tagged outcomes to Claude API |
 
 Query params for `/api/scan`: `threshold` (int, default 55), `strategy` (string, default "balanced").
@@ -238,6 +243,8 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
 | `signal_json` | TEXT \| NULL | Full enriched signal snapshot at scan time for later research/backtesting |
 | `data_quality` | TEXT \| NULL | `current` for post-fix rows; `legacy_pre_fill_check` for pre-fix rows |
 | `evaluation_version` | TEXT \| NULL | `entry_fill_v2` for corrected auto-evaluation; `pre_entry_fill_v1` for legacy outcomes |
+| `pnl_pct` | REAL \| NULL | Leveraged P&L % (raw_pct × leverage); written by `evaluate_outcome()` and PATCH with exit_price; NULL for EXPIRED/SKIPPED and old manual tags without exit_price |
+| `leverage` | REAL \| NULL | Strategy leverage cap at signal time; written by `log_signals()`; backfilled from `signal_json.leverage_cap` for old rows on startup |
 
 `ai_report` is a JSON string: `[{"label": "Setup", "text": "..."}, {"label": "Structure", ...}, ...]`
 Parse with `JSON.parse()` in the frontend. Four sections: Setup, Structure, Invalidation, Risk.
@@ -263,6 +270,8 @@ const S = {
   countdownId: null,
   volFilter:  'any',    // any | low | medium | high_extreme
   minVolume:  0,        // minimum 24h volume in USD (0 = no filter)
+  explainerOpen: false, // true when #strategy-explainer is visible
+  editingStrategy: null,// strategy key currently loaded in custom editor
 };
 
 const M = {
@@ -295,6 +304,7 @@ const H = {
   posSortDir:         'asc',  // 'asc' | 'desc'
   posStratFilter:     '',     // '' = all strategies
   priceStream:        null,   // EventSource handle for SSE price stream (/api/stream/prices)
+  strategies:         null,   // array from GET /api/strategies — populated on page load
 };
 
 let lastHistorySigs = [];
@@ -324,7 +334,11 @@ Four tabs, one shared detail panel:
 
 **Shared detail panel** (`#detail-panel`, `<aside>`): populated by `renderDetail(sig)` from signals or market tab. Slides in from right on desktop; slides up from bottom on mobile. Contains `#panel-resize-handle` (drag-to-resize, hidden on mobile) and `#panel-body` (all innerHTML writes target this, not the aside itself).
 
-**Strategy bar** (inside `#signals-section`): four pills (Balanced / Funding Arb / Momentum / Mean Rev).
+**Strategy bar** (inside `#signals-section`): four pills (Balanced / Funding Arb / Momentum / Mean Rev). Clicking a pill shows/hides `#strategy-explainer` (toggle). `setStrategy(key, fromUser)` — pass `fromUser=true` only from user click handlers; programmatic calls must omit it to avoid showing the explainer on init.
+
+**Strategy explainer** (`#strategy-explainer`, below `#strategy-bar`): inline panel hidden by default (`display:none`). Shows regime badge, optional Custom badge, description, weight bars (momentum/funding/basis), gates/filters, parameters, live performance stats, and strategy actions. Populated by `populateExplainer(strat)`. Toggle controlled by `S.explainerOpen`.
+
+**Strategy editor** (`#strategy-editor`, rendered inside `#strategy-explainer`): compact inline form opened by Clone/Edit actions. Lets users set name/key/base/regime/risk, weights, filters, min conviction, leverage cap, enabled state, and description. Uses `POST /api/strategies/custom`, `PATCH /api/strategies/custom/<key>`, and `DELETE /api/strategies/custom/<key>`, then refreshes `H.strategies` and rerenders strategy pills.
 
 **Filter bar** (inside `#signals-section`): direction toggle, volatility filter select, min-volume input. State persisted to localStorage key `mt7_filters`.
 
@@ -408,7 +422,10 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P3d+ | exit_price capture in evaluate_outcome() — close price of triggering candle | ✅ Done |
 | P3d++ | Closed signal row click → detail panel (trade summary + Claude coach review) | ✅ Done |
 | P3e | SSE live price refresh for open positions (History tab) | ✅ Done |
-| Strategy Lab | First-class strategy keys, explainers, custom strategy configs, per-strategy tracking | 🔲 Planned |
+| Strategy Lab foundation | strategy_key end-to-end, GET /api/strategies, dynamic UI from API | ✅ Done |
+| Strategy Lab explainer | Per-strategy explainer panel (weights, filters, historical performance) | ✅ Done |
+| Strategy Lab custom backend | SQLite persistence, validation, custom strategy CRUD routes, scan support | ✅ Done |
+| Strategy Lab custom UI | Clone/edit/save custom strategies from dashboard | ✅ Done |
 | P4 | README, GitHub publish, 5 external beta testers | 🔲 Planned |
 
 ---
@@ -417,13 +434,11 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 
 Next in priority order:
 
-1. **P3e — WebSocket live price refresh**: Wire `lib/mexc_stream.py` to the frontend for real-time price updates on open positions and watched pairs. The library exists and is complete but is not connected to any Flask route or UI. Approach: add a Server-Sent Events (SSE) endpoint in `app.py` that streams price updates; frontend subscribes on History tab entry and unsubscribes on tab leave. This replaces/augments the current 30s polling via `GET /api/prices`.
+1. **Strategy Lab mobile/user QA pass**: Verify clone/edit/save/disable/delete on desktop and iPhone Safari after deploy. Pay close attention to the inline editor height, keyboard behavior, and strategy bar overflow when custom strategies are added.
 
-2. **Strategy Lab foundation — make strategies first-class**: Current strategies are hardcoded scoring profiles, not user-editable strategy modules. Before adding custom strategies, add stable `strategy_key` alongside the existing human `strategy` name everywhere signals are created, logged, filtered, refreshed, and analyzed. Add `GET /api/strategies` so the frontend renders strategy pills and history filters from backend metadata instead of duplicating hardcoded names in `index.html`. Then add a compact strategy explainer panel showing weights, filters, min conviction, leverage cap, intended market regime, and how the score is assembled.
+2. **Strategy analytics / comparison layer**: Add compact analytics that compare built-ins and custom strategies: total signals, open/closed counts, win rate, average R/P&L, best/worst symbols, and performance by volatility/regime where available. This should build on the existing `/api/strategies` performance object rather than creating a second analytics path.
 
-3. **Strategy Lab custom configs — user-created strategies**: After `strategy_key` exists end-to-end, allow users to duplicate a prebuilt strategy, edit weights/filters/min conviction/leverage cap, run scans under that custom strategy, and track outcomes separately. Store custom strategy configs in a local persistent format (SQLite table or local JSON file) rather than app state. Keep execution manual; this is for signal research and paper-tracking, not auto-trading.
-
-4. **P4 — Public release**: Write external-facing `README.md` with full setup instructions (currently minimal). Push to GitHub. Recruit 5 external beta testers.
+3. **P4 — Public release**: Write external-facing `README.md` with full setup instructions (currently minimal). Include local run and VPS deploy/restart notes. Push to GitHub. Recruit 5 external beta testers.
 
 ---
 
@@ -440,19 +455,16 @@ Current reality:
 - `backtest.py` already iterates all strategies in `STRATEGIES`, but it mirrors only part of live enrichment and should remain a standalone live-data research script.
 
 Important gaps before user-created strategies:
-- The backend returns/stores only human display names like `"Balanced"` in signal rows. It does not persist a stable `strategy_key` like `"balanced"`.
-- The frontend hardcodes strategy buttons, metadata, history filter options, and leverage fallback maps. Adding a new strategy currently requires editing multiple UI constants.
-- `GET /api/signal/<symbol>` enriches with Balanced regardless of the original logged strategy. Open-position live detail refresh can therefore merge Balanced context/leverage into a non-Balanced signal.
-- There is no in-app strategy explainer that shows weights, gates, scoring rules, and historical performance together.
-- There is no safe user strategy schema, validation layer, persistence, or editor.
+- Built-in and custom strategy identity now use stable `strategy_key` values. Custom keys are persisted in SQLite.
+- The frontend still keeps `STRAT_META` and `STRATEGY_LEVERAGE` as fallbacks. This is acceptable for built-ins, but custom strategies must not require adding new hardcoded frontend constants.
+- The backend has a safe custom strategy schema, validation layer, persistence table, CRUD routes, and scan support.
+- The frontend editor exists inline inside the strategy explainer. It still needs real-device QA after deploy.
+- Custom strategy signal JSON includes `strategy_is_custom` and `strategy_config` snapshot data. The relational `signals` table still only has `strategy_key`; use `signal_json` when future analysis needs config-level details.
 
 Recommended implementation order:
-1. Add `strategy_key` to enriched signal dicts, SQLite logging, history serialization, closed detail responses, and analysis payloads. Keep `strategy` as the display name for backwards compatibility.
-2. Add `GET /api/strategies` returning backend-owned metadata: key, name, description, risk level, weights, filters, leverage cap, min conviction, and short explainer text.
-3. Update `index.html` to render scan pills, history filter options, open-position strategy filters, and leverage fallback from `/api/strategies` instead of hardcoded `STRAT_META` / `STRATEGY_LEVERAGE`.
-4. Update `GET /api/signal/<symbol>` to accept a `strategy` query param and use that strategy for live context refreshes.
-5. Add the strategy explainer UI before custom strategy editing. Users need to understand the built-ins before cloning/tuning them.
-6. Add custom strategy persistence only after the key/metadata/explainer path is stable.
+1. Run mobile/desktop QA on the custom editor and fix any layout or workflow issues.
+2. Add strategy analytics/comparison after custom UI is verified usable.
+3. Prepare P4 README and beta tester flow after analytics is useful enough to explain externally.
 
 ---
 
@@ -473,7 +485,7 @@ Recommended implementation order:
 - Do not rename `fmtAge` — a naming collision between the history tab helper and a stale global caused corrupted scan timestamps (fixed in commit 8037615). The function name is intentional.
 - Do not touch the equity sparkline's mousemove/crosshair logic without testing hover on mobile — canvas mouse events behave differently on touch.
 - Do not change strategy filter option values in the history tab — they must match the DB strings exactly: "Balanced", "Funding Arb", "Momentum Breakout". A mismatch causes silent empty results.
-- Do not add new strategies by editing only one place. Until `GET /api/strategies` exists, strategy metadata is duplicated across `app.py` (`STRATEGIES`) and `index.html` (`STRAT_META`, strategy buttons, history filter options, `STRATEGY_LEVERAGE`). Keep them in sync or, preferably, complete the Strategy Lab foundation first.
+- Do not add new strategies by editing only one place. Strategy metadata now spans: `STRATEGIES` and `_STRATEGY_NAME_TO_KEY` in `app.py`; `STRAT_META` and `STRATEGY_LEVERAGE` in `index.html` (kept as fallbacks). When adding a strategy, update all four plus the descriptions/regime maps inside `api_strategies()`.
 - Do not refresh a logged signal's live detail with Balanced by accident. `GET /api/signal/<symbol>` currently defaults to Balanced; when adding strategy-aware refresh, pass the original `strategy_key` and preserve the original paper-trade entries/exits/stop.
 - Do not set `exit_price` to 0 when unknown — use NULL so it can be distinguished from a genuine zero-price edge case. Only `evaluate_outcome()` writes `exit_price`; manual tags via `PATCH /api/signal/result` leave it NULL.
 - Do not use `display: none` on `:nth-child()` td/th cells to hide columns in a `table-layout: fixed` JS-generated table — the column slot still exists in the layout algorithm and the table overflows. Use conditional JS rendering instead (skip rendering hidden cells in the template literal).
@@ -497,6 +509,32 @@ python3 app.py
 Opens at `http://localhost:8080` (auto-increments if busy).
 Opens at `http://<LAN_IP>:8080` on iPhone (same WiFi).
 Port configurable via `MATRIX_PORT` env var.
+
+## VPS Deploy / Restart
+
+The live VPS app runs from `/opt/matrix-trader/` on `root@62.238.15.113`. After local edits, sync code and restart the service; otherwise Flask may keep serving the old template/process even though local files are fixed.
+
+```bash
+cd /Users/bnortey/Documents/coding_projects/Matrix_Trader_7.0
+rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+ssh root@62.238.15.113
+systemctl restart matrix-trader
+systemctl status matrix-trader --no-pager
+```
+
+If the service gets wedged and `systemctl restart` does not clear it, a force kill is acceptable on this single-purpose VPS:
+
+```bash
+pkill -9 python3 2>/dev/null && sleep 3 && pkill -9 python3 2>/dev/null && sleep 2 && systemctl start matrix-trader && sleep 8
+ss -tulnp | grep python
+```
+
+Post-deploy smoke checks:
+
+```bash
+curl -s http://localhost:8080/ | grep "loadStrategies"
+curl -s http://localhost:8080/api/strategies
+```
 
 Run backtest separately (makes live MEXC API calls, takes ~5 min):
 ```bash
@@ -581,9 +619,47 @@ Deploy after self-verify and HANDOFF.md update are both complete
 - [ ] localStorage key `mt7_filters` persists filter state across reloads
 - [ ] localStorage key `mt7_guide_seen` hides the first-run guide on return visits
 - [ ] localStorage key `mt7_panel_width` persists detail panel width; restored on reload
+- [ ] `/api/strategies` response includes `performance` object per strategy with `total_signals`, `wins`, `losses`, `win_rate`, `avg_conviction`, `top_symbol`
+- [ ] Clicking a strategy button shows `#strategy-explainer` with correct weights bars, gates, parameters, and performance stats
+- [ ] Clicking the same strategy button again hides the explainer (`S.explainerOpen` toggles false)
+- [ ] Win rate shows as percentage when closed signals exist; "No closed signals yet" when `win_rate` is null
+- [ ] Weight bars render with relative widths (momentum/funding/basis); volume shown as multiplier in Parameters row
+- [ ] `signals` table has `strategy_key` column; existing rows backfilled from display name (e.g., `Balanced` → `balanced`)
+- [ ] New scans write `strategy_key` alongside `strategy` display name in `log_signals()`
+- [ ] `GET /api/strategies` returns 4 strategies with `key`, `name`, `description`, `weights`, `filters`, `min_conviction`, `max_leverage`, `regime`
+- [ ] Strategy buttons in signals tab render dynamically from `/api/strategies` (not hardcoded HTML)
+- [ ] Closed-history `#hf-strategy` dropdown options populated from `/api/strategies`; values are display names matching DB strings
+- [ ] `GET /api/signal/<symbol>` uses the logged signal's `strategy_key` (not always Balanced); falls back to Balanced if no DB record
+- [ ] `custom_strategies` table exists after `init_db()` with key/name/base_key/enabled/config_json/created_at/updated_at
+- [ ] `POST /api/strategies/custom` creates a custom strategy and returns `is_custom: true`
+- [ ] `PATCH /api/strategies/custom/<key>` can disable a custom strategy; disabled strategies are hidden from normal `/api/strategies`
+- [ ] `GET /api/strategies?include_disabled=1` includes disabled custom strategies
+- [ ] `DELETE /api/strategies/custom/<key>` removes the custom definition without touching historical signals
+- [ ] `GET /api/scan?strategy=<custom_key>` accepts enabled custom strategy keys and logs `strategy_key`
+- [ ] Clicking Clone in `#strategy-explainer` opens `#strategy-editor` with prefilled values
+- [ ] Creating a custom strategy from the editor adds a custom pill to `#strategy-bar`
+- [ ] Editing a custom strategy updates `/api/strategies` and refreshes the explainer without collapsing
+- [ ] Disabling a selected custom strategy returns selection to Balanced and hides it from the normal strategy list
+- [ ] Deleting a custom strategy removes the pill and preserves historical signals
+- [ ] Mobile: custom editor fields fit at 375px without horizontal scroll
 - [ ] `GET /api/stream/prices?symbols=BTC_USDT` returns `Content-Type: text/event-stream` and streams `data: {...}` events every ~3s
 - [ ] History tab entry subscribes SSE and `H.priceStream` is set; leaving the tab closes the stream and sets it to null
 - [ ] `H.posRefreshTimer` is null while SSE is active; restores on SSE error/close
+- [ ] `signals` table has `pnl_pct` and `leverage` columns after `init_db()` runs
+- [ ] `leverage` is backfilled from `signal_json.leverage_cap` for existing rows on startup
+- [ ] New scans write `leverage` from `sig.get("leverage_cap")` at log time
+- [ ] PARTIAL `exit_price` with stop hit is a blended price, not just the last TP level
+- [ ] WIN/LOSS/PARTIAL all write leveraged `pnl_pct` to DB at `evaluate_outcome()` time via `api_outcomes_check()`
+- [ ] `PATCH /api/signal/result` with `exit_price` in body persists `exit_price` and `pnl_pct`
+- [ ] Signals older than 80h get auto-tagged `EXPIRED` on next scan or outcome check
+- [ ] `pnl_pct` appears in `/api/signals/history` response (column included in `SELECT *`)
+- [ ] `/api/signal/detail/<id>` prefers persisted `pnl_pct`; falls back to on-the-fly for old rows
+- [ ] AI review prompt (`/api/analysis`) includes `avg pnl` per strategy and `pnl:%` per signal line
+- [ ] Pairs with < 50 1h candles are skipped before enrichment (enrich_signal returns None)
+- [ ] Pairs with < 20 4h candles are skipped before enrichment (enrich_signal returns None)
+- [ ] Skipped pairs log a stderr line: `[kline gate] {symbol} skipped — 1h:{n} 4h:{n}`
+- [ ] Signals with 50–99 1h candles OR 20–49 4h candles get `data_quality = "low"` in the signal dict and DB
+- [ ] `kline_depth_1h` and `kline_depth_4h` appear in `/api/signal/<symbol>` response signal object
 
 ---
 
@@ -602,10 +678,48 @@ Claude Code reads the actual files. It does not need the full HANDOFF.md pasted 
 
 ## Session Notes
 
+### 2026-04-24 — Session summary (paper trading data integrity sprint)
+Built: Seven changes to fix paper trading data accuracy for strategy evaluation. (1) Added `pnl_pct REAL` and `leverage REAL` columns to the `signals` table via idempotent ALTER TABLE migrations in `init_db()`. On startup, `leverage` is backfilled for all existing rows using `json_extract(signal_json, '$.leverage_cap')` in a single SQL UPDATE. (2) `log_signals()` now extracts `leverage_cap`/`max_leverage` from the signal dict and writes it to the DB at insert time alongside `strategy_key`. (3) PARTIAL outcomes in `evaluate_outcome()` now use a blended exit price (1/3 at each TP hit + remainder at stop) instead of recording the last TP hit as exit_price — e.g., TP1-then-stopped blends `(tp1/3) + (stop×2/3)`. (4) Added `_compute_leveraged_pnl(sig, exit_price)` helper that computes `raw_pct × leverage`, falling back to `signal_json.leverage_cap` if the `leverage` column is NULL; `evaluate_outcome()` result is now written with `pnl_pct` in the same UPDATE. (5) `PATCH /api/signal/result` now accepts optional `exit_price` and `entry_price` in the request body; if `exit_price` is provided, computes and persists `pnl_pct` using the same helper. (6) Added `expire_stale_signals()` which tags `result IS NULL` signals older than 80h as `EXPIRED` with `result_note='Auto-expired after 80h'`; called at the top of both `run_scan()` and `api_outcomes_check()`. (7) `api_signal_detail()` now prefers the persisted `pnl_pct` column and falls back to unleveraged on-the-fly for pre-migration rows; `api_analysis()` now includes `avg pnl` per strategy in the summary block and `pnl:{pct}%` in each signal log line.
+Decided: PARTIAL blended calc uses equal thirds (1/3 per tier). This models a standard ladder trade where each of three ladder entries closes the same position size. If future signals use unequal sizing, the helper will need a position-weight parameter. Blending only applies to `stop_hit and best_tp > 0` returns; PARTIAL-but-still-open (TP1 or TP2 hit, no stop) keeps exit_price = last TP hit.
+Watch out for: `expire_stale_signals()` runs inside `run_scan()` — it's a lightweight SQL query so latency impact is negligible, but it runs before the strategy registry fetch. If the DB is unavailable, the error is printed to stderr and `run_scan()` continues. `_compute_leveraged_pnl` defaults leverage to 1.0 if neither the DB column nor `signal_json.leverage_cap` is available — this means old manually-created test signals without leverage data will show unleveraged P&L, not zero. The `log_lines` list comprehension in `api_analysis()` uses an inline ternary to conditionally append `pnl:{pct}%`; if that logic needs extending, refactor to a helper function.
+
+### 2026-04-24 — Session summary (kline depth gate)
+Built: Added a minimum kline history gate inside `enrich_signal()` in `app.py`. After the 1h kline DataFrame is built, `n1h = len(df)` is measured. A second fetch (`Hour4`, limit=50) counts `n4h`. If `n1h < 50` OR `n4h < 20`, the function logs `[kline gate] {symbol} skipped — 1h:{n1h} 4h:{n4h}` to stderr and returns None — identical to all existing short-circuit returns so the caller needs no changes. Signals that pass the gate have `kline_depth_1h` and `kline_depth_4h` added to their dict. If `n1h < 100` or `n4h < 50`, `data_quality` is set to `"low"`; otherwise `"current"`. `log_signals()` now reads `sig.get("data_quality") or "current"` instead of hardcoding `"current"`, so logged signals inherit the low-quality flag. The `/api/signal/<symbol>` route exposes both depth fields automatically (signal dict pass-through).
+Decided: Thresholds — 50 1h candles (~2 days) and 20 4h candles (~3.3 days) as the hard gate; 100 1h / 50 4h as the soft "low quality" flag. The 4h fetch uses `limit=50` — just enough to count; the array is not used for any indicators. Gate uses the existing `return None` pattern, so `run_scan()` / `api_signal()` callers need no changes.
+Watch out for: The 4h kline fetch is an extra API call per enriched symbol (top 30 only). It adds latency to Stage 2 enrichment proportional to the number of enriched symbols. If scan times increase noticeably, consider batching or caching this depth check. The existing `len(df) < 16` check is still present and fires before the new gate — it's now effectively dead code for the normal path (50 > 16), but harmless to leave as an early guard.
+
 > **Session notes policy:** Keep the last three sessions verbatim. After that, extract
 > any new gotchas into "What NOT To Do", any new DOM structure into "Dashboard Structure",
 > and delete the raw note. Knowledge graduates into the permanent sections — it does not
 > accumulate here indefinitely.
+
+### 2026-04-24 — Session summary (Strategy Lab custom UI)
+Built: Added inline custom strategy editor inside `#strategy-explainer` in `templates/index.html`. The explainer now shows custom badges, base strategy metadata, and actions: Clone for all strategies; Edit/Disable/Delete for custom strategies. Added `#strategy-editor` form with fields for name, key, base, regime, weights, volume multiplier, min conviction, max leverage, filters, risk, enabled state, and description. Added JS helpers `refreshStrategies()`, `showStrategyEditor()`, `buildEditorPayload()`, `saveStrategyEditor()`, `toggleCustomStrategy()`, and `deleteCustomStrategy()`. Strategy buttons now visually distinguish custom strategies and refresh from `/api/strategies` after create/update/delete. Saving a selected strategy forces the explainer open so the same-key toggle behavior does not collapse it.
+Verified: Inline JS parse check and `python3 -c "import app; print('OK')"`. Browser/manual QA still needed after deploy, especially on iPhone Safari.
+Decided: The editor stays inline under the explainer instead of using a modal or new tab. This keeps the built-in explanation, performance, and custom tuning controls in one place and preserves the local single-page dashboard model.
+Watch out for: `esc()` is HTML escaping, not general JS string escaping. It is safe for current strategy keys because backend validation restricts keys to lowercase letters, numbers, and underscores. If future keys allow quotes or punctuation, update the onclick wiring to use event listeners instead of string interpolation.
+
+### 2026-04-24 — Session summary (Strategy Lab custom backend)
+Built: Added `custom_strategies` SQLite table in `init_db()` with stable key, display name, built-in base key, enabled flag, JSON config, and timestamps. Added backend strategy registry helpers that merge built-ins and enabled custom strategies into one shape for scanning and `/api/strategies`. Added server-side validation for custom keys, weights, volume multiplier, filters, min conviction, leverage cap, regime, and risk level. Extended signal enrichment/logging to carry `strategy_key`, `strategy_is_custom`, and a `strategy_config` snapshot in `signal_json`. Added custom strategy CRUD routes: `POST /api/strategies/custom`, `PATCH /api/strategies/custom/<key>`, and `DELETE /api/strategies/custom/<key>`. Extended `/api/strategies` to return custom metadata (`is_custom`, `enabled`, `base_key`) and support `?include_disabled=1`. `GET /api/scan?strategy=<custom_key>` now resolves enabled custom strategies through the merged registry.
+Verified: `python3 -m py_compile app.py`, `python3 -c "import app; print('OK')"`, and a Flask test-client flow that created `custom_codex_tmp`, confirmed it appeared in `/api/strategies`, disabled it, confirmed it was hidden from normal `/api/strategies`, confirmed it appeared with `?include_disabled=1`, then deleted it.
+Decided: Normal scans only resolve enabled strategies. `GET /api/signal/<symbol>` resolves with `include_disabled=True` so a disabled custom strategy can still refresh context for already-logged positions if the custom definition still exists. Deleted custom definitions leave historical signals intact; future analysis should use `signal_json.strategy_config` snapshots where config details matter.
+Watch out for: The frontend does not have a custom editor yet. Because current strategy buttons render all enabled `/api/strategies`, enabled custom strategies will appear automatically once created, but the UX for creating/editing them still needs to be built.
+
+### 2026-04-24 — Session summary (roadmap cleanup + deploy checklist)
+Built: Cleaned up `HANDOFF.md` after Strategy Lab foundation/explainer shipped. The phase table was already correct, but Current Task List and Strategy System Direction still described P3e/foundation/explainer as future work. Rewrote next priorities as Strategy Lab custom configs, strategy analytics/comparison, then P4 public release. Added a VPS Deploy / Restart section with the proven `rsync` + `systemctl restart matrix-trader` flow, the force-kill fallback for the single-purpose VPS, and smoke checks (`grep "loadStrategies"`, `/api/strategies`) to verify the live server is serving the newest template.
+Decided: Custom strategy persistence should use SQLite, not local app state, so custom strategies can be joined to signal history and survive deploys/restarts. Custom strategy signals should persist both a stable key and enough config snapshot data for future analysis if the custom strategy is edited later.
+Watch out for: A frontend fix is not actually live until the VPS process has the new files and has restarted. If the UI looks stale after code changes, verify the live template first with `curl -s http://localhost:8080/ | grep "loadStrategies"` from the VPS.
+
+### 2026-04-24 — Session summary (Strategy Lab explainer panel)
+Built: Extended `api_strategies()` to open one SQLite connection and run per-strategy aggregation queries — `COUNT(*)`, `SUM(CASE WHEN result='WIN')`, `SUM(CASE WHEN result='LOSS')`, `AVG(conviction)`, and a GROUP BY symbol query for top_symbol. Computes `win_rate = wins/(wins+losses)` (null if no closed signals). Result added as `"performance"` object on each strategy in the response. Error path falls back to zeroed performance dicts so the route never crashes. In `index.html`: added `S.explainerOpen: false` to S state. Added `<div id="strategy-explainer">` below `#strategy-bar`. Added scoped CSS block for `.sx-*` classes using only existing CSS variables. Modified `setStrategy(key, fromUser = false)` — programmatic calls (init, renderStrategyButtons) pass no second arg so the explainer is never shown on load; user button clicks pass `fromUser=true` and trigger toggle logic (hide if same strategy + open, else show + populate). Added `populateExplainer(strat)` that writes the full explainer HTML: regime badge with color-coded border, description, weight bars (momentum/funding/basis relative to each other; volume_mult shown as multiplier in Parameters), gates with human-readable labels, parameters row, performance grid. Updated button onclick in `renderStrategyButtons()` to pass `fromUser=true`.
+Decided: `volume_mult` excluded from weight bars (incompatible scale — 1.0–1.2 vs 5–50); shown as "Volume boost 1.1×" in Parameters row instead. `explainerOpen` added to S (not H) — it tracks signals-tab display state, not history tab. The task spec said H but that was a copy error.
+Watch out for: `setStrategy()` now has a `fromUser` param — any future caller that should NOT show the explainer must omit the second arg or pass `false`. Do not add `fromUser=true` to programmatic calls like `renderStrategyButtons()` or the init sequence. `$('strategy-explainer').innerHTML` is written directly (not via `panel-body`) — this is correct; the explainer is its own div, not the shared detail panel aside.
+Follow-up fix: User testing showed the active strategy could update while `#strategy-explainer` stayed hidden. Hardened `index.html` by adding `loadStrategies()` as a single metadata cache/fetch helper, making `renderStrategyButtons()` duplicate-safe, and making `setStrategy()` async so a real strategy button click can fetch metadata on demand instead of returning early when `H.strategies` is still null. `setStrategy()` also defensively infers button-originated clicks from `window.event.currentTarget.classList.contains('strat-btn')`, which protects older/static click paths that call `setStrategy(key)` without the second arg. Added `app.config["TEMPLATES_AUTO_RELOAD"] = True`, but the currently running Flask process still needs one restart before this takes effect.
+
+### 2026-04-24 — Session summary (Strategy Lab foundation — strategy_key + /api/strategies + dynamic UI)
+Built: Added `_STRATEGY_NAME_TO_KEY` dict and `strategy_name_to_key(name)` helper near `STRATEGIES` in `app.py`. Added `strategy_key TEXT DEFAULT 'balanced'` column via idempotent ALTER TABLE migration in `init_db()`; backfill loop runs on every startup (idempotent — sets same values). Updated `log_signals()` to derive `skey = strategy_name_to_key(...)` and write it explicitly on every INSERT. Fixed `GET /api/signal/<symbol>` to resolve strategy via (1) `?strategy=<key>` query param, (2) DB lookup for most recent signal's `strategy_key`, (3) 'balanced' fallback — passes resolved strategy config to `score_ticker()` and `enrich_signal()`. Added `GET /api/strategies` route returning all 4 strategies with `key`, `name`, `description`, `weights` (momentum/funding/basis/volume), `filters`, `min_conviction`, `max_leverage`, `regime`. In `index.html`: added `H.strategies: null`; removed 4 hardcoded strategy button elements from HTML; added `renderStrategyButtons()` (async: fetches `/api/strategies`, renders `.strat-btn` elements via DOM + populates `#hf-strategy` options, calls `setStrategy(S.strategy)` after). Removed 4 hardcoded `#hf-strategy` options; init sequence calls `renderStrategyButtons()` after `setStrategy('balanced')`. `STRAT_META` and `STRATEGY_LEVERAGE` kept as fallbacks.
+Decided: `STRAT_META` (tooltips, short label text) and `STRATEGY_LEVERAGE` (leverage fallback in equity curve + getLeverage) are kept intact — they serve different UI concerns from the API data and would require more refactoring to remove safely. The open-positions strategy filter (`#pos-strat-filter`) was NOT made dynamic — it's a separate concern and may already have a name/key mismatch bug; leave for Strategy Lab explainer sprint.
+Watch out for: `renderStrategyButtons()` is async — there's a brief moment on page load where the strategy-bar has no buttons. `setStrategy('balanced')` is called synchronously at init to set `S.strategy` and the label text; once `renderStrategyButtons()` resolves it calls `setStrategy(S.strategy)` again to mark the correct button active. If `/api/strategies` fails, strategy bar stays empty but scan still works (S.strategy defaults to 'balanced'). `#hf-strategy` options use display names as values (e.g., `"Balanced"`) to match DB `strategy` column strings — do NOT change these to keys.
 
 ### 2026-04-24 — Session summary (P3e — SSE live price refresh)
 Built: `GET /api/stream/prices` SSE endpoint in `app.py` — polls `/contract/ticker` every 3s, filters to `?symbols=` param, yields one `data: {"symbol": ..., "price": ...}\n\n` SSE event per matching symbol. Uses `stream_with_context(generate())` with `GeneratorExit` guard for clean disconnects. Added `Response, stream_with_context` to Flask imports. In `index.html`: added `H.priceStream` to the H state object, added `subscribePositionStream()` (creates EventSource, first message clears `posRefreshTimer`, onerror falls back to `startPosTimers()`) and `unsubscribePositionStream()` (closes EventSource, nulls handle). Modified `startPosTimers()` to skip `posRefreshTimer` when `H.priceStream` is set. Added `subscribePositionStream()` call at end of `fetchAndRenderPositions()`. Modified `switchTab()` to call `unsubscribePositionStream()` on history tab leave.

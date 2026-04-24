@@ -5,6 +5,8 @@ import socket
 import sqlite3
 import time
 import threading
+import copy
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -29,6 +31,7 @@ from lib.ai_client import call_ai
 load_dotenv()
 
 app = Flask(__name__)
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 MEXC_BASE    = "https://contract.mexc.com/api/v1"
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -108,6 +111,47 @@ def init_db() -> None:
         con.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN strategy_key TEXT DEFAULT 'balanced'")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN pnl_pct REAL DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN leverage REAL DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # Backfill leverage from signal_json for existing rows that have it
+    con.execute("""
+        UPDATE signals
+        SET leverage = json_extract(signal_json, '$.leverage_cap')
+        WHERE leverage IS NULL AND signal_json IS NOT NULL
+    """)
+    con.commit()
+    # Backfill strategy_key from display name for all existing rows
+    for display_name, key in _STRATEGY_NAME_TO_KEY.items():
+        con.execute(
+            "UPDATE signals SET strategy_key=? WHERE strategy=?",
+            (key, display_name),
+        )
+    con.commit()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS custom_strategies (
+            key         TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            base_key    TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            config_json TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        )
+    """)
+    con.commit()
     con.close()
 
 
@@ -130,19 +174,22 @@ def log_signals(signals: list[dict]) -> None:
                 continue
             entries = sig.get("entries") or [None, None, None]
             exits   = sig.get("exits")   or [None, None, None]
+            skey = sig.get("strategy_key") or strategy_name_to_key(sig.get("strategy", ""))
+            leverage_val = sig.get("leverage_cap") or sig.get("max_leverage") or None
             con.execute("""
                 INSERT INTO signals
-                (logged_at, symbol, exchange, direction, strategy, conviction,
+                (logged_at, symbol, exchange, direction, strategy, strategy_key, conviction,
                  price, entry1, entry2, entry3, tp1, tp2, tp3, stop_loss,
                  atr_pct, volatility, funding_rate, rsi_1h, trend_score,
-                 tags, signal_why, signal_json, data_quality)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 tags, signal_why, signal_json, data_quality, leverage)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 datetime.utcnow().isoformat(),
                 sig["symbol"],
                 sig.get("exchange", "MEXC"),
                 sig["direction"],
                 sig.get("strategy", ""),
+                skey,
                 sig.get("conviction", 0),
                 sig.get("price", 0),
                 entries[0], entries[1], entries[2],
@@ -156,7 +203,8 @@ def log_signals(signals: list[dict]) -> None:
                 ",".join(sig.get("tags", [])),
                 sig.get("signal_why", ""),
                 json.dumps(sig, default=str),
-                "current",
+                sig.get("data_quality") or "current",
+                leverage_val,
             ))
         con.commit()
         con.close()
@@ -175,6 +223,36 @@ def log_signals(signals: list[dict]) -> None:
 #   momentum strong : weak  = 1 : 0.5
 #   funding  strong : weak  = 1 : 0.4
 #   basis           = full weight or nothing (no weak tier)
+
+_STRATEGY_NAME_TO_KEY: dict[str, str] = {
+    "Balanced":           "balanced",
+    "Funding Arb":        "funding_arb",
+    "Momentum Breakout":  "momentum_breakout",
+    "Mean Reversion":     "mean_reversion",
+}
+
+
+def strategy_name_to_key(name: str) -> str:
+    """Convert a strategy display name to its stable key. Falls back to 'balanced'."""
+    return _STRATEGY_NAME_TO_KEY.get(name, "balanced")
+
+
+_STRATEGY_DESCRIPTIONS = {
+    "balanced":          "General-purpose scanner for all market conditions using balanced momentum, funding, and basis weights.",
+    "funding_arb":       "Targets pairs with extreme funding rates in ranging markets where one side is paying heavily.",
+    "momentum_breakout": "Rides strong directional moves with volume expansion in clearly trending markets.",
+    "mean_reversion":    "Fades exhausted RSI extremes, expecting price to snap back after extended one-sided moves.",
+}
+
+_STRATEGY_REGIME = {
+    "balanced":          "any",
+    "funding_arb":       "neutral",
+    "momentum_breakout": "bull",
+    "mean_reversion":    "any",
+}
+
+_CUSTOM_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
+
 
 STRATEGIES: dict = {
     "balanced": {
@@ -244,6 +322,223 @@ STRATEGIES: dict = {
         },
     },
 }
+
+
+def slugify_strategy_key(name: str) -> str:
+    """Build a stable custom strategy key from a display name."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    if not slug or not slug[0].isalpha():
+        slug = f"strategy_{slug}" if slug else "custom_strategy"
+    return f"custom_{slug}"[:64]
+
+
+def clone_strategy_config(cfg: dict) -> dict:
+    """Deep-copy a strategy config so request edits cannot mutate globals."""
+    return copy.deepcopy(cfg)
+
+
+def builtin_strategy_config(key: str, cfg: dict) -> dict:
+    out = clone_strategy_config(cfg)
+    out["key"] = key
+    out["is_custom"] = False
+    out["enabled"] = True
+    out["base_key"] = key
+    out["regime"] = _STRATEGY_REGIME.get(key, "any")
+    out["description"] = _STRATEGY_DESCRIPTIONS.get(key, out.get("description", ""))
+    return out
+
+
+def load_custom_strategy_rows(include_disabled: bool = False) -> list[dict]:
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        query = "SELECT * FROM custom_strategies"
+        if not include_disabled:
+            query += " WHERE enabled=1"
+        query += " ORDER BY created_at ASC"
+        rows = [dict(r) for r in con.execute(query).fetchall()]
+        con.close()
+        return rows
+    except Exception as e:
+        print(f"load_custom_strategy_rows error: {e}", file=sys.stderr)
+        return []
+
+
+def custom_row_to_strategy(row: dict) -> dict | None:
+    try:
+        cfg = json.loads(row.get("config_json") or "{}")
+        cfg["key"] = row["key"]
+        cfg["name"] = row["name"]
+        cfg["base_key"] = row.get("base_key") or "balanced"
+        cfg["enabled"] = bool(row.get("enabled"))
+        cfg["is_custom"] = True
+        cfg.setdefault("description", f"Custom clone of {cfg['base_key']}")
+        cfg.setdefault("risk_level", "medium")
+        cfg.setdefault("regime", "any")
+        cfg.setdefault("filters", {})
+        return cfg
+    except Exception as e:
+        print(f"custom_row_to_strategy error [{row.get('key', '?')}]: {e}", file=sys.stderr)
+        return None
+
+
+def get_strategy_registry(include_disabled: bool = False) -> dict[str, dict]:
+    registry = {
+        key: builtin_strategy_config(key, cfg)
+        for key, cfg in STRATEGIES.items()
+    }
+    for row in load_custom_strategy_rows(include_disabled=include_disabled):
+        cfg = custom_row_to_strategy(row)
+        if cfg:
+            registry[cfg["key"]] = cfg
+    return registry
+
+
+def get_strategy_config(strategy_key: str, include_disabled: bool = False) -> dict:
+    registry = get_strategy_registry(include_disabled=include_disabled)
+    return registry.get(strategy_key, registry["balanced"])
+
+
+def validate_custom_strategy_payload(
+    payload: dict,
+    existing_key: str | None = None,
+) -> tuple[dict | None, str | None]:
+    registry = get_strategy_registry(include_disabled=True)
+    base_key = payload.get("base_key") or payload.get("base") or "balanced"
+    if base_key not in STRATEGIES:
+        return None, "base_key must be one of the built-in strategies"
+
+    base = clone_strategy_config(STRATEGIES[base_key])
+    name = str(payload.get("name") or base["name"] + " Copy").strip()
+    if not name:
+        return None, "name is required"
+    if len(name) > 80:
+        return None, "name must be 80 characters or fewer"
+
+    key = str(payload.get("key") or existing_key or slugify_strategy_key(name)).strip().lower()
+    if not _CUSTOM_KEY_RE.match(key):
+        return None, "key must be 3-64 chars: lowercase letters, numbers, underscores; start with a letter"
+    if key in STRATEGIES:
+        return None, "custom strategy key cannot collide with a built-in strategy"
+    if existing_key is None and key in registry:
+        return None, "custom strategy key already exists"
+    if existing_key is not None and key != existing_key:
+        return None, "strategy key cannot be changed after creation"
+
+    weights_in = payload.get("weights") or {}
+    weights = clone_strategy_config(base["weights"])
+    for api_key, cfg_key in {
+        "momentum": "momentum",
+        "funding": "funding",
+        "basis": "basis",
+        "volume": "volume_mult",
+        "volume_mult": "volume_mult",
+    }.items():
+        if api_key in weights_in:
+            try:
+                val = float(weights_in[api_key])
+            except (TypeError, ValueError):
+                return None, f"weights.{api_key} must be numeric"
+            if cfg_key == "volume_mult":
+                if val < 0.5 or val > 2.0:
+                    return None, "volume multiplier must be between 0.5 and 2.0"
+                weights[cfg_key] = round(val, 2)
+            else:
+                if val < 0 or val > 100:
+                    return None, f"weights.{api_key} must be between 0 and 100"
+                weights[cfg_key] = int(round(val))
+
+    min_conviction = payload.get("min_conviction", base["min_conviction"])
+    try:
+        min_conviction = int(min_conviction)
+    except (TypeError, ValueError):
+        return None, "min_conviction must be an integer"
+    if min_conviction < 0 or min_conviction > 100:
+        return None, "min_conviction must be between 0 and 100"
+
+    leverage_cap = payload.get("leverage_cap", payload.get("max_leverage", base["leverage_cap"]))
+    try:
+        leverage_cap = int(leverage_cap)
+    except (TypeError, ValueError):
+        return None, "leverage_cap must be an integer"
+    if leverage_cap < 1 or leverage_cap > 50:
+        return None, "leverage_cap must be between 1 and 50"
+
+    filters = clone_strategy_config(base.get("filters", {}))
+    if "filters" in payload:
+        filters = {}
+        for fkey, raw_val in (payload.get("filters") or {}).items():
+            if raw_val in ("", None):
+                continue
+            if fkey not in {"min_funding_abs", "min_24h_change_pct", "rsi_long_max", "rsi_short_min"}:
+                return None, f"unsupported filter: {fkey}"
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                return None, f"filters.{fkey} must be numeric"
+            if fkey == "min_funding_abs" and (val < 0 or val > 0.01):
+                return None, "min_funding_abs must be between 0 and 0.01"
+            if fkey == "min_24h_change_pct" and (val < 0 or val > 50):
+                return None, "min_24h_change_pct must be between 0 and 50"
+            if fkey in {"rsi_long_max", "rsi_short_min"} and (val < 1 or val > 99):
+                return None, f"{fkey} must be between 1 and 99"
+            filters[fkey] = val
+
+    regime = str(payload.get("regime") or _STRATEGY_REGIME.get(base_key, "any")).strip().lower()
+    if regime not in {"bull", "bear", "neutral", "any"}:
+        return None, "regime must be one of bull, bear, neutral, any"
+
+    risk_level = str(payload.get("risk_level") or base.get("risk_level", "medium")).strip().lower()
+    if risk_level not in {"low", "medium", "high"}:
+        return None, "risk_level must be one of low, medium, high"
+
+    description = str(payload.get("description") or f"Custom clone of {base['name']}").strip()
+    if len(description) > 240:
+        return None, "description must be 240 characters or fewer"
+
+    enabled = payload.get("enabled", True)
+    enabled = bool(enabled)
+
+    config = {
+        "key": key,
+        "name": name,
+        "description": description,
+        "risk_level": risk_level,
+        "weights": weights,
+        "leverage_cap": leverage_cap,
+        "min_conviction": min_conviction,
+        "filters": filters,
+        "regime": regime,
+        "base_key": base_key,
+        "enabled": enabled,
+        "is_custom": True,
+    }
+    return config, None
+
+
+def strategy_to_api(key: str, cfg: dict, performance: dict | None = None) -> dict:
+    w = cfg["weights"]
+    return {
+        "key":            key,
+        "name":           cfg["name"],
+        "description":    cfg.get("description", ""),
+        "weights": {
+            "momentum": w.get("momentum", 0),
+            "funding":  w.get("funding", 0),
+            "basis":    w.get("basis", 0),
+            "volume":   w.get("volume_mult", 1.0),
+        },
+        "filters":        cfg.get("filters", {}),
+        "min_conviction": cfg["min_conviction"],
+        "max_leverage":   cfg["leverage_cap"],
+        "regime":         cfg.get("regime", "any"),
+        "risk_level":     cfg.get("risk_level", "medium"),
+        "is_custom":      bool(cfg.get("is_custom", False)),
+        "enabled":        bool(cfg.get("enabled", True)),
+        "base_key":       cfg.get("base_key", key),
+        "performance":    performance or {},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +1142,19 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
         if len(df) < 16:
             return None
 
+        n1h = len(df)
+
+        # --- Kline depth gate ---
+        # Fetch 4h candles just to measure history depth; count only, not used for indicators.
+        kline4h_data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": "Hour4", "limit": 50})
+        n4h = 0
+        if kline4h_data and isinstance(kline4h_data, dict):
+            n4h = len(kline4h_data.get("close", []))
+
+        if n1h < 50 or n4h < 20:
+            print(f"[kline gate] {symbol} skipped — 1h:{n1h} 4h:{n4h}", file=sys.stderr)
+            return None
+
         # --- Momentum: 1h and 4h price change ---
         # change_1h_pct: open→close on the most recent completed candle.
         # Using open rather than close[-2] because MEXC sometimes delivers the
@@ -1029,6 +1337,15 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             "ai_report": None,          # populated below after sig is fully built
             # Strategy context — surfaced in the UI
             "strategy": strat["name"],
+            "strategy_key": strat.get("key") or strategy_name_to_key(strat["name"]),
+            "strategy_is_custom": bool(strat.get("is_custom", False)),
+            "strategy_config": {
+                "weights": strat.get("weights", {}),
+                "filters": strat.get("filters", {}),
+                "min_conviction": strat.get("min_conviction"),
+                "leverage_cap": strat.get("leverage_cap"),
+                "base_key": strat.get("base_key"),
+            },
             "leverage_cap": strat["leverage_cap"],
             # Market sentiment — populated below from Binance/Bybit/OKX public APIs
             "binance_ls_long_pct": None,
@@ -1039,6 +1356,11 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             # True when symbol is in SENTIMENT_PAIRS; False for MEXC-only altcoins.
             # Used by the frontend to distinguish "geo-blocked" from "not tracked".
             "sentiment_tracked": symbol.split("_")[0] in SENTIMENT_PAIRS,
+            # Kline history depth measured at enrichment time
+            "kline_depth_1h": n1h,
+            "kline_depth_4h": n4h,
+            # "low" when history is thin (50–99 1h or 20–49 4h candles); "current" otherwise
+            "data_quality": "low" if (n1h < 100 or n4h < 50) else "current",
         }
         sig["signal_why"] = why_signal(sig)
         sig["ai_report"]  = generate_report(sig)
@@ -1076,7 +1398,11 @@ def run_scan(
     Returns (signals, total_pairs) where total_pairs is the raw ticker count.
     Signals have conviction >= effective_threshold, sorted descending.
     """
-    strat = STRATEGIES.get(strategy_key, STRATEGIES["balanced"])
+    expire_stale_signals()
+
+    registry = get_strategy_registry()
+    strat = registry.get(strategy_key, registry["balanced"])
+    strategy_key = strat["key"]
     effective_threshold = max(threshold, strat["min_conviction"])
 
     tickers = fetch_mexc("/contract/ticker")
@@ -1121,10 +1447,11 @@ def api_scan():
     try:
         threshold    = request.args.get("threshold", CONVICTION_THRESHOLD, type=int)
         strategy_key = request.args.get("strategy", "balanced")
-        if strategy_key not in STRATEGIES:
+        registry = get_strategy_registry()
+        if strategy_key not in registry:
             strategy_key = "balanced"
         signals, total_pairs = run_scan(threshold=threshold, strategy_key=strategy_key)
-        strat = STRATEGIES[strategy_key]
+        strat = registry.get(strategy_key, registry["balanced"])
         log_signals(signals)
         return jsonify({
             "success":       True,
@@ -1164,8 +1491,33 @@ def api_signal(symbol: str):
     detail modal to refresh or display a specific ticker on demand.
     Fetches all tickers and finds the matching one — MEXC's public ticker
     endpoint doesn't support single-symbol filtering reliably.
+
+    Strategy resolution order:
+      1. ?strategy=<key> query param (explicit override)
+      2. Most recent logged signal's strategy_key for this symbol (from DB)
+      3. 'balanced' fallback
     """
     try:
+        # Resolve which strategy to use for enrichment
+        strategy_key = request.args.get("strategy", "").strip().lower()
+        registry = get_strategy_registry(include_disabled=True)
+        if not strategy_key or strategy_key not in registry:
+            try:
+                con = sqlite3.connect(DB_PATH)
+                row = con.execute(
+                    "SELECT strategy_key FROM signals WHERE symbol=? ORDER BY logged_at DESC LIMIT 1",
+                    (symbol.upper(),),
+                ).fetchone()
+                con.close()
+                if row and row[0] and row[0] in registry:
+                    strategy_key = row[0]
+                else:
+                    strategy_key = "balanced"
+            except Exception:
+                strategy_key = "balanced"
+
+        strat = registry.get(strategy_key, registry["balanced"])
+
         tickers = fetch_mexc("/contract/ticker")
         if not tickers:
             return jsonify({"success": False, "error": "MEXC unavailable"}), 502
@@ -1176,11 +1528,11 @@ def api_signal(symbol: str):
         if not ticker:
             return jsonify({"success": False, "error": f"Symbol {symbol!r} not found"}), 404
 
-        base = score_ticker(ticker)
+        base = score_ticker(ticker, strategy=strat)
         if not base:
             return jsonify({"success": False, "error": "Unable to score ticker"}), 422
 
-        signal = enrich_signal(base)
+        signal = enrich_signal(base, strategy=strat)
         if not signal:
             return jsonify({"success": False, "error": "Insufficient kline data"}), 422
 
@@ -1197,23 +1549,44 @@ def api_signal(symbol: str):
 def api_signal_result():
     """Mark a logged signal with a trade outcome."""
     try:
-        body   = request.get_json(force=True)
-        sig_id = int(body["id"])
-        result = body.get("result", "").upper()
-        note   = body.get("result_note", "")
+        body        = request.get_json(force=True)
+        sig_id      = int(body["id"])
+        result      = body.get("result", "").upper()
+        note        = body.get("result_note", "")
+        exit_price  = body.get("exit_price")   # optional float
+        entry_price = body.get("entry_price")  # optional float — overrides DB entry1
         valid  = {"WIN", "LOSS", "PARTIAL", "EXPIRED", "SKIPPED"}
         if result not in valid:
             return jsonify({"success": False, "error": f"result must be one of {valid}"}), 400
+
+        # Fetch the existing row to get entry1, direction, leverage for pnl_pct
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        existing = con.execute("SELECT * FROM signals WHERE id=?", (sig_id,)).fetchone()
+        con.close()
+        if not existing:
+            return jsonify({"success": False, "error": "Signal not found"}), 404
+        existing = dict(existing)
+
+        pnl_pct = None
+        if exit_price is not None:
+            exit_price = float(exit_price)
+            # Use caller-supplied entry_price if provided; fall back to DB entry1
+            if entry_price is not None:
+                existing["entry1"] = float(entry_price)
+            pnl_pct = _compute_leveraged_pnl(existing, exit_price)
+
         con = sqlite3.connect(DB_PATH)
         con.execute("""
             UPDATE signals
-            SET result=?, result_note=?, result_at=?
+            SET result=?, result_note=?, result_at=?, exit_price=?, pnl_pct=?
             WHERE id=?
-        """, (result, note, datetime.utcnow().isoformat(), sig_id))
+        """, (result, note, datetime.utcnow().isoformat(), exit_price, pnl_pct, sig_id))
         con.commit()
+        con.row_factory = sqlite3.Row
         row = con.execute("SELECT * FROM signals WHERE id=?", (sig_id,)).fetchone()
         con.close()
-        return jsonify({"success": True, "signal": row})
+        return jsonify({"success": True, "signal": dict(row) if row else None})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -1275,12 +1648,14 @@ def api_signal_detail(signal_id: int):
             except Exception:
                 pass
 
-        # P&L %
-        pnl_pct    = None
         entry1     = sig.get("entry1")
         exit_price = sig.get("exit_price")
         direction  = sig.get("direction", "")
-        if entry1 and exit_price and entry1 != 0:
+
+        # Prefer persisted leveraged pnl_pct; fall back to unleveraged on-the-fly
+        # calculation for old rows that predate the pnl_pct column
+        pnl_pct = sig.get("pnl_pct")
+        if pnl_pct is None and entry1 and exit_price and entry1 != 0:
             if direction == "LONG":
                 pnl_pct = round((exit_price - entry1) / entry1 * 100, 2)
             else:
@@ -1337,6 +1712,68 @@ def api_signal_detail(signal_id: int):
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _compute_leveraged_pnl(sig: dict, exit_price: float | None) -> float | None:
+    """
+    Compute leveraged P&L % for a closed trade.
+
+    raw_pct = (exit - entry) / entry * 100  (sign-corrected per direction)
+    Returns raw_pct * leverage, rounded to 2 dp.
+    Returns None if exit_price or entry1 is missing.
+    """
+    if exit_price is None:
+        return None
+    entry1 = sig.get("entry1")
+    if not entry1 or entry1 == 0:
+        return None
+    direction = sig.get("direction", "")
+    leverage = sig.get("leverage")
+    if leverage is None:
+        try:
+            sj = json.loads(sig.get("signal_json") or "{}")
+            leverage = sj.get("leverage_cap")
+        except Exception:
+            pass
+    leverage = float(leverage) if leverage else 1.0
+    if direction == "LONG":
+        raw_pct = (exit_price - entry1) / entry1 * 100
+    else:
+        raw_pct = (entry1 - exit_price) / entry1 * 100
+    return round(raw_pct * leverage, 2)
+
+
+def expire_stale_signals() -> int:
+    """
+    Tag open signals older than 80 hours as EXPIRED so they don't
+    accumulate in the open-positions panel indefinitely.
+    Returns the count of signals expired.
+    """
+    try:
+        cutoff = (datetime.utcnow() - timedelta(hours=80)).isoformat()
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            "SELECT id FROM signals WHERE result IS NULL AND logged_at < ?",
+            (cutoff,),
+        ).fetchall()
+        if rows:
+            now = datetime.utcnow().isoformat()
+            for row in rows:
+                con.execute(
+                    """
+                    UPDATE signals
+                    SET result='EXPIRED', result_note='Auto-expired after 80h',
+                        result_at=?, exit_price=NULL, pnl_pct=NULL
+                    WHERE id=?
+                    """,
+                    (now, row[0]),
+                )
+            con.commit()
+        con.close()
+        return len(rows)
+    except Exception as e:
+        print(f"expire_stale_signals error: {e}", file=sys.stderr)
+        return 0
 
 
 def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str | None] | None:
@@ -1478,7 +1915,12 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
     if stop_hit and best_tp == 0:
         return ("LOSS",    f"Stop hit at {stop_loss}",              exit_price, result_at, entry_at)
     if stop_hit and best_tp > 0:
-        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}", exit_price, result_at, entry_at)
+        # Blended exit: ladder exits 1/3 of position at each TP hit before stop takes the rest
+        if best_tp == 1:
+            blended = round(tp1 * (1 / 3) + stop_loss * (2 / 3), 8)
+        else:  # best_tp == 2 (TP3 + stop can't co-occur — TP3 breaks the loop)
+            blended = round(tp1 * (1 / 3) + tp2 * (1 / 3) + stop_loss * (1 / 3), 8)
+        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}", blended, result_at, entry_at)
     if best_tp == 3:
         return ("WIN",     f"TP3 hit at {tp3}",                    exit_price, result_at, entry_at)
     if best_tp == 2:
@@ -1497,6 +1939,7 @@ def api_outcomes_check():
     Returns a summary of how many signals were evaluated and tagged.
     Safe to call repeatedly — already-tagged signals are skipped.
     """
+    expire_stale_signals()
     try:
         con  = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
@@ -1515,11 +1958,13 @@ def api_outcomes_check():
                 skipped += 1
                 continue
             result, note, exit_price, result_at, entry_at = outcome
+            pnl_pct = _compute_leveraged_pnl(sig, exit_price)
             con = sqlite3.connect(DB_PATH)
             con.execute(
                 """
                 UPDATE signals
                 SET result=?, result_note=?, result_at=?, exit_price=?, entry_at=?,
+                    pnl_pct=?,
                     data_quality=COALESCE(data_quality, 'current'),
                     evaluation_version=?
                 WHERE id=?
@@ -1530,6 +1975,7 @@ def api_outcomes_check():
                     result_at or datetime.utcnow().isoformat(),
                     exit_price,
                     entry_at,
+                    pnl_pct,
                     "entry_fill_v2",
                     sig["id"],
                 ),
@@ -1601,6 +2047,187 @@ def api_stream_prices():
     )
 
 
+@app.route("/api/strategies")
+def api_strategies():
+    """Return all strategy configs as a JSON array for dynamic frontend rendering.
+    Includes live performance stats queried from the signals DB."""
+    include_disabled = request.args.get("include_disabled", "0") in {"1", "true", "yes"}
+    registry = get_strategy_registry(include_disabled=include_disabled)
+
+    # Fetch performance stats for all strategies in one DB connection
+    perf: dict[str, dict] = {}
+    try:
+        con = sqlite3.connect(DB_PATH)
+        for key in registry:
+            row = con.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN result='WIN'  THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END), "
+                "AVG(conviction) "
+                "FROM signals WHERE strategy_key=?",
+                (key,),
+            ).fetchone()
+            total    = int(row[0] or 0)
+            wins     = int(row[1] or 0)
+            losses   = int(row[2] or 0)
+            avg_conv = row[3]
+            wr       = wins / (wins + losses) if (wins + losses) > 0 else None
+            top_row  = con.execute(
+                "SELECT symbol FROM signals WHERE strategy_key=? "
+                "GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+            perf[key] = {
+                "total_signals":  total,
+                "wins":           wins,
+                "losses":         losses,
+                "win_rate":       round(wr, 4) if wr is not None else None,
+                "avg_conviction": round(avg_conv, 1) if avg_conv is not None else None,
+                "top_symbol":     top_row[0] if top_row else None,
+            }
+        con.close()
+    except Exception as e:
+        print(f"api_strategies perf query error: {e}", file=sys.stderr)
+        for key in registry:
+            if key not in perf:
+                perf[key] = {
+                    "total_signals": 0, "wins": 0, "losses": 0,
+                    "win_rate": None, "avg_conviction": None, "top_symbol": None,
+                }
+
+    result = [
+        strategy_to_api(key, cfg, performance=perf.get(key, {}))
+        for key, cfg in registry.items()
+        if cfg.get("enabled", True) or include_disabled
+    ]
+    return jsonify({"success": True, "strategies": result})
+
+
+@app.route("/api/strategies/custom", methods=["POST"])
+def api_create_custom_strategy():
+    """Create a custom strategy by cloning a built-in and applying validated overrides."""
+    try:
+        body = request.get_json(force=True) or {}
+        cfg, err = validate_custom_strategy_payload(body)
+        if err:
+            return jsonify({"success": False, "error": err}), 400
+
+        now = datetime.utcnow().isoformat()
+        row_json = json.dumps({
+            "description": cfg["description"],
+            "risk_level": cfg["risk_level"],
+            "weights": cfg["weights"],
+            "leverage_cap": cfg["leverage_cap"],
+            "min_conviction": cfg["min_conviction"],
+            "filters": cfg["filters"],
+            "regime": cfg["regime"],
+        }, sort_keys=True)
+
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            INSERT INTO custom_strategies
+            (key, name, base_key, enabled, config_json, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?)
+        """, (
+            cfg["key"], cfg["name"], cfg["base_key"], 1 if cfg["enabled"] else 0,
+            row_json, now, now,
+        ))
+        con.commit()
+        con.close()
+        return jsonify({"success": True, "strategy": strategy_to_api(cfg["key"], cfg)})
+    except sqlite3.IntegrityError:
+        return jsonify({"success": False, "error": "custom strategy key already exists"}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/strategies/custom/<strategy_key>", methods=["PATCH"])
+def api_update_custom_strategy(strategy_key: str):
+    """Update a custom strategy config. Built-in strategies are immutable."""
+    try:
+        key = strategy_key.strip().lower()
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM custom_strategies WHERE key=?", (key,)).fetchone()
+        con.close()
+        if not row:
+            return jsonify({"success": False, "error": "custom strategy not found"}), 404
+
+        existing = custom_row_to_strategy(dict(row))
+        if not existing:
+            return jsonify({"success": False, "error": "stored custom strategy is invalid"}), 500
+
+        body = request.get_json(force=True) or {}
+        merged = {
+            "key": key,
+            "name": existing["name"],
+            "base_key": existing["base_key"],
+            "enabled": existing["enabled"],
+            "description": existing.get("description", ""),
+            "risk_level": existing.get("risk_level", "medium"),
+            "weights": {
+                "momentum": existing["weights"].get("momentum", 0),
+                "funding": existing["weights"].get("funding", 0),
+                "basis": existing["weights"].get("basis", 0),
+                "volume": existing["weights"].get("volume_mult", 1.0),
+            },
+            "filters": existing.get("filters", {}),
+            "min_conviction": existing["min_conviction"],
+            "leverage_cap": existing["leverage_cap"],
+            "regime": existing.get("regime", "any"),
+        }
+        for field in ("name", "enabled", "description", "risk_level", "weights", "filters", "min_conviction", "leverage_cap", "max_leverage", "regime"):
+            if field in body:
+                merged[field] = body[field]
+
+        cfg, err = validate_custom_strategy_payload(merged, existing_key=key)
+        if err:
+            return jsonify({"success": False, "error": err}), 400
+
+        row_json = json.dumps({
+            "description": cfg["description"],
+            "risk_level": cfg["risk_level"],
+            "weights": cfg["weights"],
+            "leverage_cap": cfg["leverage_cap"],
+            "min_conviction": cfg["min_conviction"],
+            "filters": cfg["filters"],
+            "regime": cfg["regime"],
+        }, sort_keys=True)
+
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            UPDATE custom_strategies
+            SET name=?, enabled=?, config_json=?, updated_at=?
+            WHERE key=?
+        """, (
+            cfg["name"], 1 if cfg["enabled"] else 0, row_json,
+            datetime.utcnow().isoformat(), key,
+        ))
+        con.commit()
+        con.close()
+        return jsonify({"success": True, "strategy": strategy_to_api(key, cfg)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/strategies/custom/<strategy_key>", methods=["DELETE"])
+def api_delete_custom_strategy(strategy_key: str):
+    """Delete a custom strategy definition. Historical signals remain intact."""
+    try:
+        key = strategy_key.strip().lower()
+        if key in STRATEGIES:
+            return jsonify({"success": False, "error": "built-in strategies cannot be deleted"}), 400
+        con = sqlite3.connect(DB_PATH)
+        cur = con.execute("DELETE FROM custom_strategies WHERE key=?", (key,))
+        con.commit()
+        con.close()
+        if cur.rowcount == 0:
+            return jsonify({"success": False, "error": "custom strategy not found"}), 404
+        return jsonify({"success": True, "deleted": key})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/analysis", methods=["POST"])
 def api_analysis():
     """AI strategy review: analyse tagged signal outcomes via available AI provider."""
@@ -1634,13 +2261,18 @@ def api_analysis():
         for s in sigs:
             by_strat[s["strategy"]].append(s)
 
+        def avg_pnl(lst: list) -> str:
+            vals = [s["pnl_pct"] for s in lst if s.get("pnl_pct") is not None]
+            return f"{sum(vals) / len(vals):.1f}%" if vals else "n/a"
+
         strat_lines = []
         for strat_name, ss in by_strat.items():
             winners = [s for s in ss if s["result"] == "WIN"]
             losers  = [s for s in ss if s["result"] == "LOSS"]
             strat_lines.append(
                 f"  {strat_name}: {len(ss)} signals, {win_rate_str(ss)} win rate, "
-                f"avg conv winners={avg_conv(winners)} losers={avg_conv(losers)}"
+                f"avg conv winners={avg_conv(winners)} losers={avg_conv(losers)}, "
+                f"avg pnl winners={avg_pnl(winners)} losers={avg_pnl(losers)}"
             )
         strat_block = "\n".join(strat_lines) or "  (no data)"
 
@@ -1693,6 +2325,10 @@ def api_analysis():
         # ── full log (max 100 most recent) ───────────────────────────────────
         log_lines = [
             f"  {s['logged_at'][:16]} | {s['symbol']} | {s['direction']} | "
+            f"{s['strategy']} | conviction:{s['conviction']} | "
+            f"tags:[{s.get('tags', '')}] | result:{s['result']} | "
+            f"pnl:{s['pnl_pct']}%" if s.get('pnl_pct') is not None
+            else f"  {s['logged_at'][:16]} | {s['symbol']} | {s['direction']} | "
             f"{s['strategy']} | conviction:{s['conviction']} | "
             f"tags:[{s.get('tags', '')}] | result:{s['result']}"
             for s in sigs[:100]
