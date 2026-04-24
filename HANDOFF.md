@@ -2,13 +2,13 @@
 
 > Paste this entire file at the start of any AI session (ChatGPT, Gemini,
 > etc.) when continuing work on this project. Read every word before
-> writing a single line of code. This file was auto-generated from the
-> actual codebase — it reflects current state, not planned state.
+> writing a single line of code. This file is manually maintained to reflect current state, not planned state.
+> Update it at the end of every session before deploying.
 
 Last updated: 2026-04-23
 Last commit: 8037615 fix: fmtAge naming collision causing corrupted scan timestamp; fix idle-cta height clipping text
 app.py: 1576 lines
-index.html: 3464 lines
+index.html: 3520 lines
 
 ---
 
@@ -54,29 +54,43 @@ Matrix Trader 7.0 is a local web application for high-leverage crypto trading on
 
 ```
 Matrix_Trader_7.0/
-├── CLAUDE.md              ← source of truth for Claude Code sessions
-├── HANDOFF.md             ← this file (auto-generated)
-├── README.md              ← exists, minimal
-├── .gitignore             ← includes .env, __pycache__, data/
-├── .env                   ← ANTHROPIC_API_KEY, MEXC_API_KEY (not committed)
-├── requirements.txt
-├── app.py                 ← entire Flask backend, 1576 lines
-├── backtest.py            ← standalone backtest script, 4 strategies × 14 symbols
+├── CLAUDE.md              ← Claude Code orientation; phase status defers to HANDOFF.md
+├── HANDOFF.md             ← this file; manually maintained; update every session
+├── README.md              ← minimal placeholder; write properly in P4
+├── .gitignore             ← covers .env, __pycache__, data/
+├── .env                   ← ANTHROPIC_API_KEY, MATRIX_PORT (not committed; never touch)
+├── requirements.txt       ← all deps installed; add packages here if needed
+├── app.py                 ← entire Flask backend, 1576 lines; keep flat, one file
+├── backtest.py            ← standalone script, 456 lines; do NOT import from app.py
 ├── templates/
-│   └── index.html         ← entire frontend (CSS + HTML + JS), 3464 lines
-├── static/
-│   └── style.css          ← minimal overrides (most CSS is inline in index.html)
+│   └── index.html         ← entire frontend: HTML + CSS + JS, 3520 lines; one file
+├── static/                ← directory exists; no style.css — all CSS is inline in index.html
 ├── docs/
-│   ├── design-brief.md    ← original design document
-│   └── project-status.md  ← human-readable status overview
-├── data/                  ← gitignored; created at runtime
-│   ├── signals.db         ← SQLite signal history (auto-created by init_db())
+│   ├── design-brief.md    ← original design doc; read-only reference
+│   └── project-status.md  ← human-readable status; may be stale; HANDOFF.md is authoritative
+├── .claude/
+│   ├── settings.local.json ← Claude Code project permissions
+│   └── commands/
+│       ├── handoff.md      ← /handoff skill: regenerates HANDOFF.md from codebase
+│       └── handoff_command.md ← legacy handoff command
+├── data/                  ← gitignored; auto-created at runtime; never commit
+│   ├── signals.db         ← SQLite signal history; auto-created by init_db()
 │   └── backtest_results.json ← written by backtest.py
-└── lib/                   ← pure utility functions, no Flask, no API calls
-    ├── indicators.py      ← vwap, ema, rsi, atr, atr_pct, volatility_regime
-    ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
-    └── mexc_stream.py     ← WebSocket client (built, not yet wired to UI)
+└── lib/                   ← pure utility functions only; no Flask, no API calls
+    ├── indicators.py      ← 261 lines; complete; wired into app.py scoring
+    ├── laddering.py       ← 120 lines; complete; wired into enrich_signal()
+    └── mexc_stream.py     ← 263 lines; complete; NOT YET WIRED to any route or UI (P3e)
 ```
+
+**Touch policy:**
+- `app.py` and `index.html`: always read the relevant sections before editing
+- `lib/` files: pure functions only; no imports from app.py; no Flask
+- `data/`: never touch directly; managed by `init_db()` and runtime writes
+- `docs/`: read-only reference; never edit
+- `.env`: never read, never write, never commit
+- `static/`: no CSS file exists here; do not create one — CSS lives inline in index.html
+
+**Tree update cadence:** update when a file/folder is added, deleted, or changes role (e.g. mexc_stream.py gets wired). Update line counts on >10% change. Do not update for bug fixes or content-only changes.
 
 ---
 
@@ -356,6 +370,8 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 
 ## Phase Status
 
+> Source of truth for phase status. The phase table in CLAUDE.md defers to this file.
+
 | Phase | What | Status |
 |---|---|---|
 | P0 | Flask app, MEXC scan, basic scoring, web dashboard | ✅ Done |
@@ -403,6 +419,8 @@ Next in priority order:
 - Do not rename `fmtAge` — a naming collision between the history tab helper and a stale global caused corrupted scan timestamps (fixed in commit 8037615). The function name is intentional.
 - Do not touch the equity sparkline's mousemove/crosshair logic without testing hover on mobile — canvas mouse events behave differently on touch.
 - Do not change strategy filter option values in the history tab — they must match the DB strings exactly: "Balanced", "Funding Arb", "Momentum Breakout". A mismatch causes silent empty results.
+- Do not use `display: none` on `:nth-child()` td/th cells to hide columns in a `table-layout: fixed` JS-generated table — the column slot still exists in the layout algorithm and the table overflows. Use conditional JS rendering instead (skip rendering hidden cells in the template literal).
+- Do not mark a task complete without adding its verification items to the checklist at the bottom of this file. If the task added a new localStorage key, new route, new UI element, or new persistent behavior — it gets a checklist item.
 
 ---
 
@@ -428,26 +446,56 @@ python3 backtest.py
 
 ## Task Framing Template
 
-When asking any AI to make a change, frame it exactly like this:
+Every task prompt assumes CLAUDE.md and HANDOFF.md have been read first.
 
+Task prompts should NOT repeat what HANDOFF.md already covers:
+- Project constraints and hard rules
+- Color system and CSS variables
+- Mobile behavior (desktop slides right, mobile slides up)
+- State isolation rules (S, M, H never cross)
+- Deploy sequence
+- What NOT To Do list
+
+Task prompts should ONLY cover:
+1. What to build — specific and concrete
+2. Task-specific ambiguity to check before writing (the "stop and describe" trigger)
+3. Implementation order — only if sequence matters
+4. Self-verification specific to this feature — code-checkable, not browser-checkable
+5. HANDOFF.md update instruction
+
+Template:
 ```
-Read CLAUDE.md and HANDOFF.md before touching anything.
+Task: [one sentence]
+Requirements:
 
-[Task description]
+[specific requirements not already covered by hard rules]
 
-Constraints:
-- No backend changes / No frontend changes (whichever applies)
-- Do not change [specific things to preserve]
+Before writing:
 
-After writing: [verification steps]
-Explain every decision.
+[what to look for in the actual files that HANDOFF.md might not capture]
+If [specific ambiguity found], STOP and describe — do not guess
+
+Implementation order: [only if order matters]
+Self-verify:
+
+[each item checkable by reading the output, not opening a browser]
+No new files, no routes, no backend changes [delete whichever don't apply]
+
+Before deploying:
+
+Add verification checklist items to HANDOFF.md for any new feature
+Add a session note summarizing what was built, decided, and what to watch for
+If a file or folder was added or removed, update the File Structure tree in HANDOFF.md
+Deploy after self-verify and HANDOFF.md update are both complete
 ```
 
 ---
 
 ## Verification Checklist
 
-Before reporting any task complete:
+> Run this checklist before reporting any task complete. Add new items here whenever
+> a task introduces a new localStorage key, new route, new UI element, or new persistent
+> behavior. This checklist is part of the definition of done — not an afterthought.
 
 - [ ] `python3 -c "import app; print('OK')"` exits clean
 - [ ] `GET /` returns 200
@@ -461,11 +509,12 @@ Before reporting any task complete:
 - [ ] Open positions panel shows untagged signals with live prices
 - [ ] Outcome buttons update `result` and reload the table
 - [ ] Equity sparkline renders and hover tooltip shows date/balance/change
-- [ ] Mobile: UI fits on 375px screen without horizontal scroll (except history table which scrolls intentionally)
+- [ ] Mobile: UI fits on 375px screen without horizontal scroll — history table included (5-column mobile layout)
 - [ ] No `console.error` in browser on page load
 - [ ] No Python traceback on server start
 - [ ] localStorage key `mt7_filters` persists filter state across reloads
 - [ ] localStorage key `mt7_guide_seen` hides the first-run guide on return visits
+- [ ] localStorage key `mt7_panel_width` persists detail panel width; restored on reload
 
 ---
 
@@ -484,6 +533,11 @@ Claude Code reads the actual files. It does not need the full HANDOFF.md pasted 
 
 ## Session Notes
 
+> **Session notes policy:** Keep the last three sessions verbatim. After that, extract
+> any new gotchas into "What NOT To Do", any new DOM structure into "Dashboard Structure",
+> and delete the raw note. Knowledge graduates into the permanent sections — it does not
+> accumulate here indefinitely.
+
 ### 2026-04-19 — Session summary
 Built: P2a strategy registry (Balanced/Funding Arb/Momentum/Mean Reversion), pill UI, STRAT_META object, setStrategy() wiring.
 Decided: Strategy profiles live in app.py as a dict; weights/filters/caps all in one place.
@@ -500,10 +554,22 @@ Watch out for: log_signals() must never raise — swallow all exceptions. init_d
 Built: P3b History tab (this session completed the UI — summary bar, outcome buttons, filter selects, win-rate stats). CLAUDE.md updated to reflect P3 current phase. VPS deployment to Hetzner at 62.238.15.113:8080.
 Decided: History tab auto-loads on switchTab('history') — no manual refresh button needed. H state object is minimal (loading flag only) — history data is not cached in JS state, always fetched fresh. Outcome button labels abbreviated (WIN/LOSS/PAR/EXP/SKP) to fit 375px iPhone screens; full word in title attr.
 Deferred: P3c AI strategy review (next task), P3d paper trading, P3e WebSocket.
-Watch out for: The history table intentionally scrolls horizontally on mobile — this is correct, not a bug. Do not remove overflow-x: auto from #hist-table-wrap. Direction filter in loadHistory() is client-side — if you move it server-side, remove the client-side filter or signals will be double-filtered.
+Watch out for: ~~The history table intentionally scrolls horizontally on mobile~~ — OVERRIDDEN 2026-04-23: table was confirmed unusable on live iPhone screenshot. Now hides 5 low-priority columns on mobile and fits 375px with no scroll. Direction filter in loadHistory() is client-side — if you move it server-side, remove the client-side filter or signals will be double-filtered.
 
 ### 2026-04-23 — Session summary
 Built: P3c AI strategy review (POST /api/analysis — Claude API call, last 200 tagged outcomes, min 10 required, strategy/direction breakdown, tag and symbol analysis). P3d open positions panel — full live tracking: 30s price refresh, per-position P&L, leverage-aware notional sizing, liquidation price, dollar P&L from equity curve, equity sparkline with hover tooltip (crosshair, date, balance, change), live performance banner (signals, win rate, P&L, open positions, best trade, streak), sortable columns, strategy filter, autonomous outcome checker background thread (every 15 min), evaluate_outcome() against Min15 klines (stop/TP detection with partial credit for TP1 hit before stop), daily trend direction tag.
 Decided: Dollar P&L derived from equity curve so it correlates exactly with the Balance column. Equity curve uses account size input in positions header as the starting balance. Background outcome thread sleeps 1 min on startup then runs every 15 min. evaluate_outcome() uses pessimistic ambiguity rule — if TP1 was hit but stop was later hit, result is PARTIAL. 0.1% slippage applied to entry prices.
 Deferred: P3e WebSocket live price refresh (lib/mexc_stream.py exists but not wired to UI).
 Watch out for: fmtAge naming collision — a local function in history tab clashed with a stale global, corrupting scan timestamp display (fixed in 8037615). Equity sparkline canvas mousemove handler uses clientX/clientY offset calculations — do not simplify without testing hover accuracy. Strategy filter option values must match DB strings exactly (Balanced, Funding Arb, Momentum Breakout) — mismatch causes silent empty results.
+
+### 2026-04-23 — Session summary (panel resize)
+Built: Draggable resize handle on left edge of #detail-panel. Width persists to localStorage key `mt7_panel_width`, restored on DOMContentLoaded. Min 320px, max 90vw. Handle hidden on mobile via media query.
+Decided: `panel.innerHTML = ` writes to `$('panel-body').innerHTML` instead — introduced `#panel-body` wrapper div inside the aside so the handle element (position: absolute) is never wiped by content renders. `#detail-panel` changed from `overflow-y: auto` to `overflow: hidden; position: relative; display: flex; flex-direction: column`. Mobile media query `display: block !important` changed to `display: flex !important; flex-direction: column !important` to keep panel-body flex: 1 working on mobile.
+Deferred: nothing.
+Watch out for: All four innerHTML write sites (renderDetail, enrichMarketPair ×3) now target `$('panel-body')` not `$('detail-panel')`. If a future change adds a fifth write site to the panel, it must use `$('panel-body')` too. The `panel.classList` calls in renderDetail, selectSignal, enrichMarketPair, closePanel still correctly target `$('detail-panel')` — do not change those.
+
+### 2026-04-23 — Session summary (mobile history table, v2 — JS fix)
+Built: History table truly fits 375px with zero horizontal scroll. Previous CSS-only fix was replaced — `display: none` on `:nth-child()` cells is unreliable with `table-layout: fixed` on JS-generated tables; hidden column slots still exist in the layout algorithm. Fix: `renderHistoryTable()` now checks `window.innerWidth < 768` (`isMobile`) and conditionally skips rendering Strategy/Conv/Why/R/Balance cells entirely. CSS changed from `display: none` rules to clean 5-column widths (Time=52px, Symbol=60px, Dir=44px, Result=auto, $P&L=70px). Time format shortened on mobile to "Apr 23" (no hours/minutes).
+Decided: JS-conditional rendering is the correct approach when CSS alone can't be relied on for fixed-layout tables. Columns not in the DOM = no layout slot, no overflow.
+Deferred: nothing.
+Watch out for: `isMobile` is evaluated once at render time. If user rotates device or resizes browser without refreshing, the table won't rerender. This is acceptable — `loadHistory()` is called on every tab switch so re-entry fixes it. Do not cache `isMobile` as a module-level constant — it must be evaluated fresh inside `renderHistoryTable()` each call. Previous session note about `display: none` + `:nth-child()` approach is superseded — that approach has been removed.

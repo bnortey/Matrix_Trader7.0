@@ -412,8 +412,19 @@
       width: 260px; flex-shrink: 0;
       background: var(--bg2);
       border-left: 1px solid var(--border);
-      overflow-y: auto;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      flex-direction: column;
     }
+    #panel-resize-handle {
+      position: absolute; top: 0; left: 0;
+      width: 4px; height: 100%;
+      cursor: col-resize;
+      background: rgba(255,255,255,0.08);
+      z-index: 1;
+    }
+    #panel-body { flex: 1; overflow-y: auto; min-height: 0; }
     .d-inner { padding: 14px; }
     .d-sym-row { display: flex; align-items: baseline; gap: 3px; margin-bottom: 6px; }
     .d-sym  { font-family: var(--mono); font-size: 18px; font-weight: 800; }
@@ -763,9 +774,10 @@
         transform: translateY(100%);
         transition: transform 200ms ease;
         z-index: 100;
-        display: block !important;
+        display: flex !important; flex-direction: column !important;
       }
       #detail-panel.open { transform: translateY(0); }
+      #panel-resize-handle { display: none; }
       .d-close { display: flex; }
       .logo-name { display: none; }
       #scan-meta { display: none; }
@@ -788,7 +800,19 @@
       #guide-btn { text-align: center; }
       #hist-bar { gap: 16px; padding: 12px 14px; }
       .hist-stat-val { font-size: 16px; }
-      .hist-why { max-width: 140px; }
+      /* History table: 5 columns on mobile, no horizontal scroll */
+      #hist-table-wrap { overflow-x: hidden; }
+      #hist-table { table-layout: fixed; }
+      /* Columns rendered on mobile: Time(1) | Symbol(2) | Dir(3) | Result(4,auto) | $P&L(5) */
+      #hist-table th:nth-child(1) { width: 52px; }
+      #hist-table th:nth-child(2) { width: 60px; }
+      #hist-table th:nth-child(3) { width: 44px; }
+      #hist-table th:nth-child(5) { width: 70px; }
+      /* Compact cell padding and font */
+      #hist-table th,
+      #hist-table td { padding: 5px 4px; font-size: 0.75rem; }
+      #hist-table .outcome-btn { padding: 1px 3px; font-size: 8px; }
+      #hist-table .outcome-group { gap: 2px; }
     }
     @media (max-width: 499px) {
       #perf-banner { padding: 12px; gap: 8px; }
@@ -1208,7 +1232,8 @@
 
     <!-- ════ SHARED DETAIL PANEL ════ -->
     <aside id="detail-panel" class="hidden">
-      <!-- populated by renderDetail() or enrichMarketPair() -->
+      <div id="panel-resize-handle"></div>
+      <div id="panel-body"><!-- populated by renderDetail() or enrichMarketPair() --></div>
     </aside>
 
   </div><!-- /main -->
@@ -1652,7 +1677,7 @@ function renderDetail(sig) {
   if (sig.daily_trend_aligned === true)  displayTags.push('daily_aligned');
   if (sig.daily_trend_aligned === false) displayTags.push('counter_trend');
 
-  panel.innerHTML = `
+  $('panel-body').innerHTML = `
 <div class="d-inner" style="position:relative">
   <button class="d-close" onclick="closePanel()">✕</button>
   <div class="d-sym-row">
@@ -2319,7 +2344,7 @@ async function enrichMarketPair(symbol, rowIdx) {
   // Loading state: row dims, panel shows spinner
   if (rowEl) rowEl.classList.add('mkt-loading');
 
-  panel.innerHTML = `
+  $('panel-body').innerHTML = `
 <div class="d-inner" style="position:relative">
   <button class="d-close" onclick="closePanel()">✕</button>
   <div class="d-analyzing">
@@ -2343,7 +2368,7 @@ async function enrichMarketPair(symbol, rowIdx) {
     if (rowEl) rowEl.classList.remove('mkt-loading');
 
     if (!data.success) {
-      panel.innerHTML = `
+      $('panel-body').innerHTML = `
 <div class="d-inner" style="position:relative">
   <button class="d-close" onclick="closePanel()">✕</button>
   <div style="padding:20px 14px;color:var(--text2);font-size:12px;line-height:1.6">
@@ -2360,7 +2385,7 @@ async function enrichMarketPair(symbol, rowIdx) {
 
   } catch (e) {
     if (rowEl) rowEl.classList.remove('mkt-loading');
-    panel.innerHTML = `
+    $('panel-body').innerHTML = `
 <div class="d-inner" style="position:relative">
   <button class="d-close" onclick="closePanel()">✕</button>
   <div style="padding:20px 14px;color:var(--red);font-size:12px">
@@ -2865,6 +2890,7 @@ function renderHistoryTable(sigs) {
 
   const acct         = parseFloat(localStorage.getItem('mt7_account_size') || '0');
   const riskPerTrade = acct > 0 ? acct * 0.01 : 0;
+  const isMobile     = window.innerWidth < 768;
 
   // Pre-compute running balance after each trade (chronological, compounding)
   const balanceAfter  = {};
@@ -2887,7 +2913,7 @@ function renderHistoryTable(sigs) {
     const day = dt.getDate();
     const hh  = String(dt.getHours()).padStart(2, '0');
     const mm  = String(dt.getMinutes()).padStart(2, '0');
-    const timeStr = `${mon} ${day} ${hh}:${mm}`;
+    const timeStr = isMobile ? `${mon} ${day}` : `${mon} ${day} ${hh}:${mm}`;
 
     const sym    = esc((s.symbol || '').replace('_USDT', ''));
     const dirCls = s.direction === 'LONG' ? 'hist-dir-long' : 'hist-dir-short';
@@ -2923,13 +2949,13 @@ function renderHistoryTable(sigs) {
       <td class="hist-time">${timeStr}</td>
       <td class="hist-symbol">${sym}</td>
       <td class="${dirCls}">${dirLbl}</td>
-      <td class="hist-strat">${strat}</td>
-      <td class="hist-conv">${s.conviction}</td>
-      <td><div class="hist-why" title="${why}">${why}</div></td>
+      ${isMobile ? '' : `<td class="hist-strat">${strat}</td>`}
+      ${isMobile ? '' : `<td class="hist-conv">${s.conviction}</td>`}
+      ${isMobile ? '' : `<td><div class="hist-why" title="${why}">${why}</div></td>`}
       <td><div class="outcome-group">${btns}</div></td>
       <td style="text-align:right;font-size:12px;white-space:nowrap">${pnlCell}</td>
-      <td style="text-align:right;font-size:12px;white-space:nowrap">${rCell}</td>
-      <td style="text-align:right">${balCell}</td>
+      ${isMobile ? '' : `<td style="text-align:right;font-size:12px;white-space:nowrap">${rCell}</td>`}
+      ${isMobile ? '' : `<td style="text-align:right">${balCell}</td>`}
     </tr>`;
   }).join('');
 
@@ -2937,9 +2963,10 @@ function renderHistoryTable(sigs) {
     <table id="hist-table">
       <thead><tr>
         <th>Time</th><th>Symbol</th><th>Dir</th>
-        <th>Strategy</th><th>Conv</th><th>Why</th><th>Result</th>
-        <th style="text-align:right">$P&L</th><th style="text-align:right">R</th>
-        <th style="text-align:right">Balance</th>
+        ${isMobile ? '' : '<th>Strategy</th><th>Conv</th><th>Why</th>'}
+        <th>Result</th>
+        <th style="text-align:right">$P&L</th>
+        ${isMobile ? '' : '<th style="text-align:right">R</th><th style="text-align:right">Balance</th>'}
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
@@ -3397,6 +3424,49 @@ function dismissGuide() {
 /* ============================================================
    INIT
    ============================================================ */
+/* ── Panel resize handle ── */
+(function initPanelResize() {
+  const KEY  = 'mt7_panel_width';
+  const MIN_W = 320;
+  function maxW() { return Math.floor(window.innerWidth * 0.9); }
+
+  try {
+    const saved = parseInt(localStorage.getItem(KEY), 10);
+    if (saved >= MIN_W) $('detail-panel').style.width = saved + 'px';
+  } catch (_) {}
+
+  const handle = $('panel-resize-handle');
+  if (!handle) return;
+  let dragging = false;
+
+  handle.addEventListener('mousedown', function(e) {
+    if (window.innerWidth < 768) return;
+    dragging = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', function(e) {
+    if (!dragging) return;
+    const panel = $('detail-panel');
+    const rect  = panel.getBoundingClientRect();
+    const w = Math.min(maxW(), Math.max(MIN_W, Math.round(rect.right - e.clientX)));
+    panel.style.width = w + 'px';
+  });
+
+  document.addEventListener('mouseup', function() {
+    if (!dragging) return;
+    dragging = false;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    const w = parseInt($('detail-panel').style.width, 10);
+    if (w >= MIN_W) {
+      try { localStorage.setItem(KEY, w); } catch (_) {}
+    }
+  });
+})();
+
 loadFilters();
 const savedAcct = localStorage.getItem('mt7_account_size');
 if (savedAcct && $('hist-account-size')) $('hist-account-size').value = savedAcct;
