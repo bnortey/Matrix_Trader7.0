@@ -7,9 +7,9 @@
 
 Last updated: 2026-04-24
 Last commit: b8abdb2 feat: capture exit_price in evaluate_outcome() — close price of triggering candle
-app.py: 2411 lines
+app.py: 2486 lines
 index.html: 4119 lines
-HANDOFF.md: 745 lines
+HANDOFF.md: 762 lines
 
 ---
 
@@ -159,6 +159,7 @@ Sentiment APIs (no key needed):
 | `/api/strategies/custom/<strategy_key>` | PATCH | Updates a custom strategy; supports enable/disable and config edits |
 | `/api/strategies/custom/<strategy_key>` | DELETE | Deletes a custom strategy definition; historical signals remain intact |
 | `/api/analysis` | POST | AI strategy review: sends last 200 tagged outcomes to Claude API |
+| `/api/backfill/pnl` | POST | **MAINTENANCE** — Re-evaluates historical signals (result NOT NULL, pnl_pct NULL) against live kline data; writes corrected exit_price, blended PARTIAL, and leveraged pnl_pct. Safe to call repeatedly (skips already-backfilled rows). |
 
 Query params for `/api/scan`: `threshold` (int, default 55), `strategy` (string, default "balanced").
 Query params for `/api/signals/history`: `limit` (int, default 100), `strategy`, `result`, `symbol`.
@@ -645,6 +646,10 @@ Deploy after self-verify and HANDOFF.md update are both complete
 - [ ] `GET /api/stream/prices?symbols=BTC_USDT` returns `Content-Type: text/event-stream` and streams `data: {...}` events every ~3s
 - [ ] History tab entry subscribes SSE and `H.priceStream` is set; leaving the tab closes the stream and sets it to null
 - [ ] `H.posRefreshTimer` is null while SSE is active; restores on SSE error/close
+- [ ] `POST /api/backfill/pnl` returns `{"success": true, "updated": N, "skipped": N, "errors": N}`
+- [ ] Re-evaluated PARTIAL signals have blended `exit_price` (not equal to `tp1`)
+- [ ] All 313 historical signals get `pnl_pct` populated after backfill runs (check: `SELECT COUNT(*) FROM signals WHERE pnl_pct IS NULL AND result IS NOT NULL` returns 0)
+- [ ] Backfilled rows have `evaluation_version = 'backfill_v1'`
 - [ ] `signals` table has `pnl_pct` and `leverage` columns after `init_db()` runs
 - [ ] `leverage` is backfilled from `signal_json.leverage_cap` for existing rows on startup
 - [ ] New scans write `leverage` from `sig.get("leverage_cap")` at log time
@@ -677,6 +682,11 @@ Claude Code reads the actual files. It does not need the full HANDOFF.md pasted 
 ---
 
 ## Session Notes
+
+### 2026-04-24 — Session summary (pnl_pct historical backfill)
+Built: Added `POST /api/backfill/pnl` maintenance route in `app.py`. Queries all signals where `result IS NOT NULL AND pnl_pct IS NULL AND exit_price IS NOT NULL AND entry1 IS NOT NULL` (the 313 pre-migration historical rows). For each: calls `evaluate_outcome(sig)` to re-fetch real MEXC Min15 klines and re-run the full evaluation including blended PARTIAL exit prices, then computes leveraged `pnl_pct` via `_compute_leveraged_pnl()`, and writes `exit_price`, `pnl_pct`, `entry_at`, `result`, `result_note`, `evaluation_version='backfill_v1'` in one UPDATE. Sleeps 0.1s between each signal to rate-limit MEXC. Per-signal errors are caught and counted without aborting the run. Returns `{success, updated, skipped, errors}`. Safe to re-call — `pnl_pct IS NULL` filter skips already-backfilled rows.
+Decided: Route is POST only (not GET) to prevent accidental browser trigger. Placed in a dedicated "Maintenance routes" section above the entry point. Does not modify `data_quality` — that column reflects scan-time quality, not re-evaluation quality. `evaluate_outcome()` may return None for very old signals if klines have aged out of MEXC's 300-candle window; those are counted as skipped, not errors.
+Watch out for: The backfill makes one MEXC kline API call per signal — 313 signals at 0.1s delay = ~31 seconds minimum. Do not call from a browser tab that will time out; use `curl -X POST http://localhost:8080/api/backfill/pnl` from the VPS shell for reliable execution. If MEXC is temporarily unavailable, skipped count will be high — just re-call the route later (it's idempotent).
 
 ### 2026-04-24 — Session summary (paper trading data integrity sprint)
 Built: Seven changes to fix paper trading data accuracy for strategy evaluation. (1) Added `pnl_pct REAL` and `leverage REAL` columns to the `signals` table via idempotent ALTER TABLE migrations in `init_db()`. On startup, `leverage` is backfilled for all existing rows using `json_extract(signal_json, '$.leverage_cap')` in a single SQL UPDATE. (2) `log_signals()` now extracts `leverage_cap`/`max_leverage` from the signal dict and writes it to the DB at insert time alongside `strategy_key`. (3) PARTIAL outcomes in `evaluate_outcome()` now use a blended exit price (1/3 at each TP hit + remainder at stop) instead of recording the last TP hit as exit_price — e.g., TP1-then-stopped blends `(tp1/3) + (stop×2/3)`. (4) Added `_compute_leveraged_pnl(sig, exit_price)` helper that computes `raw_pct × leverage`, falling back to `signal_json.leverage_cap` if the `leverage` column is NULL; `evaluate_outcome()` result is now written with `pnl_pct` in the same UPDATE. (5) `PATCH /api/signal/result` now accepts optional `exit_price` and `entry_price` in the request body; if `exit_price` is provided, computes and persists `pnl_pct` using the same helper. (6) Added `expire_stale_signals()` which tags `result IS NULL` signals older than 80h as `EXPIRED` with `result_note='Auto-expired after 80h'`; called at the top of both `run_scan()` and `api_outcomes_check()`. (7) `api_signal_detail()` now prefers the persisted `pnl_pct` column and falls back to unleveraged on-the-fly for pre-migration rows; `api_analysis()` now includes `avg pnl` per strategy in the summary block and `pnl:{pct}%` in each signal log line.

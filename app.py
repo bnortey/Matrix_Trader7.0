@@ -2371,6 +2371,81 @@ def api_analysis():
 
 
 # ---------------------------------------------------------------------------
+# Maintenance routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/backfill/pnl", methods=["POST"])
+def api_backfill_pnl():
+    """
+    MAINTENANCE — Backfill pnl_pct (and corrected exit_price) for historical
+    signals that were evaluated before the pnl_pct column and blended PARTIAL
+    fix existed.
+
+    Queries signals WHERE result IS NOT NULL AND pnl_pct IS NULL
+    AND exit_price IS NOT NULL AND entry1 IS NOT NULL, re-runs evaluate_outcome()
+    against live MEXC kline data, and writes corrected exit_price, pnl_pct,
+    entry_at, and evaluation_version='backfill_v1'.
+
+    Safe to call multiple times — the pnl_pct IS NULL filter skips already-
+    backfilled rows. POST to prevent accidental browser trigger.
+    """
+    updated = 0
+    skipped = 0
+    errors  = 0
+
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT * FROM signals
+            WHERE result IS NOT NULL
+              AND pnl_pct IS NULL
+              AND exit_price IS NOT NULL
+              AND entry1 IS NOT NULL
+            ORDER BY logged_at ASC
+        """).fetchall()
+        con.close()
+
+        sigs = [dict(r) for r in rows]
+        print(f"[backfill/pnl] {len(sigs)} signals to backfill", file=sys.stderr)
+
+        for sig in sigs:
+            try:
+                outcome = evaluate_outcome(sig)
+                if outcome is None:
+                    skipped += 1
+                    continue
+
+                result, note, exit_price, result_at, entry_at = outcome
+                pnl_pct = _compute_leveraged_pnl(sig, exit_price)
+
+                con = sqlite3.connect(DB_PATH)
+                con.execute("""
+                    UPDATE signals
+                    SET exit_price=?, pnl_pct=?, entry_at=?,
+                        result=?, result_note=?,
+                        evaluation_version='backfill_v1'
+                    WHERE id=?
+                """, (exit_price, pnl_pct, entry_at, result, note, sig["id"]))
+                con.commit()
+                con.close()
+                updated += 1
+
+            except Exception as e:
+                print(f"[backfill/pnl] error on id={sig.get('id')}: {e}", file=sys.stderr)
+                errors += 1
+
+            time.sleep(0.1)  # rate-limit MEXC API calls
+
+        print(f"[backfill/pnl] done — updated:{updated} skipped:{skipped} errors:{errors}",
+              file=sys.stderr)
+        return jsonify({"success": True, "updated": updated, "skipped": skipped, "errors": errors})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
