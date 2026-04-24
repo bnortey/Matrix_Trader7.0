@@ -6,7 +6,7 @@ import sqlite3
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 
 import requests
@@ -88,6 +88,26 @@ def init_db() -> None:
         con.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN entry_at TEXT DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN signal_json TEXT DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN data_quality TEXT DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN evaluation_version TEXT DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     con.close()
 
 
@@ -115,8 +135,8 @@ def log_signals(signals: list[dict]) -> None:
                 (logged_at, symbol, exchange, direction, strategy, conviction,
                  price, entry1, entry2, entry3, tp1, tp2, tp3, stop_loss,
                  atr_pct, volatility, funding_rate, rsi_1h, trend_score,
-                 tags, signal_why)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 tags, signal_why, signal_json, data_quality)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 datetime.utcnow().isoformat(),
                 sig["symbol"],
@@ -135,6 +155,8 @@ def log_signals(signals: list[dict]) -> None:
                 sig.get("trend_score"),
                 ",".join(sig.get("tags", [])),
                 sig.get("signal_why", ""),
+                json.dumps(sig, default=str),
+                "current",
             ))
         con.commit()
         con.close()
@@ -1317,13 +1339,16 @@ def api_signal_detail(signal_id: int):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
+def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str | None] | None:
     """
     Fetch Min15 klines since the signal was logged and determine if stop or TP was hit.
 
-    Returns (result, note) or None if no level was hit yet / insufficient data.
+    Returns (result, note, exit_price, result_at, entry_at) or None if no level
+    was hit yet / insufficient data.
 
     Evaluation rules (applied per candle in chronological order):
+      - First wait for entry1 to be touched. Signals are logged at scan time, but
+        the ladder entry may be away from current price.
       - Stop hit (LONG: low <= stop | SHORT: high >= stop) → LOSS (or PARTIAL if TP1 hit first)
       - TP3 fully hit → WIN
       - TP1 or TP2 hit, no stop → PARTIAL
@@ -1334,15 +1359,18 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
     direction = sig.get("direction", "")
     logged_at = sig.get("logged_at", "")
     stop_loss = sig.get("stop_loss")
+    entry1    = sig.get("entry1")
     tp1       = sig.get("tp1")
     tp2       = sig.get("tp2")
     tp3       = sig.get("tp3")
 
-    if not symbol or not direction or not stop_loss or not tp1:
+    if not symbol or not direction or not entry1 or not stop_loss or not tp1:
         return None
 
     try:
         dt       = datetime.fromisoformat(logged_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         start_ts = int(dt.timestamp())
     except Exception:
         return None
@@ -1370,8 +1398,10 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
     candles: list[dict] = []
     for i, t in enumerate(raw_times):
         try:
-            if int(t) >= start_ts:
+            candle_ts = int(t)
+            if candle_ts >= start_ts:
                 candles.append({
+                    "time":  candle_ts,
                     "high":  float(raw_highs[i]),
                     "low":   float(raw_lows[i]),
                     "close": float(raw_closes[i]),
@@ -1384,14 +1414,33 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
 
     stop_hit   = False
     best_tp    = 0              # highest TP tier reached before stop: 0=none, 1, 2, 3
-    exit_close: float | None = None  # close of candle where result was determined
+    entry_hit  = False
+    entry_at: str | None = None
+    exit_price: float | None = None
+    result_at: str | None = None
+
+    def _iso(ts: int) -> str:
+        return datetime.utcfromtimestamp(ts).isoformat()
 
     for c in candles:
-        h, l, cl = c["high"], c["low"], c["close"]
+        h, l, ts = c["high"], c["low"], c["time"]
+
+        if not entry_hit:
+            if direction == "LONG":
+                entry_hit = l <= entry1
+            else:
+                entry_hit = h >= entry1
+            if not entry_hit:
+                continue
+            entry_at = _iso(ts)
+
         if direction == "LONG":
             if l <= stop_loss:
                 stop_hit   = True
-                exit_close = cl  # stop candle close (pessimistic for PARTIAL too)
+                exit_price = stop_loss if best_tp == 0 else (
+                    tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
+                )
+                result_at = _iso(ts)
                 break
             prev_tp = best_tp
             if tp3 and h >= tp3:
@@ -1401,11 +1450,17 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
             elif tp1 and h >= tp1:
                 best_tp = max(best_tp, 1)
             if best_tp > prev_tp:
-                exit_close = cl  # update to close of highest-TP candle reached so far
+                exit_price = tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
+                result_at = _iso(ts)
+                if best_tp == 3:
+                    break
         else:  # SHORT
             if h >= stop_loss:
                 stop_hit   = True
-                exit_close = cl
+                exit_price = stop_loss if best_tp == 0 else (
+                    tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
+                )
+                result_at = _iso(ts)
                 break
             prev_tp = best_tp
             if tp3 and l <= tp3:
@@ -1415,18 +1470,21 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None] | None:
             elif tp1 and l <= tp1:
                 best_tp = max(best_tp, 1)
             if best_tp > prev_tp:
-                exit_close = cl
+                exit_price = tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
+                result_at = _iso(ts)
+                if best_tp == 3:
+                    break
 
     if stop_hit and best_tp == 0:
-        return ("LOSS",    f"Stop hit at {stop_loss}",              exit_close)
+        return ("LOSS",    f"Stop hit at {stop_loss}",              exit_price, result_at, entry_at)
     if stop_hit and best_tp > 0:
-        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}", exit_close)
+        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}", exit_price, result_at, entry_at)
     if best_tp == 3:
-        return ("WIN",     f"TP3 hit at {tp3}",                    exit_close)
+        return ("WIN",     f"TP3 hit at {tp3}",                    exit_price, result_at, entry_at)
     if best_tp == 2:
-        return ("PARTIAL", f"TP2 hit at {tp2}",                    exit_close)
+        return ("PARTIAL", f"TP2 hit at {tp2}",                    exit_price, result_at, entry_at)
     if best_tp == 1:
-        return ("PARTIAL", f"TP1 hit at {tp1}",                    exit_close)
+        return ("PARTIAL", f"TP1 hit at {tp1}",                    exit_price, result_at, entry_at)
     return None   # still open — no level hit yet
 
 
@@ -1456,11 +1514,25 @@ def api_outcomes_check():
             if outcome is None:
                 skipped += 1
                 continue
-            result, note, exit_price = outcome
+            result, note, exit_price, result_at, entry_at = outcome
             con = sqlite3.connect(DB_PATH)
             con.execute(
-                "UPDATE signals SET result=?, result_note=?, result_at=?, exit_price=? WHERE id=?",
-                (result, note, datetime.utcnow().isoformat(), exit_price, sig["id"]),
+                """
+                UPDATE signals
+                SET result=?, result_note=?, result_at=?, exit_price=?, entry_at=?,
+                    data_quality=COALESCE(data_quality, 'current'),
+                    evaluation_version=?
+                WHERE id=?
+                """,
+                (
+                    result,
+                    note,
+                    result_at or datetime.utcnow().isoformat(),
+                    exit_price,
+                    entry_at,
+                    "entry_fill_v2",
+                    sig["id"],
+                ),
             )
             con.commit()
             con.close()

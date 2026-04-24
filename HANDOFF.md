@@ -231,8 +231,12 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
 |---|---|---|
 | `result` | TEXT \| NULL | `PATCH /api/signal/result` (manual) or `evaluate_outcome()` (auto) |
 | `result_note` | TEXT \| NULL | `evaluate_outcome()` — describes which level was hit |
-| `result_at` | TEXT \| NULL | UTC ISO timestamp when result was written |
-| `exit_price` | REAL \| NULL | `evaluate_outcome()` only — close price of the triggering candle; NULL for manual tags and EXPIRED/SKIPPED |
+| `result_at` | TEXT \| NULL | UTC ISO timestamp of the candle where the auto-evaluated outcome occurred; manual tags use write time |
+| `exit_price` | REAL \| NULL | `evaluate_outcome()` only — decisive TP/SL level for the outcome; NULL for manual tags and EXPIRED/SKIPPED |
+| `entry_at` | TEXT \| NULL | `evaluate_outcome()` only — UTC ISO timestamp of the candle where entry1 was first touched |
+| `signal_json` | TEXT \| NULL | Full enriched signal snapshot at scan time for later research/backtesting |
+| `data_quality` | TEXT \| NULL | `current` for post-fix rows; `legacy_pre_fill_check` for pre-fix rows |
+| `evaluation_version` | TEXT \| NULL | `entry_fill_v2` for corrected auto-evaluation; `pre_entry_fill_v1` for legacy outcomes |
 
 `ai_report` is a JSON string: `[{"label": "Setup", "text": "..."}, {"label": "Structure", ...}, ...]`
 Parse with `JSON.parse()` in the frontend. Four sections: Setup, Structure, Invalidation, Risk.
@@ -569,10 +573,15 @@ Deferred: nothing.
 Watch out for: `isMobile` is evaluated once at render time. If user rotates device or resizes browser without refreshing, the table won't rerender. This is acceptable — `loadHistory()` is called on every tab switch so re-entry fixes it. Do not cache `isMobile` as a module-level constant — it must be evaluated fresh inside `renderHistoryTable()` each call.
 
 ### 2026-04-23 — Session summary (exit_price capture)
-Built: `exit_price REAL DEFAULT NULL` column added to signals table via `ALTER TABLE` migration in `init_db()` (wrapped in try/except OperationalError for idempotency). `evaluate_outcome()` now fetches `close` from klines alongside `high`/`low`, tracks `exit_close` at the triggering candle, and returns a 3-tuple `(result, note, exit_price)`. `api_outcomes_check()` updated to unpack the 3-tuple and write `exit_price` in the UPDATE. Manual tagging via `PATCH /api/signal/result` leaves `exit_price` NULL — only auto-evaluation sets it.
-Decided: exit_price = close of the candle where TP or SL was hit. For PARTIAL-via-stop, use the stop candle close (pessimistic). For WIN/PARTIAL-via-TP-only, use the close of the highest-TP candle. NULL for EXPIRED, SKIPPED, and any manually tagged result.
+Built: `exit_price REAL DEFAULT NULL` column added to signals table via `ALTER TABLE` migration in `init_db()` (wrapped in try/except OperationalError for idempotency). Later accuracy pass changed `evaluate_outcome()` to return `(result, note, exit_price, result_at, entry_at)` and write both `exit_price` and `entry_at`.
+Decided: exit_price = decisive TP/SL level for the outcome, not the candle close. NULL for EXPIRED, SKIPPED, and any manually tagged result.
 Deferred: displaying exit_price in the history tab UI.
-Watch out for: `init_db()` is only called under `__main__` — calling it via `import app` in a script requires `app.init_db()` explicitly. The ALTER TABLE is idempotent; running twice is safe. `evaluate_outcome()` return type is now `tuple[str, str, float | None] | None` — any future caller that unpacks as `result, note = outcome` will raise a ValueError.
+Watch out for: `init_db()` is only called under `__main__` — calling it via `import app` in a script requires `app.init_db()` explicitly. The ALTER TABLE is idempotent; running twice is safe. `evaluate_outcome()` return type is now `tuple[str, str, float | None, str | None, str | None] | None` — any future caller that unpacks as `result, note = outcome` will raise a ValueError.
+
+### 2026-04-24 — Session summary (paper trading accuracy pass)
+Built: `evaluate_outcome()` now treats logged signals as pending ladder trades instead of immediately filled positions. It waits for `entry1` to be touched before a stop or TP can count, parses naive stored UTC timestamps as UTC instead of local machine time, records the candle timestamp for `result_at`, and writes `entry_at`. `exit_price` now stores the decisive TP/SL level instead of the triggering candle close. Added idempotent migrations for `entry_at` and `signal_json`; `log_signals()` stores the full enriched signal dict as JSON so future strategy analysis has access to the complete scan-time context.
+Decided: Existing historical rows are labelled with `data_quality='legacy_pre_fill_check'` and `evaluation_version='pre_entry_fill_v1'`. They may contain pre-fix outcomes and NULL `exit_price`/`entry_at`; re-evaluate/backfill deliberately before using them for serious research. Future logged rows default to `data_quality='current'`, and corrected auto-evaluated outcomes use `evaluation_version='entry_fill_v2'`.
+Watch out for: `evaluate_outcome()` return type is now `tuple[str, str, float | None, str | None, str | None] | None`.
 
 ### 2026-04-23 — Session summary (AI provider fallback chain)
 Built: `lib/ai_client.py` — provider fallback chain with `call_ai(system, user, max_tokens)` as the single public function. Provider order: Claude → Gemini → DeepSeek → Groq. Each `_call_*()` function lazy-imports its SDK (so missing packages only fail at call time, not module import). `app.py` top-level `import anthropic` removed; `from lib.ai_client import call_ai` added. Both `api_signal_detail()` and `api_analysis()` now call `call_ai()`. `api_analysis()` no longer gates on `ANTHROPIC_API_KEY` specifically — `call_ai()` tries all configured providers. `requirements.txt` updated with `google-generativeai>=0.8.0`, `openai>=1.0.0`, `groq>=0.9.0`.

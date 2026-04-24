@@ -1606,6 +1606,12 @@ function renderRows() {
   container.innerHTML = S.filtered.map((sig, i) => rowHTML(sig, i)).join('');
 }
 
+function normalizeTags(tags) {
+  if (Array.isArray(tags)) return tags.filter(Boolean);
+  if (typeof tags === 'string') return tags.split(',').map(t => t.trim()).filter(Boolean);
+  return [];
+}
+
 function getFreshnessClass() {
   if (!S.scanTime) return 'stale';
   const ageMs = Date.now() - S.scanTime;
@@ -1621,7 +1627,7 @@ function rowHTML(sig, i) {
   const active = S.selected === i ? 'active' : '';
   const cc = pctColor(sig.change_24h_pct);
   const fc = fundColor(sig.funding_rate);
-  const tags = [...(sig.tags || [])];
+  const tags = normalizeTags(sig.tags);
   if (sig.daily_trend_aligned === true)  tags.push('daily_aligned');
   if (sig.daily_trend_aligned === false) tags.push('counter_trend');
   const tagsHtml = tags.length
@@ -1673,7 +1679,7 @@ function renderDetail(sig) {
   const liveBadge = sig._liveAnalysis
     ? '<span class="d-live">Live analysis</span>'
     : '';
-  const displayTags = [...(sig.tags || [])];
+  const displayTags = normalizeTags(sig.tags);
   if (sig.daily_trend_aligned === true)  displayTags.push('daily_aligned');
   if (sig.daily_trend_aligned === false) displayTags.push('counter_trend');
 
@@ -2592,6 +2598,27 @@ const H = {
 
 let lastHistorySigs = [];
 
+function hydrateHistorySignal(row) {
+  let snap = {};
+  if (row && row.signal_json) {
+    try {
+      const parsed = JSON.parse(row.signal_json);
+      if (parsed && typeof parsed === 'object') snap = parsed;
+    } catch (e) {
+      snap = {};
+    }
+  }
+
+  const sig = { ...snap, ...row };
+  sig.tags = normalizeTags(Array.isArray(snap.tags) && !row.tags ? snap.tags : row.tags || snap.tags);
+  if (!sig.entries) sig.entries = [sig.entry1, sig.entry2, sig.entry3];
+  if (!sig.exits)   sig.exits   = [sig.tp1,    sig.tp2,    sig.tp3   ];
+  if (sig.tp1 == null && sig.exits) sig.tp1 = sig.exits[0];
+  if (sig.tp2 == null && sig.exits) sig.tp2 = sig.exits[1];
+  if (sig.tp3 == null && sig.exits) sig.tp3 = sig.exits[2];
+  return sig;
+}
+
 const OUTCOME_LABELS = {
   WIN: 'WIN', LOSS: 'LOSS', PARTIAL: 'PAR', EXPIRED: 'EXP', SKIPPED: 'SKP',
 };
@@ -2618,7 +2645,7 @@ async function loadHistory() {
       return;
     }
 
-    const all = data.signals || [];
+    const all = (data.signals || []).map(hydrateHistorySignal);
 
     // Split: open positions (untagged) vs closed signals (tagged)
     H.openPositions = all.filter(s => s.result === null);
@@ -3118,7 +3145,7 @@ async function fetchAndRenderPositions() {
     const histResp = await fetch('/api/signals/history?limit=500');
     const histData = await histResp.json();
     if (histData.success) {
-      const all          = histData.signals || [];
+      const all          = (histData.signals || []).map(hydrateHistorySignal);
       const prevOpenCount = H.openPositions.length;
       H.openPositions    = all.filter(s => s.result === null);
       lastHistorySigs    = all.filter(s => s.result !== null);

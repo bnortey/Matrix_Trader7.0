@@ -1,4 +1,4 @@
-# Matrix Trader 7.0 — Claude Code Context
+# Matrix Trader 7.0 — Codex Context
 
 > Read this file at the start of every session. It is the source of truth for what this project is, where it stands, and how to work on it.
 
@@ -20,7 +20,7 @@ It is a **local web application**: a Python Flask backend that serves a dark-the
 1. User opens the dashboard
 2. Hits "Scan All Perps" — fetches all 800+ MEXC futures tickers via public API
 3. Sees a ranked signal table (LONG/SHORT, conviction score, entry/TP/SL)
-4. Clicks a signal → requests an AI-generated trade brief (Claude API)
+4. Clicks a signal → requests an AI-generated trade brief (Codex API)
 5. Uses the risk calculator to size the position
 6. Executes manually on MEXC
 
@@ -51,7 +51,7 @@ See HANDOFF.md for current phase status and task list. HANDOFF.md is the source 
 
 ```
 Matrix_Trader_7.0/
-├── CLAUDE.md              ← this file
+├── AGENTS.md              ← this file
 ├── README.md              ← for external users (write in Phase 4)
 ├── .gitignore
 ├── .env                   ← ANTHROPIC_API_KEY, MEXC_API_KEY (if needed)
@@ -80,7 +80,7 @@ Matrix_Trader_7.0/
 - **Backend:** Python 3.11+ / Flask
 - **Frontend:** Single HTML file, vanilla JS, dark theme
 - **Data:** MEXC public contract API — no auth required for market data
-- **AI layer:** Anthropic Claude API (for signal reports) — key in `.env`
+- **AI layer:** Anthropic Codex API (for signal reports) — key in `.env`
 - **WebSocket:** MEXC contract WS `wss://contract.mexc.com/edge`
 
 ---
