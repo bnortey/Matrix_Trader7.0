@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from functools import partial
 
-import anthropic
 import requests
 import pandas as pd
 from collections import defaultdict
@@ -25,6 +24,7 @@ from lib.indicators import (
     daily_trend_direction,
 )
 from lib.laddering import generate_ladders
+from lib.ai_client import call_ai
 
 load_dotenv()
 
@@ -1268,37 +1268,26 @@ def api_signal_detail(signal_id: int):
         tags_raw  = sig.get("tags") or ""
         tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
 
-        # AI trade coach review — gracefully skipped if key absent or call fails
-        ai_analysis = None
-        try:
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            if api_key:
-                user_msg = (
-                    f"Trade review:\n"
-                    f"Symbol: {sig.get('symbol')} | Direction: {direction} | Strategy: {sig.get('strategy')}\n"
-                    f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Result: {sig.get('result')}\n"
-                    f"Stop: {sig.get('stop_loss')} | TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
-                    f"Duration: {duration_minutes or 'unknown'} minutes\n"
-                    f"Signal reason: {sig.get('signal_why')}\n"
-                    f"Tags: {tags_raw}\n"
-                    f"Result note: {sig.get('result_note')}\n\n"
-                    f"In 3-4 sentences: what likely happened in this trade, what the signal "
-                    f"got right or wrong, and one specific thing to watch for next time on "
-                    f"this type of setup."
-                )
-                client = anthropic.Anthropic(api_key=api_key)
-                message = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=512,
-                    system=(
-                        "You are a trading coach reviewing a completed trade. "
-                        "Be direct and specific. No fluff. 3-4 sentences maximum."
-                    ),
-                    messages=[{"role": "user", "content": user_msg}],
-                )
-                ai_analysis = message.content[0].text
-        except Exception:
-            pass  # ai_analysis stays None; do not crash
+        # AI trade coach review — gracefully skipped if no provider key or call fails
+        user_msg = (
+            f"Trade review:\n"
+            f"Symbol: {sig.get('symbol')} | Direction: {direction} | Strategy: {sig.get('strategy')}\n"
+            f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Result: {sig.get('result')}\n"
+            f"Stop: {sig.get('stop_loss')} | TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
+            f"Duration: {duration_minutes or 'unknown'} minutes\n"
+            f"Signal reason: {sig.get('signal_why')}\n"
+            f"Tags: {tags_raw}\n"
+            f"Result note: {sig.get('result_note')}\n\n"
+            f"In 3-4 sentences: what likely happened in this trade, what the signal "
+            f"got right or wrong, and one specific thing to watch for next time on "
+            f"this type of setup."
+        )
+        ai_analysis = call_ai(
+            system="You are a trading coach reviewing a completed trade. "
+                   "Be direct and specific. No fluff. 3-4 sentences maximum.",
+            user=user_msg,
+            max_tokens=512,
+        )
 
         return jsonify({
             "success":          True,
@@ -1513,13 +1502,9 @@ def api_prices():
 
 @app.route("/api/analysis", methods=["POST"])
 def api_analysis():
-    """AI strategy review: analyse tagged signal outcomes via Claude API."""
+    """AI strategy review: analyse tagged signal outcomes via available AI provider."""
     print("AI strategy review requested", file=sys.stderr)
     try:
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            return jsonify({"success": False, "error": "ANTHROPIC_API_KEY not configured"}), 400
-
         # Load last 200 tagged signals
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
@@ -1638,14 +1623,9 @@ def api_analysis():
             "supporting signals as low-confidence."
         )
 
-        client = anthropic.Anthropic(api_key=api_key)
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        analysis_text = message.content[0].text
+        analysis_text = call_ai(system=system_prompt, user=user_msg, max_tokens=2048)
+        if analysis_text is None:
+            return jsonify({"success": False, "error": "No AI provider available — check API keys"}), 400
 
         return jsonify({"success": True, "analysis": analysis_text})
 

@@ -79,7 +79,8 @@ Matrix_Trader_7.0/
 └── lib/                   ← pure utility functions only; no Flask, no API calls
     ├── indicators.py      ← 261 lines; complete; wired into app.py scoring
     ├── laddering.py       ← 120 lines; complete; wired into enrich_signal()
-    └── mexc_stream.py     ← 263 lines; complete; NOT YET WIRED to any route or UI (P3e)
+    ├── mexc_stream.py     ← 263 lines; complete; NOT YET WIRED to any route or UI (P3e)
+    └── ai_client.py       ← AI provider fallback chain; call_ai() is the only public fn
 ```
 
 **Touch policy:**
@@ -438,6 +439,8 @@ Next in priority order:
 - Do not add a fifth innerHTML write to the detail panel without targeting `$('panel-body')`. All four existing write sites (renderDetail, enrichMarketPair ×3, showClosedDetail) already target panel-body.
 - Do not mark a task complete without adding its verification items to the checklist at the bottom of this file. If the task added a new localStorage key, new route, new UI element, or new persistent behavior — it gets a checklist item.
 - Do not add `onclick="showClosedDetail(...)"` to open-positions rows — that handler is only for closed (tagged) signal rows in the history table. Open positions use `showPositionDetail()`.
+- Do not call any AI provider directly from routes — always use `call_ai()` from `lib/ai_client.py`. Adding a new provider means adding one entry to `PROVIDERS` and one `_call_*()` function in `lib/ai_client.py` only.
+- Do not import `anthropic` at the top of `app.py` — it has been removed. The lazy import inside `_call_claude()` in `lib/ai_client.py` handles it.
 
 ---
 
@@ -570,6 +573,12 @@ Built: `exit_price REAL DEFAULT NULL` column added to signals table via `ALTER T
 Decided: exit_price = close of the candle where TP or SL was hit. For PARTIAL-via-stop, use the stop candle close (pessimistic). For WIN/PARTIAL-via-TP-only, use the close of the highest-TP candle. NULL for EXPIRED, SKIPPED, and any manually tagged result.
 Deferred: displaying exit_price in the history tab UI.
 Watch out for: `init_db()` is only called under `__main__` — calling it via `import app` in a script requires `app.init_db()` explicitly. The ALTER TABLE is idempotent; running twice is safe. `evaluate_outcome()` return type is now `tuple[str, str, float | None] | None` — any future caller that unpacks as `result, note = outcome` will raise a ValueError.
+
+### 2026-04-23 — Session summary (AI provider fallback chain)
+Built: `lib/ai_client.py` — provider fallback chain with `call_ai(system, user, max_tokens)` as the single public function. Provider order: Claude → Gemini → DeepSeek → Groq. Each `_call_*()` function lazy-imports its SDK (so missing packages only fail at call time, not module import). `app.py` top-level `import anthropic` removed; `from lib.ai_client import call_ai` added. Both `api_signal_detail()` and `api_analysis()` now call `call_ai()`. `api_analysis()` no longer gates on `ANTHROPIC_API_KEY` specifically — `call_ai()` tries all configured providers. `requirements.txt` updated with `google-generativeai>=0.8.0`, `openai>=1.0.0`, `groq>=0.9.0`.
+Decided: Lazy imports per provider (not at module level) so importing `lib/ai_client` never fails even if SDK packages are missing. `_DISPATCH` dict maps provider names to functions to keep `call_ai()` clean. `api_analysis` max_tokens=2048 (was 2000 — rounded up to match task spec).
+Deferred: nothing.
+Watch out for: `call_ai()` returns `None` if all providers fail or none have keys — callers must handle `None` gracefully (detail route sets `ai_analysis=None`, analysis route returns 400). Do not add provider logic directly to routes; always add to `lib/ai_client.py`. The `anthropic` package is still in `requirements.txt` — it is needed by `_call_claude()` at runtime.
 
 ### 2026-04-23 — Session summary (closed signal detail panel)
 Built: `GET /api/signal/detail/<int:signal_id>` — returns full trade summary (entry, exit_price, stop, TPs, result, pnl_pct, duration_minutes, signal_why, tags, volatility) plus a short Claude AI coach review (`max_tokens=512`, system="You are a trading coach..."). Coach review gracefully returns null on failure. `showClosedDetail(id)` function in index.html — opens `#detail-panel` using the same desktop/mobile split as `enrichMarketPair` (desktop: remove `hidden`; mobile: add `open` + overlay + overflow hidden). Renders `.d-inner` with `.d-close` button, `.d-sym-row`, `.d-badges`, `.ctx-grid` (8 cells: Strategy, Conviction, Entry, Exit, Stop, TP1, P&L, Duration), signal_why italic, result_note, and Coach Review section. Closed signal `<tr>` rows now have `onclick="showClosedDetail(${s.id})"` and `cursor:pointer`. Outcome buttons call `event.stopPropagation()` to prevent row-click firing.
