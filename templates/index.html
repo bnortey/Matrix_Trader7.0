@@ -1328,7 +1328,7 @@ let currentTVSymbol   = null;
 let currentTVInterval = '60';
 
 function switchTab(tab) {
-  if (tab !== 'history') stopPosTimers();  // stop refresh when leaving History tab
+  if (tab !== 'history') { stopPosTimers(); unsubscribePositionStream(); }
   currentTab = tab;
   toggle('signals-section', tab === 'signals');
   toggle('market-section',  tab === 'market');
@@ -2633,6 +2633,7 @@ const H = {
   closedAll:          [],     // all tagged signals before closed-table filters
   closedSort:         'logged_at',
   closedSortDir:      'desc',
+  priceStream:        null,   // EventSource handle for SSE price stream (/api/stream/prices)
 };
 
 let lastHistorySigs = [];
@@ -3205,13 +3206,37 @@ function fmtHours(hours) {
 
 function startPosTimers() {
   stopPosTimers();
-  H.posRefreshTimer = setInterval(fetchAndRenderPositions, 30000);
+  if (!H.priceStream) H.posRefreshTimer = setInterval(fetchAndRenderPositions, 30000);
   H.posCounterTimer = setInterval(updatePosCounter, 1000);
 }
 
 function stopPosTimers() {
   if (H.posRefreshTimer) { clearInterval(H.posRefreshTimer); H.posRefreshTimer = null; }
   if (H.posCounterTimer) { clearInterval(H.posCounterTimer); H.posCounterTimer = null; }
+}
+
+function subscribePositionStream() {
+  if (!H.openPositions.length) return;
+  unsubscribePositionStream();
+  const symbols = [...new Set(H.openPositions.map(p => p.symbol))].join(',');
+  H.priceStream = new EventSource('/api/stream/prices?symbols=' + encodeURIComponent(symbols));
+  H.priceStream.onmessage = function(e) {
+    if (H.posRefreshTimer) { clearInterval(H.posRefreshTimer); H.posRefreshTimer = null; }
+    try {
+      const { symbol, price } = JSON.parse(e.data);
+      H.priceCache[symbol] = { price, ts: Date.now() };
+      renderOpenPositions();
+      updatePosCounter();
+    } catch (_) {}
+  };
+  H.priceStream.onerror = function() {
+    unsubscribePositionStream();
+    if (currentTab === 'history') startPosTimers();
+  };
+}
+
+function unsubscribePositionStream() {
+  if (H.priceStream) { H.priceStream.close(); H.priceStream = null; }
 }
 
 function updatePosCounter() {
@@ -3275,7 +3300,8 @@ async function fetchAndRenderPositions() {
   H.posFetching = false;
   renderOpenPositions();
   updatePosCounter();
-	  startPosTimers();  // reset 30s interval after each refresh
+	  startPosTimers();  // reset 30s interval after each refresh; skipped if SSE active
+	  subscribePositionStream();  // upgrade to SSE price updates when positions exist
 	  updatePerfBanner(H.closedAll, H.openPositions);
 
   // If a position detail panel is open, refresh it with latest prices

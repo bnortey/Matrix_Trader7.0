@@ -5,10 +5,10 @@
 > writing a single line of code. This file is manually maintained to reflect current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-04-23
+Last updated: 2026-04-24
 Last commit: b8abdb2 feat: capture exit_price in evaluate_outcome() — close price of triggering candle
-app.py: 1694 lines
-index.html: 3604 lines
+app.py: 1775 lines
+index.html: 3770 lines
 
 ---
 
@@ -79,7 +79,7 @@ Matrix_Trader_7.0/
 └── lib/                   ← pure utility functions only; no Flask, no API calls
     ├── indicators.py      ← 261 lines; complete; wired into app.py scoring
     ├── laddering.py       ← 120 lines; complete; wired into enrich_signal()
-    ├── mexc_stream.py     ← 263 lines; complete; NOT YET WIRED to any route or UI (P3e)
+    ├── mexc_stream.py     ← 263 lines; complete; WebSocket client — not used by SSE route (P3e used poll loop)
     └── ai_client.py       ← AI provider fallback chain; call_ai() is the only public fn
 ```
 
@@ -152,6 +152,7 @@ Sentiment APIs (no key needed):
 | `/api/signal/detail/<int:signal_id>` | GET | Returns full trade detail + short Claude AI coach review for a closed signal |
 | `/api/outcomes/check` | POST | Evaluates all open (untagged) signals against Min15 klines; auto-tags hits |
 | `/api/prices` | GET | Batch price fetch for multiple symbols — used by open positions panel |
+| `/api/stream/prices` | GET | SSE stream: price updates every 3s for `?symbols=` (comma-sep); replaces 30s polling when History tab is active |
 | `/api/analysis` | POST | AI strategy review: sends last 200 tagged outcomes to Claude API |
 
 Query params for `/api/scan`: `threshold` (int, default 55), `strategy` (string, default "balanced").
@@ -293,6 +294,7 @@ const H = {
   posSort:            'age',  // active sort column for open positions table
   posSortDir:         'asc',  // 'asc' | 'desc'
   posStratFilter:     '',     // '' = all strategies
+  priceStream:        null,   // EventSource handle for SSE price stream (/api/stream/prices)
 };
 
 let lastHistorySigs = [];
@@ -405,7 +407,8 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P3d | Open positions panel — live P&L, 30s refresh, auto-tagging, equity curve | ✅ Done |
 | P3d+ | exit_price capture in evaluate_outcome() — close price of triggering candle | ✅ Done |
 | P3d++ | Closed signal row click → detail panel (trade summary + Claude coach review) | ✅ Done |
-| P3e | WebSocket live price refresh for watched pairs | 🔲 Next |
+| P3e | SSE live price refresh for open positions (History tab) | ✅ Done |
+| Strategy Lab | First-class strategy keys, explainers, custom strategy configs, per-strategy tracking | 🔲 Planned |
 | P4 | README, GitHub publish, 5 external beta testers | 🔲 Planned |
 
 ---
@@ -416,7 +419,40 @@ Next in priority order:
 
 1. **P3e — WebSocket live price refresh**: Wire `lib/mexc_stream.py` to the frontend for real-time price updates on open positions and watched pairs. The library exists and is complete but is not connected to any Flask route or UI. Approach: add a Server-Sent Events (SSE) endpoint in `app.py` that streams price updates; frontend subscribes on History tab entry and unsubscribes on tab leave. This replaces/augments the current 30s polling via `GET /api/prices`.
 
-2. **P4 — Public release**: Write external-facing `README.md` with full setup instructions (currently minimal). Push to GitHub. Recruit 5 external beta testers.
+2. **Strategy Lab foundation — make strategies first-class**: Current strategies are hardcoded scoring profiles, not user-editable strategy modules. Before adding custom strategies, add stable `strategy_key` alongside the existing human `strategy` name everywhere signals are created, logged, filtered, refreshed, and analyzed. Add `GET /api/strategies` so the frontend renders strategy pills and history filters from backend metadata instead of duplicating hardcoded names in `index.html`. Then add a compact strategy explainer panel showing weights, filters, min conviction, leverage cap, intended market regime, and how the score is assembled.
+
+3. **Strategy Lab custom configs — user-created strategies**: After `strategy_key` exists end-to-end, allow users to duplicate a prebuilt strategy, edit weights/filters/min conviction/leverage cap, run scans under that custom strategy, and track outcomes separately. Store custom strategy configs in a local persistent format (SQLite table or local JSON file) rather than app state. Keep execution manual; this is for signal research and paper-tracking, not auto-trading.
+
+4. **P4 — Public release**: Write external-facing `README.md` with full setup instructions (currently minimal). Push to GitHub. Recruit 5 external beta testers.
+
+---
+
+## Strategy System Direction
+
+This conversation is now focused on managing, analyzing, and developing the strategies Matrix Trader uses to generate signals. The desired end state: the dashboard should let users choose specific strategies, understand how each one works, track the signals and outcomes generated by each strategy, and add their own strategies to test alongside Matrix Trader's built-ins.
+
+Current reality:
+- Strategies live in `STRATEGIES` in `app.py` and are **scoring profiles**. They share the same scanner pipeline (`score_ticker()` → `enrich_signal()` → `generate_report()` → `log_signals()`).
+- Built-ins are Balanced, Funding Arb, Momentum Breakout, and Mean Reversion.
+- Strategy selection already works for scans via `GET /api/scan?strategy=<key>`.
+- History already logs the human strategy name and can filter by strategy/result/symbol.
+- Open positions and closed signals already track outcomes and can be reviewed by AI.
+- `backtest.py` already iterates all strategies in `STRATEGIES`, but it mirrors only part of live enrichment and should remain a standalone live-data research script.
+
+Important gaps before user-created strategies:
+- The backend returns/stores only human display names like `"Balanced"` in signal rows. It does not persist a stable `strategy_key` like `"balanced"`.
+- The frontend hardcodes strategy buttons, metadata, history filter options, and leverage fallback maps. Adding a new strategy currently requires editing multiple UI constants.
+- `GET /api/signal/<symbol>` enriches with Balanced regardless of the original logged strategy. Open-position live detail refresh can therefore merge Balanced context/leverage into a non-Balanced signal.
+- There is no in-app strategy explainer that shows weights, gates, scoring rules, and historical performance together.
+- There is no safe user strategy schema, validation layer, persistence, or editor.
+
+Recommended implementation order:
+1. Add `strategy_key` to enriched signal dicts, SQLite logging, history serialization, closed detail responses, and analysis payloads. Keep `strategy` as the display name for backwards compatibility.
+2. Add `GET /api/strategies` returning backend-owned metadata: key, name, description, risk level, weights, filters, leverage cap, min conviction, and short explainer text.
+3. Update `index.html` to render scan pills, history filter options, open-position strategy filters, and leverage fallback from `/api/strategies` instead of hardcoded `STRAT_META` / `STRATEGY_LEVERAGE`.
+4. Update `GET /api/signal/<symbol>` to accept a `strategy` query param and use that strategy for live context refreshes.
+5. Add the strategy explainer UI before custom strategy editing. Users need to understand the built-ins before cloning/tuning them.
+6. Add custom strategy persistence only after the key/metadata/explainer path is stable.
 
 ---
 
@@ -437,6 +473,8 @@ Next in priority order:
 - Do not rename `fmtAge` — a naming collision between the history tab helper and a stale global caused corrupted scan timestamps (fixed in commit 8037615). The function name is intentional.
 - Do not touch the equity sparkline's mousemove/crosshair logic without testing hover on mobile — canvas mouse events behave differently on touch.
 - Do not change strategy filter option values in the history tab — they must match the DB strings exactly: "Balanced", "Funding Arb", "Momentum Breakout". A mismatch causes silent empty results.
+- Do not add new strategies by editing only one place. Until `GET /api/strategies` exists, strategy metadata is duplicated across `app.py` (`STRATEGIES`) and `index.html` (`STRAT_META`, strategy buttons, history filter options, `STRATEGY_LEVERAGE`). Keep them in sync or, preferably, complete the Strategy Lab foundation first.
+- Do not refresh a logged signal's live detail with Balanced by accident. `GET /api/signal/<symbol>` currently defaults to Balanced; when adding strategy-aware refresh, pass the original `strategy_key` and preserve the original paper-trade entries/exits/stop.
 - Do not set `exit_price` to 0 when unknown — use NULL so it can be distinguished from a genuine zero-price edge case. Only `evaluate_outcome()` writes `exit_price`; manual tags via `PATCH /api/signal/result` leave it NULL.
 - Do not use `display: none` on `:nth-child()` td/th cells to hide columns in a `table-layout: fixed` JS-generated table — the column slot still exists in the layout algorithm and the table overflows. Use conditional JS rendering instead (skip rendering hidden cells in the template literal).
 - Do not write innerHTML directly to `$('detail-panel')` — write to `$('panel-body')` only. The aside contains a sibling `#panel-resize-handle` that must not be wiped.
@@ -543,6 +581,9 @@ Deploy after self-verify and HANDOFF.md update are both complete
 - [ ] localStorage key `mt7_filters` persists filter state across reloads
 - [ ] localStorage key `mt7_guide_seen` hides the first-run guide on return visits
 - [ ] localStorage key `mt7_panel_width` persists detail panel width; restored on reload
+- [ ] `GET /api/stream/prices?symbols=BTC_USDT` returns `Content-Type: text/event-stream` and streams `data: {...}` events every ~3s
+- [ ] History tab entry subscribes SSE and `H.priceStream` is set; leaving the tab closes the stream and sets it to null
+- [ ] `H.posRefreshTimer` is null while SSE is active; restores on SSE error/close
 
 ---
 
@@ -565,6 +606,17 @@ Claude Code reads the actual files. It does not need the full HANDOFF.md pasted 
 > any new gotchas into "What NOT To Do", any new DOM structure into "Dashboard Structure",
 > and delete the raw note. Knowledge graduates into the permanent sections — it does not
 > accumulate here indefinitely.
+
+### 2026-04-24 — Session summary (P3e — SSE live price refresh)
+Built: `GET /api/stream/prices` SSE endpoint in `app.py` — polls `/contract/ticker` every 3s, filters to `?symbols=` param, yields one `data: {"symbol": ..., "price": ...}\n\n` SSE event per matching symbol. Uses `stream_with_context(generate())` with `GeneratorExit` guard for clean disconnects. Added `Response, stream_with_context` to Flask imports. In `index.html`: added `H.priceStream` to the H state object, added `subscribePositionStream()` (creates EventSource, first message clears `posRefreshTimer`, onerror falls back to `startPosTimers()`) and `unsubscribePositionStream()` (closes EventSource, nulls handle). Modified `startPosTimers()` to skip `posRefreshTimer` when `H.priceStream` is set. Added `subscribePositionStream()` call at end of `fetchAndRenderPositions()`. Modified `switchTab()` to call `unsubscribePositionStream()` on history tab leave.
+Decided: `lib/mexc_stream.py` was not used — it's a full WebSocket client (263 lines, background threads, reconnect logic) which is overkill for SSE. The SSE endpoint reuses the existing `fetch_mexc("/contract/ticker")` poll, keeping the implementation flat and consistent with the rest of `app.py`. The 30s polling fallback (posRefreshTimer) is preserved and automatically re-activates on SSE failure.
+Watch out for: `subscribePositionStream()` is called at the end of every `fetchAndRenderPositions()` run — including the 30s fallback run when SSE is broken. This is intentional: it retries SSE after each fallback cycle. If the SSE server is broken, EventSource fires onerror immediately → `unsubscribePositionStream()` + `startPosTimers()` → 30s posRefreshTimer loop continues. No tight retry loop — at worst one retry attempt every 30s. `posCounterTimer` (1s "Xs ago" counter) always starts regardless of SSE state.
+
+### 2026-04-24 — Session summary (strategy system analysis / Strategy Lab direction)
+Analyzed: Current strategies are scoring profiles, not separate engines. `STRATEGIES` in `app.py` controls weights, filters, min conviction, and leverage caps; all strategies share `score_ticker()`, `enrich_signal()`, `generate_report()`, and `log_signals()`. UI strategy selection already works for `/api/scan?strategy=<key>`, and history/outcome tracking already groups by human strategy name.
+Decided: The next strategy work should make strategies first-class before adding user-created strategies. Add stable `strategy_key` end-to-end, add `GET /api/strategies`, render strategy UI from backend metadata, fix `/api/signal/<symbol>` to refresh with the original strategy, then add a strategy explainer panel. Only after that should custom strategy cloning/editing/persistence be built.
+Deferred: No code changes to app behavior in this session. Custom strategy editor, persistence schema, and backtest integration remain planned work.
+Watch out for: Backend currently stores display names like `"Balanced"` in `signals.strategy`, while frontend scan state uses keys like `"balanced"`. This name/key split is the central risk for custom strategies. Also, open-position live refresh calls `/api/signal/<symbol>` without a strategy param today, so it can silently use Balanced context for a non-Balanced logged signal.
 
 ### 2026-04-23 — Session summary (mobile history table, v2 — JS fix)
 Built: History table truly fits 375px with zero horizontal scroll. Previous CSS-only fix was replaced — `display: none` on `:nth-child()` cells is unreliable with `table-layout: fixed` on JS-generated tables; hidden column slots still exist in the layout algorithm. Fix: `renderHistoryTable()` now checks `window.innerWidth < 768` (`isMobile`) and conditionally skips rendering Strategy/Conv/Why/R/Balance cells entirely. CSS changed from `display: none` rules to clean 5-column widths (Time=52px, Symbol=60px, Dir=44px, Result=auto, $P&L=70px). Time format shortened on mobile to "Apr 23" (no hours/minutes).

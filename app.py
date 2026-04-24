@@ -12,7 +12,7 @@ from functools import partial
 import requests
 import pandas as pd
 from collections import defaultdict
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from dotenv import load_dotenv
 
 from lib.indicators import (
@@ -1570,6 +1570,35 @@ def api_prices():
         return jsonify({"success": True, "prices": prices})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/stream/prices")
+def api_stream_prices():
+    """SSE stream: push price updates every 3s for the requested symbols.
+    Accepts ?symbols= (comma-separated). Each event: data: {"symbol": ..., "price": ...}"""
+    symbols_param = request.args.get("symbols", "")
+    want = {s.strip().upper() for s in symbols_param.split(",") if s.strip()}
+
+    def generate():
+        try:
+            while True:
+                if want:
+                    tickers = fetch_mexc("/contract/ticker")
+                    if tickers:
+                        for t in tickers:
+                            sym = t.get("symbol", "")
+                            if sym in want:
+                                price = float(t.get("lastPrice") or t.get("fairPrice") or 0)
+                                yield f"data: {json.dumps({'symbol': sym, 'price': price})}\n\n"
+                time.sleep(3)
+        except GeneratorExit:
+            pass
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/api/analysis", methods=["POST"])
