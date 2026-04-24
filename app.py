@@ -2400,7 +2400,7 @@ def api_backfill_pnl():
             SELECT * FROM signals
             WHERE result IS NOT NULL
               AND pnl_pct IS NULL
-              AND exit_price IS NOT NULL
+              AND result NOT IN ('EXPIRED', 'SKIPPED')
               AND entry1 IS NOT NULL
             ORDER BY logged_at ASC
         """).fetchall()
