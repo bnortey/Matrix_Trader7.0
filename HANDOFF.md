@@ -6,9 +6,9 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-04-23
-Last commit: 8037615 fix: fmtAge naming collision causing corrupted scan timestamp; fix idle-cta height clipping text
-app.py: 1576 lines
-index.html: 3520 lines
+Last commit: b8abdb2 feat: capture exit_price in evaluate_outcome() — close price of triggering candle
+app.py: 1694 lines
+index.html: 3604 lines
 
 ---
 
@@ -60,10 +60,10 @@ Matrix_Trader_7.0/
 ├── .gitignore             ← covers .env, __pycache__, data/
 ├── .env                   ← ANTHROPIC_API_KEY, MATRIX_PORT (not committed; never touch)
 ├── requirements.txt       ← all deps installed; add packages here if needed
-├── app.py                 ← entire Flask backend, 1576 lines; keep flat, one file
-├── backtest.py            ← standalone script, 456 lines; do NOT import from app.py
+├── app.py                 ← entire Flask backend, 1694 lines; keep flat, one file
+├── backtest.py            ← standalone script; do NOT import from app.py
 ├── templates/
-│   └── index.html         ← entire frontend: HTML + CSS + JS, 3520 lines; one file
+│   └── index.html         ← entire frontend: HTML + CSS + JS, 3604 lines; one file
 ├── static/                ← directory exists; no style.css — all CSS is inline in index.html
 ├── docs/
 │   ├── design-brief.md    ← original design doc; read-only reference
@@ -148,6 +148,7 @@ Sentiment APIs (no key needed):
 | `/api/signal/<symbol>` | GET | Fully enriches a single symbol on demand |
 | `/api/signal/result` | PATCH | Tags a logged signal with WIN/LOSS/PARTIAL/EXPIRED/SKIPPED |
 | `/api/signals/history` | GET | Returns logged signal history; filters: strategy, result, symbol, limit |
+| `/api/signal/detail/<int:signal_id>` | GET | Returns full trade detail + short Claude AI coach review for a closed signal |
 | `/api/outcomes/check` | POST | Evaluates all open (untagged) signals against Min15 klines; auto-tags hits |
 | `/api/prices` | GET | Batch price fetch for multiple symbols — used by open positions panel |
 | `/api/analysis` | POST | AI strategy review: sends last 200 tagged outcomes to Claude API |
@@ -314,7 +315,7 @@ Four tabs, one shared detail panel:
 - `#open-positions-section` — live open positions (untagged signals) with P&L tracking, 30s price refresh
 - `#closed-signals-section` — tagged signals with outcome buttons, equity curve, strategy review
 
-**Shared detail panel** (`#detail-panel`, `<aside>`): populated by `renderDetail(sig)` from signals or market tab. Slides in from right on desktop; slides up from bottom on mobile.
+**Shared detail panel** (`#detail-panel`, `<aside>`): populated by `renderDetail(sig)` from signals or market tab. Slides in from right on desktop; slides up from bottom on mobile. Contains `#panel-resize-handle` (drag-to-resize, hidden on mobile) and `#panel-body` (all innerHTML writes target this, not the aside itself).
 
 **Strategy bar** (inside `#signals-section`): four pills (Balanced / Funding Arb / Momentum / Mean Rev).
 
@@ -329,7 +330,8 @@ Four tabs, one shared detail panel:
 **Closed signals panel** (`#closed-signals-section`):
 - Summary stats bar: Logged · Tagged · Win Rate · W/L/P counts · Avg Conviction (wins vs losses)
 - Equity curve: sparkline chart of account growth over time, with hover tooltip (crosshair, date, balance, change)
-- Outcome buttons: WIN / LOSS / PAR / EXP / SKP — PATCH `/api/signal/result`, full reload after
+- History table: 10 columns on desktop, 5 columns on mobile (JS-conditional rendering in `renderHistoryTable()`). Clicking a closed-signal row calls `showClosedDetail(id)` to open the detail panel with trade summary + Claude coach review.
+- Outcome buttons: WIN / LOSS / PAR / EXP / SKP — PATCH `/api/signal/result`, full reload after. Buttons call `event.stopPropagation()` to prevent row-click firing.
 - Three filter selects: Strategy · Direction (client-side) · Result
 - Strategy Review button → `requestAnalysis()` → POST `/api/analysis`
 
@@ -396,6 +398,8 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P3b | History tab UI — summary bar, outcome buttons, filters, win rate | ✅ Done |
 | P3c | AI strategy review — POST /api/analysis, Claude API, History tab button | ✅ Done |
 | P3d | Open positions panel — live P&L, 30s refresh, auto-tagging, equity curve | ✅ Done |
+| P3d+ | exit_price capture in evaluate_outcome() — close price of triggering candle | ✅ Done |
+| P3d++ | Closed signal row click → detail panel (trade summary + Claude coach review) | ✅ Done |
 | P3e | WebSocket live price refresh for watched pairs | 🔲 Next |
 | P4 | README, GitHub publish, 5 external beta testers | 🔲 Planned |
 
@@ -430,7 +434,10 @@ Next in priority order:
 - Do not change strategy filter option values in the history tab — they must match the DB strings exactly: "Balanced", "Funding Arb", "Momentum Breakout". A mismatch causes silent empty results.
 - Do not set `exit_price` to 0 when unknown — use NULL so it can be distinguished from a genuine zero-price edge case. Only `evaluate_outcome()` writes `exit_price`; manual tags via `PATCH /api/signal/result` leave it NULL.
 - Do not use `display: none` on `:nth-child()` td/th cells to hide columns in a `table-layout: fixed` JS-generated table — the column slot still exists in the layout algorithm and the table overflows. Use conditional JS rendering instead (skip rendering hidden cells in the template literal).
+- Do not write innerHTML directly to `$('detail-panel')` — write to `$('panel-body')` only. The aside contains a sibling `#panel-resize-handle` that must not be wiped.
+- Do not add a fifth innerHTML write to the detail panel without targeting `$('panel-body')`. All four existing write sites (renderDetail, enrichMarketPair ×3, showClosedDetail) already target panel-body.
 - Do not mark a task complete without adding its verification items to the checklist at the bottom of this file. If the task added a new localStorage key, new route, new UI element, or new persistent behavior — it gets a checklist item.
+- Do not add `onclick="showClosedDetail(...)"` to open-positions rows — that handler is only for closed (tagged) signal rows in the history table. Open positions use `showPositionDetail()`.
 
 ---
 
@@ -513,11 +520,15 @@ Deploy after self-verify and HANDOFF.md update are both complete
 - [ ] `GET /api/signals/history` returns 200
 - [ ] `POST /api/outcomes/check` returns 200
 - [ ] `GET /api/prices?symbols=BTC_USDT` returns 200
+- [ ] `GET /api/signal/detail/<id>` returns 200 for a valid signal_id from the DB
 - [ ] Signal cards show entry/TP/SL in the detail panel
 - [ ] Strategy pills work and update `#strat-lbl`
 - [ ] History tab loads on click and shows table (or empty state)
 - [ ] Open positions panel shows untagged signals with live prices
 - [ ] Outcome buttons update `result` and reload the table
+- [ ] Clicking a closed signal row opens the detail panel with trade summary + Coach Review section
+- [ ] Coach Review shows Claude analysis text or "Analysis unavailable" gracefully
+- [ ] Outcome buttons do NOT trigger row click (stopPropagation)
 - [ ] Equity sparkline renders and hover tooltip shows date/balance/change
 - [ ] Mobile: UI fits on 375px screen without horizontal scroll — history table included (5-column mobile layout)
 - [ ] No `console.error` in browser on page load
@@ -548,44 +559,20 @@ Claude Code reads the actual files. It does not need the full HANDOFF.md pasted 
 > and delete the raw note. Knowledge graduates into the permanent sections — it does not
 > accumulate here indefinitely.
 
-### 2026-04-19 — Session summary
-Built: P2a strategy registry (Balanced/Funding Arb/Momentum/Mean Reversion), pill UI, STRAT_META object, setStrategy() wiring.
-Decided: Strategy profiles live in app.py as a dict; weights/filters/caps all in one place.
-Deferred: Strategy-specific UI differentiation beyond the label.
-Watch out for: STRAT_META in index.html must stay in sync with STRATEGIES dict in app.py — same keys, same names.
-
-### 2026-04-20 — Session summary
-Built: P2c AI trade brief (generate_report() — 4-section JSON, §1 strategy-aware, §3 ATR formula parity with JS). P2d market sentiment via OKX (live), Binance/Bybit (graceful 451/403 fallback). P2e error hardening (fetch_mexc() 3-attempt retry, specific error messages on scan fail, volatility/volume filters, localStorage persistence for filters). UX additions: first-run guide overlay, strategy pill tooltips (native title attr), tag hover tooltips (TAG_TIPS lookup). P3a SQLite signal history (init_db, log_signals, PATCH /api/signal/result, GET /api/signals/history). P3b History tab UI (summary bar with win rate stats, outcome button group WIN/LOSS/PAR/EXP/SKP, three filter selects). backtest.py standalone script (14 symbols × 4 strategies, sliding 100-candle window, real MEXC funding history, conviction band breakdown).
-Decided: Binance/Bybit geo-blocked on US IPs — fail gracefully with None, never retry. OKX uses ccy=BTC param (not instId), oiUsd field (already USD). Duplicate guard in log_signals uses 30-min window on symbol+strategy+direction. History direction filter is client-side (backend doesn't have it). Full reload after tagOutcome() so summary stats stay in sync.
-Deferred: P3c AI strategy review, P3d paper trading, P3e WebSocket live refresh.
-Watch out for: log_signals() must never raise — swallow all exceptions. init_db() creates data/ dir; data/ is gitignored. logged_at timestamps are UTC without Z suffix — append 'Z' in JS before passing to new Date(). OKX L/S response is [[timestamp_ms, ratio_string], ...] — access data[0][1]. The `sentiment_tracked` boolean distinguishes geo-blocked major pairs (True, all None) from untracked altcoins (False, never fetched).
-
-### 2026-04-21 — Session summary
-Built: P3b History tab (this session completed the UI — summary bar, outcome buttons, filter selects, win-rate stats). CLAUDE.md updated to reflect P3 current phase. VPS deployment to Hetzner at 62.238.15.113:8080.
-Decided: History tab auto-loads on switchTab('history') — no manual refresh button needed. H state object is minimal (loading flag only) — history data is not cached in JS state, always fetched fresh. Outcome button labels abbreviated (WIN/LOSS/PAR/EXP/SKP) to fit 375px iPhone screens; full word in title attr.
-Deferred: P3c AI strategy review (next task), P3d paper trading, P3e WebSocket.
-Watch out for: ~~The history table intentionally scrolls horizontally on mobile~~ — OVERRIDDEN 2026-04-23: table was confirmed unusable on live iPhone screenshot. Now hides 5 low-priority columns on mobile and fits 375px with no scroll. Direction filter in loadHistory() is client-side — if you move it server-side, remove the client-side filter or signals will be double-filtered.
-
-### 2026-04-23 — Session summary
-Built: P3c AI strategy review (POST /api/analysis — Claude API call, last 200 tagged outcomes, min 10 required, strategy/direction breakdown, tag and symbol analysis). P3d open positions panel — full live tracking: 30s price refresh, per-position P&L, leverage-aware notional sizing, liquidation price, dollar P&L from equity curve, equity sparkline with hover tooltip (crosshair, date, balance, change), live performance banner (signals, win rate, P&L, open positions, best trade, streak), sortable columns, strategy filter, autonomous outcome checker background thread (every 15 min), evaluate_outcome() against Min15 klines (stop/TP detection with partial credit for TP1 hit before stop), daily trend direction tag.
-Decided: Dollar P&L derived from equity curve so it correlates exactly with the Balance column. Equity curve uses account size input in positions header as the starting balance. Background outcome thread sleeps 1 min on startup then runs every 15 min. evaluate_outcome() uses pessimistic ambiguity rule — if TP1 was hit but stop was later hit, result is PARTIAL. 0.1% slippage applied to entry prices.
-Deferred: P3e WebSocket live price refresh (lib/mexc_stream.py exists but not wired to UI).
-Watch out for: fmtAge naming collision — a local function in history tab clashed with a stale global, corrupting scan timestamp display (fixed in 8037615). Equity sparkline canvas mousemove handler uses clientX/clientY offset calculations — do not simplify without testing hover accuracy. Strategy filter option values must match DB strings exactly (Balanced, Funding Arb, Momentum Breakout) — mismatch causes silent empty results.
-
-### 2026-04-23 — Session summary (panel resize)
-Built: Draggable resize handle on left edge of #detail-panel. Width persists to localStorage key `mt7_panel_width`, restored on DOMContentLoaded. Min 320px, max 90vw. Handle hidden on mobile via media query.
-Decided: `panel.innerHTML = ` writes to `$('panel-body').innerHTML` instead — introduced `#panel-body` wrapper div inside the aside so the handle element (position: absolute) is never wiped by content renders. `#detail-panel` changed from `overflow-y: auto` to `overflow: hidden; position: relative; display: flex; flex-direction: column`. Mobile media query `display: block !important` changed to `display: flex !important; flex-direction: column !important` to keep panel-body flex: 1 working on mobile.
-Deferred: nothing.
-Watch out for: All four innerHTML write sites (renderDetail, enrichMarketPair ×3) now target `$('panel-body')` not `$('detail-panel')`. If a future change adds a fifth write site to the panel, it must use `$('panel-body')` too. The `panel.classList` calls in renderDetail, selectSignal, enrichMarketPair, closePanel still correctly target `$('detail-panel')` — do not change those.
-
-### 2026-04-23 — Session summary (exit_price capture)
-Built: `exit_price REAL DEFAULT NULL` column added to signals table via `ALTER TABLE` migration in `init_db()` (wrapped in try/except OperationalError for idempotency). `evaluate_outcome()` now fetches `close` from klines alongside `high`/`low`, tracks `exit_close` at the triggering candle, and returns a 3-tuple `(result, note, exit_price)`. `api_outcomes_check()` updated to unpack the 3-tuple and write `exit_price` in the UPDATE. Manual tagging via `PATCH /api/signal/result` leaves `exit_price` NULL — only auto-evaluation sets it.
-Decided: exit_price = close of the candle where TP or SL was hit. For PARTIAL-via-stop, use the stop candle close (pessimistic). For WIN/PARTIAL-via-TP-only, use the close of the highest-TP candle. NULL for EXPIRED, SKIPPED, and any manually tagged result.
-Deferred: displaying exit_price in the history tab UI (P3e+ scope).
-Watch out for: `init_db()` is only called under `__main__` — calling it via `import app` in a script requires `app.init_db()` explicitly. The ALTER TABLE is idempotent; running twice is safe. `evaluate_outcome()` return type is now `tuple[str, str, float | None] | None` — any future caller that unpacks as `result, note = outcome` will raise a ValueError.
-
 ### 2026-04-23 — Session summary (mobile history table, v2 — JS fix)
 Built: History table truly fits 375px with zero horizontal scroll. Previous CSS-only fix was replaced — `display: none` on `:nth-child()` cells is unreliable with `table-layout: fixed` on JS-generated tables; hidden column slots still exist in the layout algorithm. Fix: `renderHistoryTable()` now checks `window.innerWidth < 768` (`isMobile`) and conditionally skips rendering Strategy/Conv/Why/R/Balance cells entirely. CSS changed from `display: none` rules to clean 5-column widths (Time=52px, Symbol=60px, Dir=44px, Result=auto, $P&L=70px). Time format shortened on mobile to "Apr 23" (no hours/minutes).
 Decided: JS-conditional rendering is the correct approach when CSS alone can't be relied on for fixed-layout tables. Columns not in the DOM = no layout slot, no overflow.
 Deferred: nothing.
-Watch out for: `isMobile` is evaluated once at render time. If user rotates device or resizes browser without refreshing, the table won't rerender. This is acceptable — `loadHistory()` is called on every tab switch so re-entry fixes it. Do not cache `isMobile` as a module-level constant — it must be evaluated fresh inside `renderHistoryTable()` each call. Previous session note about `display: none` + `:nth-child()` approach is superseded — that approach has been removed.
+Watch out for: `isMobile` is evaluated once at render time. If user rotates device or resizes browser without refreshing, the table won't rerender. This is acceptable — `loadHistory()` is called on every tab switch so re-entry fixes it. Do not cache `isMobile` as a module-level constant — it must be evaluated fresh inside `renderHistoryTable()` each call.
+
+### 2026-04-23 — Session summary (exit_price capture)
+Built: `exit_price REAL DEFAULT NULL` column added to signals table via `ALTER TABLE` migration in `init_db()` (wrapped in try/except OperationalError for idempotency). `evaluate_outcome()` now fetches `close` from klines alongside `high`/`low`, tracks `exit_close` at the triggering candle, and returns a 3-tuple `(result, note, exit_price)`. `api_outcomes_check()` updated to unpack the 3-tuple and write `exit_price` in the UPDATE. Manual tagging via `PATCH /api/signal/result` leaves `exit_price` NULL — only auto-evaluation sets it.
+Decided: exit_price = close of the candle where TP or SL was hit. For PARTIAL-via-stop, use the stop candle close (pessimistic). For WIN/PARTIAL-via-TP-only, use the close of the highest-TP candle. NULL for EXPIRED, SKIPPED, and any manually tagged result.
+Deferred: displaying exit_price in the history tab UI.
+Watch out for: `init_db()` is only called under `__main__` — calling it via `import app` in a script requires `app.init_db()` explicitly. The ALTER TABLE is idempotent; running twice is safe. `evaluate_outcome()` return type is now `tuple[str, str, float | None] | None` — any future caller that unpacks as `result, note = outcome` will raise a ValueError.
+
+### 2026-04-23 — Session summary (closed signal detail panel)
+Built: `GET /api/signal/detail/<int:signal_id>` — returns full trade summary (entry, exit_price, stop, TPs, result, pnl_pct, duration_minutes, signal_why, tags, volatility) plus a short Claude AI coach review (`max_tokens=512`, system="You are a trading coach..."). Coach review gracefully returns null on failure. `showClosedDetail(id)` function in index.html — opens `#detail-panel` using the same desktop/mobile split as `enrichMarketPair` (desktop: remove `hidden`; mobile: add `open` + overlay + overflow hidden). Renders `.d-inner` with `.d-close` button, `.d-sym-row`, `.d-badges`, `.ctx-grid` (8 cells: Strategy, Conviction, Entry, Exit, Stop, TP1, P&L, Duration), signal_why italic, result_note, and Coach Review section. Closed signal `<tr>` rows now have `onclick="showClosedDetail(${s.id})"` and `cursor:pointer`. Outcome buttons call `event.stopPropagation()` to prevent row-click firing.
+Decided: Route uses `<int:signal_id>` (integer) so Flask resolves `/api/signal/detail/123` before `/api/signal/<symbol>` — no routing conflict. Coach review uses `max_tokens=512` (short, fast). All innerHTML for the panel targets `$('panel-body')`, not `$('detail-panel')`.
+Deferred: nothing.
+Watch out for: The `showClosedDetail` panel opener uses `$('overlay')` not `$('panel-overlay')` — the overlay element ID is `overlay`. Existing `closePanel()` function handles cleanup (removes `open` class, clears overflow, clears `$('overlay').classList`). Do NOT add `showClosedDetail` to open-positions rows — those use `showPositionDetail()`.

@@ -2923,7 +2923,7 @@ function renderHistoryTable(sigs) {
 
     const btns = Object.keys(OUTCOME_LABELS).map(o => {
       const active = s.result === o ? ' ' + OUTCOME_CSS[o] : '';
-      return `<button class="outcome-btn${active}" onclick="tagOutcome(${s.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`;
+      return `<button class="outcome-btn${active}" onclick="event.stopPropagation();tagOutcome(${s.id},'${o}')" title="${o}">${OUTCOME_LABELS[o]}</button>`;
     }).join('');
 
     const rVal = RESULT_R[s.result];
@@ -2945,7 +2945,7 @@ function renderHistoryTable(sigs) {
       ? `<span style="color:var(--text3);font-size:11px">$${balanceAfter[s.id].toFixed(0)}</span>`
       : '—';
 
-    return `<tr>
+    return `<tr onclick="showClosedDetail(${s.id})" style="cursor:pointer">
       <td class="hist-time">${timeStr}</td>
       <td class="hist-symbol">${sym}</td>
       <td class="${dirCls}">${dirLbl}</td>
@@ -2987,6 +2987,76 @@ async function tagOutcome(id, result) {
     }
   } catch (e) {
     console.error('tagOutcome error:', e);
+  }
+}
+
+async function showClosedDetail(id) {
+  const panel = $('detail-panel');
+  if (window.innerWidth >= 768) {
+    panel.classList.remove('hidden');
+  } else {
+    $('overlay').classList.add('on');
+    panel.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+
+  $('panel-body').innerHTML = `
+    <div class="d-analyzing">
+      <div class="spinner"></div>
+      Loading trade detail…
+    </div>`;
+
+  try {
+    const resp = await fetch(`/api/signal/detail/${id}`);
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || 'failed');
+    const d = data;
+    const dirCls  = d.direction === 'LONG' ? 'bull' : 'bear';
+    const dirLbl  = d.direction === 'LONG' ? '▲ LONG' : '▼ SHORT';
+    const resCls  = {WIN:'green',LOSS:'red',PARTIAL:'amber',EXPIRED:'text3',SKIPPED:'text3'}[d.result] || 'text3';
+
+    const fmtP = v => v != null ? `$${parseFloat(v).toFixed(4)}` : '—';
+    const fmtPct = v => v != null ? `${v >= 0 ? '+' : ''}${parseFloat(v).toFixed(2)}%` : '—';
+
+    const pnlColor = d.pnl_pct != null ? (d.pnl_pct >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--text3)';
+    const dur = d.duration_minutes != null
+      ? (d.duration_minutes < 60 ? `${Math.round(d.duration_minutes)}m` : `${Math.round(d.duration_minutes/60)}h`)
+      : '—';
+
+    const aiHtml = d.ai_analysis
+      ? `<div style="font-size:13px;line-height:1.6;color:var(--text2);white-space:pre-wrap">${d.ai_analysis}</div>`
+      : `<div style="color:var(--text3);font-size:12px">Analysis unavailable.</div>`;
+
+    $('panel-body').innerHTML = `
+<div class="d-inner" style="position:relative">
+  <button class="d-close" onclick="closePanel()">✕</button>
+  <div class="d-sym-row">
+    <span class="d-sym">${d.symbol.replace('_USDT','')}</span>
+    <span class="d-usdt">USDT</span>
+  </div>
+  <div class="d-badges" style="margin-bottom:8px">
+    <span class="dir-pill ${d.direction === 'LONG' ? 'long' : 'short'}">${d.direction}</span>
+    <span style="color:var(--${resCls});font-size:12px;font-weight:600;padding:2px 8px;border:1px solid var(--${resCls});border-radius:4px">${d.result || '—'}</span>
+  </div>
+  <div class="ctx-grid" style="margin-top:12px">
+    <div class="ctx-item"><div class="ctx-lbl">Strategy</div><div class="ctx-val" style="font-size:12px">${d.strategy}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">Conviction</div><div class="ctx-val">${d.conviction}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">Entry</div><div class="ctx-val">${fmtP(d.entry_price)}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">Exit</div><div class="ctx-val">${fmtP(d.exit_price)}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">Stop</div><div class="ctx-val">${fmtP(d.stop_loss)}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">TP1</div><div class="ctx-val">${fmtP(d.tp1)}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">P&amp;L</div><div class="ctx-val" style="color:${pnlColor}">${fmtPct(d.pnl_pct)}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">Duration</div><div class="ctx-val">${dur}</div></div>
+  </div>
+  ${d.signal_why ? `<div style="margin-top:12px;font-size:12px;color:var(--text3);font-style:italic">${d.signal_why}</div>` : ''}
+  ${d.result_note ? `<div style="margin-top:6px;font-size:12px;color:var(--text3)">Note: ${d.result_note}</div>` : ''}
+  <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+    <div class="d-lbl">Coach Review</div>
+    ${aiHtml}
+  </div>
+</div>`;
+  } catch (e) {
+    $('panel-body').innerHTML = `<div style="color:var(--red);padding:16px">Error loading detail: ${e.message}</div>`;
   }
 }
 
