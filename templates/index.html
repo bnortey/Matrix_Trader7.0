@@ -141,7 +141,7 @@
     .sx-param-val { color:var(--text); font-weight:600; }
     .sx-filter-row { font-size:11px; color:var(--text2); margin-bottom:3px; }
     .sx-filter-val { color:var(--amber); font-weight:600; }
-    .sx-perf { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+    .sx-perf { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; }
     .sx-perf-lbl { font-size:10px; color:var(--text3); margin-bottom:2px; }
     .sx-perf-val { font-size:12px; font-weight:600; color:var(--text); }
     .sx-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
@@ -166,7 +166,7 @@
     .sx-editor-msg.error { color:var(--red); }
     .sx-editor-msg.ok { color:var(--green); }
     @media (max-width:720px) { .sx-editor-grid { grid-template-columns:repeat(2, minmax(80px,1fr)); } .sx-field textarea { grid-column:span 2; } }
-    @media (max-width:480px) { .sx-perf { grid-template-columns:repeat(2,1fr); } }
+    @media (max-width:480px) { .sx-perf { grid-template-columns:repeat(3,1fr); } }
 
     /* ── Stat bar ── */
     #stat-bar { display: flex; background: var(--bg3); border-bottom: 1px solid var(--border); flex-shrink: 0; }
@@ -1222,6 +1222,9 @@
               <option value="momentum_breakout">Momentum</option>
               <option value="mean_reversion">Mean Rev</option>
             </select>
+            <input id="pos-symbol-filter" class="hist-filter-input" type="search"
+              placeholder="Search symbol" style="width:110px;margin-left:8px"
+              oninput="H.posSymbolFilter=this.value.trim().toUpperCase(); renderOpenPositions()">
           </div>
           <div id="open-positions-body">
             <div class="hist-loading">Switch to this tab after a scan to see open positions.</div>
@@ -2203,6 +2206,8 @@ function populateExplainer(strat) {
         <div><div class="sx-perf-lbl">Win rate</div><div class="sx-perf-val" style="color:${wr ? 'var(--green)' : 'var(--text)'}">${wr ?? 'No closed signals yet'}</div></div>
         <div><div class="sx-perf-lbl">Avg conviction</div><div class="sx-perf-val">${avgConv ?? '—'}</div></div>
         <div><div class="sx-perf-lbl">Top symbol</div><div class="sx-perf-val">${p.top_symbol ?? '—'}</div></div>
+        <div><div class="sx-perf-lbl">Avg win P&amp;L</div><div class="sx-perf-val" style="color:${p.avg_win_pnl != null ? 'var(--green)' : 'var(--text)'}">${fmtPct(p.avg_win_pnl, 1)}</div></div>
+        <div><div class="sx-perf-lbl">Avg loss P&amp;L</div><div class="sx-perf-val" style="color:${p.avg_loss_pnl != null ? 'var(--red)' : 'var(--text)'}">${fmtPct(p.avg_loss_pnl, 1)}</div></div>
       </div>`}
     </div>
     ${actionsHTML}
@@ -2977,6 +2982,7 @@ const H = {
   posSort:            'age',  // active sort column for open positions table
   posSortDir:         'asc',  // 'asc' | 'desc'
   posStratFilter:     '',     // '' = all strategies
+  posSymbolFilter:    '',     // '' = all symbols; uppercased substring match
   closedAll:          [],     // all tagged signals before closed-table filters
   closedSort:         'logged_at',
   closedSortDir:      'desc',
@@ -3079,6 +3085,7 @@ function closedSortValue(sig, key) {
     case 'strategy':  return sig.strategy || '';
     case 'conviction': return Number(sig.conviction) || 0;
     case 'result':    return sig.result || '';
+    case 'pnl_pct':   return sig.pnl_pct != null ? Number(sig.pnl_pct) : -999999;
     case 'pnl':       return RESULT_R[sig.result] ?? 0;
     case 'r':         return RESULT_R[sig.result] ?? 0;
     case 'balance':   return new Date(sig.logged_at || 0).getTime() || 0;
@@ -3308,6 +3315,15 @@ function renderHistorySummary(sigs) {
   const avgW = avgC(wins);
   const avgL = avgC(losses);
 
+  const winsWithPnl  = wins.filter(s => s.pnl_pct != null);
+  const lossesWithPnl = losses.filter(s => s.pnl_pct != null);
+  const avgWinPnl  = winsWithPnl.length
+    ? (winsWithPnl.reduce((a, s) => a + s.pnl_pct, 0) / winsWithPnl.length).toFixed(1)
+    : null;
+  const avgLossPnl = lossesWithPnl.length
+    ? (lossesWithPnl.reduce((a, s) => a + s.pnl_pct, 0) / lossesWithPnl.length).toFixed(1)
+    : null;
+
   const acctRaw  = parseFloat(localStorage.getItem('mt7_account_size') || '0');
   const acct     = acctRaw > 0 ? acctRaw : 0;
   const riskPerTrade = acct * 0.01;
@@ -3346,6 +3362,14 @@ function renderHistorySummary(sigs) {
     <div class="hist-stat">
       <span class="hist-stat-val">${avgL !== null ? avgL : '—'}</span>
       <span class="hist-stat-lbl">Avg Conv (L)</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val" style="color:var(--green)">${avgWinPnl != null ? '+' + avgWinPnl + '%' : '—'}</span>
+      <span class="hist-stat-lbl">Avg Win P&amp;L</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val" style="color:var(--red)">${avgLossPnl != null ? avgLossPnl + '%' : '—'}</span>
+      <span class="hist-stat-lbl">Avg Loss P&amp;L</span>
     </div>
     <div class="hist-stat">
       <span class="hist-stat-lbl" style="margin-bottom:4px">Est. P&L</span>
@@ -3433,6 +3457,7 @@ function renderHistoryTable(sigs) {
       ${isMobile ? '' : `<td class="hist-conv">${s.conviction}</td>`}
       ${isMobile ? '' : `<td><div class="hist-why" title="${why}">${why}</div></td>`}
       <td><div class="outcome-group">${btns}</div></td>
+      ${isMobile ? '' : `<td style="text-align:right;font-size:12px;white-space:nowrap;color:${s.pnl_pct != null ? (s.pnl_pct > 0 ? 'var(--green)' : s.pnl_pct < 0 ? 'var(--red)' : 'var(--amber)') : 'var(--text3)'}">${fmtPct(s.pnl_pct, 1)}</td>`}
       <td style="text-align:right;font-size:12px;white-space:nowrap">${pnlCell}</td>
       ${isMobile ? '' : `<td style="text-align:right;font-size:12px;white-space:nowrap">${rCell}</td>`}
       ${isMobile ? '' : `<td style="text-align:right">${balCell}</td>`}
@@ -3445,6 +3470,7 @@ function renderHistoryTable(sigs) {
         ${sortTh('logged_at', 'Time')}${sortTh('symbol', 'Symbol')}${sortTh('direction', 'Dir')}
         ${isMobile ? '' : `${sortTh('strategy', 'Strategy')}${sortTh('conviction', 'Conv')}<th>Why</th>`}
         ${sortTh('result', 'Result')}
+        ${isMobile ? '' : sortTh('pnl_pct', 'P&L %', 'right')}
         ${sortTh('pnl', '$P&L', 'right')}
         ${isMobile ? '' : `${sortTh('r', 'R', 'right')}${sortTh('balance', 'Balance', 'right')}`}
       </tr></thead>
@@ -3499,6 +3525,12 @@ async function showClosedDetail(id) {
     const fmtPct = v => v != null ? `${v >= 0 ? '+' : ''}${parseFloat(v).toFixed(2)}%` : '—';
 
     const pnlColor = d.pnl_pct != null ? (d.pnl_pct >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--text3)';
+    const _acctSz = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+    const _notionalPnl = _acctSz > 0 && d.pnl_pct != null
+      ? _acctSz * 0.01 * (d.pnl_pct / 100) : null;
+    const notionalPnlHtml = _notionalPnl !== null
+      ? `<div style="font-size:10px;color:${pnlColor};margin-top:2px">${_notionalPnl >= 0 ? '+' : ''}$${Math.abs(_notionalPnl).toFixed(2)}<span style="color:var(--text3);margin-left:3px">est. notional</span></div>`
+      : '';
     const dur = d.duration_minutes != null
       ? (d.duration_minutes < 60 ? `${Math.round(d.duration_minutes)}m` : `${Math.round(d.duration_minutes/60)}h`)
       : '—';
@@ -3525,7 +3557,7 @@ async function showClosedDetail(id) {
     <div class="ctx-item"><div class="ctx-lbl">Exit</div><div class="ctx-val">${fmtP(d.exit_price)}</div></div>
     <div class="ctx-item"><div class="ctx-lbl">Stop</div><div class="ctx-val">${fmtP(d.stop_loss)}</div></div>
     <div class="ctx-item"><div class="ctx-lbl">TP1</div><div class="ctx-val">${fmtP(d.tp1)}</div></div>
-    <div class="ctx-item"><div class="ctx-lbl">P&amp;L</div><div class="ctx-val" style="color:${pnlColor}">${fmtPct(d.pnl_pct)}</div></div>
+    <div class="ctx-item"><div class="ctx-lbl">P&amp;L</div><div class="ctx-val" style="color:${pnlColor}">${fmtPct(d.pnl_pct)}</div>${notionalPnlHtml}</div>
     <div class="ctx-item"><div class="ctx-lbl">Duration</div><div class="ctx-val">${dur}</div></div>
   </div>
   ${d.signal_why ? `<div style="margin-top:12px;font-size:12px;color:var(--text3);font-style:italic">${d.signal_why}</div>` : ''}
@@ -3575,6 +3607,20 @@ function subscribePositionStream() {
       H.priceCache[symbol] = { price, ts: Date.now() };
       renderOpenPositions();
       updatePosCounter();
+      // Refresh live status bar in detail panel if the updated symbol is selected
+      if (H.selectedPositionId) {
+        const selPos = H.openPositions.find(p => p.id === H.selectedPositionId);
+        if (selPos && selPos.symbol === symbol) {
+          selPos._livePrice = price;
+          selPos._pnl_pct = selPos.entry1 > 0
+            ? (selPos.direction === 'LONG'
+                ? (price - selPos.entry1) / selPos.entry1 * 100
+                : (selPos.entry1 - price) / selPos.entry1 * 100)
+            : 0;
+          const bar = $('pos-status-bar');
+          if (bar) bar.outerHTML = buildStatusBarHTML(selPos);
+        }
+      }
     } catch (_) {}
   };
   H.priceStream.onerror = function() {
@@ -3688,9 +3734,10 @@ function buildStatusBarHTML(pos) {
     ? fmtHours((Date.now() - new Date(pos.logged_at.endsWith('Z') ? pos.logged_at : pos.logged_at + 'Z')) / 3600000)
     : '—';
 
-  const acctSzBar  = parseFloat(localStorage.getItem('mt7_account_size') || '0');
-  const levBar     = getLeverage(pos);
-  const notionalBar = acctSzBar > 0 ? getNotional(acctSzBar, 1, levBar) : null;
+  const acctSzBar    = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+  const levBar       = getLeverage(pos);
+  const notionalBar  = acctSzBar > 0 ? getNotional(acctSzBar, 1, levBar) : null;
+  const livePnlDollar = acctSzBar > 0 ? acctSzBar * 0.01 * (pnl / 100) : null;
   const liqPriceBar = current > 0 ? getLiqPrice(pos, current) : null;
   const liqDistBar  = liqPriceBar && current > 0 ? Math.abs(current - liqPriceBar) / current * 100 : null;
   const liqColorBar = liqDistBar !== null && liqDistBar < 15 ? 'var(--red)' : 'var(--text2)';
@@ -3709,9 +3756,12 @@ function buildStatusBarHTML(pos) {
     padding:14px;
     margin-bottom:14px;
   ">
-    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
-      <span style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em">Live P&amp;L</span>
-      <span style="font-size:24px;font-weight:800;font-family:var(--mono);color:${pnlColor}">${pnlSign}${pnl.toFixed(2)}%</span>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+      <span style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;padding-top:6px">Live P&amp;L</span>
+      <div style="text-align:right">
+        <div style="font-size:24px;font-weight:800;font-family:var(--mono);color:${pnlColor}">${pnlSign}${pnl.toFixed(2)}%</div>
+        ${livePnlDollar !== null ? `<div style="font-size:11px;font-family:var(--mono);color:${pnlColor}">${livePnlDollar >= 0 ? '+' : ''}$${Math.abs(livePnlDollar).toFixed(2)}<span style="color:var(--text3);margin-left:3px;font-size:10px">est. notional</span></div>` : ''}
+      </div>
     </div>
     <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:12px">
       <span style="color:var(--text3)">Entry <span style="color:var(--text2);font-family:var(--mono)">${fmtPrice(entry)}</span></span>
@@ -3840,21 +3890,25 @@ function renderOpenPositions() {
   const countEl = $('pos-count');
   if (!body) return;
 
-  // Apply strategy filter then sort
+  // Apply strategy and symbol filters then sort
   let positions = H.openPositions;
   if (H.posStratFilter) positions = positions.filter(p => p.strategy === H.posStratFilter);
+  if (H.posSymbolFilter) positions = positions.filter(p =>
+    (p.symbol || '').toUpperCase().replace(/_USD[TC]$/, '').includes(H.posSymbolFilter)
+  );
 
+  const isFiltered = H.posStratFilter || H.posSymbolFilter;
   if (!positions.length) {
-    if (countEl) countEl.textContent = H.posStratFilter
+    if (countEl) countEl.textContent = isFiltered
       ? `0/${H.openPositions.length}`
       : '0';
     body.innerHTML = H.openPositions.length
-      ? '<div class="hist-empty">No positions match the selected strategy.</div>'
+      ? '<div class="hist-empty">No positions match the current filters.</div>'
       : '<div class="hist-empty">No open positions — hit Scan to log new signals.</div>';
     return;
   }
 
-  if (countEl) countEl.textContent = H.posStratFilter
+  if (countEl) countEl.textContent = isFiltered
     ? `${positions.length}/${H.openPositions.length}`
     : H.openPositions.length;
 

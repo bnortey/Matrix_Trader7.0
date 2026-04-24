@@ -8,8 +8,8 @@
 
 Last updated: 2026-04-24
 Last commit: a6ec8f2 feat: Strategy Lab foundation + explainer + custom, kline gate, leveraged P&L, blended PARTIAL, historical backfill — April 24
-app.py: 2486 lines
-index.html: 4119 lines
+app.py: 2498 lines
+index.html: 4173 lines
 
 ---
 
@@ -156,7 +156,7 @@ Sentiment APIs (no key needed):
 | `/api/outcomes/check` | POST | Evaluates all open (untagged) signals against Min15 klines; auto-tags hits; also runs expire_stale_signals() |
 | `/api/prices` | GET | Batch price fetch for multiple symbols — used by open positions panel |
 | `/api/stream/prices` | GET | SSE stream: price updates every 3s for `?symbols=` (comma-sep) |
-| `/api/strategies` | GET | Returns built-in + enabled custom strategy configs; `?include_disabled=1` includes disabled custom strategies |
+| `/api/strategies` | GET | Returns built-in + enabled custom strategy configs; `?include_disabled=1` includes disabled custom strategies; `performance` object includes `avg_win_pnl` and `avg_loss_pnl` per strategy |
 | `/api/strategies/custom` | POST | Creates a custom strategy from a built-in base with validated weights/filters/risk settings |
 | `/api/strategies/custom/<strategy_key>` | PATCH | Updates a custom strategy; supports enable/disable and config edits |
 | `/api/strategies/custom/<strategy_key>` | DELETE | Deletes a custom strategy definition; historical signals remain intact |
@@ -316,6 +316,7 @@ const H = {
   posSort:            'age',
   posSortDir:         'asc',
   posStratFilter:     '',
+  posSymbolFilter:    '',
   closedAll:          [],
   closedSort:         'logged_at',
   closedSortDir:      'desc',
@@ -584,7 +585,11 @@ Task prompts should ONLY cover:
 - [ ] localStorage key `mt7_filters` persists filter state across reloads
 - [ ] localStorage key `mt7_guide_seen` hides the first-run guide on return visits
 - [ ] localStorage key `mt7_panel_width` persists detail panel width
-- [ ] `/api/strategies` response includes `performance` object per strategy
+- [ ] `/api/strategies` response includes `performance` object per strategy with `avg_win_pnl` and `avg_loss_pnl`
+- [ ] History table shows sortable "P&L %" column (desktop) with colored leveraged pnl_pct values
+- [ ] Null pnl_pct shows as "—" in muted color in history table
+- [ ] "Avg Win P&L" and "Avg Loss P&L" stat boxes appear above history table
+- [ ] Strategy explainer performance grid shows 6 cells including avg win/loss P&L
 - [ ] Clicking a strategy button shows `#strategy-explainer` with correct data
 - [ ] Clicking the same strategy button again hides the explainer
 - [ ] `signals` table has `pnl_pct` and `leverage` columns after `init_db()` runs
@@ -607,6 +612,11 @@ Task prompts should ONLY cover:
 - [ ] Custom strategy clone/edit/save/disable/delete works on desktop
 - [ ] `GET /api/stream/prices?symbols=BTC_USDT` returns `Content-Type: text/event-stream`
 - [ ] History tab SSE subscribes on entry and closes on tab leave
+- [ ] Closed signal detail shows est. notional P&L when account_size is set
+- [ ] Closed signal detail shows nothing for notional when account_size is 0 or unset
+- [ ] Open position detail shows live notional P&L (est. notional) updating with SSE / 30s poll
+- [ ] Open positions table has symbol search input that filters rows in real time
+- [ ] Open positions count shows X/Y when filters are active
 
 ---
 
@@ -626,6 +636,14 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 > Keep the last three sessions verbatim. After that, extract gotchas into
 > "What NOT To Do", DOM structure into "Dashboard Structure", and delete
 > the raw note. Knowledge graduates into permanent sections.
+
+### 2026-04-24 — Session summary (notional P&L + position symbol search)
+Built: Three UI improvements to position panels. (1) Closed signal detail panel: computes `est. notional = acct × 0.01 × (pnl_pct / 100)` client-side and shows it as a small colored sub-line inside the P&L ctx-item; hidden when account_size is 0 or pnl_pct is null. (2) Open position detail panel (`buildStatusBarHTML`): same formula using live `pnl` %; shown as a small colored line below the big `24px` P&L % number; updates dynamically. SSE onmessage handler now also updates `#pos-status-bar` via `outerHTML` replacement whenever the selected position's symbol gets a price tick — so the notional and P&L % stay live at 3s cadence. (3) Open positions table: added `posSymbolFilter` to H state; symbol search `<input id="pos-symbol-filter">` added to `#open-positions-header` (matches `.hist-filter-input` class); `renderOpenPositions()` filters by uppercased substring; count shows `X/Y` when either strategy or symbol filter is active.
+Watch out for: `outerHTML` replacement of `#pos-status-bar` removes the old element from DOM and inserts the new one. If other code saves a reference to the element (not current practice), it would become stale. Do not cache `$('pos-status-bar')` across ticks.
+
+### 2026-04-24 — Session summary (pnl_pct UI surface)
+Built: Surfaced `pnl_pct` (leveraged P&L %) in three UI locations. (1) History table: sortable "P&L %" column added after Result (desktop only), colored green/red/amber from DB value; sort key `pnl_pct` added to `closedSortValue()`. (2) History summary bar: two new stat boxes "Avg Win P&L" and "Avg Loss P&L" computed client-side from `H.closedAll`. (3) Strategy explainer performance grid: two new cells "Avg win P&L" / "Avg loss P&L" from `performance.avg_win_pnl` / `performance.avg_loss_pnl`; grid expanded from 4→6 cols (mobile: 2→3 cols). Backend: `api_strategies()` now queries `AVG(pnl_pct)` for WIN and LOSS per strategy, returns as `avg_win_pnl` and `avg_loss_pnl` in the `performance` object.
+Watch out for: P&L % column is desktop-only (hidden on mobile) to preserve the 5-column mobile layout. The `fmtPct(val, 1)` helper is used for consistent `+X.X%`/`-X.X%`/`—` formatting.
 
 ### 2026-04-24 — Session summary (pnl_pct historical backfill)
 Built: `POST /api/backfill/pnl` maintenance route. Queries signals where `result IS NOT NULL AND pnl_pct IS NULL AND result NOT IN ('EXPIRED','SKIPPED') AND entry1 IS NOT NULL`. Re-runs `evaluate_outcome()` per signal (live MEXC klines), computes leveraged `pnl_pct` via `_compute_leveraged_pnl()`, writes corrected `exit_price` (blended PARTIAL), `pnl_pct`, `entry_at`, `result_note`, `evaluation_version='backfill_v1'`. 0.1s sleep between each signal. Per-signal errors caught without aborting the run. Initial filter used `exit_price IS NOT NULL` which missed 228 pre-exit_price-column rows; fixed to `result NOT IN ('EXPIRED','SKIPPED')` in a follow-up commit. Final result: 298 of 313 historical signals backfilled; 15 skipped (klines aged out of MEXC 75h window, all from 2026-04-21).

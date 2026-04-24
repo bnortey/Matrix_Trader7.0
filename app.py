@@ -2077,6 +2077,14 @@ def api_strategies():
                 "GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT 1",
                 (key,),
             ).fetchone()
+            win_pnl_row = con.execute(
+                "SELECT AVG(pnl_pct) FROM signals WHERE strategy_key=? AND result='WIN' AND pnl_pct IS NOT NULL",
+                (key,),
+            ).fetchone()
+            loss_pnl_row = con.execute(
+                "SELECT AVG(pnl_pct) FROM signals WHERE strategy_key=? AND result='LOSS' AND pnl_pct IS NOT NULL",
+                (key,),
+            ).fetchone()
             perf[key] = {
                 "total_signals":  total,
                 "wins":           wins,
@@ -2084,6 +2092,8 @@ def api_strategies():
                 "win_rate":       round(wr, 4) if wr is not None else None,
                 "avg_conviction": round(avg_conv, 1) if avg_conv is not None else None,
                 "top_symbol":     top_row[0] if top_row else None,
+                "avg_win_pnl":    round(win_pnl_row[0], 1) if win_pnl_row[0] is not None else None,
+                "avg_loss_pnl":   round(loss_pnl_row[0], 1) if loss_pnl_row[0] is not None else None,
             }
         con.close()
     except Exception as e:
@@ -2093,6 +2103,7 @@ def api_strategies():
                 perf[key] = {
                     "total_signals": 0, "wins": 0, "losses": 0,
                     "win_rate": None, "avg_conviction": None, "top_symbol": None,
+                    "avg_win_pnl": None, "avg_loss_pnl": None,
                 }
 
     result = [
