@@ -185,7 +185,7 @@ These are the only MT6 components worth keeping. Everything else was discarded.
 
 ```bash
 # .env
-ANTHROPIC_API_KEY=sk-ant-...     # required for AI signal reports
+ANTHROPIC_API_KEY=<your_anthropic_key>     # required for AI signal reports
 MEXC_API_KEY=                    # optional — only needed for private endpoints
 MEXC_API_SECRET=                 # optional
 ```
