@@ -2294,7 +2294,7 @@ const TAG_META = {
 
 async function loadStrategies() {
   if (H.strategies) return H.strategies;
-  const resp = await fetch('/api/strategies');
+  const resp = await fetch('/api/strategies?include_disabled=1');
   const data = await resp.json();
   if (!data.success || !data.strategies) throw new Error('Failed to load strategies');
   H.strategies = data.strategies;
