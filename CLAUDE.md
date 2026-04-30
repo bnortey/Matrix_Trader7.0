@@ -1,49 +1,52 @@
 # Matrix Trader 7.0 — Claude Code Context
 
-> Read this file at the start of every session. It is the source of truth for what this project is, where it stands, and how to work on it.
+> Read this file at the start of every session.
+> **Phase status and task list live in HANDOFF.md — that is the source of truth.**
+> This file covers orientation, architecture, rules, and what not to touch.
+> Do not trust your memory of a prior session. Read the actual files.
 
 ---
 
 ## What This Is
 
-**Matrix Trader 7.0** is a high-leverage crypto trading assistant for perpetual swap markets on MEXC.
+**Matrix Trader 7.0** is a local web application for high-leverage crypto trading on MEXC perpetual swap markets. A Python Flask backend serves a single-file dark-themed dashboard. It runs on a Mac or VPS and is accessible from iPhone over local WiFi or via the VPS IP.
 
-It is a **local web application**: a Python Flask backend that serves a dark-themed HTML dashboard. You run it on your Mac with `python3 app.py` and open it in any browser — including on iPhone over local WiFi.
+**The core loop:**
+1. User hits "Scan All Perps" — fetches all 800+ MEXC tickers via public API
+2. Sees ranked LONG/SHORT signals with conviction scores, entry/TP/SL ladders
+3. Clicks a signal → AI-generated 4-section trade brief (Claude API)
+4. Tags outcomes (WIN / LOSS / PARTIAL / EXPIRED / SKIPPED) — auto-evaluation runs every 15 min
+5. Reviews strategy analytics, equity curve, and per-trade coach reviews
+6. Executes manually on MEXC
 
 **It is not:**
 - An auto-trading bot (no order execution)
-- A prediction engine (no ARIMA, no price forecasting)
-- A SaaS product (local only for now)
-- A multi-exchange aggregator (MEXC-first; other exchanges are context only)
-
-**The core loop:**
-1. User opens the dashboard
-2. Hits "Scan All Perps" — fetches all 800+ MEXC futures tickers via public API
-3. Sees a ranked signal table (LONG/SHORT, conviction score, entry/TP/SL)
-4. Clicks a signal → requests an AI-generated trade brief (Claude API)
-5. Uses the risk calculator to size the position
-6. Executes manually on MEXC
+- A price forecasting engine (no ARIMA, no ML prediction)
+- A SaaS product (local + one VPS for now)
+- A multi-exchange aggregator (MEXC is primary; Binance/Bybit/OKX are context only)
 
 ---
 
-## Project History
-
-This is the 7th iteration. Versions 2–6 all failed. The MT6 codebase (`Matrix_Trader_6_0/`) was analyzed and the failure modes are documented. Do not repeat them:
+## Why These Rules Exist — MT2–MT6 Failures
 
 | MT6 Mistake | MT7 Rule |
 |---|---|
-| Matrix chat bot as delivery mechanism | Web app only |
+| Chatbot as delivery mechanism | Web app only |
 | ARIMA price forecasting | No forecasting. Signals only. |
 | Two competing TUI implementations | One interface: the web dashboard |
-| Coinglass API key committed in plaintext | All keys in `.env`, never committed |
-| 17 planning markdown files instead of code | Ship before you plan |
-| God class `EnhancedTradingBot` (900+ lines) | `app.py` stays flat until Phase 2 |
+| API key committed in plaintext | All keys in `.env`, never committed |
+| 17 planning files instead of code | Ship before you plan |
+| God class `EnhancedTradingBot` (900+ lines) | `app.py` stays flat — one file |
 | Multi-exchange as primary venues | MEXC is primary. Others are context. |
 
 ---
 
 ## Phase Status
-See HANDOFF.md for current phase status and task list. HANDOFF.md is the source of truth.
+
+See **HANDOFF.md** — that file is updated every session and is authoritative.
+
+As of April 27, 2026: phases P0 through P7a are complete. `app.py` is 3,692 lines.
+`index.html` is 5,296 lines. The app is live on a VPS at `root@62.238.15.113`.
 
 ---
 
@@ -51,104 +54,220 @@ See HANDOFF.md for current phase status and task list. HANDOFF.md is the source 
 
 ```
 Matrix_Trader_7.0/
-├── CLAUDE.md              ← this file
-├── README.md              ← for external users (write in Phase 4)
-├── .gitignore
-├── .env                   ← ANTHROPIC_API_KEY, MEXC_API_KEY (if needed)
-├── requirements.txt
-├── app.py                 ← entire Flask backend (keep flat, one file)
+├── CLAUDE.md              ← this file (orientation + rules)
+├── AGENTS.md              ← Codex orientation; mirrors CLAUDE.md; keep in sync
+├── HANDOFF.md             ← session state, task list, session summaries — authoritative
+├── STRATEGIES.md          ← user-facing strategy guide
+├── SERVER_GUIDE.md        ← VPS access, deploy, service management
+├── README.md              ← public-facing setup guide (published)
+├── .gitignore             ← covers .env, __pycache__, data/, *.db
+├── .env                   ← secrets only; never read, never write, never commit
+├── requirements.txt       ← all deps installed; add packages here if needed
+├── app.py                 ← entire Flask backend — 3,692 lines; keep flat, one file
+├── backtest.py            ← standalone script; do NOT import from app.py
 ├── templates/
-│   └── index.html         ← the full dashboard UI
-├── static/
-│   └── style.css
-└── lib/                   ← ported MT6 components, cleaned up
-    ├── indicators.py      ← RSI, EMA, VWAP, ATR
+│   └── index.html         ← entire frontend: HTML + CSS + JS; one file, no framework
+├── static/                ← directory exists; no CSS file — all CSS is inline in index.html
+├── docs/
+│   ├── design-brief.md    ← original design doc; read-only reference
+│   └── project-status.md  ← may be stale; HANDOFF.md is authoritative
+├── .claude/
+│   └── commands/
+│       └── handoff.md     ← /handoff skill: regenerates HANDOFF.md from codebase
+├── data/                  ← gitignored; auto-created at runtime; never commit
+│   ├── signals.db         ← SQLite: signals, custom_strategies, position_events, filtered_candidates
+│   ├── risk_gates.json    ← live risk gate config (block/shadow/off per gate)
+│   └── backtest_results.json
+└── lib/                   ← pure utility functions only; no Flask, no API calls
+    ├── indicators.py      ← RSI, EMA, VWAP, ATR, volatility_regime, daily_trend_direction
     ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
-    └── mexc_stream.py     ← WebSocket wrapper
+    ├── mexc_stream.py     ← WebSocket client (built; not used by SSE route — SSE uses poll loop)
+    ├── coinglass_client.py ← optional CoinGlass V4 client; fails closed if key is missing
+    └── ai_client.py       ← AI provider fallback chain; call_ai() is the only public function
 ```
 
-**Rules:**
-- `app.py` is the backend. Everything lives here until Phase 2.
-- `lib/` files are utilities only — no Flask routes, no API calls, pure functions.
-- `templates/index.html` is the entire frontend. One file.
-- No new files or folders without a specific reason.
+**Touch policy:**
+- `app.py` and `index.html`: read the relevant section before editing
+- `lib/`: pure functions only — no imports from `app.py`, no Flask
+- `data/`: never touch directly — managed by `init_db()` and runtime writes
+- `docs/`: read-only reference; never edit
+- `.env`: never read, write, or commit
+- `static/`: no CSS file — do not create one; CSS lives inline in `index.html`
 
 ---
 
 ## Tech Stack
 
-- **Backend:** Python 3.11+ / Flask
-- **Frontend:** Single HTML file, vanilla JS, dark theme
-- **Data:** MEXC public contract API — no auth required for market data
-- **AI layer:** Anthropic Claude API (for signal reports) — key in `.env`
-- **WebSocket:** MEXC contract WS `wss://contract.mexc.com/edge`
+```
+Backend:    Python 3.11+ / Flask
+Frontend:   Single HTML file — vanilla JS, inline CSS, dark theme, no build step
+Database:   SQLite3 (stdlib) — data/signals.db
+AI:         lib/ai_client.py — fallback chain: Claude → GPT → Gemini → Groq
+Data:       MEXC public contract API (no auth for market data)
+            OKX public API (L/S ratio, OI — geo-unrestricted)
+            CoinGlass V4 (optional — requires COINGLASS_API_KEY in .env)
+SSE:        /api/stream/prices — poll loop pushing prices every 3s
+WebSocket:  lib/mexc_stream.py — built but not wired to any route
+```
+
+**Dependencies (all installed):**
+```
+flask, requests, pandas, numpy, websocket-client, python-dotenv,
+anthropic, google-generativeai, openai, groq
+```
 
 ---
 
-## MEXC API Reference
+## Environment Variables
 
-All public, no auth needed:
-
+```bash
+# .env — never commit this file
+ANTHROPIC_API_KEY=sk-ant-...     # required — signal reports, coach reviews, strategy analysis
+MATRIX_PORT=8080                  # optional — defaults to 8080
+MEXC_API_KEY=                     # optional — only needed for private endpoints (not currently used)
+MEXC_API_SECRET=                  # optional
+COINGLASS_API_KEY=                # optional — enables CoinGlass OI/liquidation enrichment
 ```
-Base URL: https://contract.mexc.com/api/v1
-
-GET /contract/ticker                    — all perp tickers (800+ pairs)
-GET /contract/detail                    — contract specs (leverage, fees)
-GET /contract/kline/{symbol}            — OHLCV data
-GET /contract/depth/{symbol}            — orderbook
-GET /contract/funding_rate/{symbol}     — current funding rate
-
-Intervals: Min1, Min5, Min15, Min30, Min60, Hour4, Hour8, Day1
-```
-
-Response wrapper: `{ "success": true, "data": [...] }`
 
 ---
 
-## Signal Scoring Logic
+## Running the App
 
-Each ticker gets a score from 0–100 and a direction (LONG/SHORT):
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # add ANTHROPIC_API_KEY
+python3 app.py
+# Local:  http://localhost:8080
+# iPhone: http://<LAN_IP>:8080 (same WiFi)
+# Port configurable via MATRIX_PORT env var
+```
 
-| Input | Weight | Notes |
+**VPS deploy:**
+```bash
+cd /Users/bnortey/Documents/coding_projects/Matrix_Trader_7.0
+rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
+      --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+ssh root@62.238.15.113 "systemctl restart matrix-trader"
+```
+
+---
+
+## Signal Pipeline — How Scoring Works
+
+Two stages. Stage 1 is fast and free; Stage 2 is expensive and limited to top 30.
+
+**Stage 1 — `score_ticker()` — kline-free, runs on all 800+ tickers**
+
+Inputs from `/contract/ticker` response only (no extra API calls):
+
+| Input | Effect |
+|---|---|
+| `riseFallRate` (24h change) | Momentum score — strong tier >5%, weak tier >2% |
+| `fundingRate` | Funding score — negative = squeeze setup |
+| `fairPrice` vs `lastPrice` | Basis spread — premium = bearish lean, discount = bullish |
+| `volume24` | Volume multiplier (strategy-defined) when vol > $10M |
+
+Direction = whichever side accumulates more points. Ties go LONG.
+Output: `conviction_base` (0–100), `direction`, `tags[]`, base signal dict.
+
+**Stage 2 — `enrich_signal()` — top 30 signals only, runs in 10 concurrent threads**
+
+Adds: 1h klines (RSI, EMA, ATR, trend score), 4h klines (daily trend), order book depth (imbalance), funding rate, market sentiment (OKX L/S, OKX OI; Binance/Bybit geo-blocked), CoinGlass OI/liquidation context (optional), ladders (3-tier ATR-based entry/TP/SL), signal_why, ai_report.
+
+Gate: pairs with < 50 1h candles or < 20 4h candles are skipped.
+
+**Risk gates — applied after Stage 2, before `log_signals()`**
+
+Two live gates in `data/risk_gates.json`, each with `block` / `shadow` / `off` mode:
+- `long_vol_long`: high/extreme-ATR LONG circuit breaker (default: `block`)
+- `short_vol_short`: extreme-ATR SHORT circuit breaker, Balanced only (default: `shadow`)
+
+Blocked signals are dropped. Shadow signals pass through tagged `*_vol_shadow`. Both modes log to `filtered_candidates` table.
+
+**Conviction threshold:** default 55. Signals below this are filtered from results.
+
+---
+
+## Strategy System
+
+Four built-in strategies in `STRATEGIES` dict in `app.py`:
+
+| Key | Name | Leverage | Character |
+|---|---|---|---|
+| `balanced` | Balanced | 20x | General-purpose — all regimes |
+| `funding_arb` | Funding Arb | 10x | Requires meaningful funding rate |
+| `momentum_breakout` | Momentum Breakout | 25x | Requires strong 24h move |
+| `mean_reversion` | Mean Reversion | 15x | RSI extremes only |
+
+Custom strategies persist in `custom_strategies` SQLite table. They clone a built-in base and can override weights, filters, leverage cap, min conviction, and regime.
+
+**Do not add a new strategy by editing only one place.** Metadata spans:
+- `STRATEGIES` and `_STRATEGY_NAME_TO_KEY` in `app.py`
+- `STRAT_META` and `STRATEGY_LEVERAGE` in `index.html`
+
+---
+
+## Database Schema — Key Tables
+
+**`signals`** — one row per logged signal
+Key columns: `symbol`, `direction`, `strategy`, `conviction`, `price`, `entry1–3`, `tp1–3`, `stop_loss`, `atr_pct`, `volatility`, `funding_rate`, `rsi_1h`, `trend_score`, `tags`, `signal_why`, `result`, `exit_price`, `entry_at`, `pnl_pct`, `leverage`, `data_quality`, `signal_json`, `evaluation_version`, `strategy_key`
+
+**`position_events`** — incremental trade lifecycle ledger
+Event types: `ENTRY_FILLED`, `TP1_HIT`, `TP2_HIT`, `TP3_HIT`, `STOP_HIT`, manual close events.
+Each event stores `realized_pct` and `remaining_size_pct`.
+
+**`custom_strategies`** — user-created strategy clones
+
+**`filtered_candidates`** — signals that were blocked or shadowed by risk gates
+Stores `gate_key`, `gate_mode`, and why the signal was suppressed.
+
+---
+
+## Dashboard — Five Tabs
+
+| Tab | Section | What It Does |
 |---|---|---|
-| 24h price change | High | >5% strong momentum |
-| Funding rate | High | Negative = short squeeze setup |
-| Price vs fair price spread | Medium | Spread > 0 = longs paying |
-| Orderbook imbalance | Medium | bid/ask depth ratio (10 levels) |
-| Volume vs baseline | Low | relative, not absolute |
-| Volatility regime (ATR%) | Modifier | scales leverage recommendation |
+| Signals | `#signals-section` | Strategy bar, filter bar, ranked signal cards, detail panel |
+| Market | `#market-section` | All 800+ tickers paginated, sortable, searchable |
+| Tools | `#tools-section` | Risk calculator, compound planner |
+| Strategies | `#strategies-section` | Analytics: equity curves, regime breakdown, symbol performance, Portfolio Lab |
+| History | `#history-section` | Open positions (live P&L via SSE) + closed signals (equity curve, outcome tagging) |
 
-Conviction threshold: signals below 55 are filtered out by default.
+**Shared detail panel** (`#detail-panel`): slides in from right (desktop) / up from bottom (mobile). Always write innerHTML to `#panel-body`, not the aside.
+
+**State objects** — fully isolated, never cross-reference:
+- `S` — Signals tab state
+- `M` — Market tab state
+- `H` — History tab state (open positions, price cache, closed signals)
+- `A` — Strategies tab analytics state
 
 ---
 
-## Key Functions to Know
+## Key API Routes
 
-### From lib/indicators.py
-```python
-vwap(df)           # Volume-weighted average price
-ema(df, period)    # Exponential moving average
-rsi(df, period=14) # Relative strength index
-atr(df, period=14) # Average true range
-```
+| Route | Method | What |
+|---|---|---|
+| `/api/scan` | GET | Scans with one strategy; `?strategy=<key>&threshold=<n>` |
+| `/api/scan/all` | POST | Fetches tickers once, runs all enabled strategies |
+| `/api/market` | GET | All scored tickers for market browser |
+| `/api/signal/<symbol>` | GET | Full enrichment of a single symbol on demand |
+| `/api/signal/result` | PATCH | Tag outcome; accepts `exit_price` to compute `pnl_pct` |
+| `/api/signals/history` | GET | Signal history with filters |
+| `/api/signal/detail/<id>` | GET | Full trade detail + Claude coach review (closed signals) |
+| `/api/outcomes/check` | POST | Auto-evaluate open positions against klines |
+| `/api/stream/prices` | GET | SSE: price updates every 3s for `?symbols=` |
+| `/api/strategies` | GET | All strategies with performance stats |
+| `/api/strategies/analytics` | GET | Chart-ready analytics for Strategies tab |
+| `/api/strategies/portfolio` | GET | Strategy Portfolio Lab simulator |
+| `/api/risk-gates` | GET | Current risk gate config + historical impact |
+| `/api/risk-gates/<key>` | PATCH | Change gate mode live (block/shadow/off) |
+| `/api/strategies/custom` | POST | Create custom strategy |
+| `/api/strategies/custom/<key>` | PATCH / DELETE | Edit or delete custom strategy |
+| `/api/analysis` | POST | AI strategy review (last 200 tagged outcomes) |
+| `/api/backfill/pnl` | POST | MAINTENANCE — re-evaluate historical signals |
+| `/api/cleanup/phantom-events` | POST | MAINTENANCE — delete orphan position events |
 
-### From lib/laddering.py
-```python
-generate_ladders(
-    current_price,
-    atr_value,
-    tiers=3,
-    direction="LONG",   # MT7 addition — MT6 only did long-side
-    risk_reward=(1, 2)
-) -> (entries, exits)
-```
-
-### From lib/mexc_stream.py
-```python
-MexcStreamAPI(on_kline, on_depth, on_funding)
-.start(["kline.BTC_USDT.Min15", "depth.BTC_USDT"])
-.stop()
-```
+Background thread `_outcome_loop` runs `api_outcomes_check()` every 15 minutes.
 
 ---
 
@@ -158,60 +277,48 @@ MexcStreamAPI(on_kline, on_depth, on_funding)
 2. **One file, one job.** `app.py` stays flat. `lib/` files are pure functions.
 3. **No features that don't serve the trader.** If it doesn't help make a better trade decision, it doesn't ship.
 4. **The mobile test is non-negotiable.** Every UI change must work on iPhone Safari.
-5. **No committed secrets.** `.env` only. `.env` is in `.gitignore` from day one.
+5. **No committed secrets.** `.env` only. Never committed.
 6. **Error handling is a feature.** Every API call is wrapped in try/except. App never crashes.
 7. **Signal quality over quantity.** 20 high-conviction signals beats 200 weak ones.
 8. **The tool is for trading, not for looking at.** Aesthetics serve the signal, not the other way around.
-9. **No databases for application state.** SQLite is acceptable for signal history logging and outcome tracking.
+9. **S and M state objects are completely isolated.** Never share state between tabs.
+10. **No JS frameworks.** Vanilla JS only.
+11. **No glassmorphism, gradients, or drop shadows.** Dark flat UI only.
+12. **Read the actual files before writing a single line.** Do not assume state from memory or prior sessions.
+13. **No databases for application state.** SQLite for signal history and outcome tracking only.
 
 ---
 
-## What's Ported from MT6
+## What NOT To Do
 
-These are the only MT6 components worth keeping. Everything else was discarded.
+A condensed version of HANDOFF.md's full list — the most critical items:
 
-| Component | Source | Status |
-|---|---|---|
-| RSI, EMA, VWAP, ATR | `Matrix_Trader_6_0/strategies/indicators.py` | Port to `lib/indicators.py` |
-| Laddering logic | `Matrix_Trader_6_0/strategies/laddering.py` | Port to `lib/laddering.py`, add short-side |
-| WebSocket wrapper | `Matrix_Trader_6_0/mexc_stream_api.py` | Port to `lib/mexc_stream.py` |
-| OB imbalance calc | `Matrix_Trader_6_0/enhanced_trading_bot.py` (lines ~2966–2977) | Inline in `app.py` scoring |
-| Volatility regime | `Matrix_Trader_6_0/market_extras.py` | Inline in `app.py` scoring |
-| Concurrent fetch pattern | `Matrix_Trader_6_0/enhanced_trading_bot.py` (ThreadPoolExecutor) | Already in `app.py` |
-
----
-
-## Environment Variables
-
-```bash
-# .env
-ANTHROPIC_API_KEY=<your_anthropic_key>     # required for AI signal reports
-MEXC_API_KEY=                    # optional — only needed for private endpoints
-MEXC_API_SECRET=                 # optional
-```
-
----
-
-## Running the App
-
-```bash
-pip install -r requirements.txt
-python3 app.py
-```
-
-Opens at `http://localhost:5000` on Mac.
-Opens at `http://192.168.x.x:5000` on iPhone (same WiFi).
-
----
+- Do not call `enrich_signal()` from `backtest.py` — it makes live API calls
+- Do not import from `app.py` in a way that triggers Flask server startup
+- Do not add new SQLite columns without a migration — wrap in `try/except OperationalError`
+- Do not use `datetime.now()` — always `datetime.utcnow()`; all timestamps are UTC ISO without Z
+- Do not add JS frameworks — no React, Vue, jQuery, Alpine
+- Do not write innerHTML to `$('detail-panel')` — write to `$('panel-body')` only
+- Do not filter direction server-side in `/api/signals/history` — client-side only
+- Do not commit `.env`, `data/`, or `__pycache__/`
+- Do not modify `S` state from market tab code or `M` state from signals tab code
+- Do not call any AI provider directly from routes — always use `call_ai()` from `lib/ai_client.py`
+- Do not import `anthropic` at top of `app.py` — lazy import inside `lib/ai_client.py` handles it
+- Do not add new strategies by editing only one place — metadata spans `app.py` and `index.html`
+- Do not write TP/SL events to `position_events` without a prior `ENTRY_FILLED` event
+- Do not place CoinGlass conviction adjustments in `score_ticker()` — they belong in `enrich_signal()`
+- Do not promote `fragility_high`/`fragility_extreme` thresholds to hard gates without 2+ weeks of data
+- Do not run `POST /api/backfill/pnl` from a browser — use `curl -X POST` from the VPS shell
 
 ---
 
 ## When Starting a New Session
 
 1. Read this file (you just did)
-2. Check which P3 tasks are unchecked above
-3. Look at the current state of `app.py` and `templates/index.html`
-4. Pick the next unchecked task and complete it fully before moving to the next
-5. Update the checkbox in this file when a task is done
+2. Read HANDOFF.md — check the phase table and current task list
+3. Read the relevant section of `app.py` or `index.html` before touching anything
+4. Complete one task fully before moving to the next
+5. Update HANDOFF.md session summary before ending the session
 
 Do not start a new task until the previous one works end-to-end.
+Do not assume anything about current state — read the actual files.

@@ -27,6 +27,12 @@ from lib.indicators import (
 )
 from lib.laddering import generate_ladders
 from lib.ai_client import call_ai
+from lib.coinglass_client import (
+    coinglass_enabled,
+    enrich_symbol_with_coinglass,
+    get_coin_market_snapshot,
+    get_symbol_derivatives_context,
+)
 
 load_dotenv()
 
@@ -47,6 +53,37 @@ KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plen
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
 ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
 DB_PATH = "data/signals.db"
+RISK_GATES_PATH = "data/risk_gates.json"
+
+DEFAULT_RISK_GATES = {
+    "long_vol_long": {
+        "key": "long_vol_long",
+        "name": "High-volatility LONG circuit breaker",
+        "mode": "block",  # block | shadow | off
+        "direction": "LONG",
+        "volatility": ["high", "extreme"],
+        "description": (
+            "Blocks or shadows LONG candidates in high/extreme ATR regimes. "
+            "Created from the April 25 audit where these signals caused the "
+            "largest drawdown cluster while SHORTs in the same regimes stayed useful."
+        ),
+    },
+    "short_vol_short": {
+        "key": "short_vol_short",
+        "name": "Extreme-volatility SHORT circuit breaker (Balanced)",
+        "mode": "shadow",  # shadow for one week, promote to block if pattern holds
+        "direction": "SHORT",
+        "volatility": ["extreme"],
+        "strategy_scope": "balanced",
+        "description": (
+            "Shadows Balanced SHORT candidates in extreme ATR regimes. "
+            "April 26 audit: Balanced SHORT extreme avg −34.2 pnl_pct over 25 trades, "
+            "8% win rate. Momentum SHORT extreme was +53.3 avg (1 outlier win in 14) — "
+            "left open pending more data. Default SHADOW for one week; promote to BLOCK "
+            "if pattern holds. Only fires for strategies that set block_short_volatility."
+        ),
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Signal history — SQLite
@@ -141,6 +178,68 @@ def init_db() -> None:
         )
     con.commit()
     con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signals_open_dedupe
+        ON signals (symbol, direction, strategy_key, result)
+    """)
+    con.commit()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS position_events (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id          INTEGER NOT NULL,
+            event_type         TEXT NOT NULL,
+            event_at           TEXT NOT NULL,
+            price              REAL,
+            realized_pct       REAL DEFAULT 0,
+            remaining_size_pct REAL DEFAULT 100,
+            note               TEXT,
+            created_at         TEXT NOT NULL,
+            UNIQUE(signal_id, event_type)
+        )
+    """)
+    con.commit()
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_position_events_signal
+        ON position_events (signal_id, event_at)
+    """)
+    con.commit()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS filtered_candidates (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at    TEXT NOT NULL,
+            gate_key     TEXT DEFAULT 'long_vol_long',
+            gate_mode    TEXT DEFAULT 'block',
+            symbol       TEXT NOT NULL,
+            exchange     TEXT NOT NULL,
+            direction    TEXT NOT NULL,
+            strategy     TEXT NOT NULL,
+            strategy_key TEXT NOT NULL,
+            conviction   INTEGER,
+            price        REAL,
+            atr_pct      REAL,
+            volatility   TEXT,
+            funding_rate REAL,
+            tags         TEXT,
+            reason       TEXT NOT NULL,
+            signal_json  TEXT
+        )
+    """)
+    con.commit()
+    try:
+        con.execute("ALTER TABLE filtered_candidates ADD COLUMN gate_key TEXT DEFAULT 'long_vol_long'")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        con.execute("ALTER TABLE filtered_candidates ADD COLUMN gate_mode TEXT DEFAULT 'block'")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_filtered_candidates_lookup
+        ON filtered_candidates (strategy_key, direction, volatility, logged_at)
+    """)
+    con.commit()
+    con.execute("""
         CREATE TABLE IF NOT EXISTS custom_strategies (
             key         TEXT PRIMARY KEY,
             name        TEXT NOT NULL,
@@ -159,22 +258,23 @@ def log_signals(signals: list[dict]) -> None:
     """
     Append enriched signals to the history DB after every scan.
     Failures are swallowed — logging must never crash the scan.
-    Duplicate guard: skip any signal already logged in the last 30 minutes
-    for the same symbol + strategy + direction combination.
+    Duplicate guard: skip if an open (result IS NULL) signal already exists
+    for the same symbol + direction + strategy_key. Different strategies may
+    each hold the same symbol simultaneously — that is intentional.
     """
     try:
         con = sqlite3.connect(DB_PATH)
-        cutoff = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
         for sig in signals:
-            exists = con.execute("""
-                SELECT 1 FROM signals
-                WHERE symbol=? AND strategy=? AND direction=? AND logged_at > ?
-            """, (sig["symbol"], sig.get("strategy", ""), sig["direction"], cutoff)).fetchone()
-            if exists:
-                continue
             entries = sig.get("entries") or [None, None, None]
             exits   = sig.get("exits")   or [None, None, None]
             skey = sig.get("strategy_key") or strategy_name_to_key(sig.get("strategy", ""))
+            exists = con.execute("""
+                SELECT 1 FROM signals
+                WHERE symbol=? AND direction=? AND strategy_key=? AND result IS NULL
+                LIMIT 1
+            """, (sig["symbol"], sig["direction"], skey)).fetchone()
+            if exists:
+                continue
             leverage_val = sig.get("leverage_cap") or sig.get("max_leverage") or None
             con.execute("""
                 INSERT INTO signals
@@ -210,6 +310,88 @@ def log_signals(signals: list[dict]) -> None:
         con.close()
     except Exception as e:
         print(f"log_signals error: {e}", file=sys.stderr)
+
+
+def load_risk_gates() -> dict:
+    """Load local risk-gate configuration from data/risk_gates.json."""
+    gates = copy.deepcopy(DEFAULT_RISK_GATES)
+    try:
+        if os.path.exists(RISK_GATES_PATH):
+            with open(RISK_GATES_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            for key, cfg in (raw or {}).items():
+                if key in gates and isinstance(cfg, dict):
+                    gates[key].update(cfg)
+    except Exception as e:
+        print(f"load_risk_gates error: {e}", file=sys.stderr)
+
+    for key, cfg in gates.items():
+        cfg["key"] = key
+        if cfg.get("mode") not in {"block", "shadow", "off"}:
+            cfg["mode"] = DEFAULT_RISK_GATES[key]["mode"]
+        vols = cfg.get("volatility") or DEFAULT_RISK_GATES[key]["volatility"]
+        cfg["volatility"] = [str(v) for v in vols if str(v) in {"low", "medium", "high", "extreme"}]
+        if not cfg["volatility"]:
+            cfg["volatility"] = list(DEFAULT_RISK_GATES[key]["volatility"])
+    return gates
+
+
+def save_risk_gates(gates: dict) -> None:
+    os.makedirs("data", exist_ok=True)
+    # Preserve non-gate keys (e.g. disabled_builtins) already in the file.
+    try:
+        if os.path.exists(RISK_GATES_PATH):
+            with open(RISK_GATES_PATH, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        else:
+            existing = {}
+    except Exception:
+        existing = {}
+    merged = {k: v for k, v in existing.items() if k not in DEFAULT_RISK_GATES}
+    merged.update(gates)
+    with open(RISK_GATES_PATH, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2, sort_keys=True)
+
+
+def get_risk_gate(gate_key: str) -> dict:
+    return load_risk_gates()[gate_key]
+
+
+def get_long_vol_gate() -> dict:
+    return get_risk_gate("long_vol_long")
+
+
+def log_filtered_candidate(candidate: dict) -> None:
+    """Shadow-log a candidate blocked by a risk gate. Never crash scanning."""
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=1)
+        con.execute("""
+            INSERT INTO filtered_candidates
+            (logged_at, gate_key, gate_mode, symbol, exchange, direction, strategy, strategy_key, conviction,
+             price, atr_pct, volatility, funding_rate, tags, reason, signal_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            datetime.utcnow().isoformat(),
+            candidate.get("gate_key", "long_vol_long"),
+            candidate.get("gate_mode", "block"),
+            candidate.get("symbol", ""),
+            candidate.get("exchange", "MEXC"),
+            candidate.get("direction", ""),
+            candidate.get("strategy", ""),
+            candidate.get("strategy_key", ""),
+            candidate.get("conviction"),
+            candidate.get("price"),
+            candidate.get("atr_pct"),
+            candidate.get("volatility"),
+            candidate.get("funding_rate"),
+            ",".join(candidate.get("tags", [])),
+            candidate.get("reason", "risk_gate"),
+            json.dumps(candidate, default=str),
+        ))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"log_filtered_candidate error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +450,9 @@ STRATEGIES: dict = {
         "leverage_cap":    20,
         "min_conviction":  55,
         "filters":         {},
+        "risk_gates": {
+            "block_short_volatility": ["extreme"],
+        },
     },
     "funding_arb": {
         "name": "Funding Arb",
@@ -338,14 +523,41 @@ def clone_strategy_config(cfg: dict) -> dict:
     return copy.deepcopy(cfg)
 
 
+def _get_disabled_builtins() -> set:
+    """Return the set of built-in strategy keys that have been disabled."""
+    try:
+        with open(RISK_GATES_PATH, "r") as f:
+            data = json.load(f)
+        return set(data.get("disabled_builtins", []))
+    except Exception:
+        return set()
+
+
+def _set_disabled_builtins(disabled: set) -> None:
+    """Write the disabled_builtins set into risk_gates.json, preserving all other keys."""
+    os.makedirs("data", exist_ok=True)
+    try:
+        if os.path.exists(RISK_GATES_PATH):
+            with open(RISK_GATES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {}
+    except Exception:
+        data = {}
+    data["disabled_builtins"] = sorted(disabled)
+    with open(RISK_GATES_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
 def builtin_strategy_config(key: str, cfg: dict) -> dict:
     out = clone_strategy_config(cfg)
     out["key"] = key
     out["is_custom"] = False
-    out["enabled"] = True
     out["base_key"] = key
     out["regime"] = _STRATEGY_REGIME.get(key, "any")
     out["description"] = _STRATEGY_DESCRIPTIONS.get(key, out.get("description", ""))
+    disabled_builtins = _get_disabled_builtins()
+    out["enabled"] = key not in disabled_builtins
     return out
 
 
@@ -384,14 +596,18 @@ def custom_row_to_strategy(row: dict) -> dict | None:
 
 
 def get_strategy_registry(include_disabled: bool = False) -> dict[str, dict]:
-    registry = {
-        key: builtin_strategy_config(key, cfg)
-        for key, cfg in STRATEGIES.items()
-    }
+    registry = {}
+    for key, cfg in STRATEGIES.items():
+        built = builtin_strategy_config(key, cfg)
+        if include_disabled or built["enabled"]:
+            registry[key] = built
     for row in load_custom_strategy_rows(include_disabled=include_disabled):
         cfg = custom_row_to_strategy(row)
         if cfg:
             registry[cfg["key"]] = cfg
+    # balanced must always be present as fallback even when disabled
+    if "balanced" not in registry:
+        registry["balanced"] = builtin_strategy_config("balanced", STRATEGIES["balanced"])
     return registry
 
 
@@ -500,6 +716,20 @@ def validate_custom_strategy_payload(
     enabled = payload.get("enabled", True)
     enabled = bool(enabled)
 
+    direction_lock = payload.get("direction_lock", None)
+    if direction_lock not in (None, "LONG", "SHORT"):
+        return None, "direction_lock must be 'LONG', 'SHORT', or null"
+
+    allowed_volatility = payload.get("allowed_volatility", None)
+    if allowed_volatility is not None:
+        if not isinstance(allowed_volatility, list) or not allowed_volatility:
+            return None, "allowed_volatility must be a non-empty list or null"
+        valid_regimes = {"low", "medium", "high", "extreme"}
+        for v in allowed_volatility:
+            if v not in valid_regimes:
+                return None, f"allowed_volatility contains invalid regime: {v}"
+        allowed_volatility = list(allowed_volatility)
+
     config = {
         "key": key,
         "name": name,
@@ -513,6 +743,8 @@ def validate_custom_strategy_payload(
         "base_key": base_key,
         "enabled": enabled,
         "is_custom": True,
+        "direction_lock": direction_lock,
+        "allowed_volatility": allowed_volatility,
     }
     return config, None
 
@@ -534,11 +766,52 @@ def strategy_to_api(key: str, cfg: dict, performance: dict | None = None) -> dic
         "max_leverage":   cfg["leverage_cap"],
         "regime":         cfg.get("regime", "any"),
         "risk_level":     cfg.get("risk_level", "medium"),
-        "is_custom":      bool(cfg.get("is_custom", False)),
-        "enabled":        bool(cfg.get("enabled", True)),
-        "base_key":       cfg.get("base_key", key),
-        "performance":    performance or {},
+        "is_custom":          bool(cfg.get("is_custom", False)),
+        "enabled":            bool(cfg.get("enabled", True)),
+        "base_key":           cfg.get("base_key", key),
+        "direction_lock":     cfg.get("direction_lock", None),
+        "allowed_volatility": cfg.get("allowed_volatility", None),
+        "performance":        performance or {},
     }
+
+
+def blocked_volatility_regimes(direction: str, strategy: dict | None = None) -> set[str]:
+    """Return volatility regimes where candidates should be blocked or shadowed."""
+    direction = str(direction or "").upper()
+    sentinel = object()
+    if direction == "SHORT":
+        gate_key = "short_vol_short"
+        strategy_gate_key = "block_short_volatility"
+        default_raw = sentinel
+    else:
+        gate_key = "long_vol_long"
+        strategy_gate_key = "block_long_volatility"
+        default_raw = sentinel
+
+    gate = get_risk_gate(gate_key)
+    if gate.get("mode") == "off":
+        return set()
+    strat_gates = (strategy or {}).get("risk_gates") or {}
+    raw = strat_gates.get(strategy_gate_key, default_raw)
+    if direction == "LONG" and raw is sentinel:
+        raw = gate.get("volatility", [])
+    elif direction == "SHORT" and raw is sentinel:
+        raw = None
+    if raw in (None, False):
+        return set()
+    if raw is True:
+        return set(gate.get("volatility", []))
+    if isinstance(raw, str):
+        return {raw}
+    try:
+        return {str(v) for v in raw}
+    except TypeError:
+        return set(gate.get("volatility", []))
+
+
+def blocked_long_volatility_regimes(strategy: dict | None = None) -> set[str]:
+    """Backward-compatible wrapper for older call sites."""
+    return blocked_volatility_regimes("LONG", strategy)
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +992,11 @@ def fetch_market_sentiment(mexc_symbol: str, price: float) -> dict:
 # Stage 1: lightweight ticker scoring
 # ---------------------------------------------------------------------------
 
-def score_ticker(ticker: dict, strategy: dict | None = None) -> dict | None:
+def score_ticker(
+    ticker: dict,
+    strategy: dict | None = None,
+    coinglass_snapshot: dict[str, dict] | None = None,
+) -> dict | None:
     """
     Score a single ticker using only the fields available in the /contract/ticker
     response. No additional API calls. Returns a base signal dict or None if
@@ -819,7 +1096,7 @@ def score_ticker(ticker: dict, strategy: dict | None = None) -> dict | None:
             direction = "SHORT"
             conviction_base = min(int(short_score * vol_mult), 100)
 
-        return {
+        result = {
             "symbol": symbol,
             "exchange": "MEXC",
             "direction": direction,
@@ -831,6 +1108,10 @@ def score_ticker(ticker: dict, strategy: dict | None = None) -> dict | None:
             "open_interest": open_interest,
             "tags": tags,
         }
+        result.update(enrich_symbol_with_coinglass(symbol, coinglass_snapshot))
+        cg_oi = result.get("coinglass_open_interest_usd")
+        result["derivatives_open_interest"] = cg_oi if cg_oi is not None else open_interest
+        return result
     except Exception as e:
         print(f"score_ticker error [{ticker.get('symbol', '?')}]: {e}", file=sys.stderr)
         return None
@@ -1094,7 +1375,11 @@ def generate_report(sig: dict) -> str:
     return json.dumps(sections)
 
 
-def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
+def enrich_signal(
+    base: dict,
+    strategy: dict | None = None,
+    filter_stats: dict | None = None,
+) -> dict | None:
     """
     Stage 2: fetch klines and depth for one symbol, run RSI/ATR indicators,
     compute orderbook imbalance, adjust conviction, and generate entry/TP/SL
@@ -1155,6 +1440,16 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             print(f"[kline gate] {symbol} skipped — 1h:{n1h} 4h:{n4h}", file=sys.stderr)
             return None
 
+        # --- Direction lock filter ---
+        direction_lock = strat.get("direction_lock")
+        if direction_lock and direction != direction_lock:
+            print(
+                f"[direction lock] {symbol} skipped — strategy={strat.get('key')} "
+                f"locked={direction_lock} signal={direction}",
+                file=sys.stderr,
+            )
+            return None
+
         # --- Momentum: 1h and 4h price change ---
         # change_1h_pct: open→close on the most recent completed candle.
         # Using open rather than close[-2] because MEXC sometimes delivers the
@@ -1189,6 +1484,59 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
 
         atr_pct_val = calc_atr_pct(df, price, period=14)
         vol_regime = volatility_regime(atr_pct_val)
+
+        gate_key = "short_vol_short" if direction == "SHORT" else "long_vol_long"
+        vol_gate = get_risk_gate(gate_key)
+        gate_mode = vol_gate.get("mode", "block")
+        blocked_vols = blocked_volatility_regimes(direction, strat)
+        if vol_regime in blocked_vols:
+            should_block = gate_mode == "block"
+            reason_prefix = "short_vol" if direction == "SHORT" else "long_vol"
+            reason = f"{reason_prefix}_{'refuse' if should_block else 'shadow'}"
+            if filter_stats is not None:
+                lock = filter_stats.get("lock")
+                if lock:
+                    with lock:
+                        filter_stats[reason] = filter_stats.get(reason, 0) + 1
+                else:
+                    filter_stats[reason] = filter_stats.get(reason, 0) + 1
+            final_tags = list(dict.fromkeys(tags + [reason]))
+            skey = strat.get("key") or strategy_name_to_key(strat["name"])
+            candidate = {
+                "gate_key": gate_key,
+                "gate_mode": gate_mode,
+                "symbol": symbol,
+                "exchange": "MEXC",
+                "direction": direction,
+                "strategy": strat["name"],
+                "strategy_key": skey,
+                "conviction": base.get("conviction_base"),
+                "price": price,
+                "atr_pct": round(atr_pct_val, 4),
+                "volatility": vol_regime,
+                "funding_rate": base.get("funding_rate"),
+                "tags": final_tags,
+                "reason": reason,
+                "source": "enrich_signal",
+            }
+            print(
+                f"[{reason}] {symbol} {'skipped' if should_block else 'shadowed'} — strategy={skey} vol={vol_regime} dir={direction}",
+                file=sys.stderr,
+            )
+            log_filtered_candidate(candidate)
+            if should_block:
+                return None
+            tags.append(reason)
+
+        # --- Volatility allowlist filter (custom strategies only) ---
+        allowed_volatility = strat.get("allowed_volatility")
+        if allowed_volatility and vol_regime not in allowed_volatility:
+            print(
+                f"[vol allowlist] {symbol} skipped — strategy={strat.get('key')} "
+                f"allowed={allowed_volatility} actual={vol_regime}",
+                file=sys.stderr,
+            )
+            return None
 
         # --- Trend score: EMA20/EMA50 alignment ---
         # EWM never produces NaN with adjust=False, but dropna() guards against
@@ -1285,6 +1633,15 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             tiers=3,
             direction=direction,
         )
+        if entries and price > 0:
+            ladder_spread_pct = abs(entries[0] - stop_loss) / price
+            if ladder_spread_pct < 0.001:
+                print(
+                    f"[ladder gate] {symbol} skipped — entry1={entries[0]} "
+                    f"stop={stop_loss} spread_pct={ladder_spread_pct:.4f}",
+                    file=sys.stderr,
+                )
+                return None
 
         # --- Daily trend direction ---
         # Separate API call — failure must never abort enrichment.
@@ -1322,6 +1679,24 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             # Funding / open interest
             "funding_rate": base["funding_rate"],
             "open_interest": base["open_interest"],
+            "derivatives_open_interest": base.get("derivatives_open_interest"),
+            "coinglass_available": base.get("coinglass_available", False),
+            "coinglass_symbol": base.get("coinglass_symbol"),
+            "coinglass_current_price": base.get("coinglass_current_price"),
+            "coinglass_open_interest_usd": base.get("coinglass_open_interest_usd"),
+            "coinglass_market_cap_usd": base.get("coinglass_market_cap_usd"),
+            "coinglass_oi_market_cap_ratio": base.get("coinglass_oi_market_cap_ratio"),
+            "coinglass_funding_oi_weighted": base.get("coinglass_funding_oi_weighted"),
+            "coinglass_funding_vol_weighted": base.get("coinglass_funding_vol_weighted"),
+            "coinglass_volume_usd": base.get("coinglass_volume_usd"),
+            "coinglass_mexc_open_interest_usd": None,
+            "coinglass_oi_change_1h_pct": None,
+            "coinglass_oi_change_24h_pct": None,
+            "coinglass_funding_interval_hours": None,
+            "coinglass_liq_long_24h_usd": None,
+            "coinglass_liq_short_24h_usd": None,
+            "coinglass_mexc_liq_long_24h_usd": None,
+            "coinglass_mexc_liq_short_24h_usd": None,
             "next_funding_minutes": next_funding_minutes,
             # Volume
             "volume_24h": base["volume_24h"],
@@ -1362,6 +1737,74 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
             # "low" when history is thin (50–99 1h or 20–49 4h candles); "current" otherwise
             "data_quality": "low" if (n1h < 100 or n4h < 50) else "current",
         }
+        cg_context = get_symbol_derivatives_context(symbol)
+        if cg_context.get("coinglass_available"):
+            sig.update({k: v for k, v in cg_context.items() if v is not None})
+            sig["derivatives_open_interest"] = (
+                sig.get("coinglass_open_interest_usd")
+                or sig.get("derivatives_open_interest")
+                or sig.get("open_interest")
+            )
+        # --- P7a: CoinGlass conviction adjustments (stage-2 only) ---
+        # All blocks operate on sig["conviction"] and sig["tags"] directly after
+        # the per-symbol cg_context merge above. CoinGlass fields are None when
+        # the key is absent or the plan doesn't cover per-symbol data; every block
+        # must skip cleanly when its required field is None so CoinGlass absence
+        # is invisible to signal quality.
+
+        # Change 1: Cross-exchange funding confirmation — Funding Arb strategy only.
+        if sig.get("strategy_key") == "funding_arb":
+            cg_fund = sig.get("coinglass_funding_oi_weighted")
+            mexc_fund = sig.get("funding_rate")
+            if (
+                cg_fund is not None
+                and mexc_fund is not None
+                and abs(mexc_fund) > 0.0003
+            ):
+                if (cg_fund > 0) == (mexc_fund > 0) and abs(cg_fund) > 0.0003:
+                    sig["conviction"] = min(100, sig["conviction"] + 8)
+                    sig["tags"] = list(dict.fromkeys(sig["tags"] + ["cg_funding_confirmed"]))
+                elif (cg_fund > 0) != (mexc_fund > 0):
+                    sig["conviction"] = max(0, sig["conviction"] - 5)
+                    sig["tags"] = list(dict.fromkeys(sig["tags"] + ["cg_funding_divergence"]))
+
+        # Change 2: Liquidation asymmetry — all strategies.
+        liq_long_cg = sig.get("coinglass_liq_long_24h_usd")
+        liq_short_cg = sig.get("coinglass_liq_short_24h_usd")
+        if (
+            liq_long_cg is not None
+            and liq_short_cg is not None
+            and (liq_long_cg + liq_short_cg) > 0
+        ):
+            smaller_liq = min(liq_long_cg, liq_short_cg)
+            liq_ratio = (max(liq_long_cg, liq_short_cg) / smaller_liq) if smaller_liq > 0 else 10.0
+            if liq_ratio >= 3.0:
+                long_liq_dominant = liq_long_cg > liq_short_cg
+                sig_dir = sig.get("direction", "LONG")
+                liq_aligned = (sig_dir == "SHORT" and long_liq_dominant) or (
+                    sig_dir == "LONG" and not long_liq_dominant
+                )
+                if liq_aligned:
+                    sig["conviction"] = min(100, sig["conviction"] + 5)
+                    sig["tags"] = list(dict.fromkeys(sig["tags"] + ["liq_aligned"]))
+                else:
+                    sig["conviction"] = max(0, sig["conviction"] - 5)
+                    sig["tags"] = list(dict.fromkeys(sig["tags"] + ["liq_contrary"]))
+
+        # Thresholds (0.20 / 0.40) are initial guesses with no backtested basis — shadow only.
+        # Do not escalate to a hard gate without reviewing fragility_high tag performance
+        # across at least 2 weeks of closed signals.
+        # Change 3: OI/market-cap fragility — all strategies.
+        oi_mc_ratio = sig.get("coinglass_oi_market_cap_ratio")
+        if oi_mc_ratio is not None:
+            if oi_mc_ratio > 0.40:
+                sig["tags"] = list(dict.fromkeys(sig["tags"] + ["fragility_extreme"]))
+                sig["conviction"] = int(sig["conviction"] * 0.80)
+            elif oi_mc_ratio > 0.20:
+                sig["tags"] = list(dict.fromkeys(sig["tags"] + ["fragility_high"]))
+                sig["conviction"] = int(sig["conviction"] * 0.90)
+        sig["conviction"] = max(0, min(100, sig["conviction"]))
+
         sig["signal_why"] = why_signal(sig)
         sig["ai_report"]  = generate_report(sig)
 
@@ -1382,39 +1825,45 @@ def enrich_signal(base: dict, strategy: dict | None = None) -> dict | None:
 def run_scan(
     threshold: int = CONVICTION_THRESHOLD,
     strategy_key: str = "balanced",
+    tickers: list | None = None,
 ) -> tuple[list[dict], int]:
     """
     Two-stage scan across all MEXC perpetual tickers.
 
-    Stage 1: Fetch all 800+ tickers, score each with score_ticker() using the
-             active strategy's weights and stage-1 filters. Discard anything
-             with conviction_base < 20, take the top ENRICH_TOP_N.
+    Stage 1: Fetch all 800+ tickers (or use pre-fetched `tickers`), score each
+             with score_ticker() using the active strategy's weights and
+             stage-1 filters. Discard anything with conviction_base < 20, take
+             the top ENRICH_TOP_N.
     Stage 2: Enrich the top N concurrently — fetches klines + depth per symbol,
              runs indicators, applies stage-2 strategy filters, builds ladders.
 
     The effective conviction floor is max(threshold, strategy.min_conviction)
     so each strategy's minimum bar is always respected.
 
+    When `tickers` is provided (e.g. by api_scan_all), the ticker fetch and
+    expire_stale_signals() are skipped — the caller handles both.
+
     Returns (signals, total_pairs) where total_pairs is the raw ticker count.
     Signals have conviction >= effective_threshold, sorted descending.
     """
-    expire_stale_signals()
+    if tickers is None:
+        expire_stale_signals()
+        tickers = fetch_mexc("/contract/ticker")
+        if not tickers or not isinstance(tickers, list):
+            return [], 0
 
     registry = get_strategy_registry()
     strat = registry.get(strategy_key, registry["balanced"])
     strategy_key = strat["key"]
     effective_threshold = max(threshold, strat["min_conviction"])
-
-    tickers = fetch_mexc("/contract/ticker")
-    if not tickers or not isinstance(tickers, list):
-        return [], 0
+    coinglass_snapshot = get_coin_market_snapshot()
 
     total_pairs = len(tickers)
 
     # Stage 1 — strategy weights + stage-1 filters applied inside score_ticker
     base_signals: list[dict] = []
     for t in tickers:
-        scored = score_ticker(t, strategy=strat)
+        scored = score_ticker(t, strategy=strat, coinglass_snapshot=coinglass_snapshot)
         if scored and scored["conviction_base"] >= 20:
             base_signals.append(scored)
 
@@ -1422,12 +1871,31 @@ def run_scan(
     top = base_signals[:ENRICH_TOP_N]
 
     # Stage 2 — concurrent enrichment, strategy-aware
-    enrich = partial(enrich_signal, strategy=strat)
+    filter_stats = {
+        "lock": threading.Lock(),
+        "long_vol_refuse": 0,
+        "long_vol_shadow": 0,
+        "short_vol_refuse": 0,
+        "short_vol_shadow": 0,
+    }
+    enrich = partial(enrich_signal, strategy=strat, filter_stats=filter_stats)
     signals: list[dict] = []
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as executor:
         for sig in executor.map(enrich, top):
             if sig and sig["conviction"] >= effective_threshold:
                 signals.append(sig)
+
+    refused = int(filter_stats.get("long_vol_refuse") or 0)
+    shadowed = int(filter_stats.get("long_vol_shadow") or 0)
+    short_refused = int(filter_stats.get("short_vol_refuse") or 0)
+    short_shadowed = int(filter_stats.get("short_vol_shadow") or 0)
+    if refused or shadowed or short_refused or short_shadowed:
+        print(
+            f"[scan risk gates] strategy={strategy_key} "
+            f"long_vol_refuse={refused} long_vol_shadow={shadowed} "
+            f"short_vol_refuse={short_refused} short_vol_shadow={short_shadowed}",
+            file=sys.stderr,
+        )
 
     signals.sort(key=lambda s: s["conviction"], reverse=True)
     return signals, total_pairs
@@ -1447,7 +1915,10 @@ def api_scan():
     try:
         threshold    = request.args.get("threshold", CONVICTION_THRESHOLD, type=int)
         strategy_key = request.args.get("strategy", "balanced")
-        registry = get_strategy_registry()
+        registry = get_strategy_registry(include_disabled=True)
+        strat = registry.get(strategy_key)
+        if strat and not strat.get("enabled", True) and strategy_key != "balanced":
+            return jsonify({"success": False, "error": f"Strategy '{strategy_key}' is disabled"}), 400
         if strategy_key not in registry:
             strategy_key = "balanced"
         signals, total_pairs = run_scan(threshold=threshold, strategy_key=strategy_key)
@@ -1465,6 +1936,43 @@ def api_scan():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/scan/all", methods=["POST"])
+def api_scan_all():
+    """Fetch tickers once, score and enrich for every enabled strategy in
+    parallel, log results, and return all signals grouped by strategy key.
+    The frontend caches the results so strategy switching is instant."""
+    try:
+        t0 = time.time()
+        expire_stale_signals()
+
+        tickers = fetch_mexc("/contract/ticker")
+        if not tickers or not isinstance(tickers, list):
+            return jsonify({"success": False, "error": "MEXC ticker feed unavailable"}), 502
+
+        total_pairs = len(tickers)
+        registry = get_strategy_registry()
+        results: dict = {}
+
+        for key in registry:
+            signals, _ = run_scan(strategy_key=key, tickers=tickers)
+            log_signals(signals)
+            results[key] = {
+                "signals":     signals,
+                "total_pairs": total_pairs,
+                "strategy":    key,
+            }
+
+        scan_time = round(time.time() - t0, 2)
+        return jsonify({
+            "success":     True,
+            "results":     results,
+            "total_pairs": total_pairs,
+            "scan_time":   scan_time,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/market")
 def api_market():
     try:
@@ -1472,14 +1980,21 @@ def api_market():
         if not tickers or not isinstance(tickers, list):
             return jsonify({"success": False, "error": "MEXC unavailable"}), 502
 
+        coinglass_snapshot = get_coin_market_snapshot()
         pairs = []
         for t in tickers:
-            scored = score_ticker(t)
+            scored = score_ticker(t, coinglass_snapshot=coinglass_snapshot)
             if scored:
                 pairs.append(scored)
 
         pairs.sort(key=lambda p: p["conviction_base"], reverse=True)
-        return jsonify({"success": True, "pairs": pairs, "count": len(pairs)})
+        return jsonify({
+            "success": True,
+            "pairs": pairs,
+            "count": len(pairs),
+            "coinglass_enabled": coinglass_enabled(),
+            "coinglass_pairs": len(coinglass_snapshot),
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -1528,7 +2043,8 @@ def api_signal(symbol: str):
         if not ticker:
             return jsonify({"success": False, "error": f"Symbol {symbol!r} not found"}), 404
 
-        base = score_ticker(ticker, strategy=strat)
+        coinglass_snapshot = get_coin_market_snapshot()
+        base = score_ticker(ticker, strategy=strat, coinglass_snapshot=coinglass_snapshot)
         if not base:
             return jsonify({"success": False, "error": "Unable to score ticker"}), 422
 
@@ -1586,6 +2102,22 @@ def api_signal_result():
         con.row_factory = sqlite3.Row
         row = con.execute("SELECT * FROM signals WHERE id=?", (sig_id,)).fetchone()
         con.close()
+        if row and result not in {"EXPIRED", "SKIPPED"}:
+            event_type = {
+                "WIN": "MANUAL_WIN",
+                "LOSS": "MANUAL_LOSS",
+                "PARTIAL": "MANUAL_PARTIAL",
+            }.get(result)
+            if event_type:
+                log_position_event(
+                    dict(row),
+                    event_type,
+                    datetime.utcnow().isoformat(),
+                    exit_price,
+                    pnl_pct or 0.0,
+                    0.0,
+                    note or f"Manual {result}",
+                )
         return jsonify({"success": True, "signal": dict(row) if row else None})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1614,11 +2146,26 @@ def api_signals_history():
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         rows = con.execute(query, params).fetchall()
+        signals = [dict(r) for r in rows]
+        ids = [s["id"] for s in signals]
+        events_by_signal: dict[int, list[dict]] = defaultdict(list)
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            event_rows = con.execute(f"""
+                SELECT * FROM position_events
+                WHERE signal_id IN ({placeholders})
+                ORDER BY event_at ASC, id ASC
+            """, ids).fetchall()
+            for ev in event_rows:
+                d = dict(ev)
+                events_by_signal[int(d["signal_id"])].append(d)
         con.close()
+        for sig in signals:
+            sig["position_events"] = events_by_signal.get(int(sig["id"]), [])
         return jsonify({
             "success": True,
-            "signals": [dict(r) for r in rows],
-            "count":   len(rows),
+            "signals": signals,
+            "count":   len(signals),
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1631,12 +2178,18 @@ def api_signal_detail(signal_id: int):
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         row = con.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
+        event_rows = con.execute("""
+            SELECT * FROM position_events
+            WHERE signal_id=?
+            ORDER BY event_at ASC, id ASC
+        """, (signal_id,)).fetchall()
         con.close()
 
         if not row:
             return jsonify({"success": False, "error": "not found"}), 404
 
         sig = dict(row)
+        sig["position_events"] = [dict(ev) for ev in event_rows]
 
         # Duration in minutes (both timestamps are UTC ISO without Z)
         duration_minutes = None
@@ -1664,6 +2217,8 @@ def api_signal_detail(signal_id: int):
         # Tags stored as comma-separated string → list
         tags_raw  = sig.get("tags") or ""
         tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        journey = compute_trade_journey(sig, pnl_pct)
+        journey_prompt = format_journey_for_prompt(journey)
 
         # AI trade coach review — gracefully skipped if no provider key or call fails
         user_msg = (
@@ -1672,18 +2227,21 @@ def api_signal_detail(signal_id: int):
             f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Result: {sig.get('result')}\n"
             f"Stop: {sig.get('stop_loss')} | TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
             f"Duration: {duration_minutes or 'unknown'} minutes\n"
+            f"Trade journey stats:\n{journey_prompt}\n"
             f"Signal reason: {sig.get('signal_why')}\n"
             f"Tags: {tags_raw}\n"
             f"Result note: {sig.get('result_note')}\n\n"
-            f"In 3-4 sentences: what likely happened in this trade, what the signal "
-            f"got right or wrong, and one specific thing to watch for next time on "
-            f"this type of setup."
+            f"Write a concise but useful coach review in 2 short paragraphs. "
+            f"First describe the price journey from signal/entry to close using the journey stats. "
+            f"Then explain what the signal got right or wrong and one specific thing to watch next time. "
+            f"Do not claim the strategy should change based on a single trade; frame learning as evidence to aggregate."
         )
         ai_analysis = call_ai(
             system="You are a trading coach reviewing a completed trade. "
-                   "Be direct and specific. No fluff. 3-4 sentences maximum.",
+                   "Be direct, specific, and grounded only in the supplied trade data. "
+                   "Explain MAE/MFE/capture in plain trader language. No fluff.",
             user=user_msg,
-            max_tokens=512,
+            max_tokens=900,
         )
 
         return jsonify({
@@ -1708,10 +2266,222 @@ def api_signal_detail(signal_id: int):
             "signal_why":       sig.get("signal_why"),
             "tags":             tags_list,
             "volatility":       sig.get("volatility"),
+            "journey":          journey,
             "ai_analysis":      ai_analysis,
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _parse_utc_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", ""))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _signed_raw_pct(direction: str, entry: float, price: float) -> float | None:
+    if not entry:
+        return None
+    if direction == "LONG":
+        return (price - entry) / entry * 100
+    return (entry - price) / entry * 100
+
+
+def _journey_label(result: str | None, mae_pct: float, mfe_pct: float, capture_ratio: float | None, stop_pressure_pct: float | None, entry_delay_min: int | None) -> str:
+    near_stop = stop_pressure_pct is not None and stop_pressure_pct >= 80
+    delayed = entry_delay_min is not None and entry_delay_min >= 60
+    if result == "LOSS":
+        return "failed_fast" if mfe_pct < 1 else "reversed_after_progress"
+    if result == "WIN":
+        if near_stop:
+            return "near_stop_win"
+        if capture_ratio is not None and capture_ratio >= 70 and mae_pct < max(1.0, mfe_pct * 0.25):
+            return "clean_follow_through"
+        if delayed:
+            return "delayed_confirmation"
+        return "profitable_but_choppy"
+    if result == "PARTIAL":
+        return "partial_then_pressure" if near_stop else "partial_follow_through"
+    if result == "EXPIRED":
+        return "stalled_setup"
+    return "path_unclassified"
+
+
+def compute_trade_journey(sig: dict, pnl_pct: float | None = None) -> dict:
+    """
+    Analyze the candle path between signal log and close.
+
+    Uses Min15 candles to compute MAE/MFE, target timing, stop pressure, and
+    capture ratio. If MEXC no longer has the kline window, returns an
+    unavailable journey instead of failing the detail route.
+    """
+    symbol = sig.get("symbol")
+    direction = sig.get("direction", "")
+    entry = sig.get("entry1")
+    if not symbol or direction not in {"LONG", "SHORT"} or not entry:
+        return {"available": False, "reason": "missing entry, symbol, or direction"}
+
+    logged_dt = _parse_utc_iso(sig.get("logged_at"))
+    result_dt = _parse_utc_iso(sig.get("result_at")) or datetime.now(timezone.utc)
+    if not logged_dt:
+        return {"available": False, "reason": "missing logged_at"}
+
+    start_ts = int(logged_dt.timestamp())
+    end_ts = int(result_dt.timestamp())
+    limit = min(300, max(20, int((end_ts - start_ts) / 900) + 6))
+
+    klines = fetch_mexc(f"/contract/kline/{symbol}", params={
+        "interval": "Min15",
+        "start": start_ts,
+        "limit": limit,
+    })
+    if not klines or not isinstance(klines, dict):
+        return {"available": False, "reason": "kline history unavailable"}
+
+    raw_times = klines.get("time", [])
+    raw_highs = klines.get("high", [])
+    raw_lows = klines.get("low", [])
+    raw_closes = klines.get("close", [])
+    candles: list[dict] = []
+    for i, t in enumerate(raw_times):
+        try:
+            ts = int(t)
+            if start_ts <= ts <= end_ts + 900:
+                candles.append({
+                    "time": ts,
+                    "high": float(raw_highs[i]),
+                    "low": float(raw_lows[i]),
+                    "close": float(raw_closes[i]),
+                })
+        except (ValueError, IndexError, TypeError):
+            pass
+
+    if not candles:
+        return {"available": False, "reason": "no candles in trade window"}
+
+    entry_hit_ts: int | None = None
+    best_favorable = 0.0
+    worst_adverse = 0.0
+    best_price = None
+    worst_price = None
+    target_hits: dict[str, str] = {}
+    target_prices = {"tp1": sig.get("tp1"), "tp2": sig.get("tp2"), "tp3": sig.get("tp3")}
+    stop_loss = sig.get("stop_loss")
+
+    for c in candles:
+        ts, high, low = c["time"], c["high"], c["low"]
+        if entry_hit_ts is None:
+            touched = low <= entry if direction == "LONG" else high >= entry
+            if not touched:
+                continue
+            entry_hit_ts = ts
+
+        if direction == "LONG":
+            favorable = _signed_raw_pct(direction, entry, high) or 0.0
+            adverse = abs(min(_signed_raw_pct(direction, entry, low) or 0.0, 0.0))
+            favorable_price = high
+            adverse_price = low
+            for label, price in target_prices.items():
+                if price and label not in target_hits and high >= price:
+                    target_hits[label] = datetime.utcfromtimestamp(ts).isoformat()
+        else:
+            favorable = _signed_raw_pct(direction, entry, low) or 0.0
+            adverse = abs(min(_signed_raw_pct(direction, entry, high) or 0.0, 0.0))
+            favorable_price = low
+            adverse_price = high
+            for label, price in target_prices.items():
+                if price and label not in target_hits and low <= price:
+                    target_hits[label] = datetime.utcfromtimestamp(ts).isoformat()
+
+        if favorable > best_favorable:
+            best_favorable = favorable
+            best_price = favorable_price
+        if adverse > worst_adverse:
+            worst_adverse = adverse
+            worst_price = adverse_price
+
+    exit_price = sig.get("exit_price")
+    final_raw_pct = _signed_raw_pct(direction, entry, exit_price) if exit_price else None
+    capture_ratio = None
+    if final_raw_pct is not None and best_favorable > 0 and final_raw_pct > 0:
+        capture_ratio = max(0.0, min(100.0, final_raw_pct / best_favorable * 100))
+
+    planned_stop_pct = None
+    stop_pressure_pct = None
+    if stop_loss:
+        planned_stop_pct = abs(_signed_raw_pct(direction, entry, stop_loss) or 0.0)
+        if planned_stop_pct > 0:
+            stop_pressure_pct = min(100.0, worst_adverse / planned_stop_pct * 100)
+
+    entry_delay_min = None
+    if entry_hit_ts:
+        entry_delay_min = int((entry_hit_ts - start_ts) / 60)
+
+    entry_to_close_min = None
+    if entry_hit_ts and end_ts:
+        entry_to_close_min = int((end_ts - entry_hit_ts) / 60)
+
+    leverage = sig.get("leverage")
+    if leverage is None:
+        try:
+            leverage = json.loads(sig.get("signal_json") or "{}").get("leverage_cap")
+        except Exception:
+            leverage = None
+    leverage = float(leverage) if leverage else None
+
+    label = _journey_label(
+        sig.get("result"),
+        worst_adverse,
+        best_favorable,
+        capture_ratio,
+        stop_pressure_pct,
+        entry_delay_min,
+    )
+
+    return {
+        "available": True,
+        "timeframe": "Min15",
+        "candles": len(candles),
+        "entry_hit": entry_hit_ts is not None,
+        "entry_delay_minutes": entry_delay_min,
+        "entry_to_close_minutes": entry_to_close_min,
+        "mae_pct": round(worst_adverse, 2),
+        "mfe_pct": round(best_favorable, 2),
+        "mae_leveraged_pct": round(worst_adverse * leverage, 2) if leverage else None,
+        "mfe_leveraged_pct": round(best_favorable * leverage, 2) if leverage else None,
+        "best_price": round(best_price, 10) if best_price is not None else None,
+        "worst_price": round(worst_price, 10) if worst_price is not None else None,
+        "final_raw_pct": round(final_raw_pct, 2) if final_raw_pct is not None else None,
+        "final_leveraged_pct": pnl_pct,
+        "capture_ratio_pct": round(capture_ratio, 1) if capture_ratio is not None else None,
+        "planned_stop_pct": round(planned_stop_pct, 2) if planned_stop_pct is not None else None,
+        "stop_pressure_pct": round(stop_pressure_pct, 1) if stop_pressure_pct is not None else None,
+        "target_hits": target_hits,
+        "path_label": label,
+    }
+
+
+def format_journey_for_prompt(journey: dict) -> str:
+    if not journey or not journey.get("available"):
+        return f"- Journey unavailable: {journey.get('reason', 'unknown') if journey else 'unknown'}"
+    target_hits = journey.get("target_hits") or {}
+    hit_text = ", ".join(f"{k.upper()} at {v}" for k, v in target_hits.items()) or "No target timestamps detected"
+    return (
+        f"- Path label: {journey.get('path_label')}\n"
+        f"- Entry hit: {journey.get('entry_hit')} after {journey.get('entry_delay_minutes')} minutes\n"
+        f"- Entry-to-close time: {journey.get('entry_to_close_minutes')} minutes over {journey.get('candles')} Min15 candles\n"
+        f"- MAE: {journey.get('mae_pct')}% raw ({journey.get('mae_leveraged_pct')}% leveraged if available)\n"
+        f"- MFE: {journey.get('mfe_pct')}% raw ({journey.get('mfe_leveraged_pct')}% leveraged if available)\n"
+        f"- Capture ratio: {journey.get('capture_ratio_pct')}% of favorable excursion\n"
+        f"- Stop pressure: {journey.get('stop_pressure_pct')}% of planned stop distance used\n"
+        f"- Target hits: {hit_text}"
+    )
 
 
 def _compute_leveraged_pnl(sig: dict, exit_price: float | None) -> float | None:
@@ -1741,6 +2511,52 @@ def _compute_leveraged_pnl(sig: dict, exit_price: float | None) -> float | None:
     else:
         raw_pct = (entry1 - exit_price) / entry1 * 100
     return round(raw_pct * leverage, 2)
+
+
+def _leveraged_level_pnl(sig: dict, price: float | None, size_fraction: float = 1.0) -> float:
+    """Incremental leveraged P&L contribution for a partial size at a price."""
+    if price is None:
+        return 0.0
+    full = _compute_leveraged_pnl(sig, price)
+    if full is None:
+        return 0.0
+    return round(full * size_fraction, 2)
+
+
+def log_position_event(
+    sig: dict,
+    event_type: str,
+    event_at: str | None,
+    price: float | None,
+    realized_pct: float = 0.0,
+    remaining_size_pct: float = 100.0,
+    note: str = "",
+) -> None:
+    """Persist TP/SL/entry lifecycle events idempotently for paper positions."""
+    signal_id = sig.get("id")
+    if not signal_id or not event_type or not event_at:
+        return
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=1)
+        con.execute("""
+            INSERT OR IGNORE INTO position_events
+            (signal_id, event_type, event_at, price, realized_pct,
+             remaining_size_pct, note, created_at)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            signal_id,
+            event_type,
+            event_at,
+            price,
+            round(float(realized_pct or 0), 2),
+            round(float(remaining_size_pct), 2),
+            note,
+            datetime.utcnow().isoformat(),
+        ))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"log_position_event error [{signal_id}:{event_type}]: {e}", file=sys.stderr)
 
 
 def expire_stale_signals() -> int:
@@ -1787,8 +2603,8 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
       - First wait for entry1 to be touched. Signals are logged at scan time, but
         the ladder entry may be away from current price.
       - Stop hit (LONG: low <= stop | SHORT: high >= stop) → LOSS (or PARTIAL if TP1 hit first)
+      - TP1/TP2 hit → log position_events and keep remainder open
       - TP3 fully hit → WIN
-      - TP1 or TP2 hit, no stop → PARTIAL
     If TP1 was hit in an earlier candle but stop was hit later, result is PARTIAL —
     the trader would have taken partial profits before being stopped on the remainder.
     """
@@ -1831,12 +2647,30 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
     if not raw_times or not raw_highs or not raw_lows or not raw_closes:
         return None
 
-    # Build candle list — only candles that opened at or after signal time
+    # Lifecycle invariant: TP/SL events must follow ENTRY_FILLED. See P5c.
+    # Bootstrap from persisted entry_at so re-evaluations skip pre-entry candles.
+    existing_entry_at = sig.get("entry_at")
+    entry_hit  = bool(existing_entry_at)
+    entry_at: str | None = existing_entry_at or None
+
+    # Candle scan starts at entry_at when confirmed; otherwise from logged_at.
+    # Candles before entry are scenery, not events.
+    scan_start_ts = start_ts
+    if existing_entry_at:
+        try:
+            edt = datetime.fromisoformat(existing_entry_at)
+            if edt.tzinfo is None:
+                edt = edt.replace(tzinfo=timezone.utc)
+            scan_start_ts = int(edt.timestamp())
+        except Exception:
+            pass
+
+    # Build candle list — only candles that opened at or after scan_start_ts
     candles: list[dict] = []
     for i, t in enumerate(raw_times):
         try:
             candle_ts = int(t)
-            if candle_ts >= start_ts:
+            if candle_ts >= scan_start_ts:
                 candles.append({
                     "time":  candle_ts,
                     "high":  float(raw_highs[i]),
@@ -1851,8 +2685,6 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
 
     stop_hit   = False
     best_tp    = 0              # highest TP tier reached before stop: 0=none, 1, 2, 3
-    entry_hit  = False
-    entry_at: str | None = None
     exit_price: float | None = None
     result_at: str | None = None
 
@@ -1870,14 +2702,25 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
             if not entry_hit:
                 continue
             entry_at = _iso(ts)
+            log_position_event(
+                sig, "ENTRY_FILLED", entry_at, entry1,
+                0.0, 100.0, f"Entry 1 touched at {entry1}"
+            )
 
         if direction == "LONG":
             if l <= stop_loss:
                 stop_hit   = True
+                stop_size = 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)
+                remaining = 0.0
                 exit_price = stop_loss if best_tp == 0 else (
                     tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
                 )
                 result_at = _iso(ts)
+                log_position_event(
+                    sig, "STOP_HIT", result_at, stop_loss,
+                    _leveraged_level_pnl(sig, stop_loss, stop_size),
+                    remaining, f"Stop touched after TP{best_tp}" if best_tp else "Stop touched"
+                )
                 break
             prev_tp = best_tp
             if tp3 and h >= tp3:
@@ -1889,15 +2732,30 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
             if best_tp > prev_tp:
                 exit_price = tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
                 result_at = _iso(ts)
+                for tier in range(prev_tp + 1, best_tp + 1):
+                    tier_price = tp3 if tier == 3 else tp2 if tier == 2 else tp1
+                    log_position_event(
+                        sig, f"TP{tier}_HIT", result_at, tier_price,
+                        _leveraged_level_pnl(sig, tier_price, 1 / 3),
+                        max(0.0, (3 - tier) / 3 * 100),
+                        f"TP{tier} touched at {tier_price}",
+                    )
                 if best_tp == 3:
                     break
         else:  # SHORT
             if h >= stop_loss:
                 stop_hit   = True
+                stop_size = 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)
+                remaining = 0.0
                 exit_price = stop_loss if best_tp == 0 else (
                     tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
                 )
                 result_at = _iso(ts)
+                log_position_event(
+                    sig, "STOP_HIT", result_at, stop_loss,
+                    _leveraged_level_pnl(sig, stop_loss, stop_size),
+                    remaining, f"Stop touched after TP{best_tp}" if best_tp else "Stop touched"
+                )
                 break
             prev_tp = best_tp
             if tp3 and l <= tp3:
@@ -1909,6 +2767,14 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
             if best_tp > prev_tp:
                 exit_price = tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
                 result_at = _iso(ts)
+                for tier in range(prev_tp + 1, best_tp + 1):
+                    tier_price = tp3 if tier == 3 else tp2 if tier == 2 else tp1
+                    log_position_event(
+                        sig, f"TP{tier}_HIT", result_at, tier_price,
+                        _leveraged_level_pnl(sig, tier_price, 1 / 3),
+                        max(0.0, (3 - tier) / 3 * 100),
+                        f"TP{tier} touched at {tier_price}",
+                    )
                 if best_tp == 3:
                     break
 
@@ -1923,10 +2789,8 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
         return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}", blended, result_at, entry_at)
     if best_tp == 3:
         return ("WIN",     f"TP3 hit at {tp3}",                    exit_price, result_at, entry_at)
-    if best_tp == 2:
-        return ("PARTIAL", f"TP2 hit at {tp2}",                    exit_price, result_at, entry_at)
-    if best_tp == 1:
-        return ("PARTIAL", f"TP1 hit at {tp1}",                    exit_price, result_at, entry_at)
+    if best_tp in {1, 2}:
+        return None   # partial TP events are logged; remainder stays open until TP3 or stop
     return None   # still open — no level hit yet
 
 
@@ -1955,6 +2819,22 @@ def api_outcomes_check():
         for sig in open_sigs:
             outcome = evaluate_outcome(sig)
             if outcome is None:
+                # Persist entry_at if ENTRY_FILLED was logged this run but signals.entry_at is still NULL
+                if not sig.get("entry_at"):
+                    _con = sqlite3.connect(DB_PATH)
+                    _con.row_factory = sqlite3.Row
+                    _ev = _con.execute(
+                        "SELECT event_at FROM position_events "
+                        "WHERE signal_id=? AND event_type='ENTRY_FILLED'",
+                        (sig["id"],),
+                    ).fetchone()
+                    if _ev:
+                        _con.execute(
+                            "UPDATE signals SET entry_at=? WHERE id=? AND entry_at IS NULL",
+                            (_ev["event_at"], sig["id"]),
+                        )
+                        _con.commit()
+                    _con.close()
                 skipped += 1
                 continue
             result, note, exit_price, result_at, entry_at = outcome
@@ -2061,9 +2941,10 @@ def api_strategies():
         for key in registry:
             row = con.execute(
                 "SELECT COUNT(*), "
-                "SUM(CASE WHEN result='WIN'  THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END), "
-                "AVG(conviction) "
+                "SUM(CASE WHEN result='WIN'     THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN result='LOSS'    THEN 1 ELSE 0 END), "
+                "AVG(conviction), "
+                "SUM(CASE WHEN result='PARTIAL' THEN 1 ELSE 0 END) "
                 "FROM signals WHERE strategy_key=?",
                 (key,),
             ).fetchone()
@@ -2071,18 +2952,19 @@ def api_strategies():
             wins     = int(row[1] or 0)
             losses   = int(row[2] or 0)
             avg_conv = row[3]
-            wr       = wins / (wins + losses) if (wins + losses) > 0 else None
+            partials = int(row[4] or 0)
+            wr       = wins / (wins + losses + partials) if (wins + losses + partials) > 0 else None
             top_row  = con.execute(
                 "SELECT symbol FROM signals WHERE strategy_key=? "
                 "GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT 1",
                 (key,),
             ).fetchone()
             win_pnl_row = con.execute(
-                "SELECT AVG(pnl_pct) FROM signals WHERE strategy_key=? AND result='WIN' AND pnl_pct IS NOT NULL",
+                "SELECT AVG(pnl_pct) FROM signals WHERE strategy_key=? AND pnl_pct > 0",
                 (key,),
             ).fetchone()
             loss_pnl_row = con.execute(
-                "SELECT AVG(pnl_pct) FROM signals WHERE strategy_key=? AND result='LOSS' AND pnl_pct IS NOT NULL",
+                "SELECT AVG(pnl_pct) FROM signals WHERE strategy_key=? AND pnl_pct <= 0",
                 (key,),
             ).fetchone()
             perf[key] = {
@@ -2114,6 +2996,424 @@ def api_strategies():
     return jsonify({"success": True, "strategies": result})
 
 
+@app.route("/api/strategies/analytics")
+def api_strategies_analytics():
+    """Return chart-ready strategy performance analytics from logged signals."""
+    try:
+        registry = get_strategy_registry(include_disabled=True)
+        analytics: dict[str, dict] = {}
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+
+        for key, cfg in registry.items():
+            rows = [
+                dict(r) for r in con.execute(
+                    "SELECT * FROM signals WHERE strategy_key=? ORDER BY logged_at ASC",
+                    (key,),
+                ).fetchall()
+            ]
+
+            open_rows = [r for r in rows if r.get("result") is None]
+            closed = [r for r in rows if r.get("result") is not None]
+            trade_rows = [
+                r for r in closed
+                if r.get("result") not in {"SKIPPED", "EXPIRED"}
+            ]
+            pnl_rows = [r for r in trade_rows if r.get("pnl_pct") is not None]
+            wins = [r for r in trade_rows if r.get("result") == "WIN"]
+            losses = [r for r in trade_rows if r.get("result") == "LOSS"]
+            partials = [r for r in trade_rows if r.get("result") == "PARTIAL"]
+            total_pnl = sum(float(r.get("pnl_pct") or 0) for r in pnl_rows)
+            avg_pnl = total_pnl / len(pnl_rows) if pnl_rows else None
+            win_rate = len(wins) / (len(wins) + len(losses) + len(partials)) if (len(wins) + len(losses) + len(partials)) else None
+
+            equity = []
+            cumulative = 0.0
+            for r in pnl_rows:
+                cumulative += float(r.get("pnl_pct") or 0)
+                equity.append({
+                    "logged_at": r.get("logged_at"),
+                    "symbol": r.get("symbol"),
+                    "result": r.get("result"),
+                    "pnl_pct": round(float(r.get("pnl_pct") or 0), 2),
+                    "cumulative_pnl": round(cumulative, 2),
+                })
+
+            outcome_counts = {
+                "WIN": 0, "LOSS": 0, "PARTIAL": 0, "EXPIRED": 0, "SKIPPED": 0,
+            }
+            for r in closed:
+                res = r.get("result")
+                if res in outcome_counts:
+                    outcome_counts[res] += 1
+
+            buckets = [
+                ("<= -20%", lambda v: v <= -20),
+                ("-20 to -10", lambda v: -20 < v <= -10),
+                ("-10 to 0", lambda v: -10 < v < 0),
+                ("0 to 10", lambda v: 0 <= v < 10),
+                ("10 to 20", lambda v: 10 <= v < 20),
+                (">= 20%", lambda v: v >= 20),
+            ]
+            distribution = []
+            pnl_values = [float(r.get("pnl_pct") or 0) for r in pnl_rows]
+            for label, fn in buckets:
+                distribution.append({
+                    "label": label,
+                    "count": sum(1 for v in pnl_values if fn(v)),
+                })
+
+            by_symbol: dict[str, dict] = {}
+            for r in pnl_rows:
+                symbol = r.get("symbol") or "UNKNOWN"
+                d = by_symbol.setdefault(symbol, {"symbol": symbol, "count": 0, "total_pnl": 0.0})
+                d["count"] += 1
+                d["total_pnl"] += float(r.get("pnl_pct") or 0)
+            symbol_rows = []
+            for d in by_symbol.values():
+                symbol_rows.append({
+                    "symbol": d["symbol"],
+                    "count": d["count"],
+                    "total_pnl": round(d["total_pnl"], 2),
+                    "avg_pnl": round(d["total_pnl"] / d["count"], 2) if d["count"] else None,
+                })
+            best_symbols = sorted(symbol_rows, key=lambda x: x["total_pnl"], reverse=True)[:5]
+            worst_symbols = sorted(symbol_rows, key=lambda x: x["total_pnl"])[:5]
+
+            regime_map: dict[str, dict] = {}
+            for r in pnl_rows:
+                regime = r.get("volatility") or "unknown"
+                d = regime_map.setdefault(regime, {"regime": regime, "count": 0, "total_pnl": 0.0})
+                d["count"] += 1
+                d["total_pnl"] += float(r.get("pnl_pct") or 0)
+            regimes = []
+            for regime in ["low", "medium", "high", "extreme", "unknown"]:
+                d = regime_map.get(regime, {"regime": regime, "count": 0, "total_pnl": 0.0})
+                regimes.append({
+                    "regime": regime,
+                    "count": d["count"],
+                    "total_pnl": round(d["total_pnl"], 2),
+                    "avg_pnl": round(d["total_pnl"] / d["count"], 2) if d["count"] else None,
+                })
+
+            last = rows[-1] if rows else None
+            best = max(pnl_rows, key=lambda r: float(r.get("pnl_pct") or 0), default=None)
+            worst = min(pnl_rows, key=lambda r: float(r.get("pnl_pct") or 0), default=None)
+
+            analytics[key] = {
+                "strategy": strategy_to_api(key, cfg),
+                "summary": {
+                    "total": len(rows),
+                    "open": len(open_rows),
+                    "closed": len(closed),
+                    "trades": len(trade_rows),
+                    "wins": len(wins),
+                    "losses": len(losses),
+                    "partials": len(partials),
+                    "win_rate": round(win_rate, 4) if win_rate is not None else None,
+                    "avg_pnl": round(avg_pnl, 2) if avg_pnl is not None else None,
+                    "total_pnl": round(total_pnl, 2),
+                    "best_symbol": best.get("symbol") if best else None,
+                    "best_pnl": round(float(best.get("pnl_pct") or 0), 2) if best else None,
+                    "worst_symbol": worst.get("symbol") if worst else None,
+                    "worst_pnl": round(float(worst.get("pnl_pct") or 0), 2) if worst else None,
+                    "last_signal_at": last.get("logged_at") if last else None,
+                    "last_symbol": last.get("symbol") if last else None,
+                    "last_direction": last.get("direction") if last else None,
+                },
+                "equity": equity,
+                "outcomes": outcome_counts,
+                "distribution": distribution,
+                "symbols": {
+                    "best": best_symbols,
+                    "worst": worst_symbols,
+                },
+                "regimes": regimes,
+            }
+
+        con.close()
+        return jsonify({"success": True, "analytics": analytics})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/strategies/portfolio")
+def api_strategy_portfolio():
+    """
+    Replay closed strategy outcomes as a portfolio simulator.
+
+    This is decision support only: selected strategies are compounded against
+    historical pnl_pct rows, with optional application of the current long-vol
+    circuit breaker so users can compare the old vs gated strategy mix.
+    """
+    try:
+        registry = get_strategy_registry(include_disabled=True)
+        requested = request.args.get("strategies", "").strip()
+        if requested:
+            selected_keys = [
+                k.strip() for k in requested.split(",")
+                if k.strip() in registry
+            ]
+        else:
+            selected_keys = list(registry.keys())
+        if not selected_keys:
+            selected_keys = ["balanced"]
+
+        try:
+            account_start = float(request.args.get("account", "200"))
+        except (TypeError, ValueError):
+            account_start = 200.0
+        account_start = max(1.0, min(account_start, 10_000_000.0))
+
+        try:
+            risk_pct = float(request.args.get("risk_pct", "1"))
+        except (TypeError, ValueError):
+            risk_pct = 1.0
+        risk_pct = max(0.01, min(risk_pct, 100.0))
+
+        gate_mode = request.args.get("long_vol_gate", "on").strip().lower()
+        apply_long_vol_gate = gate_mode not in {"0", "false", "off", "no"}
+        blocked_vols = set(get_long_vol_gate().get("volatility", []))
+
+        placeholders = ",".join("?" for _ in selected_keys)
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = [
+            dict(r) for r in con.execute(f"""
+                SELECT id, logged_at, symbol, direction, strategy, strategy_key,
+                       result, pnl_pct, volatility
+                FROM signals
+                WHERE strategy_key IN ({placeholders})
+                  AND result IS NOT NULL
+                  AND result NOT IN ('SKIPPED', 'EXPIRED')
+                  AND pnl_pct IS NOT NULL
+                ORDER BY logged_at ASC, id ASC
+            """, selected_keys).fetchall()
+        ]
+
+        filtered_logged = 0
+        try:
+            filtered_logged = con.execute(f"""
+                SELECT COUNT(*) FROM filtered_candidates
+                WHERE strategy_key IN ({placeholders})
+            """, selected_keys).fetchone()[0]
+        except sqlite3.OperationalError:
+            filtered_logged = 0
+        con.close()
+
+        balance = account_start
+        peak = account_start
+        max_drawdown_pct = 0.0
+        equity = []
+        skipped_by_gate = []
+        by_strategy: dict[str, dict] = {}
+        wins = losses = partials = 0
+
+        for key in selected_keys:
+            by_strategy[key] = {
+                "key": key,
+                "name": registry[key]["name"],
+                "trades": 0,
+                "skipped_by_gate": 0,
+                "total_pnl": 0.0,
+                "account_delta": 0.0,
+            }
+
+        for r in rows:
+            key = r.get("strategy_key") or "balanced"
+            is_blocked = (
+                apply_long_vol_gate
+                and r.get("direction") == "LONG"
+                and (r.get("volatility") or "") in blocked_vols
+            )
+            if is_blocked:
+                skipped_by_gate.append(r)
+                if key in by_strategy:
+                    by_strategy[key]["skipped_by_gate"] += 1
+                continue
+
+            pnl_pct = float(r.get("pnl_pct") or 0.0)
+            before = balance
+            account_delta = balance * (risk_pct / 100.0) * (pnl_pct / 100.0)
+            balance = max(0.0, balance + account_delta)
+            peak = max(peak, balance)
+            if peak > 0:
+                drawdown = (peak - balance) / peak * 100.0
+                max_drawdown_pct = max(max_drawdown_pct, drawdown)
+
+            if r.get("result") == "WIN":
+                wins += 1
+            elif r.get("result") == "LOSS":
+                losses += 1
+            elif r.get("result") == "PARTIAL":
+                partials += 1
+
+            if key in by_strategy:
+                by_strategy[key]["trades"] += 1
+                by_strategy[key]["total_pnl"] += pnl_pct
+                by_strategy[key]["account_delta"] += account_delta
+
+            equity.append({
+                "id": r.get("id"),
+                "logged_at": r.get("logged_at"),
+                "symbol": r.get("symbol"),
+                "strategy_key": key,
+                "strategy": r.get("strategy"),
+                "direction": r.get("direction"),
+                "volatility": r.get("volatility"),
+                "result": r.get("result"),
+                "pnl_pct": round(pnl_pct, 2),
+                "account_delta": round(account_delta, 2),
+                "balance": round(balance, 2),
+                "balance_before": round(before, 2),
+            })
+
+        trades = len(equity)
+        closed_considered = len(rows)
+        win_rate = wins / trades if trades else None
+        summary = {
+            "account_start": round(account_start, 2),
+            "account_final": round(balance, 2),
+            "return_pct": round((balance / account_start - 1) * 100.0, 2),
+            "risk_pct": round(risk_pct, 4),
+            "trades": trades,
+            "closed_considered": closed_considered,
+            "skipped_by_gate": len(skipped_by_gate),
+            "shadow_filtered_logged": filtered_logged,
+            "wins": wins,
+            "losses": losses,
+            "partials": partials,
+            "win_rate": round(win_rate, 4) if win_rate is not None else None,
+            "max_drawdown_pct": round(max_drawdown_pct, 2),
+            "long_vol_gate": apply_long_vol_gate,
+        }
+
+        by_strategy_rows = []
+        for d in by_strategy.values():
+            trades_n = d["trades"]
+            by_strategy_rows.append({
+                "key": d["key"],
+                "name": d["name"],
+                "trades": trades_n,
+                "skipped_by_gate": d["skipped_by_gate"],
+                "total_pnl": round(d["total_pnl"], 2),
+                "avg_pnl": round(d["total_pnl"] / trades_n, 2) if trades_n else None,
+                "account_delta": round(d["account_delta"], 2),
+            })
+
+        return jsonify({
+            "success": True,
+            "selected_strategies": selected_keys,
+            "summary": summary,
+            "by_strategy": by_strategy_rows,
+            "equity": equity,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/risk-gates")
+def api_risk_gates():
+    """Return live risk-gate config plus lightweight audit stats."""
+    try:
+        gates = load_risk_gates()
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+
+        summaries: dict[str, dict] = {}
+        for key, cfg in gates.items():
+            rows = [
+                dict(r) for r in con.execute("""
+                    SELECT gate_mode, COUNT(*) AS n, MAX(logged_at) AS last_seen
+                    FROM filtered_candidates
+                    WHERE gate_key=?
+                    GROUP BY gate_mode
+                """, (key,)).fetchall()
+            ]
+            total_logged = sum(int(r.get("n") or 0) for r in rows)
+            mode_counts = {r.get("gate_mode") or "unknown": int(r.get("n") or 0) for r in rows}
+            last_seen = max((r.get("last_seen") for r in rows if r.get("last_seen")), default=None)
+            summaries[key] = {
+                "total_logged": total_logged,
+                "mode_counts": mode_counts,
+                "last_seen": last_seen,
+            }
+
+        for key, cfg in gates.items():
+            direction = str(cfg.get("direction") or "").upper()
+            vols = [str(v) for v in (cfg.get("volatility") or []) if str(v)]
+            strategy_scope = cfg.get("strategy_scope")
+            historical_rows = []
+            if direction and vols:
+                placeholders = ",".join("?" for _ in vols)
+                params: list = [direction, *vols]
+                scope_sql = ""
+                if strategy_scope:
+                    scope_sql = " AND strategy_key=?"
+                    params.append(strategy_scope)
+                historical_rows = [
+                    dict(r) for r in con.execute(f"""
+                        SELECT result, pnl_pct FROM signals
+                        WHERE direction=?
+                          AND volatility IN ({placeholders})
+                          {scope_sql}
+                          AND result IS NOT NULL
+                          AND result NOT IN ('SKIPPED', 'EXPIRED')
+                          AND pnl_pct IS NOT NULL
+                    """, params).fetchall()
+                ]
+
+            pnl_vals = [float(r.get("pnl_pct") or 0) for r in historical_rows]
+            total_pnl = sum(pnl_vals)
+            wins = sum(1 for r in historical_rows if r.get("result") == "WIN")
+            trades = len(historical_rows)
+            win_rate = wins / trades if trades else None
+            recommendation = "collect_data"
+            if trades >= 20 and total_pnl < 0:
+                recommendation = "keep_blocking"
+            elif trades >= 20 and total_pnl >= 0:
+                recommendation = "review_loosen"
+
+            summaries[key]["historical_impact"] = {
+                "matched_closed_trades": trades,
+                "total_pnl": round(total_pnl, 2),
+                "avg_pnl": round(total_pnl / trades, 2) if trades else None,
+                "win_rate": round(win_rate, 4) if win_rate is not None else None,
+                "recommendation": recommendation,
+                "volatility": sorted(vols),
+                "direction": direction,
+                "strategy_scope": strategy_scope,
+            }
+        con.close()
+
+        return jsonify({
+            "success": True,
+            "gates": gates,
+            "summaries": summaries,
+            "modes": ["block", "shadow", "off"],
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/risk-gates/<gate_key>", methods=["PATCH"])
+def api_update_risk_gate(gate_key: str):
+    """Update a risk gate's live mode. Config is local and gitignored under data/."""
+    try:
+        gates = load_risk_gates()
+        if gate_key not in gates:
+            return jsonify({"success": False, "error": "risk gate not found"}), 404
+        body = request.get_json(silent=True) or {}
+        mode = str(body.get("mode", gates[gate_key].get("mode", "block"))).strip().lower()
+        if mode not in {"block", "shadow", "off"}:
+            return jsonify({"success": False, "error": "mode must be block, shadow, or off"}), 400
+        gates[gate_key]["mode"] = mode
+        save_risk_gates(gates)
+        return jsonify({"success": True, "gate": gates[gate_key], "gates": gates})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/strategies/custom", methods=["POST"])
 def api_create_custom_strategy():
     """Create a custom strategy by cloning a built-in and applying validated overrides."""
@@ -2124,7 +3424,7 @@ def api_create_custom_strategy():
             return jsonify({"success": False, "error": err}), 400
 
         now = datetime.utcnow().isoformat()
-        row_json = json.dumps({
+        row_json_dict = {
             "description": cfg["description"],
             "risk_level": cfg["risk_level"],
             "weights": cfg["weights"],
@@ -2132,7 +3432,12 @@ def api_create_custom_strategy():
             "min_conviction": cfg["min_conviction"],
             "filters": cfg["filters"],
             "regime": cfg["regime"],
-        }, sort_keys=True)
+        }
+        if cfg.get("direction_lock") is not None:
+            row_json_dict["direction_lock"] = cfg["direction_lock"]
+        if cfg.get("allowed_volatility") is not None:
+            row_json_dict["allowed_volatility"] = cfg["allowed_volatility"]
+        row_json = json.dumps(row_json_dict, sort_keys=True)
 
         con = sqlite3.connect(DB_PATH)
         con.execute("""
@@ -2186,8 +3491,10 @@ def api_update_custom_strategy(strategy_key: str):
             "min_conviction": existing["min_conviction"],
             "leverage_cap": existing["leverage_cap"],
             "regime": existing.get("regime", "any"),
+            "direction_lock": existing.get("direction_lock", None),
+            "allowed_volatility": existing.get("allowed_volatility", None),
         }
-        for field in ("name", "enabled", "description", "risk_level", "weights", "filters", "min_conviction", "leverage_cap", "max_leverage", "regime"):
+        for field in ("name", "enabled", "description", "risk_level", "weights", "filters", "min_conviction", "leverage_cap", "max_leverage", "regime", "direction_lock", "allowed_volatility"):
             if field in body:
                 merged[field] = body[field]
 
@@ -2195,7 +3502,7 @@ def api_update_custom_strategy(strategy_key: str):
         if err:
             return jsonify({"success": False, "error": err}), 400
 
-        row_json = json.dumps({
+        row_json_dict = {
             "description": cfg["description"],
             "risk_level": cfg["risk_level"],
             "weights": cfg["weights"],
@@ -2203,7 +3510,12 @@ def api_update_custom_strategy(strategy_key: str):
             "min_conviction": cfg["min_conviction"],
             "filters": cfg["filters"],
             "regime": cfg["regime"],
-        }, sort_keys=True)
+        }
+        if cfg.get("direction_lock") is not None:
+            row_json_dict["direction_lock"] = cfg["direction_lock"]
+        if cfg.get("allowed_volatility") is not None:
+            row_json_dict["allowed_volatility"] = cfg["allowed_volatility"]
+        row_json = json.dumps(row_json_dict, sort_keys=True)
 
         con = sqlite3.connect(DB_PATH)
         con.execute("""
@@ -2235,6 +3547,29 @@ def api_delete_custom_strategy(strategy_key: str):
         if cur.rowcount == 0:
             return jsonify({"success": False, "error": "custom strategy not found"}), 404
         return jsonify({"success": True, "deleted": key})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/strategies/builtin/<strategy_key>", methods=["PATCH"])
+def api_toggle_builtin_strategy(strategy_key: str):
+    """Enable or disable a built-in strategy. State persists in risk_gates.json."""
+    try:
+        key = strategy_key.strip().lower()
+        if key not in STRATEGIES:
+            return jsonify({"success": False, "error": "not a built-in strategy key"}), 404
+        body = request.get_json(silent=True) or {}
+        if "enabled" not in body:
+            return jsonify({"success": False, "error": "'enabled' field required"}), 400
+        enable = bool(body["enabled"])
+        disabled = _get_disabled_builtins()
+        if enable:
+            disabled.discard(key)
+        else:
+            disabled.add(key)
+        _set_disabled_builtins(disabled)
+        cfg = builtin_strategy_config(key, STRATEGIES[key])
+        return jsonify({"success": True, "strategy": strategy_to_api(key, cfg)})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -2434,10 +3769,9 @@ def api_backfill_pnl():
                 con.execute("""
                     UPDATE signals
                     SET exit_price=?, pnl_pct=?, entry_at=?,
-                        result=?, result_note=?,
                         evaluation_version='backfill_v1'
                     WHERE id=?
-                """, (exit_price, pnl_pct, entry_at, result, note, sig["id"]))
+                """, (exit_price, pnl_pct, entry_at, sig["id"]))
                 con.commit()
                 con.close()
                 updated += 1
@@ -2451,6 +3785,45 @@ def api_backfill_pnl():
         print(f"[backfill/pnl] done — updated:{updated} skipped:{skipped} errors:{errors}",
               file=sys.stderr)
         return jsonify({"success": True, "updated": updated, "skipped": skipped, "errors": errors})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/cleanup/phantom-events", methods=["POST"])
+def api_cleanup_phantom_events():
+    """
+    MAINTENANCE — Delete TP/SL events in position_events that were logged for
+    signals whose entry was never confirmed (entry_at IS NULL in the signals table).
+
+    These phantom events arise when evaluate_outcome() logs ENTRY_FILLED + TP events
+    in a single candle scan but the signals table entry_at column was never written
+    (because the function returned None for partial TP hits).
+
+    Does NOT delete ENTRY_FILLED rows — those would indicate a different class of bug.
+    Idempotent. Safe to call repeatedly. POST only to prevent accidental browser trigger.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        affected_ids = con.execute("""
+            SELECT DISTINCT signal_id FROM position_events
+             WHERE signal_id IN (SELECT id FROM signals WHERE entry_at IS NULL)
+               AND event_type IN ('TP1_HIT','TP2_HIT','TP3_HIT','STOP_HIT')
+        """).fetchall()
+        affected_signals = len(affected_ids)
+
+        cur = con.execute("""
+            DELETE FROM position_events
+             WHERE signal_id IN (SELECT id FROM signals WHERE entry_at IS NULL)
+               AND event_type IN ('TP1_HIT','TP2_HIT','TP3_HIT','STOP_HIT')
+        """)
+        deleted = cur.rowcount
+        con.commit()
+        con.close()
+
+        print(f"[cleanup] phantom-events deleted={deleted} affected_signals={affected_signals}",
+              file=sys.stderr)
+        return jsonify({"success": True, "deleted": deleted, "affected_signals": affected_signals})
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500

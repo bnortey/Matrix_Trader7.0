@@ -159,6 +159,8 @@ Matrix Trader ships with four built-in scoring strategies:
 
 You can clone any built-in, adjust weights (momentum, funding, basis), filters (RSI gates, min volume), conviction floor, and leverage cap, then save as a named custom strategy. Custom strategies appear as strategy pills in the scanner and are tracked separately in signal history.
 
+For a full explanation of strategy scoring, paper-trading behavior, Trade Journey metrics, Strategy Analytics, and future bot-readiness criteria, see [STRATEGIES.md](STRATEGIES.md).
+
 ## AI Reviews
 
 AI is optional. Matrix Trader can generate:
@@ -194,6 +196,7 @@ Matrix_Trader_7.0/
 ├── backtest.py
 ├── requirements.txt
 ├── .env.example
+├── STRATEGIES.md
 ├── templates/
 │   └── index.html
 ├── lib/
