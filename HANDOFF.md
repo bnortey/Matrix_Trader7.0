@@ -6,9 +6,9 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-04-28
-Last commit: a6ec8f2 feat: Strategy Lab foundation + explainer + custom, kline gate, leveraged P&L, blended PARTIAL, historical backfill — April 24
-app.py: 3692 lines
+Last updated: 2026-04-30
+Last commit: 7d93178 fix: include disabled built-in strategies in loadStrategies() so paused pills and manage buttons work
+app.py: 3870 lines
 index.html: 5403 lines
 
 ---
@@ -478,15 +478,13 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 
 ## Current Task List
 
-Next in priority order:
+All prior QA tasks complete as of 2026-04-30. Next priorities:
 
-1. **Deploy P5c and monitor**: Sync to VPS, restart `matrix-trader`, manually tag one low-risk open paper position only if appropriate, confirm it moves to Closed Signals and has non-null `pnl_pct`.
+1. **Continue monitoring risk gates**: `long_vol_long` block gate confirmed correct — extreme-vol LONGs averaging -125% loss vs +9% win. Keep in `block`. `short_vol_short` shadow gate has only 99 candidates — revisit after another week of data.
 
-2. **Strategy Portfolio Lab QA**: Verify strategy toggles, account/risk inputs, and `Block high-vol LONGs` toggle on desktop and iPhone Safari. Confirm gate-on/gate-off account results update without breaking existing Strategy Analytics.
+2. **Promote `short_vol_short` gate decision**: After ~2 weeks of shadow data, review `filtered_candidates` for `short_vol_short` and decide block vs keep shadow.
 
-3. **Post-filter audit**: After 50–100 new closed signals, compare gate-on vs gate-off simulator output and inspect `filtered_candidates` to see whether blocked high/extreme-vol LONGs are improving or still failing in shadow.
-
-4. **Strategy Lab mobile/user QA pass**: Verify clone/edit/save/disable/delete on desktop and iPhone Safari. Pay close attention to inline editor height, keyboard behavior, and strategy bar overflow when custom strategies are added.
+3. **Beta testers**: README is published. Identify 1–2 beta testers to run the app and provide signal quality feedback.
 
 ---
 
