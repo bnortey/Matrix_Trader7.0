@@ -3830,6 +3830,120 @@ def api_cleanup_phantom_events():
 
 
 # ---------------------------------------------------------------------------
+# P8 — Account integration + Bot Readiness
+# ---------------------------------------------------------------------------
+
+@app.route("/api/account/readiness")
+def api_account_readiness():
+    """Bot readiness metrics computed from signals.db. No MEXC auth needed."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("""
+            SELECT strategy_key,
+                   COUNT(*) AS closed_trades,
+                   SUM(CASE WHEN pnl_pct IS NOT NULL THEN 1 ELSE 0 END) AS trades_with_pnl,
+                   AVG(pnl_pct) AS avg_pnl,
+                   SUM(CASE WHEN pnl_pct > 0 THEN pnl_pct ELSE 0 END) AS gross_wins,
+                   SUM(CASE WHEN pnl_pct < 0 THEN ABS(pnl_pct) ELSE 0 END) AS gross_losses
+            FROM signals
+            WHERE result IS NOT NULL AND result NOT IN ('EXPIRED', 'SKIPPED')
+            GROUP BY strategy_key
+        """)
+        rows = cur.fetchall()
+
+        out = {}
+        for row in rows:
+            key = row["strategy_key"] or "balanced"
+            trades_with_pnl = row["trades_with_pnl"] or 0
+            avg_pnl = row["avg_pnl"]
+            gross_wins = row["gross_wins"] or 0.0
+            gross_losses = row["gross_losses"] or 0.0
+            profit_factor = round(gross_wins / gross_losses, 3) if gross_losses > 0 else None
+            win_rate = None
+            if trades_with_pnl > 0:
+                cur.execute(
+                    "SELECT COUNT(*) FROM signals WHERE strategy_key=? AND pnl_pct > 0",
+                    (key,)
+                )
+                wins = cur.fetchone()[0]
+                win_rate = round(wins / trades_with_pnl, 4)
+
+            trades_score = min(trades_with_pnl / 300, 1.0) * 40
+            pf_score = min((profit_factor or 0) / 1.3, 1.0) * 40
+            pnl_score = 20 if (avg_pnl is not None and avg_pnl > 0) else 0
+            readiness_pct = int(trades_score + pf_score + pnl_score)
+
+            out[key] = {
+                "strategy_key": key,
+                "closed_trades": row["closed_trades"],
+                "trades_with_pnl": trades_with_pnl,
+                "avg_pnl": round(avg_pnl, 2) if avg_pnl is not None else None,
+                "profit_factor": profit_factor,
+                "win_rate": win_rate,
+                "gross_wins": round(gross_wins, 2),
+                "gross_losses": round(gross_losses, 2),
+                "readiness_pct": readiness_pct,
+            }
+        con.close()
+        return jsonify({"success": True, "readiness": out})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/account/status")
+def api_account_status():
+    api_key = os.getenv("MEXC_API_KEY", "").strip()
+    api_secret = os.getenv("MEXC_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        return jsonify({"success": True, "connected": False,
+                        "reason": "MEXC_API_KEY or MEXC_API_SECRET not configured"})
+    try:
+        from lib.mexc_private import get_account_summary
+        summary = get_account_summary(api_key, api_secret)
+        if not summary:
+            return jsonify({"success": True, "connected": False,
+                            "reason": "MEXC API returned empty response"})
+        return jsonify({"success": True, "connected": True, "data": summary})
+    except Exception as e:
+        return jsonify({"success": True, "connected": False, "reason": str(e)})
+
+
+@app.route("/api/account/positions")
+def api_account_positions():
+    api_key = os.getenv("MEXC_API_KEY", "").strip()
+    api_secret = os.getenv("MEXC_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        return jsonify({"success": True, "connected": False, "positions": [],
+                        "reason": "MEXC_API_KEY or MEXC_API_SECRET not configured"})
+    try:
+        from lib.mexc_private import get_open_positions
+        positions = get_open_positions(api_key, api_secret)
+        return jsonify({"success": True, "connected": True, "positions": positions})
+    except Exception as e:
+        return jsonify({"success": True, "connected": False, "positions": [], "reason": str(e)})
+
+
+@app.route("/api/account/balance")
+def api_account_balance():
+    api_key = os.getenv("MEXC_API_KEY", "").strip()
+    api_secret = os.getenv("MEXC_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        return jsonify({"success": True, "connected": False, "balance": None,
+                        "reason": "MEXC_API_KEY or MEXC_API_SECRET not configured"})
+    try:
+        from lib.mexc_private import get_account_assets
+        assets = get_account_assets(api_key, api_secret)
+        if not assets:
+            return jsonify({"success": True, "connected": False, "balance": None,
+                            "reason": "MEXC API returned empty response"})
+        return jsonify({"success": True, "connected": True, "balance": assets})
+    except Exception as e:
+        return jsonify({"success": True, "connected": False, "balance": None, "reason": str(e)})
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

@@ -11,7 +11,7 @@
 It is a **local web application**: a Python Flask backend that serves a dark-themed HTML dashboard. You run it on your Mac with `python3 app.py` and open it in any browser — including on iPhone over local WiFi.
 
 **It is not:**
-- An auto-trading bot (no order execution)
+- An execution bot yet — order placement is a staged future capability (P8–P12), currently disabled.
 - A prediction engine (no ARIMA, no price forecasting)
 - A SaaS product (local only for now)
 - A multi-exchange aggregator (MEXC-first; other exchanges are context only)
@@ -39,6 +39,7 @@ This is the 7th iteration. Versions 2–6 all failed. The MT6 codebase (`Matrix_
 | 17 planning markdown files instead of code | Ship before you plan |
 | God class `EnhancedTradingBot` (900+ lines) | `app.py` stays flat until Phase 2 |
 | Multi-exchange as primary venues | MEXC is primary. Others are context. |
+| Jumped to automation without validated edge | Paper bot (P10) before micro-live (P12). Bot Readiness panel tracks progress. You decide when the data is sufficient. |
 
 ---
 
@@ -163,6 +164,21 @@ MexcStreamAPI(on_kline, on_depth, on_funding)
 7. **Signal quality over quantity.** 20 high-conviction signals beats 200 weak ones.
 8. **The tool is for trading, not for looking at.** Aesthetics serve the signal, not the other way around.
 9. **No databases for application state.** SQLite is acceptable for signal history logging and outcome tracking.
+
+---
+
+## Execution Safety Rules
+
+Immutable. Cannot be softened by any future session prompt or task description.
+
+1. Live trading is disabled by default. LIVE_TRADING_ENABLED=false in .env is the master gate.
+2. Paper simulation (P10) must run successfully before assisted live (P11) begins.
+3. User confirmation required before every order in assisted mode — no silent placement.
+4. Kill switch must be implemented and tested before P11 ships.
+5. No automatic leverage escalation under any condition.
+6. No averaging down.
+7. No blind retry loops on failed order placement.
+8. No execution on stale signal data (signal age > 5 minutes at order time).
 
 ---
 

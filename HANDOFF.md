@@ -6,16 +6,16 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-04-30
+Last updated: 2026-05-01
 Last commit: 7d93178 fix: include disabled built-in strategies in loadStrategies() so paused pills and manage buttons work
-app.py: 3870 lines
-index.html: 5403 lines
+app.py: 3984 lines
+index.html: 5467 lines
 
 ---
 
 ## What This Project Is
 
-Matrix Trader 7.0 is a local web application for high-leverage crypto trading on MEXC perpetual swap markets. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders derived from ATR, views a 4-section AI trade brief, and executes trades manually. Signal history is auto-logged to SQLite on every scan. It is not an auto-trading bot, not a price forecasting engine, and not a SaaS product.
+Matrix Trader 7.0 is a local web application for high-leverage crypto trading on MEXC perpetual swap markets. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders derived from ATR, views a 4-section AI trade brief, and executes trades manually. Signal history is auto-logged to SQLite on every scan. It is not yet an execution bot — order placement is a staged future capability (P8–P12), currently disabled. It is not a price forecasting engine, and not a SaaS product.
 
 ---
 
@@ -48,6 +48,21 @@ Matrix Trader 7.0 is a local web application for high-leverage crypto trading on
 11. **No glassmorphism, gradients, or drop shadows.** Dark flat UI only.
 12. **Read the actual files before writing a single line.** Do not assume state from memory or prior sessions.
 13. **No databases for application state.** SQLite is acceptable for signal history logging and outcome tracking only.
+
+---
+
+## Execution Safety Rules
+
+Immutable. Cannot be softened by any future session prompt or task description.
+
+1. Live trading is disabled by default. LIVE_TRADING_ENABLED=false in .env is the master gate.
+2. Paper simulation (P10) must run successfully before assisted live (P11) begins.
+3. User confirmation required before every order in assisted mode — no silent placement.
+4. Kill switch must be implemented and tested before P11 ships.
+5. No automatic leverage escalation under any condition.
+6. No averaging down.
+7. No blind retry loops on failed order placement.
+8. No execution on stale signal data (signal age > 5 minutes at order time).
 
 ---
 
@@ -170,6 +185,10 @@ Sentiment APIs (no key needed):
 | `/api/strategies/custom/<strategy_key>` | DELETE | Deletes a custom strategy definition; historical signals remain intact |
 | `/api/strategies/builtin/<strategy_key>` | PATCH | Enables or disables a built-in strategy; state persists in `data/risk_gates.json` under `disabled_builtins` |
 | `/api/analysis` | POST | AI strategy review: sends last 200 tagged outcomes to Claude API |
+| `/api/account/status` | GET | MEXC account connection status and equity summary — P8 |
+| `/api/account/positions` | GET | Live exchange positions from MEXC private API — P8 |
+| `/api/account/balance` | GET | Account balance and available margin — P8 |
+| `/api/account/readiness` | GET | Bot readiness metrics from signals DB — P8 |
 | `/api/backfill/pnl` | POST | **MAINTENANCE** — Re-evaluates historical signals (result NOT NULL, pnl_pct NULL) against live kline data; writes corrected exit_price, blended PARTIAL, and leveraged pnl_pct. Safe to call repeatedly (skips already-backfilled rows). |
 | `/api/cleanup/phantom-events` | POST | **MAINTENANCE** — Deletes TP/SL events in `position_events` for signals whose `entry_at IS NULL` (phantom events logged before entry was confirmed). Does NOT delete `ENTRY_FILLED` rows. Idempotent; returns `{deleted, affected_signals}`. |
 
@@ -273,6 +292,23 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
 `ai_report` is a JSON string: `[{"label": "Setup", "text": "..."}, ...]`. Four sections: Setup, Structure, Invalidation, Risk.
 
 `/api/signal/detail/<id>` returns an additional computed `journey` object for closed signals. It is not stored in DB. It fetches Min15 candles from MEXC for the trade window and computes: `available`, `entry_hit`, `entry_delay_minutes`, `entry_to_close_minutes`, `mae_pct`, `mfe_pct`, leveraged MAE/MFE when leverage is known, `capture_ratio_pct`, `planned_stop_pct`, `stop_pressure_pct`, `best_price`, `worst_price`, `target_hits`, `path_label`, and candle count. If MEXC no longer has the kline window, `journey.available=false` with a reason.
+
+---
+
+## Planned Database Tables (P8+)
+
+Planned additions — not yet created:
+
+```
+account_snapshots   — timestamped balance, available margin, unrealized PnL (P8)
+live_positions      — active exchange positions, leverage, liquidation price (P8)
+execution_plans     — proposed trade plans, risk decisions (P9)
+orders              — actual order lifecycle, MEXC order IDs (P11)
+execution_events    — append-only audit log: API failures, risk blocks, transitions (P11)
+```
+
+All new tables follow existing MT7 DB patterns: ALTER TABLE in try/except OperationalError,
+datetime.utcnow() only, UTC ISO timestamps without Z suffix.
 
 ---
 
@@ -473,18 +509,35 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P7a | CoinGlass signal enrichment: cross-exchange funding confirmation (Funding Arb), liquidation asymmetry soft modifier, OI/MCap fragility tag — all shadow-only, no hard gates | ✅ Done |
 | P7b | Strategy lifecycle controls: built-in pause/resume, direction lock filter, volatility allowlist filter for custom strategies | ✅ Done |
 | P4 | README updated and published to GitHub | ✅ Done (beta testers TBD) |
+| P8 | MEXC read-only account integration + Bot Readiness tracker panel in Strategies tab | ⏳ Pending |
+| P9 | Execution readiness layer — pre-flight validation, position sizing, risk budget checks, max loss gate. New lib/execution_engine.py and lib/risk_controls.py. | ⏳ Pending |
+| P10 | Paper bot mode — simulated order lifecycle with fill simulation, fee/funding modeling. Distinct from current candle-based paper tracking. | ⏳ Pending |
+| P11 | Assisted live trading — user-approved order placement, tiny size, full execution logging, kill switch mandatory, one strategy only. | ⏳ Pending |
+| P12 | Micro-live automation — one proven strategy, automated, strict exposure caps, daily loss limits, consecutive loss shutdown. | ⏳ Pending |
 
 ---
 
 ## Current Task List
 
-All prior QA tasks complete as of 2026-04-30. Next priorities:
+Execution readiness is tracked live in the Bot Readiness panel in the Strategies tab.
+Review that panel before beginning any execution phase. You decide when to proceed —
+the system surfaces the data, it does not block you.
 
-1. **Continue monitoring risk gates**: `long_vol_long` block gate confirmed correct — extreme-vol LONGs averaging -125% loss vs +9% win. Keep in `block`. `short_vol_short` shadow gate has only 99 candidates — revisit after another week of data.
+Next in priority order:
+1. Deploy P8 — account routes + readiness tracker (this session)
+2. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
+3. Review short_vol_short gate after 2+ more weeks of shadow data
+4. Run python3 analyze.py on VPS DB weekly to track strategy edge
 
-2. **Promote `short_vol_short` gate decision**: After ~2 weeks of shadow data, review `filtered_candidates` for `short_vol_short` and decide block vs keep shadow.
+---
 
-3. **Beta testers**: README is published. Identify 1–2 beta testers to run the app and provide signal quality feedback.
+## Session Summary — 2026-05-01
+
+**Job 1 — Documentation.** Updated HANDOFF.md, CLAUDE.md, AGENTS.md, STRATEGIES.md, and .env.example to introduce the P8–P12 execution roadmap. Added Execution Safety Rules (immutable, 8 rules) to CLAUDE.md and AGENTS.md identically. Added P8–P12 phase rows, four new account API routes, four new "What NOT To Do" entries, a Planned Database Tables section, and replaced the task list. No code changes in Job 1.
+
+**Job 2 — lib/mexc_private.py + P8 routes.** Created `lib/mexc_private.py` — pure functions, no Flask, MEXC keys passed as arguments, all errors caught to stderr. Implements `get_account_assets()`, `get_open_positions()`, `get_account_summary()` with HMAC-SHA256 signing. Added four routes to app.py immediately before the entry point: `GET /api/account/readiness` (DB-only, no auth, computes per-strategy readiness_pct from trades/profit-factor/avg-pnl formula), `GET /api/account/status`, `GET /api/account/positions`, `GET /api/account/balance` (all three fail-closed with `connected: false` when keys are absent).
+
+**Job 3 — Bot Readiness panel.** Added `#sa-readiness` div above `#sa-body` in the Strategies tab. `loadStrategyAnalytics()` now fetches `/api/account/readiness` and stores result in `A.readiness`. `renderReadinessPanel()` renders one row per strategy: name, inline progress bar (green ≥70 / amber ≥40 / red <40), readiness %, trades/avg-pnl/profit-factor stats, and "insufficient data" label when trades_with_pnl < 30. Footer shows execution mode as DISABLED. Mobile: stats hidden on narrow screens, bars still render.
 
 ---
 
@@ -541,6 +594,10 @@ Recommended next step: deploy P6a, verify `COINGLASS_API_KEY` is present on the 
 - Do not place P7a CoinGlass conviction adjustments (`cg_funding_confirmed`, `cg_funding_divergence`, `liq_aligned`, `liq_contrary`, `fragility_high`, `fragility_extreme`) inside `score_ticker()` — per-symbol liquidation and funding context is only fetched in stage-2 `enrich_signal()`. All six tags belong after the `get_symbol_derivatives_context()` call.
 - Do not promote `fragility_high`/`fragility_extreme` thresholds (0.20/0.40) to hard gates without reviewing 2+ weeks of tag performance data. They are deliberately soft discounts only.
 - Do not apply Change 1 (cross-exchange funding confirmation) to any strategy other than `funding_arb`.
+- Do not call any MEXC private API endpoint from app.py directly — all private calls go through lib/mexc_private.py.
+- Do not commit MEXC_API_KEY or MEXC_API_SECRET — .env only, never source.
+- Do not place a live order without a kill switch check — no execution code ships before P11.
+- Do not share position state between paper tracking (signals table) and live positions — separate systems.
 
 ---
 

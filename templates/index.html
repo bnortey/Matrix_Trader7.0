@@ -783,7 +783,24 @@
     .sa-mini-table th { text-align:left; padding:6px 7px; color:var(--text3); font-size:9px; text-transform:uppercase; letter-spacing:0.06em; border-bottom:1px solid var(--border); }
     .sa-mini-table td { padding:7px; border-bottom:1px solid rgba(255,255,255,0.04); }
     .sa-empty { padding:24px; color:var(--text3); text-align:center; font-size:12px; }
+    .br-panel { border:1px solid var(--border); border-radius:6px; padding:14px 16px; margin-bottom:14px; }
+    .br-title { font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--text2); text-transform:uppercase; margin-bottom:10px; }
+    .br-row { display:flex; align-items:center; gap:12px; padding:6px 0; border-top:1px solid var(--border); }
+    .br-row:first-of-type { border-top:none; }
+    .br-name { font-size:12px; font-weight:600; color:var(--text); width:160px; flex-shrink:0; }
+    .br-bar-wrap { flex:1; height:6px; background:var(--border); border-radius:3px; overflow:hidden; }
+    .br-bar { height:100%; border-radius:3px; transition:width .3s; }
+    .br-bar.green { background:var(--green); }
+    .br-bar.amber { background:var(--amber); }
+    .br-bar.red { background:var(--red); }
+    .br-pct { font-size:11px; font-weight:700; width:34px; text-align:right; flex-shrink:0; }
+    .br-stats { font-size:10px; color:var(--text2); white-space:nowrap; flex-shrink:0; }
+    .br-insuf { font-size:10px; color:var(--text3); font-style:italic; }
+    .br-footer { margin-top:10px; padding-top:8px; border-top:1px solid var(--border); font-size:10px; color:var(--text3); }
     @media (max-width: 900px) {
+      .br-name { width:110px; }
+      .br-stats { display:none; }
+    }
       .sa-grid, .sa-section-stack, .sa-learn-grid { grid-template-columns: 1fr; }
       .sa-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       #strategies-inner { padding: 12px; }
@@ -1255,6 +1272,8 @@
 
         <!-- Strategy manager — shown from the Strategies comparison table -->
         <div id="strategy-explainer"></div>
+
+        <div id="sa-readiness"></div>
 
         <div id="sa-body">
           <div class="sa-empty">Open this page after logging signals to compare strategy performance.</div>
@@ -3326,6 +3345,7 @@ const A = {
   longVolGate: localStorage.getItem('mt7_long_vol_gate') !== 'off',
   riskGates: null,
   riskGateLoading: false,
+  readiness: null,
 };
 
 const STRATEGY_LEARN = {
@@ -3380,6 +3400,7 @@ async function loadStrategyAnalytics(force = false) {
     if (!A.portfolioStrategies) A.portfolioStrategies = Object.keys(A.analytics);
     await loadRiskGates(false);
     await loadPortfolioSimulation(false);
+    await loadReadiness();
     renderStrategyAnalytics();
   } catch (e) {
     A.loading = false;
@@ -3500,6 +3521,49 @@ function saShortDate(iso) {
   const d = new Date(String(iso).endsWith('Z') ? iso : iso + 'Z');
   if (Number.isNaN(d.getTime())) return '—';
   return d.toLocaleDateString('en-US', { month:'short', day:'numeric' });
+}
+
+async function loadReadiness() {
+  try {
+    const resp = await fetch('/api/account/readiness');
+    const data = await resp.json();
+    if (data.success) A.readiness = data.readiness || {};
+  } catch (e) {
+    A.readiness = {};
+  }
+  renderReadinessPanel();
+}
+
+function renderReadinessPanel() {
+  const el = $('sa-readiness');
+  if (!el) return;
+  const r = A.readiness;
+  if (!r || !Object.keys(r).length) { el.innerHTML = ''; return; }
+
+  const STRAT_NAMES = { balanced: 'Balanced', funding_arb: 'Funding Arb',
+    momentum_breakout: 'Momentum Breakout', mean_reversion: 'Mean Reversion' };
+
+  const rows = Object.values(r).map(s => {
+    const pct = s.readiness_pct;
+    const barCls = pct >= 70 ? 'green' : pct >= 40 ? 'amber' : 'red';
+    const pctColor = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--amber)' : 'var(--red)';
+    const insuf = s.trades_with_pnl < 30;
+    const pf = s.profit_factor != null ? s.profit_factor.toFixed(2) : '—';
+    const avgP = s.avg_pnl != null ? (s.avg_pnl >= 0 ? '+' : '') + s.avg_pnl.toFixed(1) + '%' : '—';
+    const name = STRAT_NAMES[s.strategy_key] || s.strategy_key;
+    return `<div class="br-row">
+      <div class="br-name">${esc(name)}</div>
+      <div class="br-bar-wrap"><div class="br-bar ${barCls}" style="width:${pct}%"></div></div>
+      <div class="br-pct" style="color:${pctColor}">${pct}%</div>
+      <div class="br-stats">Trades: ${s.trades_with_pnl} &nbsp;·&nbsp; Avg P&amp;L: ${avgP} &nbsp;·&nbsp; PF: ${pf}${insuf ? ' &nbsp;<span class="br-insuf">(insufficient data)</span>' : ''}</div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `<div class="br-panel">
+    <div class="br-title">Bot Readiness</div>
+    ${rows}
+    <div class="br-footer">Execution mode: DISABLED &nbsp;·&nbsp; P11 requires review of readiness data before any live orders</div>
+  </div>`;
 }
 
 function renderStrategyAnalytics() {

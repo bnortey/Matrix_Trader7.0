@@ -463,6 +463,10 @@ Suggested readiness ladder:
 
 Bot integration should start with one proven strategy, not the whole system.
 
+Progress toward these thresholds is tracked live in the Bot Readiness panel in the Strategies tab.
+The panel reads directly from data/signals.db and updates on every page load. Use it to decide
+when a strategy is ready for P11 — the system shows the data, you make the call.
+
 ---
 
 ## Optimization Philosophy

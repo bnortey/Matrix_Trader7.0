@@ -20,7 +20,7 @@
 6. Executes manually on MEXC
 
 **It is not:**
-- An auto-trading bot (no order execution)
+- An execution bot yet — order placement is a staged future capability (P8–P12), currently disabled.
 - A price forecasting engine (no ARIMA, no ML prediction)
 - A SaaS product (local + one VPS for now)
 - A multi-exchange aggregator (MEXC is primary; Binance/Bybit/OKX are context only)
@@ -38,6 +38,7 @@
 | 17 planning files instead of code | Ship before you plan |
 | God class `EnhancedTradingBot` (900+ lines) | `app.py` stays flat — one file |
 | Multi-exchange as primary venues | MEXC is primary. Others are context. |
+| Jumped to automation without validated edge | Paper bot (P10) before micro-live (P12). Bot Readiness panel tracks progress. You decide when the data is sufficient. |
 
 ---
 
@@ -286,6 +287,21 @@ Background thread `_outcome_loop` runs `api_outcomes_check()` every 15 minutes.
 11. **No glassmorphism, gradients, or drop shadows.** Dark flat UI only.
 12. **Read the actual files before writing a single line.** Do not assume state from memory or prior sessions.
 13. **No databases for application state.** SQLite for signal history and outcome tracking only.
+
+---
+
+## Execution Safety Rules
+
+Immutable. Cannot be softened by any future session prompt or task description.
+
+1. Live trading is disabled by default. LIVE_TRADING_ENABLED=false in .env is the master gate.
+2. Paper simulation (P10) must run successfully before assisted live (P11) begins.
+3. User confirmation required before every order in assisted mode — no silent placement.
+4. Kill switch must be implemented and tested before P11 ships.
+5. No automatic leverage escalation under any condition.
+6. No averaging down.
+7. No blind retry loops on failed order placement.
+8. No execution on stale signal data (signal age > 5 minutes at order time).
 
 ---
 
