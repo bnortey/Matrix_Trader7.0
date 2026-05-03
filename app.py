@@ -33,6 +33,13 @@ from lib.coinglass_client import (
     get_coin_market_snapshot,
     get_symbol_derivatives_context,
 )
+from lib.hyperliquid_client import (
+    fetch_hl_meta_and_ctxs,
+    fetch_hl_klines,
+    fetch_hl_orderbook,
+    fetch_hl_account,
+    normalize_hl_tickers,
+)
 
 load_dotenv()
 
@@ -48,6 +55,7 @@ BYBIT_BASE   = "https://api.bybit.com"
 SENTIMENT_PAIRS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"}
 
 PORT = int(os.getenv("MATRIX_PORT", "8080"))
+HL_WALLET_ADDRESS = os.getenv("HL_WALLET_ADDRESS", "")
 CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
@@ -549,6 +557,42 @@ def _set_disabled_builtins(disabled: set) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
+def _get_symbol_overrides() -> dict:
+    """Return the symbol_overrides dict from risk_gates.json. Returns {} on any error."""
+    try:
+        with open(RISK_GATES_PATH, "r") as f:
+            data = json.load(f)
+        return data.get("symbol_overrides", {})
+    except Exception:
+        return {}
+
+
+def _load_symbol_performance_cache(min_trades: int = 5) -> dict:
+    """
+    Loads historical avg pnl_pct per symbol from signals.db.
+    Returns {symbol: {avg_pnl, trade_count}} for symbols with >= min_trades closed trades.
+    Called once per scan at the start of run_scan(). Returns {} on any error.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute('''
+            SELECT symbol,
+                   COUNT(*) as n,
+                   ROUND(AVG(pnl_pct), 4) as avg_pnl
+            FROM signals
+            WHERE result IS NOT NULL
+            AND pnl_pct IS NOT NULL
+            AND result NOT IN ('EXPIRED', 'SKIPPED')
+            GROUP BY symbol
+            HAVING COUNT(*) >= ?
+        ''', (min_trades,)).fetchall()
+        con.close()
+        return {r[0]: {'avg_pnl': r[2], 'trade_count': r[1]} for r in rows}
+    except Exception as e:
+        print(f'[sym_penalty] cache load error: {e}', file=sys.stderr)
+        return {}
+
+
 def builtin_strategy_config(key: str, cfg: dict) -> dict:
     out = clone_strategy_config(cfg)
     out["key"] = key
@@ -996,6 +1040,7 @@ def score_ticker(
     ticker: dict,
     strategy: dict | None = None,
     coinglass_snapshot: dict[str, dict] | None = None,
+    **kwargs,
 ) -> dict | None:
     """
     Score a single ticker using only the fields available in the /contract/ticker
@@ -1098,7 +1143,7 @@ def score_ticker(
 
         result = {
             "symbol": symbol,
-            "exchange": "MEXC",
+            "exchange": ticker.get("exchange", "MEXC"),
             "direction": direction,
             "conviction_base": conviction_base,
             "price": price,
@@ -1111,6 +1156,43 @@ def score_ticker(
         result.update(enrich_symbol_with_coinglass(symbol, coinglass_snapshot))
         cg_oi = result.get("coinglass_open_interest_usd")
         result["derivatives_open_interest"] = cg_oi if cg_oi is not None else open_interest
+
+        # Symbol performance penalty — applied after base conviction is set
+        _conviction_before_penalty = result['conviction_base']
+        _sym_perf = kwargs.get('sym_perf_cache', {})
+        _sym_data = _sym_perf.get(result['symbol'])
+        if _sym_data:
+            _avg = _sym_data['avg_pnl']
+            _n   = _sym_data['trade_count']
+            if _avg < -30 and _n >= 5:
+                result['conviction_base'] = max(0, result['conviction_base'] - 20)
+                result['tags'].append('sym_penalty_severe')
+            elif _avg < -15 and _n >= 5:
+                result['conviction_base'] = max(0, result['conviction_base'] - 10)
+                result['tags'].append('sym_penalty_moderate')
+            elif _avg < -5 and _n >= 8:
+                result['conviction_base'] = max(0, result['conviction_base'] - 5)
+                result['tags'].append('sym_penalty_mild')
+
+        # Symbol override — applied after penalty, can restore or force a tier
+        _overrides = kwargs.get('sym_overrides', {})
+        _override = _overrides.get(result['symbol'])
+        if _override:
+            _action = _override.get('action', '')
+            result['tags'] = [t for t in result['tags'] if not t.startswith('sym_penalty_')]
+            if _action == 'exempt':
+                result['conviction_base'] = _conviction_before_penalty
+                result['tags'].append('sym_exempt')
+            elif _action == 'force_severe':
+                result['conviction_base'] = max(0, _conviction_before_penalty - 20)
+                result['tags'].append('sym_penalty_severe')
+            elif _action == 'force_moderate':
+                result['conviction_base'] = max(0, _conviction_before_penalty - 10)
+                result['tags'].append('sym_penalty_moderate')
+            elif _action == 'force_mild':
+                result['conviction_base'] = max(0, _conviction_before_penalty - 5)
+                result['tags'].append('sym_penalty_mild')
+
         return result
     except Exception as e:
         print(f"score_ticker error [{ticker.get('symbol', '?')}]: {e}", file=sys.stderr)
@@ -1860,10 +1942,15 @@ def run_scan(
 
     total_pairs = len(tickers)
 
+    sym_perf_cache = _load_symbol_performance_cache()
+    sym_overrides = _get_symbol_overrides()
+    print(f'[sym_penalty] loaded {len(sym_perf_cache)} records, {len(sym_overrides)} overrides', file=sys.stderr)
+
     # Stage 1 — strategy weights + stage-1 filters applied inside score_ticker
     base_signals: list[dict] = []
     for t in tickers:
-        scored = score_ticker(t, strategy=strat, coinglass_snapshot=coinglass_snapshot)
+        scored = score_ticker(t, strategy=strat, coinglass_snapshot=coinglass_snapshot,
+                              sym_perf_cache=sym_perf_cache, sym_overrides=sym_overrides)
         if scored and scored["conviction_base"] >= 20:
             base_signals.append(scored)
 
@@ -3386,12 +3473,34 @@ def api_risk_gates():
             }
         con.close()
 
-        return jsonify({
+        sym_perf = _load_symbol_performance_cache(min_trades=5)
+        penalty_symbols = []
+        for sym, data in sorted(sym_perf.items(), key=lambda x: x[1]['avg_pnl']):
+            avg = data['avg_pnl']
+            n = data['trade_count']
+            if avg < -5:
+                tier = 'severe' if avg < -30 else 'moderate' if avg < -15 else 'mild'
+                penalty_symbols.append({
+                    'symbol': sym,
+                    'avg_pnl': avg,
+                    'trade_count': n,
+                    'tier': tier,
+                    'penalty': -20 if avg < -30 else -10 if avg < -15 else -5
+                })
+
+        sym_overrides = _get_symbol_overrides()
+        response = {
             "success": True,
             "gates": gates,
             "summaries": summaries,
             "modes": ["block", "shadow", "off"],
-        })
+            "symbol_performance": {
+                "penalty_count": len(penalty_symbols),
+                "symbols": penalty_symbols[:20],
+                "overrides": sym_overrides,
+            },
+        }
+        return jsonify(response)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -3832,6 +3941,47 @@ def api_cleanup_phantom_events():
 # ---------------------------------------------------------------------------
 # P8 — Account integration + Bot Readiness
 # ---------------------------------------------------------------------------
+
+@app.route("/api/risk-gates/symbol-override", methods=["POST"])
+def api_symbol_override_add():
+    """
+    Body: {symbol, action, reason}
+    action: "exempt" | "force_mild" | "force_moderate" | "force_severe"
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        symbol = (body.get('symbol') or '').strip().upper()
+        action = body.get('action', '')
+        reason = body.get('reason', '')
+        valid_actions = {'exempt', 'force_mild', 'force_moderate', 'force_severe'}
+        if not symbol or action not in valid_actions:
+            return jsonify({'success': False, 'error': 'symbol and valid action required'}), 400
+        gates = load_risk_gates()
+        if 'symbol_overrides' not in gates:
+            gates['symbol_overrides'] = {}
+        gates['symbol_overrides'][symbol] = {'action': action, 'reason': reason}
+        save_risk_gates(gates)
+        return jsonify({'success': True, 'symbol': symbol, 'action': action})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route("/api/risk-gates/symbol-override/<symbol>", methods=["DELETE"])
+def api_symbol_override_remove(symbol):
+    """Removes a symbol from symbol_overrides in risk_gates.json."""
+    try:
+        symbol = symbol.strip().upper()
+        gates = load_risk_gates()
+        overrides = _get_symbol_overrides()
+        if symbol not in overrides:
+            return jsonify({'success': False, 'error': f'{symbol} not in overrides'}), 404
+        del overrides[symbol]
+        gates['symbol_overrides'] = overrides
+        save_risk_gates(gates)
+        return jsonify({'success': True, 'removed': symbol})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route("/api/account/readiness")
 def api_account_readiness():
