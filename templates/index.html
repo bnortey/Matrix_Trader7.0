@@ -102,7 +102,25 @@
     /* ── Signals section ── */
     #signals-section { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
 
-    /* ── Strategy bar ── */
+    /* ── Exchange + strategy bars ── */
+    #exchange-bar, .exchange-bar {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      padding: 7px 12px 0;
+      border-bottom: 0;
+      background: var(--bg3); flex-shrink: 0;
+    }
+    #mkt-exchange-bar { padding-bottom: 7px; border-bottom: 1px solid var(--border); }
+    .exchange-btn {
+      padding: 4px 10px; border-radius: 4px;
+      font-size: 11px; font-weight: 700;
+      color: var(--text2);
+      background: transparent;
+      border: 1px solid var(--border);
+      transition: all 150ms; min-height: 26px;
+      white-space: nowrap;
+    }
+    .exchange-btn.active { color: var(--blue); border-color: var(--blue); background: rgba(68,138,255,0.10); }
+    .exchange-btn:hover:not(.active) { color: var(--text); background: rgba(255,255,255,0.06); }
     #strategy-bar {
       display: flex; align-items: center; gap: 5px;
       padding: 7px 12px;
@@ -270,6 +288,8 @@
     .row-main { display: flex; align-items: center; gap: 8px; }
     .row-sym { flex: 0 0 auto; min-width: 88px; }
     .row-symbol { font-family: var(--mono); font-size: 13px; font-weight: 700; display: block; }
+    .exchange-badge { display:inline-flex; align-items:center; margin-left:5px; padding:1px 4px; border-radius:3px; font-family:var(--mono); font-size:9px; font-weight:800; line-height:1.2; vertical-align:middle; }
+    .exchange-badge.hl { color:var(--blue); border:1px solid rgba(68,138,255,0.45); background:rgba(68,138,255,0.10); }
     .row-price  { font-family: var(--mono); font-size: 10px; color: var(--text3); }
     .row-conv { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
     .conv-num { font-family: var(--mono); font-size: 22px; font-weight: 700; line-height: 1; }
@@ -785,6 +805,10 @@
     .sa-empty { padding:24px; color:var(--text3); text-align:center; font-size:12px; }
     .br-panel { border:1px solid var(--border); border-radius:6px; padding:14px 16px; margin-bottom:14px; }
     .br-title { font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--text2); text-transform:uppercase; margin-bottom:10px; }
+    .br-connections { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
+    .br-conn { font-size:10px; color:var(--text2); border:1px solid var(--border); border-radius:4px; padding:4px 7px; }
+    .br-conn.connected { color:var(--green); border-color:rgba(0,230,118,0.35); }
+    .br-conn.disconnected { color:var(--text3); }
     .br-row { display:flex; align-items:center; gap:12px; padding:6px 0; border-top:1px solid var(--border); }
     .br-row:first-of-type { border-top:none; }
     .br-name { font-size:12px; font-weight:600; color:var(--text); width:160px; flex-shrink:0; }
@@ -1016,6 +1040,12 @@
     <!-- ════ SIGNALS SECTION ════ -->
     <div id="signals-section">
 
+      <!-- Exchange selector — governs next scan only -->
+      <div id="exchange-bar">
+        <button class="exchange-btn" data-exchange="mexc" onclick="setExchange('mexc')">MEXC</button>
+        <button class="exchange-btn" data-exchange="hyperliquid" onclick="setExchange('hyperliquid')">Hyperliquid</button>
+      </div>
+
       <!-- Strategy selector — always visible, governs next scan; populated by renderStrategyButtons() -->
       <div id="strategy-bar">
         <span id="strat-lbl"></span>
@@ -1070,7 +1100,7 @@
               Matrix Trader 7.0
             </div>
             <div style="font-size:13px; color:var(--text3); line-height:1.8; margin-bottom:24px">
-              Scans 800+ MEXC perpetual swap pairs in real time.<br>
+              Scans 800+ MEXC and 190+ Hyperliquid perpetual swap pairs in real time.<br>
               Scores every pair across funding rate, momentum, orderbook pressure, RSI, and ATR.<br>
               Surfaces the highest-conviction LONG and SHORT setups with entry zones, take profit levels, and stop losses derived from market structure.
             </div>
@@ -1121,17 +1151,21 @@
 
     <!-- ════ MARKET SECTION ════ -->
     <div id="market-section" class="hidden">
+      <div id="mkt-exchange-bar" class="exchange-bar">
+        <button class="exchange-btn" data-exchange="mexc" onclick="setExchange('mexc')">MEXC</button>
+        <button class="exchange-btn" data-exchange="hyperliquid" onclick="setExchange('hyperliquid')">Hyperliquid</button>
+      </div>
 
       <!-- Market idle -->
       <div id="mkt-idle">
-        <p class="cta-text">Browse all 800+ MEXC perpetual pairs.<br>Loads in under 3 seconds.</p>
+        <p class="cta-text" id="mkt-idle-text">Browse all 800+ MEXC perpetual pairs.<br>Loads in under 3 seconds.</p>
         <button class="btn-green" style="margin-top:16px" onclick="loadMarket()">Load market</button>
       </div>
 
       <!-- Market loading -->
       <div id="mkt-loading" class="hidden">
         <div class="spinner"></div>
-        <span>Fetching all pairs...</span>
+        <span id="mkt-loading-text">Fetching all pairs...</span>
       </div>
 
       <!-- Market error -->
@@ -1468,6 +1502,9 @@ const onAccountSizeInput = debounce(() => {
   renderHistorySummary(lastHistorySigs);
 }, 500);
 
+const SIGNAL_AUTO_REFRESH_MS = 5 * 60 * 1000;
+const MARKET_AUTO_REFRESH_MS = 60 * 1000;
+
 /* ============================================================
    SIGNALS STATE  (S)  — never touched by market code
    ============================================================ */
@@ -1479,10 +1516,12 @@ const S = {
   dir:      'all',
   sort:     'conviction',
   strategy: 'balanced',
+  exchange: localStorage.getItem('mt7_exchange') || 'mexc',
   totalPairs: 0,
   scanTime:   null,
   timerId:    null,
   countdownId: null,
+  autoRefreshId: null,
   volFilter:  'any',    // any | low | medium | high_extreme
   minVolume:  0,        // minimum 24h volume in USD (0 = no filter)
 };
@@ -1494,6 +1533,7 @@ const M = {
   phase:        'idle',   // idle | loading | ready | error
   pairs:        [],       // all pairs from /api/market
   filtered:     [],       // after search + dir filter + sort
+  pairsByExchange: {},    // exchange key -> loaded market rows
   dir:          'all',
   sort:         'conviction_base',
   search:       '',
@@ -1501,6 +1541,7 @@ const M = {
   pageSize:     50,
   renderedCount: 0,
   sortDir:      'desc',
+  autoRefreshId: null,
 };
 
 /* ============================================================
@@ -1523,7 +1564,9 @@ function switchTab(tab) {
   $('tab-tools').classList.toggle('active',   tab === 'tools');
   $('tab-strategies').classList.toggle('active', tab === 'strategies');
   $('tab-history').classList.toggle('active', tab === 'history');
+  if (tab === 'signals') applySignalExchangeState();
   if (tab === 'history') loadHistory();
+  if (tab === 'market') applyMarketExchangeState();
   if (tab === 'strategies') loadStrategyAnalytics();
 }
 
@@ -1626,8 +1669,8 @@ function _computeHeatMaxes(batch) {
   };
 }
 function splitSym(sym) {
-  const i = sym.lastIndexOf('_USDT');
-  return i > -1 ? [sym.slice(0, i), '_USDT'] : [sym, ''];
+  const quote = sym.endsWith('_USDC') ? '_USDC' : sym.endsWith('_USDT') ? '_USDT' : '';
+  return quote ? [sym.slice(0, -quote.length), quote] : [sym, ''];
 }
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1643,9 +1686,9 @@ function toggle(id, show) {
 function toTVSymbol(mexcSymbol, exchange) {
   exchange = exchange || 'MEXC';
   const map = {
-    'MEXC':        s => 'MEXC:'        + s.replace('_', '')         + '.P',
-    'BINANCE':     s => 'BINANCE:'     + s.replace('_USDT', 'USDT') + '.PERP',
-    'BYBIT':       s => 'BYBIT:'       + s.replace('_', '')         + '.P',
+    'MEXC':        s => 'MEXC:'        + s.replace('_USDC', '_USDT').replace('_', '') + '.P',
+    'BINANCE':     s => 'BINANCE:'     + s.replace('_USDC', 'USDT').replace('_USDT', 'USDT') + '.PERP',
+    'BYBIT':       s => 'BYBIT:'       + s.replace('_USDC', '_USDT').replace('_', '') + '.P',
     'HYPERLIQUID': s => 'HYPERLIQUID:' + s.split('_')[0]            + 'USDT.P',
   };
   return (map[exchange] || map['MEXC'])(mexcSymbol);
@@ -1837,6 +1880,7 @@ function rowHTML(sig, i) {
   const tier   = getTier(sig.conviction);
   const isLong = sig.direction === 'LONG';
   const active = S.selected === i ? 'active' : '';
+  const exchangeBadge = sig.exchange === 'HYPERLIQUID' ? '<span class="exchange-badge hl">HL</span>' : '';
   const cc = pctColor(sig.change_24h_pct);
   const fc = fundColor(sig.funding_rate);
   const tags = normalizeTags(sig.tags);
@@ -1859,7 +1903,7 @@ function rowHTML(sig, i) {
      onkeydown="if(event.key==='Enter')selectSignal(${i})">
   <div class="row-main">
     <div class="row-sym">
-      <span class="row-symbol">${esc(base)}<span style="color:var(--text3);font-size:10px">${esc(suffix)}</span></span>
+      <span class="row-symbol">${esc(base)}<span style="color:var(--text3);font-size:10px">${esc(suffix)}</span>${exchangeBadge}</span>
       <span class="row-price">${fmtPrice(sig.price)}</span>
     </div>
     <div class="row-conv">
@@ -2176,20 +2220,35 @@ function contextHTML(sig) {
 /* ============================================================
    SIGNALS: actions
    ============================================================ */
-async function scanSignals() {
+async function scanSignals(opts = {}) {
+  if (S.phase === 'scanning') return;
   setPhase('scanning');
   startProgress();
   if (S.timerId)     clearInterval(S.timerId);
   if (S.countdownId) clearInterval(S.countdownId);
 
   try {
-    const resp = await fetch('/api/scan/all', { method: 'POST' });
+    const scanExchange = S.exchange;
+    const isHL = scanExchange === 'hyperliquid';
+    const url = isHL
+      ? `/api/hl/scan?strategy=${encodeURIComponent(S.strategy)}`
+      : '/api/scan/all';
+    const resp = await fetch(url, isHL ? {} : { method: 'POST' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     if (!data.success) throw new Error(data.error || 'Unknown error');
 
     stopProgress();
-    H.scanResults  = data.results || {};
+    const exchangeResults = isHL
+      ? { [data.strategy || S.strategy]: { signals: data.signals || [], total_pairs: data.total_pairs || 0, strategy: data.strategy || S.strategy } }
+      : (data.results || {});
+    H.scanResultsByExchange[scanExchange] = exchangeResults;
+    if (S.exchange !== scanExchange) {
+      applySignalExchangeState();
+      return;
+    }
+    H.scanResults  = exchangeResults;
+    H.scanExchange = scanExchange;
     H.lastScanTime = new Date().toISOString();
     S.totalPairs   = data.total_pairs || 800;
     S.scanTime     = new Date();
@@ -2199,9 +2258,10 @@ async function scanSignals() {
 
     if (!S.signals.length) {
       $('empty-msg').textContent =
-        `${S.totalPairs} pairs scanned. No signals met the conviction threshold for ${S.strategy}.`;
+        `${S.totalPairs} ${exchangeLabel()} pairs scanned. No signals met the conviction threshold for ${S.strategy}.`;
       updateStatBar();
       setPhase('empty');
+      ensureSignalAutoRefresh();
       return;
     }
 
@@ -2209,6 +2269,7 @@ async function scanSignals() {
     updateStatBar();
     filterAndSort(true);
     startTimestamp();
+    ensureSignalAutoRefresh();
 
   } catch (e) {
     console.error('Scan error:', e);
@@ -2217,6 +2278,15 @@ async function scanSignals() {
     $('error-msg').textContent = `Scan failed: ${msg}`;
     setPhase('error');
   }
+}
+
+function ensureSignalAutoRefresh() {
+  if (S.autoRefreshId) return;
+  S.autoRefreshId = setInterval(() => {
+    if (S.phase === 'scanning') return;
+    if (!H.scanResultsByExchange[S.exchange]) return;
+    scanSignals({ auto: true });
+  }, SIGNAL_AUTO_REFRESH_MS);
 }
 
 function selectSignal(i) {
@@ -2300,6 +2370,10 @@ const TAG_TIPS = {
   'liq_contrary':           'Liquidation asymmetry (3× or more) opposes this direction — the dominant liquidation side runs against the signal.',
   'fragility_high':         'OI/market-cap ratio above 20%. Elevated leverage in the market — wider potential price swings. Conviction discounted 10%.',
   'fragility_extreme':      'OI/market-cap ratio above 40%. Extreme leverage concentration — high fragility risk. Conviction discounted 20%.',
+  'sym_penalty_severe':   'Symbol avg P&L below -30% across 5+ closed trades — conviction reduced by 20',
+  'sym_penalty_moderate': 'Symbol avg P&L below -15% across 5+ closed trades — conviction reduced by 10',
+  'sym_penalty_mild':     'Symbol avg P&L below -5% across 8+ closed trades — conviction reduced by 5',
+  'sym_exempt':           'Symbol manually exempted from conviction penalty — override active in risk_gates.json',
 };
 
 const TAG_META = {
@@ -2309,6 +2383,10 @@ const TAG_META = {
   'liq_contrary':          { label: 'Liq Contrary',      cls: 'tag-red'   },
   'fragility_high':        { label: 'OI Fragile',        cls: 'tag-amber' },
   'fragility_extreme':     { label: 'OI Extreme',        cls: 'tag-red'   },
+  'sym_penalty_severe':   { label: 'Symbol ⚠ Severe',   cls: 'tag-red'   },
+  'sym_penalty_moderate': { label: 'Symbol ⚠ Moderate', cls: 'tag-amber' },
+  'sym_penalty_mild':     { label: 'Symbol ⚠ Mild',     cls: 'tag-amber' },
+  'sym_exempt':           { label: 'Symbol Exempt',      cls: 'tag-blue'  },
 };
 
 async function loadStrategies() {
@@ -2364,6 +2442,52 @@ async function renderStrategyButtons() {
   }
 }
 
+function setExchange(exchange) {
+  S.exchange = exchange === 'hyperliquid' ? 'hyperliquid' : 'mexc';
+  try { localStorage.setItem('mt7_exchange', S.exchange); } catch (_) {}
+  document.querySelectorAll('.exchange-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.exchange === S.exchange);
+  });
+  if (currentTab === 'signals') applySignalExchangeState();
+  if (currentTab === 'market') applyMarketExchangeState();
+}
+
+function exchangeLabel(exchange = S.exchange) {
+  return exchange === 'hyperliquid' ? 'Hyperliquid' : 'MEXC';
+}
+
+function applySignalExchangeState() {
+  if (S.phase === 'scanning') return;
+  const cache = H.scanResultsByExchange[S.exchange] || null;
+  H.scanResults = cache || {};
+  H.scanExchange = cache ? S.exchange : null;
+  const res = cache ? cache[S.strategy] : null;
+  if (!res) {
+    S.signals = [];
+    S.filtered = [];
+    S.selected = -1;
+    S.totalPairs = 0;
+    setPhase('idle');
+    return;
+  }
+  S.signals = res.signals || [];
+  S.totalPairs = res.total_pairs || S.totalPairs;
+  S.selected = -1;
+  if (!S.signals.length) {
+    $('empty-msg').textContent =
+      `${S.totalPairs} ${exchangeLabel()} pairs scanned. No signals met the conviction threshold for ${S.strategy}.`;
+    updateStatBar();
+    setPhase('empty');
+    ensureSignalAutoRefresh();
+  } else {
+    setPhase('results');
+    updateStatBar();
+    filterAndSort(true);
+    startTimestamp();
+    ensureSignalAutoRefresh();
+  }
+}
+
 async function setStrategy(key, fromUser = false) {
   fromUser = fromUser || (window.event && window.event.currentTarget && window.event.currentTarget.classList.contains('strat-btn'));
   S.strategy = key;
@@ -2377,19 +2501,26 @@ async function setStrategy(key, fromUser = false) {
   if (lbl && meta) lbl.innerHTML = `Max leverage: ${meta.cap}×  ·  ${esc(meta.desc)}  ·  <button class="strat-manage-btn" onclick="switchTab('strategies')">Manage in Strategies tab →</button>`;
 
   // Load from scan cache instantly — no rescan needed
-  if (H.scanResults && H.scanResults[key] && S.phase !== 'scanning') {
-    const res = H.scanResults[key];
+  const exchangeCache = H.scanResultsByExchange[S.exchange] || {};
+  if (exchangeCache[key] && S.phase !== 'scanning') {
+    H.scanResults = exchangeCache;
+    H.scanExchange = S.exchange;
+    const res = exchangeCache[key];
     S.signals    = res.signals || [];
     S.totalPairs = res.total_pairs || S.totalPairs;
     if (!S.signals.length) {
       $('empty-msg').textContent =
-        `${S.totalPairs} pairs scanned. No signals met the conviction threshold for ${key}.`;
+        `${S.totalPairs} ${exchangeLabel()} pairs scanned. No signals met the conviction threshold for ${key}.`;
       setPhase('empty');
+      ensureSignalAutoRefresh();
     } else {
       setPhase('results');
       updateStatBar();
       filterAndSort(true);
+      ensureSignalAutoRefresh();
     }
+  } else if (H.scanExchange && H.scanExchange !== S.exchange && S.phase !== 'scanning') {
+    applySignalExchangeState();
   }
 
   if (!meta && lbl) {
@@ -2912,18 +3043,30 @@ function setMktPhase(phase) {
    ============================================================ */
 let _mktScrollBound = false;
 
-async function loadMarket() {
-  setMktPhase('loading');
+async function loadMarket(opts = {}) {
+  if (M.phase === 'loading') return;
+  const silent = !!opts.silent;
+  if (!silent) setMktPhase('loading');
+  const marketExchange = S.exchange;
+  const label = exchangeLabel(marketExchange);
+  const loadingText = $('mkt-loading-text');
+  if (loadingText) loadingText.textContent = `Fetching ${label} pairs...`;
   try {
-    const resp = await fetch('/api/market');
+    const resp = await fetch(`/api/market?exchange=${encodeURIComponent(marketExchange)}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     if (!data.success) throw new Error(data.error || 'Unknown error');
 
-    M.pairs = data.pairs || [];
-    $('tab-market').textContent = `Market (${M.pairs.length})`;
+    M.pairsByExchange[marketExchange] = data.pairs || [];
+    if (S.exchange !== marketExchange) {
+      applyMarketExchangeState();
+      return;
+    }
+    M.pairs = M.pairsByExchange[marketExchange];
+    updateMarketTabLabel();
     setMktPhase('ready');
     mktFilterAndSort();
+    ensureMarketAutoRefresh();
 
     if (!_mktScrollBound) {
       _mktScrollBound = true;
@@ -2937,8 +3080,45 @@ async function loadMarket() {
 
   } catch (e) {
     console.error('Market load error:', e);
-    setMktPhase('error');
+    if (!silent) setMktPhase('error');
   }
+}
+
+function ensureMarketAutoRefresh() {
+  if (M.autoRefreshId) return;
+  M.autoRefreshId = setInterval(() => {
+    if (currentTab !== 'market') return;
+    if (M.phase === 'loading') return;
+    if (!M.pairsByExchange[S.exchange]) return;
+    loadMarket({ silent: true });
+  }, MARKET_AUTO_REFRESH_MS);
+}
+
+function updateMarketTabLabel() {
+  const pairs = M.pairsByExchange[S.exchange] || [];
+  $('tab-market').textContent = pairs.length ? `Market (${pairs.length})` : 'Market';
+}
+
+function applyMarketExchangeState() {
+  updateMarketTabLabel();
+  const idleText = $('mkt-idle-text');
+  if (idleText) {
+    const label = exchangeLabel();
+    const size = S.exchange === 'hyperliquid' ? 'Hyperliquid futures' : '800+ MEXC perpetual';
+    idleText.innerHTML = `Browse ${size} pairs.<br>Loads in under 3 seconds.`;
+  }
+  const cached = M.pairsByExchange[S.exchange] || null;
+  if (!cached) {
+    M.pairs = [];
+    M.filtered = [];
+    M.renderedCount = 0;
+    setMktPhase('idle');
+    return;
+  }
+  M.pairs = cached;
+  setMktPhase('ready');
+  mktFilterAndSort();
+  ensureMarketAutoRefresh();
 }
 
 /* ============================================================
@@ -3064,6 +3244,7 @@ function _appendMktRows() {
 function mktRowHTML(pair, globalIdx, maxes) {
   const [base, suffix] = splitSym(pair.symbol);
   const isLong = pair.direction === 'LONG';
+  const exchangeBadge = pair.exchange === 'HYPERLIQUID' ? '<span class="exchange-badge hl">HL</span>' : '';
   const cc  = pctColor(pair.change_24h_pct);
   const fc  = fundColor(pair.funding_rate);
   const bgChange  = maxes ? heatBg(pair.change_24h_pct, maxes.change,  true)  : '';
@@ -3076,7 +3257,7 @@ function mktRowHTML(pair, globalIdx, maxes) {
                onclick="enrichMarketPair('${esc(pair.symbol)}',${globalIdx})"
                role="button" tabindex="0">
   <div class="mkt-sym-cell">
-    <div class="mkt-base">${esc(base)}<span style="color:var(--text3);font-size:9px">${esc(suffix)}</span></div>
+    <div class="mkt-base">${esc(base)}<span style="color:var(--text3);font-size:9px">${esc(suffix)}</span>${exchangeBadge}</div>
   </div>
   <div class="mkt-val-sm mkt-price-col" style="font-family:var(--mono);text-align:right;color:var(--text2)">${fmtPrice(pair.price)}</div>
   <div><span class="mkt-dir-pill ${isLong ? 'long' : 'short'}">${pair.direction}</span></div>
@@ -3116,7 +3297,7 @@ async function enrichMarketPair(symbol, rowIdx) {
   }
 
   try {
-    const resp = await fetch(`/api/signal/${encodeURIComponent(symbol)}`);
+    const resp = await fetch(`/api/signal/${encodeURIComponent(symbol)}?exchange=${encodeURIComponent(S.exchange)}`);
     const data = await resp.json();
 
     if (rowEl) rowEl.classList.remove('mkt-loading');
@@ -3346,6 +3527,7 @@ const A = {
   riskGates: null,
   riskGateLoading: false,
   readiness: null,
+  accountConnections: null,
 };
 
 const STRATEGY_LEARN = {
@@ -3525,11 +3707,22 @@ function saShortDate(iso) {
 
 async function loadReadiness() {
   try {
-    const resp = await fetch('/api/account/readiness');
-    const data = await resp.json();
+    const [readyResp, mexcResp, hlResp] = await Promise.all([
+      fetch('/api/account/readiness'),
+      fetch('/api/account/status'),
+      fetch('/api/hl/account'),
+    ]);
+    const data = await readyResp.json();
     if (data.success) A.readiness = data.readiness || {};
+    const mexc = await mexcResp.json();
+    const hl = await hlResp.json();
+    A.accountConnections = {
+      mexc: { connected: !!mexc.connected, reason: mexc.reason || '' },
+      hyperliquid: { connected: !!hl.connected, reason: hl.reason || '' },
+    };
   } catch (e) {
     A.readiness = {};
+    A.accountConnections = null;
   }
   renderReadinessPanel();
 }
@@ -3538,12 +3731,18 @@ function renderReadinessPanel() {
   const el = $('sa-readiness');
   if (!el) return;
   const r = A.readiness;
-  if (!r || !Object.keys(r).length) { el.innerHTML = ''; return; }
+  const conns = A.accountConnections || {};
+  if ((!r || !Object.keys(r).length) && !Object.keys(conns).length) { el.innerHTML = ''; return; }
 
   const STRAT_NAMES = { balanced: 'Balanced', funding_arb: 'Funding Arb',
     momentum_breakout: 'Momentum Breakout', mean_reversion: 'Mean Reversion' };
 
-  const rows = Object.values(r).map(s => {
+  const connHTML = Object.keys(conns).length ? `<div class="br-connections">
+    <div class="br-conn ${conns.mexc && conns.mexc.connected ? 'connected' : 'disconnected'}">MEXC account: ${conns.mexc && conns.mexc.connected ? 'connected' : 'disconnected'}</div>
+    <div class="br-conn ${conns.hyperliquid && conns.hyperliquid.connected ? 'connected' : 'disconnected'}">Hyperliquid account: ${conns.hyperliquid && conns.hyperliquid.connected ? 'connected' : 'disconnected'}</div>
+  </div>` : '';
+
+  const rows = Object.values(r || {}).map(s => {
     const pct = s.readiness_pct;
     const barCls = pct >= 70 ? 'green' : pct >= 40 ? 'amber' : 'red';
     const pctColor = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--amber)' : 'var(--red)';
@@ -3561,6 +3760,7 @@ function renderReadinessPanel() {
 
   el.innerHTML = `<div class="br-panel">
     <div class="br-title">Bot Readiness</div>
+    ${connHTML}
     ${rows}
     <div class="br-footer">Execution mode: DISABLED &nbsp;·&nbsp; P11 requires review of readiness data before any live orders</div>
   </div>`;
@@ -3738,13 +3938,98 @@ function renderRiskGatesPanel() {
         </div>
       </div>`;
   }).join('');
+  // Symbol Penalties section
+  const sp = data && data.symbol_performance ? data.symbol_performance : {};
+  const penaltySymbols = sp.symbols || [];
+  const overrides = sp.overrides || {};
+
+  const tierColor = t => t === 'severe' ? 'var(--red)' : 'var(--amber)';
+
+  let penaltyHTML = '';
+  if (penaltySymbols.length) {
+    const rows = penaltySymbols.map(s => `
+      <tr>
+        <td style="color:${tierColor(s.tier)};font-weight:600">${esc(s.symbol.replace('_USDT',''))}</td>
+        <td style="color:${tierColor(s.tier)}">${esc(s.tier)}</td>
+        <td style="color:${saPnlColor(s.avg_pnl)}">${saSigned(s.avg_pnl)}</td>
+        <td class="sa-mono">${s.trade_count}</td>
+        <td style="color:var(--red)">${s.penalty}</td>
+        <td><button class="sa-refresh" onclick="exemptSymbol('${esc(s.symbol)}')" ${A.riskGateLoading ? 'disabled' : ''}>Exempt</button></td>
+      </tr>`).join('');
+    penaltyHTML = `
+      <div style="margin-top:14px">
+        <div class="sa-muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Auto-detected penalties</div>
+        <div style="overflow-x:auto">
+          <table class="sa-table" style="min-width:0">
+            <thead><tr><th>Symbol</th><th>Tier</th><th>Avg P&L</th><th>Trades</th><th>Penalty</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
+  let overridesHTML = '';
+  const overrideEntries = Object.entries(overrides);
+  if (overrideEntries.length) {
+    const rows = overrideEntries.map(([sym, ov]) => `
+      <tr>
+        <td style="font-weight:600">${esc(sym.replace('_USDT',''))}</td>
+        <td>${esc(ov.action || '')}</td>
+        <td class="sa-muted" style="font-size:10px">${esc(ov.reason || '')}</td>
+        <td><button class="sa-refresh" style="color:var(--red);border-color:var(--red)" onclick="removeSymbolOverride('${esc(sym)}')" ${A.riskGateLoading ? 'disabled' : ''}>Remove</button></td>
+      </tr>`).join('');
+    overridesHTML = `
+      <div style="margin-top:14px">
+        <div class="sa-muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Active overrides</div>
+        <div style="overflow-x:auto">
+          <table class="sa-table" style="min-width:0">
+            <thead><tr><th>Symbol</th><th>Action</th><th>Reason</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
+  const symbolPenaltiesPanel = (penaltyHTML || overridesHTML) ? `
+    <div class="sa-panel" style="margin:14px 0">
+      <div class="sa-panel-title">Symbol Penalties</div>
+      <div class="sa-chart-desc">Symbols with poor historical P&amp;L get a conviction discount at scan time. Exempt a symbol to restore its full conviction score.</div>
+      ${penaltyHTML}
+      ${overridesHTML}
+    </div>` : '';
+
   return `
     <div class="sa-panel" style="margin:14px 0">
       <div class="sa-panel-title">Risk Gates</div>
       <div class="sa-chart-desc">Live scanner safety controls. Block prevents a candidate from appearing as a trade recommendation; shadow lets it through but logs it for audit; off disables the gate.</div>
       <div class="sa-section-stack">${gateCards}</div>
     </div>
+    ${symbolPenaltiesPanel}
   `;
+}
+
+async function exemptSymbol(symbol) {
+  A.riskGateLoading = true;
+  try {
+    await fetch('/api/risk-gates/symbol-override', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, action: 'exempt', reason: 'Manual exemption'})
+    });
+    await loadRiskGates(false);
+  } catch(e) { console.warn('exemptSymbol failed:', e); }
+  A.riskGateLoading = false;
+  renderStrategyAnalytics();
+}
+
+async function removeSymbolOverride(symbol) {
+  A.riskGateLoading = true;
+  try {
+    await fetch('/api/risk-gates/symbol-override/' + encodeURIComponent(symbol), {method: 'DELETE'});
+    await loadRiskGates(false);
+  } catch(e) { console.warn('removeSymbolOverride failed:', e); }
+  A.riskGateLoading = false;
+  renderStrategyAnalytics();
 }
 
 function renderPortfolioLab(items) {
@@ -3989,6 +4274,8 @@ const H = {
   priceStream:        null,   // EventSource handle for SSE price stream (/api/stream/prices)
   strategies:         null,   // array from GET /api/strategies — populated on page load
   scanResults:        {},     // {strategy_key: {signals, total_pairs, strategy}} from POST /api/scan/all
+  scanExchange:       null,   // exchange for scanResults cache
+  scanResultsByExchange: {},  // exchange key -> strategy result cache
   lastScanTime:       null,   // ISO timestamp of last successful scan/all call
   detailSymbol:       null,   // symbol currently shown in signal detail panel (for SSE subscription)
   detailSignal:       null,   // signal snapshot currently shown in the detail panel
@@ -5403,6 +5690,7 @@ const savedAcct = localStorage.getItem('mt7_account_size');
 if (savedAcct && $('hist-account-size')) $('hist-account-size').value = savedAcct;
 setPhase('idle');
 setMktPhase('idle');
+setExchange(S.exchange);
 setStrategy('balanced');
 renderStrategyButtons();  // async: fetches /api/strategies, renders buttons + populates history filter
 // Set initial sort indicator

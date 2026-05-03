@@ -108,7 +108,7 @@ def fetch_hl_account(wallet_address: str) -> dict:
     No signing required — public read by wallet address.
     """
     try:
-        if not wallet_address or not wallet_address.startswith("0x"):
+        if not wallet_address or not wallet_address.startswith("0x") or len(wallet_address) != 42:
             print(f"[hl_client] fetch_hl_account: invalid wallet address", file=sys.stderr)
             return {}
         data = _post({"type": "clearinghouseState", "user": wallet_address})
@@ -152,7 +152,7 @@ def normalize_hl_tickers(universe: list, asset_ctxs: list) -> list:
                 oi_usdc = oi_base * mark_px
 
                 results.append({
-                    "symbol": f"{name}_USDT",
+                    "symbol": f"{name}_USDC",
                     "lastPrice": mark_px,
                     "fairPrice": oracle_px,
                     "riseFallRate": rise_fall,  # decimal — score_ticker multiplies by 100

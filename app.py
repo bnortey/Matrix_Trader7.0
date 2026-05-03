@@ -942,8 +942,9 @@ def fetch_market_sentiment(mexc_symbol: str, price: float) -> dict:
     if base not in SENTIMENT_PAIRS:
         return result
 
-    bn_sym  = mexc_symbol.replace("_", "")         # "BTC_USDT" → "BTCUSDT"
     quote   = mexc_symbol.split("_")[-1]            # "BTC_USDT" → "USDT"
+    quote   = "USDT" if quote == "USDC" else quote  # HL perps display USDC; use USDT venues for sentiment context
+    bn_sym  = f"{base}{quote}"                      # "BTC_USDC" → "BTCUSDT" for external sentiment
     okx_sym = f"{base}-{quote}-SWAP"                # "BTC_USDT" → "BTC-USDT-SWAP"
 
     # --- Binance: L/S ratio ---
@@ -1492,7 +1493,7 @@ def enrich_signal(
         # --- Klines ---
         exchange = base.get("exchange", "MEXC")
         if exchange == "HYPERLIQUID":
-            coin = symbol.replace("_USDT", "")
+            coin = symbol.rsplit("_", 1)[0]
             hl_1h = fetch_hl_klines(coin, "1h", 120)
             if not hl_1h:
                 return None
@@ -2087,12 +2088,61 @@ def api_scan_all():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/hl/scan")
+def api_hl_scan():
+    """Scan Hyperliquid perps with the existing MT7 strategy engine."""
+    try:
+        threshold    = request.args.get("threshold", CONVICTION_THRESHOLD, type=int)
+        strategy_key = request.args.get("strategy", "balanced")
+        registry = get_strategy_registry(include_disabled=True)
+        strat = registry.get(strategy_key)
+        if strat and not strat.get("enabled", True) and strategy_key != "balanced":
+            return jsonify({"success": False, "error": f"Strategy '{strategy_key}' is disabled"}), 400
+        if strategy_key not in registry:
+            strategy_key = "balanced"
+
+        expire_stale_signals()
+        universe, asset_ctxs = fetch_hl_meta_and_ctxs()
+        tickers = normalize_hl_tickers(universe, asset_ctxs)
+        if not tickers:
+            return jsonify({"success": False, "error": "Hyperliquid ticker feed unavailable"}), 502
+
+        signals, total_pairs = run_scan(
+            threshold=threshold,
+            strategy_key=strategy_key,
+            tickers=tickers,
+        )
+        strat = registry.get(strategy_key, registry["balanced"])
+        log_signals(signals)
+        return jsonify({
+            "success":       True,
+            "signals":       signals,
+            "count":         len(signals),
+            "total_pairs":   total_pairs,
+            "strategy":      strategy_key,
+            "strategy_name": strat["name"],
+            "exchange":      "HYPERLIQUID",
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/market")
 def api_market():
     try:
-        tickers = fetch_mexc("/contract/ticker")
+        exchange = request.args.get("exchange", "mexc").strip().lower()
+        if exchange == "hyperliquid":
+            universe, asset_ctxs = fetch_hl_meta_and_ctxs()
+            tickers = normalize_hl_tickers(universe, asset_ctxs)
+            exchange_label = "HYPERLIQUID"
+            unavailable = "Hyperliquid unavailable"
+        else:
+            tickers = fetch_mexc("/contract/ticker")
+            exchange_label = "MEXC"
+            unavailable = "MEXC unavailable"
+
         if not tickers or not isinstance(tickers, list):
-            return jsonify({"success": False, "error": "MEXC unavailable"}), 502
+            return jsonify({"success": False, "error": unavailable}), 502
 
         coinglass_snapshot = get_coin_market_snapshot()
         pairs = []
@@ -2106,6 +2156,7 @@ def api_market():
             "success": True,
             "pairs": pairs,
             "count": len(pairs),
+            "exchange": exchange_label,
             "coinglass_enabled": coinglass_enabled(),
             "coinglass_pairs": len(coinglass_snapshot),
         })
@@ -2127,6 +2178,7 @@ def api_signal(symbol: str):
       3. 'balanced' fallback
     """
     try:
+        exchange = request.args.get("exchange", "mexc").strip().lower()
         # Resolve which strategy to use for enrichment
         strategy_key = request.args.get("strategy", "").strip().lower()
         registry = get_strategy_registry(include_disabled=True)
@@ -2147,12 +2199,19 @@ def api_signal(symbol: str):
 
         strat = registry.get(strategy_key, registry["balanced"])
 
-        tickers = fetch_mexc("/contract/ticker")
+        if exchange == "hyperliquid":
+            universe, asset_ctxs = fetch_hl_meta_and_ctxs()
+            tickers = normalize_hl_tickers(universe, asset_ctxs)
+            unavailable = "Hyperliquid unavailable"
+        else:
+            tickers = fetch_mexc("/contract/ticker")
+            unavailable = "MEXC unavailable"
         if not tickers:
-            return jsonify({"success": False, "error": "MEXC unavailable"}), 502
+            return jsonify({"success": False, "error": unavailable}), 502
 
+        requested_symbol = symbol.upper()
         ticker = next(
-            (t for t in tickers if t.get("symbol") == symbol.upper()), None
+            (t for t in tickers if str(t.get("symbol", "")).upper() == requested_symbol), None
         )
         if not ticker:
             return jsonify({"success": False, "error": f"Symbol {symbol!r} not found"}), 404
@@ -4083,6 +4142,61 @@ def api_account_status():
             return jsonify({"success": True, "connected": False,
                             "reason": "MEXC API returned empty response"})
         return jsonify({"success": True, "connected": True, "data": summary})
+    except Exception as e:
+        return jsonify({"success": True, "connected": False, "reason": str(e)})
+
+
+def _hl_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+@app.route("/api/hl/account")
+def api_hl_account():
+    wallet = HL_WALLET_ADDRESS.strip()
+    if not wallet:
+        return jsonify({"success": True, "connected": False,
+                        "reason": "HL_WALLET_ADDRESS not configured"})
+    try:
+        state = fetch_hl_account(wallet)
+        if not state:
+            return jsonify({"success": True, "connected": False,
+                            "reason": "Hyperliquid API returned empty response"})
+
+        margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+        positions = []
+        unrealized_pnl = 0.0
+        for item in state.get("assetPositions", []) or []:
+            pos = item.get("position", item) if isinstance(item, dict) else {}
+            size = _hl_float(pos.get("szi"))
+            if not size:
+                continue
+            pnl = _hl_float(pos.get("unrealizedPnl"))
+            unrealized_pnl += pnl
+            positions.append({
+                "symbol": f"{pos.get('coin', '')}_USDC" if pos.get("coin") else "",
+                "coin": pos.get("coin"),
+                "size": size,
+                "entry_price": _hl_float(pos.get("entryPx"), None),
+                "unrealized_pnl": pnl,
+                "leverage": pos.get("leverage"),
+            })
+
+        summary = {
+            "equity": _hl_float(margin.get("accountValue")),
+            "available_margin": _hl_float(state.get("withdrawable") or margin.get("totalRawUsd")),
+            "unrealized_pnl": unrealized_pnl,
+            "open_positions": positions,
+            "position_count": len(positions),
+        }
+        return jsonify({
+            "success": True,
+            "connected": True,
+            "wallet": wallet,
+            "data": summary,
+        })
     except Exception as e:
         return jsonify({"success": True, "connected": False, "reason": str(e)})
 

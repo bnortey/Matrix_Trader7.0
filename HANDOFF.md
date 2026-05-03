@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-01
-Last commit: 7d93178 fix: include disabled built-in strategies in loadStrategies() so paused pills and manage buttons work
-app.py: 3984 lines
-index.html: 5467 lines
+Last updated: 2026-05-03
+Last commit: 92514c2 feat: enrich_signal() routes klines/depth/daily to HL client when exchange=HYPERLIQUID
+app.py: 4275 lines
+index.html: 5755 lines
 
 ---
 
@@ -77,7 +77,7 @@ Matrix_Trader_7.0/
 ├── STRATEGIES.md          ← user-facing strategy guide: scoring, paper trading, analytics, bot-readiness
 ├── SERVER_GUIDE.md        ← VPS access, deploy, and service management cheat sheet
 ├── .gitignore             ← covers .env, __pycache__, data/, *.db
-├── .env                   ← ANTHROPIC_API_KEY, MATRIX_PORT, optional COINGLASS_API_KEY (not committed; never touch)
+├── .env                   ← secrets/config only: ANTHROPIC_API_KEY, MATRIX_PORT, optional COINGLASS_API_KEY, HL_WALLET_ADDRESS
 ├── requirements.txt       ← all deps installed; add packages here if needed
 ├── app.py                 ← entire Flask backend; keep flat, one file
 ├── backtest.py            ← standalone script; do NOT import from app.py
@@ -100,6 +100,7 @@ Matrix_Trader_7.0/
     ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
     ├── mexc_stream.py     ← WebSocket client — not used by SSE route (P3e used poll loop)
     ├── coinglass_client.py ← optional CoinGlass V4 derivatives context client
+    ├── hyperliquid_client.py ← Hyperliquid public scan + read-only account client
     └── ai_client.py       ← AI provider fallback chain; call_ai() is the only public fn
 ```
 
@@ -131,6 +132,21 @@ groq>=0.9.0
 ```
 
 SQLite3 is stdlib — no pip install needed. Used for `data/signals.db`.
+
+---
+
+## Environment Variables
+
+```
+ANTHROPIC_API_KEY=        # AI trade briefs / coach reviews
+MATRIX_PORT=8080          # optional app port
+MEXC_API_KEY=             # optional MEXC private account status
+MEXC_API_SECRET=          # optional MEXC private account status
+COINGLASS_API_KEY=        # optional derivatives context
+HL_WALLET_ADDRESS=        # optional Hyperliquid read-only account status, 0x... wallet
+```
+
+Hyperliquid scans do not need API keys or a wallet address. `HL_WALLET_ADDRESS` is only for `/api/hl/account`.
 
 ---
 
@@ -167,7 +183,8 @@ Sentiment APIs (no key needed):
 | `/` | GET | Serves index.html dashboard |
 | `/api/scan` | GET | Full scan: scores 800+ tickers, enriches top 30, logs to DB, returns signals array |
 | `/api/scan/all` | POST | Fetches tickers once, runs all enabled strategies, logs per-strategy signals, returns `{results: {strategy_key: {signals, total_pairs, strategy}}, total_pairs, scan_time}` |
-| `/api/market` | GET | Returns all scored tickers for market browser, optionally enriched with cached CoinGlass all-coin futures metrics when plan allows |
+| `/api/hl/scan` | GET | Hyperliquid scan: fetches `metaAndAssetCtxs`, normalizes tickers, runs the selected existing strategy, logs HL signals |
+| `/api/market` | GET | Returns scored market-browser tickers for `?exchange=mexc` or `?exchange=hyperliquid`; includes optional CoinGlass metadata when available |
 | `/api/signal/<symbol>` | GET | Fully enriches a single symbol on demand, including optional CoinGlass OI/funding/liquidation context |
 | `/api/signal/result` | PATCH | Tags a logged signal with WIN/LOSS/PARTIAL/EXPIRED/SKIPPED; accepts optional `exit_price` and `entry_price` to compute and persist `pnl_pct` |
 | `/api/signals/history` | GET | Returns logged signal history; filters: strategy, result, symbol, limit |
@@ -186,6 +203,7 @@ Sentiment APIs (no key needed):
 | `/api/strategies/builtin/<strategy_key>` | PATCH | Enables or disables a built-in strategy; state persists in `data/risk_gates.json` under `disabled_builtins` |
 | `/api/analysis` | POST | AI strategy review: sends last 200 tagged outcomes to Claude API |
 | `/api/account/status` | GET | MEXC account connection status and equity summary — P8 |
+| `/api/hl/account` | GET | Hyperliquid read-only account connection status and equity/position summary from `HL_WALLET_ADDRESS` |
 | `/api/account/positions` | GET | Live exchange positions from MEXC private API — P8 |
 | `/api/account/balance` | GET | Account balance and available margin — P8 |
 | `/api/account/readiness` | GET | Bot readiness metrics from signals DB — P8 |
@@ -207,8 +225,8 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
 ```python
 {
   # Identity
-  "symbol":               str,   # e.g. "BTC_USDT"
-  "exchange":             str,   # always "MEXC"
+  "symbol":               str,   # e.g. MEXC "BTC_USDT", Hyperliquid "BTC_USDC"
+  "exchange":             str,   # "MEXC" or "HYPERLIQUID"
   "direction":            str,   # "LONG" or "SHORT"
   "strategy":             str,   # human name e.g. "Balanced"
   "leverage_cap":         int,   # from strategy registry
@@ -325,6 +343,7 @@ const S = {
   dir:      'all',
   sort:     'conviction',
   strategy: 'balanced',
+  exchange: localStorage.getItem('mt7_exchange') || 'mexc',
   totalPairs: 0,
   scanTime:   null,
   timerId:    null,
@@ -337,6 +356,7 @@ const M = {
   phase:        'idle',   // idle | loading | ready | error
   pairs:        [],       // all pairs from /api/market
   filtered:     [],       // after search + dir filter + sort
+  pairsByExchange: {},
   dir:          'all',
   sort:         'conviction_base',
   search:       '',
@@ -369,6 +389,8 @@ const H = {
   priceStream:        null,
   strategies:         null,
   scanResults:        {},
+  scanExchange:       null,
+  scanResultsByExchange: {},
   lastScanTime:       null,
   detailSymbol:       null,   // symbol currently shown in signal detail panel (for SSE subscription)
 };
@@ -380,6 +402,7 @@ const A = {
   explainerOpen: false,
   explainerKey: null,
   editingStrategy: null,
+  accountConnections: null,
 };
 
 let lastHistorySigs = [];
@@ -414,11 +437,13 @@ Five tabs, one shared detail panel:
 
 **Strategy bar** (inside `#signals-section`): pills rendered dynamically from `/api/strategies`. Custom strategies get a blue-tinted border (`.strat-btn.custom`). Pills only switch the active scan strategy; they do not open the explainer. The subtitle line includes a static "Manage in Strategies tab →" link.
 
+**Exchange bars** (inside `#signals-section` above `#strategy-bar`, and inside `#market-section` above Market idle/ready states): MEXC / Hyperliquid pills govern the active exchange view for Signals and Market. Selection persists to `localStorage` key `mt7_exchange`. Signals cache is exchange-keyed in `H.scanResultsByExchange`, so switching exchanges swaps to that exchange's last scan or a clean idle state. MEXC scans call `POST /api/scan/all`; Hyperliquid scans call `GET /api/hl/scan?strategy=<key>`. Market cache is exchange-keyed in `M.pairsByExchange`; Market calls `GET /api/market?exchange=<key>`. History and Strategies analytics remain cross-exchange and are not filtered by this selector.
+
 **Strategy explainer** (`#strategy-explainer`, inside `#strategies-section` above analytics content): strategy-management panel hidden by default. Shows a "MANAGING: [Strategy Name]" header, regime badge, custom badge if applicable, description, weight bars, gates, parameters, performance stats, and strategy actions (Clone / Edit / Pause/Resume / Disable / Delete). Populated by `populateExplainer(strat)` and opened by `openStrategyManager(key)` from Strategies table Manage buttons. Toggle controlled by `A.explainerOpen` / `A.explainerKey`; editor state lives in `A.editingStrategy`.
 
 **Strategy editor** (`#strategy-editor`, inside `#strategy-explainer`): compact inline form for clone/edit. Uses `POST /api/strategies/custom`, `PATCH /api/strategies/custom/<key>`, `DELETE /api/strategies/custom/<key>`.
 
-**Strategies tab** (`#strategies-section`): decision-focused analytics and strategy-management page. `GET /api/strategies/analytics` feeds `A.analytics`; `renderStrategyAnalytics()` renders the comparison table with per-row Manage buttons, total/avg P&L bars, selected strategy equity curve, outcome breakdown, P&L distribution, best/worst symbols, volatility-regime bars, and `renderStrategyLearning()` educational concept blocks. Charts are inline SVG/CSS only — no charting library.
+**Strategies tab** (`#strategies-section`): decision-focused analytics and strategy-management page. Includes the strategy-management panel, Bot Readiness, and MEXC/Hyperliquid account connection status lines. `GET /api/strategies/analytics` feeds `A.analytics`; `renderStrategyAnalytics()` renders the comparison table with per-row Manage buttons, total/avg P&L bars, selected strategy equity curve, outcome breakdown, P&L distribution, best/worst symbols, volatility-regime bars, and `renderStrategyLearning()` educational concept blocks. Charts are inline SVG/CSS only — no charting library.
 
 **Filter bar** (inside `#signals-section`): direction toggle, volatility filter select, min-volume input. State persisted to localStorage key `mt7_filters`.
 
@@ -539,6 +564,26 @@ Next in priority order:
 
 **Job 3 — Bot Readiness panel.** Added `#sa-readiness` div above `#sa-body` in the Strategies tab. `loadStrategyAnalytics()` now fetches `/api/account/readiness` and stores result in `A.readiness`. `renderReadinessPanel()` renders one row per strategy: name, inline progress bar (green ≥70 / amber ≥40 / red <40), readiness %, trades/avg-pnl/profit-factor stats, and "insufficient data" label when trades_with_pnl < 30. Footer shows execution mode as DISABLED. Mobile: stats hidden on narrow screens, bars still render.
 
+**Job 4 — Symbol conviction penalty system.** Added `_load_symbol_performance_cache(min_trades=5)` and `_get_symbol_overrides()` helpers to app.py (both read-only, fail closed). Added penalty block + override block at the end of `score_ticker()` — three tiers: severe (<-30% avg P&L, 5+ trades, -20), moderate (<-15%, 5+ trades, -10), mild (<-5%, 8+ trades, -5). No hard blocks. Override actions: exempt/force_severe/force_moderate/force_mild. `run_scan()` calls both helpers once per scan and passes as `sym_perf_cache`/`sym_overrides` kwargs. `/api/risk-gates` response now includes `symbol_performance` key (penalty_count, top 20 symbols, active overrides). Added `POST /api/risk-gates/symbol-override` and `DELETE /api/risk-gates/symbol-override/<symbol>`. Four new tags in `TAG_META`/`TAG_TIPS`: `sym_penalty_severe`, `sym_penalty_moderate`, `sym_penalty_mild`, `sym_exempt`. Symbol Penalties subsection added to the Risk Gates panel in the Strategies tab with auto-detected penalties table and active overrides table with Exempt/Remove buttons. 15 penalty symbols detected on VPS at time of ship.
+
+**2026-05-01 — Patched `funding_arb_focus_short` `allowed_volatility` to include `"extreme"` (avg +41.5% at conv≥65, 8 trades). `short_vol_short` gate confirmed scoped to `balanced` only — extreme SHORT fires freely on this clone.**
+
+**Job 5 — analyze.py Section 5 fix.** `section_tp1_counterfactual()` previously counted all 748 signals with a `tp1` column value, producing an inflated +33,712 delta. Replaced with a DB query gated on confirmed `TP1_HIT` events from `position_events`. Corrected result: 141 confirmed TP1 hits, delta **-2,319** (laddered exits beat TP1-only, ladder strategy is working). A `_note` key prints the before/after count on every run. Section header updated to "confirmed TP1 hits only".
+
+---
+
+## Session Summary — 2026-05-03
+
+**Hyperliquid Phase 1 — Scan + Account.** Completed the unfinished Claude Code integration. `lib/hyperliquid_client.py` provides pure fail-closed Hyperliquid public functions for `metaAndAssetCtxs`, candles, orderbook, read-only account state, and MT7 ticker normalization. `app.py` now imports that client, reads `HL_WALLET_ADDRESS`, preserves the `exchange` field from scoring through enrichment, routes HYPERLIQUID klines/depth/daily candles away from MEXC endpoints, and exposes `GET /api/hl/scan` plus `GET /api/hl/account`. The HL scan uses existing strategies only and logs signals in the same shape as MEXC.
+
+**Frontend exchange selector.** Signals tab now has MEXC / Hyperliquid pills above the strategy pills. `S.exchange` persists to `localStorage` key `mt7_exchange`; MEXC scans still call `POST /api/scan/all`, while Hyperliquid scans call `GET /api/hl/scan?strategy=<key>`. Hyperliquid signal cards show a blue `HL` badge next to the symbol; MEXC cards remain unchanged. Bot Readiness now shows separate MEXC and Hyperliquid account connection lines. History and Strategies analytics remain cross-exchange.
+
+**Verification.** `python3 -m py_compile app.py lib/hyperliquid_client.py` passed. Inline JS parsed via `node --check`. Flask import and route registration passed after installing `requirements.txt` into the local Python environment. `/api/hl/account` returns `connected:false` when `HL_WALLET_ADDRESS` is absent. A monkeypatched Flask test client verified `/api/hl/scan` response shape. Live Hyperliquid `metaAndAssetCtxs` was verified via elevated `curl`.
+
+**QA fixes — exchange-scoped Signals and Market.** Signals now keeps separate result caches per exchange (`H.scanResultsByExchange`), so switching MEXC ↔ Hyperliquid swaps to that exchange's visible signals or a clean idle state instead of leaving stale signals from the previous exchange. Mid-scan exchange switches are guarded: completed results are stored under the exchange that launched the scan and do not overwrite the currently selected exchange view. Market tab now has the same MEXC / Hyperliquid exchange pills, exchange-keyed pair cache (`M.pairsByExchange`), and `GET /api/market?exchange=<key>` routing. Hyperliquid market rows use normalized HL tickers and show the blue `HL` badge; Market click-to-enrich passes `?exchange=<key>` so HL rows do not resolve through MEXC. Hyperliquid symbols now use `_USDC` in MT7 because Hyperliquid perps settle/quote in USDC; external sentiment lookup still maps major HL coins to USDT venues for cross-exchange context.
+
+**Auto-refresh.** Signals keep the manual Scan button, and after an exchange has been scanned once, the currently selected exchange auto-scans every 5 minutes (`SIGNAL_AUTO_REFRESH_MS`). Market keeps manual Load/Retry, and after the selected exchange has been loaded once, the active Market tab auto-refreshes the currently selected exchange every 60 seconds (`MARKET_AUTO_REFRESH_MS`). Auto-refresh skips while an existing scan/load is in progress and does not trigger for exchanges that have not been manually loaded/scanned yet.
+
 ---
 
 ## Strategy System Direction
@@ -582,6 +627,8 @@ Recommended next step: deploy P6a, verify `COINGLASS_API_KEY` is present on the 
 - Do not set `exit_price` to 0 when unknown — use NULL. Only `evaluate_outcome()` and PATCH with exit_price write this field.
 - Do not use `display: none` on `:nth-child()` td/th cells to hide columns in `table-layout: fixed` JS-generated tables — use conditional JS rendering instead.
 - Do not write innerHTML directly to `$('detail-panel')` — write to `$('panel-body')` only.
+- Do not call MEXC kline endpoints for Hyperliquid signals — check `exchange` in `enrich_signal()` and route HYPERLIQUID klines to `fetch_hl_klines()`.
+- Do not mix `HL_WALLET_ADDRESS` with `MEXC_API_KEY` / `MEXC_API_SECRET` — these are separate read systems for separate exchanges.
 - Do not add `onclick="showClosedDetail(...)"` to open-positions rows — those use `showPositionDetail()`.
 - Do not call any AI provider directly from routes — always use `call_ai()` from `lib/ai_client.py`.
 - Do not write TP/SL events to `position_events` for signals without a prior `ENTRY_FILLED` event. `evaluate_outcome()` enforces this gate (`entry_hit` must be True before any TP/SL log call is reached). See P5c.
@@ -598,6 +645,9 @@ Recommended next step: deploy P6a, verify `COINGLASS_API_KEY` is present on the 
 - Do not commit MEXC_API_KEY or MEXC_API_SECRET — .env only, never source.
 - Do not place a live order without a kill switch check — no execution code ships before P11.
 - Do not share position state between paper tracking (signals table) and live positions — separate systems.
+- Do not call `_load_symbol_performance_cache()` inside `score_ticker()` — call it once in `run_scan()` and pass the result as the `sym_perf_cache` kwarg. Calling it per-ticker would hit the DB 800+ times per scan.
+- Do not apply `sym_overrides` inside `_load_symbol_performance_cache()` — overrides are a scoring concern and belong in `score_ticker()` after the penalty block.
+- Do not use `signals.tp1 IS NOT NULL` as a proxy for "TP1 was hit" — that column is set at signal creation time. Always join to `position_events WHERE event_type = 'TP1_HIT'` for confirmed hits.
 
 ---
 
