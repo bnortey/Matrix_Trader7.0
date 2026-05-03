@@ -1490,9 +1490,23 @@ def enrich_signal(
 
     try:
         # --- Klines ---
-        # No start/end: MEXC returns the latest ~100 candles by default.
-        # 100 × Hour1 = ~4 days, enough for 14-period ATR and RSI with headroom.
-        kline_data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": KLINE_INTERVAL})
+        exchange = base.get("exchange", "MEXC")
+        if exchange == "HYPERLIQUID":
+            coin = symbol.replace("_USDT", "")
+            hl_1h = fetch_hl_klines(coin, "1h", 120)
+            if not hl_1h:
+                return None
+            kline_data = {
+                "open":  [float(k["o"]) for k in hl_1h],
+                "high":  [float(k["h"]) for k in hl_1h],
+                "low":   [float(k["l"]) for k in hl_1h],
+                "close": [float(k["c"]) for k in hl_1h],
+                "vol":   [float(k["v"]) for k in hl_1h],
+            }
+        else:
+            # No start/end: MEXC returns the latest ~100 candles by default.
+            # 100 × Hour1 = ~4 days, enough for 14-period ATR and RSI with headroom.
+            kline_data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": KLINE_INTERVAL})
 
         if not kline_data or not isinstance(kline_data, dict):
             return None
@@ -1513,10 +1527,14 @@ def enrich_signal(
 
         # --- Kline depth gate ---
         # Fetch 4h candles just to measure history depth; count only, not used for indicators.
-        kline4h_data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": "Hour4", "limit": 50})
-        n4h = 0
-        if kline4h_data and isinstance(kline4h_data, dict):
-            n4h = len(kline4h_data.get("close", []))
+        if exchange == "HYPERLIQUID":
+            hl_4h = fetch_hl_klines(coin, "4h", 480)
+            n4h = len(hl_4h)
+        else:
+            kline4h_data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": "Hour4", "limit": 50})
+            n4h = 0
+            if kline4h_data and isinstance(kline4h_data, dict):
+                n4h = len(kline4h_data.get("close", []))
 
         if n1h < 50 or n4h < 20:
             print(f"[kline gate] {symbol} skipped — 1h:{n1h} 4h:{n4h}", file=sys.stderr)
@@ -1588,7 +1606,7 @@ def enrich_signal(
                 "gate_key": gate_key,
                 "gate_mode": gate_mode,
                 "symbol": symbol,
-                "exchange": "MEXC",
+                "exchange": exchange,
                 "direction": direction,
                 "strategy": strat["name"],
                 "strategy_key": skey,
@@ -1640,22 +1658,25 @@ def enrich_signal(
             trend_score = 0
 
         # --- Next funding settlement ---
-        # One extra API call per enriched symbol (top 30 only). The endpoint
-        # returns nextSettleTime as a Unix millisecond timestamp.
         next_funding_minutes = None
-        try:
-            fr_data = fetch_mexc(f"/contract/funding_rate/{symbol}")
-            if fr_data and isinstance(fr_data, dict):
-                next_settle_ms = fr_data.get("nextSettleTime")
-                if next_settle_ms:
-                    minutes_left = (int(next_settle_ms) / 1000 - time.time()) / 60
-                    next_funding_minutes = max(0, int(round(minutes_left)))
-        except Exception:
-            next_funding_minutes = None
+        if exchange != "HYPERLIQUID":
+            # MEXC endpoint returns nextSettleTime as Unix millisecond timestamp.
+            try:
+                fr_data = fetch_mexc(f"/contract/funding_rate/{symbol}")
+                if fr_data and isinstance(fr_data, dict):
+                    next_settle_ms = fr_data.get("nextSettleTime")
+                    if next_settle_ms:
+                        minutes_left = (int(next_settle_ms) / 1000 - time.time()) / 60
+                        next_funding_minutes = max(0, int(round(minutes_left)))
+            except Exception:
+                next_funding_minutes = None
 
         # --- Orderbook imbalance ---
         imbalance = 0.5  # neutral default if depth fetch fails
-        depth_data = fetch_mexc(f"/contract/depth/{symbol}")
+        if exchange == "HYPERLIQUID":
+            depth_data = fetch_hl_orderbook(coin)
+        else:
+            depth_data = fetch_mexc(f"/contract/depth/{symbol}")
         if depth_data and isinstance(depth_data, dict):
             asks = depth_data.get("asks", [])[:10]
             bids = depth_data.get("bids", [])[:10]
@@ -1730,10 +1751,16 @@ def enrich_signal(
         daily_trend = None
         daily_trend_aligned = None
         try:
-            daily_klines = fetch_mexc(
-                f"/contract/kline/{symbol}",
-                params={"interval": "Day1", "limit": 30},
-            )
+            if exchange == "HYPERLIQUID":
+                hl_daily = fetch_hl_klines(coin, "1d", 720)
+                # Convert to list-of-entry format that daily_trend_direction accepts:
+                # [timestamp, open, close, high, low, vol] (index 3=high, 4=low)
+                daily_klines = [[k["t"], k["o"], k["c"], k["h"], k["l"], k["v"]] for k in hl_daily] if hl_daily else None
+            else:
+                daily_klines = fetch_mexc(
+                    f"/contract/kline/{symbol}",
+                    params={"interval": "Day1", "limit": 30},
+                )
             if daily_klines:
                 dt = daily_trend_direction(daily_klines)
                 daily_trend = dt
@@ -1747,7 +1774,7 @@ def enrich_signal(
         final_tags = list(dict.fromkeys(tags))  # deduplicate, preserve order
         sig = {
             "symbol": symbol,
-            "exchange": "MEXC",
+            "exchange": exchange,
             "direction": direction,
             "conviction": conviction,
             "price": price,
