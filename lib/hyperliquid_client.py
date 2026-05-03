@@ -119,43 +119,46 @@ def normalize_hl_tickers(universe: list, asset_ctxs: list) -> list:
     Produces MEXC-compatible field names so score_ticker() consumes them unchanged.
     Filters out pairs with zero volume, zero price, or missing data.
     """
-    results = []
-    for i, meta in enumerate(universe):
-        try:
-            if i >= len(asset_ctxs):
-                break
-            ctx = asset_ctxs[i]
-            name = meta.get("name", "")
-            if not name:
+    try:
+        results = []
+        for i, meta in enumerate(universe):
+            try:
+                if i >= len(asset_ctxs):
+                    break
+                ctx = asset_ctxs[i]
+                name = meta.get("name", "")
+                if not name:
+                    continue
+
+                mark_px = float(ctx.get("markPx") or 0)
+                prev_day_px = float(ctx.get("prevDayPx") or 0)
+                day_vol = float(ctx.get("dayNtlVlm") or 0)
+                oi_base = float(ctx.get("openInterest") or 0)
+                funding = float(ctx.get("funding") or 0)
+                oracle_px = float(ctx.get("oraclePx") or mark_px)
+                max_lev = int(meta.get("maxLeverage") or 50)
+
+                if mark_px <= 0 or day_vol <= 0:
+                    continue
+
+                rise_fall = (mark_px - prev_day_px) / prev_day_px if prev_day_px > 0 else 0.0
+                oi_usdc = oi_base * mark_px
+
+                results.append({
+                    "symbol":       f"{name}_USDT",
+                    "lastPrice":    mark_px,
+                    "fairPrice":    oracle_px,
+                    "riseFallRate": rise_fall,       # decimal — score_ticker multiplies by 100
+                    "fundingRate":  funding,          # already decimal
+                    "vol24h":       day_vol,          # score_ticker falls back to vol24h
+                    "holdVol":      oi_usdc,          # open interest in USDC
+                    "exchange":     "HYPERLIQUID",
+                    "maxLeverage":  max_lev,
+                })
+            except Exception as e:
+                print(f"[hl_client] normalize error at index {i}: {e}", file=sys.stderr)
                 continue
-
-            mark_px = float(ctx.get("markPx") or 0)
-            prev_day_px = float(ctx.get("prevDayPx") or 0)
-            day_vol = float(ctx.get("dayNtlVlm") or 0)
-            oi_base = float(ctx.get("openInterest") or 0)
-            funding = float(ctx.get("funding") or 0)
-            oracle_px = float(ctx.get("oraclePx") or mark_px)
-            max_lev = int(meta.get("maxLeverage") or 50)
-
-            if mark_px <= 0 or day_vol <= 0:
-                continue
-
-            rise_fall = (mark_px - prev_day_px) / prev_day_px if prev_day_px > 0 else 0.0
-            oi_usdc = oi_base * mark_px
-
-            results.append({
-                "symbol":       f"{name}_USDT",
-                "lastPrice":    mark_px,
-                "fairPrice":    oracle_px,
-                "riseFallRate": rise_fall,       # decimal — score_ticker multiplies by 100
-                "fundingRate":  funding,          # already decimal
-                "vol24h":       day_vol,          # score_ticker falls back to vol24h
-                "holdVol":      oi_usdc,          # open interest in USDC
-                "exchange":     "HYPERLIQUID",
-                "maxLeverage":  max_lev,
-            })
-        except Exception as e:
-            print(f"[hl_client] normalize error at index {i}: {e}", file=sys.stderr)
-            continue
-
-    return results
+        return results
+    except Exception as e:
+        print(f"[hl_client] normalize_hl_tickers error: {e}", file=sys.stderr)
+        return []
