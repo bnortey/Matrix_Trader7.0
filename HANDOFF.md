@@ -108,7 +108,18 @@ Matrix_Trader_7.0/
     ├── coinglass_client.py ← optional CoinGlass V4 derivatives context client
     ├── hyperliquid_client.py ← Hyperliquid public scan + read-only account client
     └── ai_client.py       ← AI provider fallback chain; call_ai() is the only public fn
+
+/opt/mt-learner/          ← External learner (VPS only — not in repo)
+    learner.py            ← Scheduler: runs 4 jobs on 30min/2hr/6hr/24hr intervals
+    analyzer.py           ← Feature, threshold, regime analysis from signals.db (read-only)
+    suggester.py          ← Generates pending.json suggestions when thresholds met
+    models/               ← feature_weights.json, conviction_thresholds.json, regime_performance.json
+    suggestions/pending.json ← Read by MT7 /api/intelligence/suggestions route
+    logs/                 ← learner.log (5MB rotating), last_heartbeat.txt
+    .env                  ← DB_PATH=/opt/matrix-trader/data/signals.db
 ```
+
+Note: External learner is a separate VPS service. It reads signals.db read-only and writes only to /opt/mt-learner/. Managed by mt-learner.service (systemd). MT7 reads learner output via pending.json — no direct import or HTTP dependency.
 
 **Touch policy:**
 - `app.py` and `index.html`: always read the relevant sections before editing
@@ -567,11 +578,13 @@ Review that panel before beginning any execution phase. You decide when to proce
 the system surfaces the data, it does not block you.
 
 Next in priority order:
-1. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes)
-2. Run `python3 analyze.py` on VPS DB weekly to track strategy edge
-3. Review `short_vol_short` gate after 2+ more weeks of shadow data
-4. Begin P9 (execution readiness layer) when agent shadow validation is ready
-5. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
+1. Monitor mt-learner — check `journalctl -u mt-learner` daily for the first week; confirm heartbeat file is updating
+2. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes)
+3. After 50+ closed signals with agent data, review Intelligence tab Shadow Validation section for Phase 2 readiness
+4. Run `python3 analyze.py` on VPS DB weekly to track strategy edge
+5. Review `short_vol_short` gate after 2+ more weeks of shadow data
+6. Begin P9 (execution readiness layer) when agent shadow validation is ready
+7. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
 
 ---
 
@@ -605,7 +618,11 @@ Next in priority order:
 
 **Hyperliquid outcome evaluation.** Resolved the limitation where Hyperliquid signals stayed open because the background evaluator always fetched MEXC klines. Added `_fetch_klines_for_signal(sig, interval, limit, start_ts)` immediately before `evaluate_outcome()`; it routes MEXC signals to `fetch_mexc("/contract/kline/...")`, Hyperliquid signals to `fetch_hl_klines()`, and defaults missing/empty `exchange` to MEXC. `evaluate_outcome()` and `compute_trade_journey()` now consume the helper DataFrame instead of fetching klines directly. `/api/outcomes/check` now explicitly selects `exchange` for open signal evaluation. No evaluation, scoring, frontend, route, or `position_events` lifecycle logic changed.
 
-## Session Summary — 2026-05-05
+## Session Summary — 2026-05-05 (mt-learner)
+
+**External Learner service deployed to VPS.** Created `/opt/mt-learner/` — a fully isolated Python service that reads `signals.db` read-only and writes only to its own directory. Three files: `analyzer.py` (feature analysis, threshold optimization, regime analysis), `suggester.py` (generates `pending.json` suggestions when statistical thresholds are met), `learner.py` (scheduler loop: job_feature every 30min, job_threshold every 2hr, job_regime every 6hr, job_proposal every 24hr; `--dry-run` flag runs all four once then exits 0). Registered as `mt-learner.service` (systemd, restart-on-failure, WorkingDirectory=/opt/mt-learner, ExecStart=/usr/bin/python3). Dry-run verified: all 4 jobs completed against 853 signals, 5 strategies analyzed, 1 threshold suggestion generated (balanced: raise min conviction from 55 → 65, 98-trade sample, high confidence). DB write-block confirmed (`attempt to write a readonly database`). `curl /api/intelligence/suggestions` returns `{"learner_running": true, "success": true, "suggestions": [...]}` with the threshold suggestion. Heartbeat file at `/opt/mt-learner/logs/last_heartbeat.txt` updates after every `job_feature` run.
+
+**Session Summary — 2026-05-05 (agents + README + analyze.py)**
 
 **Agent shadow mode fix.** Codex had introduced a contradiction: the comment said "Phase 1 shadow mode — deltas not applied to conviction" but the code did `sig["conviction"] -= 30` when `hard_blocked=True`. The MEXC adapter's `adl_risk = oi_vol_ratio >= 15` fires on many normal pairs, so nearly every signal was getting hard-blocked, dropping conviction below the 55 threshold, and producing zero signals on every scan. Fixed by removing the conviction penalty entirely — agent hard blocks now only add tags (`agent_blocked`, block reasons) and never touch conviction in Phase 1. **Do not re-add the -30 conviction penalty for hard blocks without a validated Phase 2 dataset.**
 
@@ -693,6 +710,9 @@ Recommended next step: deploy P6a, verify `COINGLASS_API_KEY` is present on the 
 - Do not apply the `direction_lock` gate inside `score_ticker()` — `direction` is set there, but the gate belongs in `enrich_signal()` where it can short-circuit without wasting enrichment quota.
 - Do not place P7a CoinGlass conviction adjustments (`cg_funding_confirmed`, `cg_funding_divergence`, `liq_aligned`, `liq_contrary`, `fragility_high`, `fragility_extreme`) inside `score_ticker()` — per-symbol liquidation and funding context is only fetched in stage-2 `enrich_signal()`. All six tags belong after the `get_symbol_derivatives_context()` call.
 - Do not promote `fragility_high`/`fragility_extreme` thresholds (0.20/0.40) to hard gates without reviewing 2+ weeks of tag performance data. They are deliberately soft discounts only.
+- Do not import from /opt/mt-learner/ inside app.py — MT7 reads learner output via pending.json file only (`/api/intelligence/suggestions` reads the file directly).
+- Do not write to /opt/matrix-trader/data/signals.db from the learner — the learner uses a read-only URI connection (`file:...?mode=ro`) and must never write to the main DB.
+- Do not trigger learner jobs from MT7 HTTP routes — the learner runs on its own schedule (mt-learner.service) and is completely decoupled from the Flask process.
 - Do not apply Change 1 (cross-exchange funding confirmation) to any strategy other than `funding_arb`.
 - Do not call any MEXC private API endpoint from app.py directly — all private calls go through lib/mexc_private.py.
 - Do not commit MEXC_API_KEY or MEXC_API_SECRET — .env only, never source.
@@ -726,6 +746,18 @@ rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' --exclude=
 ssh root@62.238.15.113
 systemctl restart matrix-trader
 systemctl status matrix-trader --no-pager
+```
+
+mt-learner is a separate service (files live at /opt/mt-learner/ — not in this repo):
+```bash
+# Restart
+systemctl restart mt-learner
+# Logs (live)
+journalctl -u mt-learner -f
+# Status
+systemctl status mt-learner
+# Dry-run (test all 4 jobs without starting scheduler)
+cd /opt/mt-learner && python3 learner.py --dry-run
 ```
 
 Force-kill fallback if restart hangs:
