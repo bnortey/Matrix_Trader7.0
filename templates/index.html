@@ -1032,6 +1032,7 @@
     <button id="tab-tools"   class="tab-btn"        onclick="switchTab('tools')">Tools</button>
     <button id="tab-strategies" class="tab-btn"     onclick="switchTab('strategies')">Strategies</button>
     <button id="tab-history" class="tab-btn"        onclick="switchTab('history')">History</button>
+    <button id="tab-intelligence" class="tab-btn"  onclick="switchTab('intelligence')">Intelligence</button>
   </div>
 
   <!-- ── MAIN (shared flex row) ── -->
@@ -1459,6 +1460,13 @@
       </div>
     </div><!-- /history-section -->
 
+    <!-- ════ INTELLIGENCE SECTION ════ -->
+    <div id="intelligence-section" class="hidden" style="flex:1;overflow-y:auto;padding:16px;">
+      <div id="intelligence-content">
+        <div style="color:var(--muted);padding:2rem;">Loading...</div>
+      </div>
+    </div><!-- /intelligence-section -->
+
     <!-- ════ SHARED DETAIL PANEL ════ -->
     <aside id="detail-panel" class="hidden">
       <div id="panel-resize-handle"></div>
@@ -1559,15 +1567,18 @@ function switchTab(tab) {
   toggle('tools-section',   tab === 'tools');
   toggle('strategies-section', tab === 'strategies');
   toggle('history-section', tab === 'history');
+  toggle('intelligence-section', tab === 'intelligence');
   $('tab-signals').classList.toggle('active', tab === 'signals');
   $('tab-market').classList.toggle('active',  tab === 'market');
   $('tab-tools').classList.toggle('active',   tab === 'tools');
   $('tab-strategies').classList.toggle('active', tab === 'strategies');
   $('tab-history').classList.toggle('active', tab === 'history');
+  $('tab-intelligence').classList.toggle('active', tab === 'intelligence');
   if (tab === 'signals') applySignalExchangeState();
   if (tab === 'history') loadHistory();
   if (tab === 'market') applyMarketExchangeState();
   if (tab === 'strategies') loadStrategyAnalytics();
+  if (tab === 'intelligence') loadIntelligence();
 }
 
 /* ============================================================
@@ -1689,7 +1700,7 @@ function toTVSymbol(mexcSymbol, exchange) {
     'MEXC':        s => 'MEXC:'        + s.replace('_USDC', '_USDT').replace('_', '') + '.P',
     'BINANCE':     s => 'BINANCE:'     + s.replace('_USDC', 'USDT').replace('_USDT', 'USDT') + '.PERP',
     'BYBIT':       s => 'BYBIT:'       + s.replace('_USDC', '_USDT').replace('_', '') + '.P',
-    'HYPERLIQUID': s => 'HYPERLIQUID:' + s.split('_')[0]            + 'USDT.P',
+    'HYPERLIQUID': s => 'BINANCE:'     + s.split('_')[0]            + 'USDT.PERP',
   };
   return (map[exchange] || map['MEXC'])(mexcSymbol);
 }
@@ -1888,7 +1899,8 @@ function rowHTML(sig, i) {
   if (sig.daily_trend_aligned === false) tags.push('counter_trend');
   const tagsHtml = tags.length
     ? `<div class="row-tags">${tags.map(t => {
-        const tip = TAG_TIPS[t] ? ` title="${esc(TAG_TIPS[t])}"` : '';
+        const tipText = TAG_TIPS[t] || (t.startsWith('agent_shadow_') ? 'Agent shadow layer tag — recorded for forward-testing. Not applied to conviction in Phase 1.' : '');
+        const tip = tipText ? ` title="${esc(tipText)}"` : '';
         const tm = TAG_META[t];
         return `<span class="tag${tm ? ' ' + tm.cls : ''}"${tip}>${esc(tm ? tm.label : t.replace(/_/g,' '))}</span>`;
       }).join('')}</div>`
@@ -1986,7 +1998,8 @@ function renderDetail(sig) {
     <div class="tags-wrap">
       ${displayTags.length
         ? displayTags.map(t => {
-            const tip = TAG_TIPS[t] ? ` title="${esc(TAG_TIPS[t])}"` : '';
+            const tipText = TAG_TIPS[t] || (t.startsWith('agent_shadow_') ? 'Agent shadow layer tag — recorded for forward-testing. Not applied to conviction in Phase 1.' : '');
+            const tip = tipText ? ` title="${esc(tipText)}"` : '';
             return `<span class="tag"${tip}>${esc(t.replace(/_/g,' '))}</span>`;
           }).join('')
         : '<span style="color:var(--text3);font-size:11px">none</span>'}
@@ -2374,6 +2387,21 @@ const TAG_TIPS = {
   'sym_penalty_moderate': 'Symbol avg P&L below -15% across 5+ closed trades — conviction reduced by 10',
   'sym_penalty_mild':     'Symbol avg P&L below -5% across 8+ closed trades — conviction reduced by 5',
   'sym_exempt':           'Symbol manually exempted from conviction penalty — override active in risk_gates.json',
+  // Risk gate shadow tags
+  'long_vol_shadow':      'High/extreme volatility LONG — risk gate is in shadow mode. Signal passed through but flagged. Gate would block this in block mode.',
+  'short_vol_shadow':     'Extreme volatility SHORT on Balanced — risk gate is in shadow mode. Signal passed through but flagged.',
+  // Agent shadow layer tags
+  'agent_blocked':               'Agent Risk Manager flagged a hard block on this signal — data stale, extreme spread, or no-trade zone detected. Conviction not affected in Phase 1 shadow mode.',
+  'agent_shadow_agent_confirmed': 'Agent layer: narrative and structural analysts agree — signal direction has broad internal consensus.',
+  'agent_shadow_agent_disagreement': 'Agent layer: narrative and structural analysts disagree significantly — conflicting signals between sentiment/news and order flow/funding.',
+  'agent_shadow_imbalance_long':  'Agent layer: orderbook imbalance strongly favors the long side — more bid depth than ask depth.',
+  'agent_shadow_imbalance_short': 'Agent layer: orderbook imbalance strongly favors the short side — more ask depth than bid depth.',
+  'agent_shadow_microprice_aligned': 'Agent layer: microprice deviation is aligned with signal direction — orderbook pressure confirms the trade.',
+  'agent_shadow_basis_dislocation': 'Agent layer: cross-venue basis is dislocated — significant price difference between this exchange and reference venues.',
+  'agent_shadow_late_move_detected': 'Agent layer: technical analyst flagged this as a potentially late entry — price may have already moved significantly.',
+  'agent_shadow_float_fragile':   'Agent layer: tokenomics analyst flagged high float fragility — supply concentration or unlock risk present.',
+  'agent_shadow_funding_squeeze_risk': 'Agent layer: funding analyst flagged squeeze risk — ADL or extreme funding conditions detected.',
+  'agent_shadow_exchange_stress': 'Agent layer: news analyst detected exchange stress indicators — abnormal funding interval or macro risk present.',
 };
 
 const TAG_META = {
@@ -3528,6 +3556,13 @@ const A = {
   riskGateLoading: false,
   readiness: null,
   accountConnections: null,
+};
+
+const I = {
+  loading:      false,
+  status:       null,
+  suggestions:  [],
+  learnerRunning: false,
 };
 
 const STRATEGY_LEARN = {
@@ -5711,6 +5746,233 @@ window.addEventListener('resize', () => {
   }
   if (currentTab === 'strategies' && A.analytics) renderStrategyAnalytics();
 });
+
+/* ============================================================
+   INTELLIGENCE TAB
+   ============================================================ */
+
+async function loadIntelligence() {
+  if (I.loading) return;
+  I.loading = true;
+  const container = document.getElementById('intelligence-content');
+  if (container) container.innerHTML = '<div style="color:var(--muted);padding:2rem;">Loading...</div>';
+  try {
+    const [statusRes, suggestionsRes] = await Promise.all([
+      fetch('/api/intelligence/status').then(r => r.json()),
+      fetch('/api/intelligence/suggestions').then(r => r.json()),
+    ]);
+    I.status = statusRes.success ? statusRes : null;
+    I.suggestions = suggestionsRes.suggestions || [];
+    I.learnerRunning = suggestionsRes.learner_running || false;
+    renderIntelligence();
+  } catch(e) {
+    if (container) container.innerHTML = '<div style="color:var(--red);padding:2rem;">Failed to load intelligence data.</div>';
+  } finally {
+    I.loading = false;
+  }
+}
+
+function renderIntelligence() {
+  const container = document.getElementById('intelligence-content');
+  if (!container) return;
+  if (!I.status) {
+    container.innerHTML = '<div style="color:var(--muted);padding:2rem;">No data available.</div>';
+    return;
+  }
+  const s = I.status;
+
+  // Phase badge
+  const phaseBadge = s.phase === 'phase2_ready'
+    ? '<span style="background:var(--green);color:#000;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">PHASE 2 READY</span>'
+    : s.phase === 'validating'
+    ? '<span style="background:#4a9eff;color:#000;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">VALIDATING</span>'
+    : '<span style="background:var(--amber);color:#000;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">SHADOW MODE</span>';
+
+  // Progress bar
+  const pct = Math.min(100, Math.round((s.shadow_signal_count / s.shadow_target) * 100));
+  const progressBar = `<div style="margin:12px 0;">
+    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px;">
+      <span>Closed signals with agent data</span>
+      <span>${s.shadow_signal_count} / ${s.shadow_target}</span>
+    </div>
+    <div style="background:var(--border);border-radius:4px;height:8px;overflow:hidden;">
+      <div style="background:var(--amber);height:100%;width:${pct}%;transition:width 0.3s;"></div>
+    </div>
+  </div>`;
+
+  // Criteria rows
+  const crit = s.criteria;
+  const critRows = [
+    [crit.enough_signals, '50+ closed signals with agent shadow data', s.shadow_signal_count + ' collected'],
+    [crit.positive_delta_better, 'shadow_delta > +5 shows higher win rate', crit.positive_delta_better === null ? 'insufficient data' : crit.positive_delta_better ? 'confirmed' : 'not yet'],
+    [crit.negative_delta_worse, 'shadow_delta < -5 shows lower win rate', crit.negative_delta_worse === null ? 'insufficient data' : crit.negative_delta_worse ? 'confirmed' : 'not yet'],
+    [crit.disagreement_penalty, 'high disagreement (>0.4) correlates with worse outcomes', crit.disagreement_penalty === null ? 'insufficient data' : crit.disagreement_penalty ? 'confirmed' : 'not yet'],
+    [crit.scan_time_ok, 'scan time within 10s of pre-agent baseline', crit.scan_time_ok ? 'ok' : 'exceeded'],
+  ].map(([pass, label, detail]) => `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
+    <span style="font-size:16px;color:${pass ? 'var(--green)' : 'var(--amber)'};min-width:20px;">${pass ? '&#10003;' : '&bull;'}</span>
+    <span style="flex:1;font-size:13px;">${label}</span>
+    <span style="font-size:11px;color:var(--muted);">${detail}</span>
+  </div>`).join('');
+
+  // Regime bars
+  const regimes = s.regime_distribution || {};
+  const totalRegime = Object.values(regimes).reduce((a, b) => a + b, 0) || 1;
+  const regimeColors = {volatile_squeeze: 'var(--red)', news_catalyst: 'var(--amber)', trending: 'var(--green)', choppy: 'var(--muted)', institutional: '#4a9eff', unknown: 'var(--border)'};
+  const regimeBars = Object.entries(regimes).map(([regime, count]) => {
+    const pct2 = totalRegime > 0 ? Math.round((count / totalRegime) * 100) : 0;
+    const color = regimeColors[regime] || 'var(--muted)';
+    return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <span style="min-width:120px;font-size:12px;color:var(--muted);">${regime.replace('_', ' ')}</span>
+      <svg width="160" height="12" style="flex-shrink:0;"><rect width="${Math.max(2, pct2 * 1.6)}" height="12" rx="2" fill="${color}"/></svg>
+      <span style="font-size:12px;color:var(--text);">${count} <span style="color:var(--muted);">(${pct2}%)</span></span>
+    </div>`;
+  }).join('');
+
+  // Delta distribution bars
+  const deltaRows = [
+    ['Strong boost (>+10)', s.delta_distribution.strong_boost, 'var(--green)'],
+    ['Mild boost (+1 to +10)', s.delta_distribution.mild_boost, '#7ecf88'],
+    ['Neutral (-1 to +1)', s.delta_distribution.neutral, 'var(--muted)'],
+    ['Mild penalty (-1 to -10)', s.delta_distribution.mild_penalty, '#cf8888'],
+    ['Strong penalty (<-10)', s.delta_distribution.strong_penalty, 'var(--red)'],
+  ];
+  const totalDelta = deltaRows.reduce((a, [, n]) => a + n, 0) || 1;
+  const deltaBars = deltaRows.map(([label, count, color]) => {
+    const pct3 = Math.round((count / totalDelta) * 100);
+    return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <span style="min-width:160px;font-size:12px;color:var(--muted);">${label}</span>
+      <svg width="120" height="12" style="flex-shrink:0;"><rect width="${Math.max(2, pct3 * 1.2)}" height="12" rx="2" fill="${color}"/></svg>
+      <span style="font-size:12px;color:var(--text);">${count}</span>
+    </div>`;
+  }).join('');
+
+  // Outcome correlation table
+  const oc = s.outcome_correlation || {};
+  const corrRows = ['win', 'loss', 'partial'].map(key => {
+    const d = oc[key] || {avg_delta: null, count: 0};
+    const val = d.count >= 10 && d.avg_delta !== null
+      ? (d.avg_delta > 0 ? '+' : '') + d.avg_delta.toFixed(2)
+      : '&mdash; insufficient data';
+    const color = d.avg_delta !== null && d.count >= 10
+      ? (d.avg_delta > 0 ? 'var(--green)' : 'var(--red)')
+      : 'var(--muted)';
+    return `<tr>
+      <td style="padding:6px 8px;font-size:13px;text-transform:uppercase;color:var(--muted);">${key}</td>
+      <td style="padding:6px 8px;font-size:13px;color:${color};font-weight:600;">${val}</td>
+      <td style="padding:6px 8px;font-size:12px;color:var(--muted);">${d.count} trades</td>
+    </tr>`;
+  }).join('');
+
+  // Suggestions section
+  let suggestionsHtml = '';
+  if (!I.learnerRunning || I.suggestions.length === 0) {
+    suggestionsHtml = `<div style="color:var(--muted);font-size:13px;margin-bottom:12px;">Learner not yet running. Start mt-learner.service on the VPS to enable strategy proposals and threshold suggestions.</div>
+    <pre style="background:var(--border);padding:12px;border-radius:4px;font-size:12px;overflow-x:auto;">systemctl start mt-learner
+systemctl status mt-learner
+journalctl -u mt-learner -f</pre>`;
+  } else {
+    suggestionsHtml = I.suggestions.map(sug => {
+      const isNewStrategy = sug.type === 'new_strategy';
+      const typeMap = {threshold: 'THRESHOLD', regime_suppress: 'REGIME SUPPRESS', new_strategy: 'NEW STRATEGY'};
+      const typeBadge = typeMap[sug.type] || (sug.type || '').toUpperCase();
+      const confColor = {low: 'var(--muted)', medium: 'var(--amber)', high: 'var(--green)'}[sug.confidence] || 'var(--muted)';
+      const statusBadge = sug.status === 'applied'
+        ? '<span style="background:var(--green);color:#000;padding:2px 6px;border-radius:3px;font-size:10px;">APPLIED</span>'
+        : sug.status === 'dismissed'
+        ? '<span style="background:var(--border);color:var(--muted);padding:2px 6px;border-radius:3px;font-size:10px;">DISMISSED</span>'
+        : '<span style="background:var(--amber);color:#000;padding:2px 6px;border-radius:3px;font-size:10px;">PENDING</span>';
+      const actionBtns = sug.status === 'pending' ? `
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <button onclick="intelligenceSuggestionAction('${sug.id}','apply')" style="background:var(--green);color:#000;border:none;padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;">Apply</button>
+          <button onclick="intelligenceSuggestionAction('${sug.id}','dismiss')" style="background:var(--border);color:var(--text);border:none;padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;">Dismiss</button>
+        </div>` : '';
+      const newStratExtra = isNewStrategy ? `
+        <div style="font-size:12px;color:var(--muted);margin-top:6px;">
+          <span style="color:var(--amber);">&#9888; NEW STRATEGY PROPOSAL &mdash; review carefully before applying</span><br>
+          Base: <strong>${sug.base_strategy || '&mdash;'}</strong> &nbsp;|&nbsp; Proposed: <strong>${(sug.proposed_name || (sug.api_payload && sug.api_payload.name) || '&mdash;')}</strong>
+        </div>` : '';
+      return `<div style="border:1px solid ${isNewStrategy ? 'var(--amber)' : 'var(--border)'};border-radius:6px;padding:14px;margin-bottom:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+          <span style="background:var(--surface);border:1px solid var(--border);padding:2px 7px;border-radius:3px;font-size:11px;color:var(--muted);">${typeBadge}</span>
+          <strong style="font-size:13px;">${sug.strategy || '&mdash;'}</strong>
+          ${statusBadge}
+        </div>
+        <div style="font-size:13px;margin-bottom:4px;">${sug.evidence_summary || ''}</div>
+        <div style="font-size:12px;color:var(--muted);">Based on ${sug.sample_size || 0} trades &nbsp;|&nbsp; Confidence: <span style="color:${confColor};text-transform:uppercase;">${sug.confidence || 'low'}</span></div>
+        ${newStratExtra}
+        ${actionBtns}
+      </div>`;
+    }).join('');
+  }
+
+  container.innerHTML = `
+    <!-- Shadow Validation -->
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+        <h3 style="margin:0;font-size:15px;">Agent Shadow Validation</h3>
+        ${phaseBadge}
+      </div>
+      ${progressBar}
+      ${critRows}
+      <div style="margin-top:12px;font-size:12px;color:var(--muted);">Phase 2 applies agent delta to conviction. Until then, all agent outputs are stored and studied only.</div>
+    </div>
+
+    <!-- Agent Findings -->
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
+      <h3 style="margin:0 0 14px;font-size:15px;">Agent Findings</h3>
+      <div style="margin-bottom:16px;">
+        <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Market Regimes Detected</div>
+        ${Object.values(regimes).reduce((a, b) => a + b, 0) === 0 ? '<div style="color:var(--muted);font-size:13px;">No agent data yet.</div>' : regimeBars}
+      </div>
+      <div style="margin-bottom:16px;">
+        <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Narrative vs Structural Alignment</div>
+        <div style="font-size:13px;margin-bottom:4px;">Narrative avg bull strength: <strong>${s.narrative_avg_bull !== null ? s.narrative_avg_bull : '&mdash;'}</strong></div>
+        <div style="font-size:13px;margin-bottom:4px;">Structural avg bull strength: <strong>${s.structural_avg_bull !== null ? s.structural_avg_bull : '&mdash;'}</strong></div>
+        <div style="font-size:13px;">Avg disagreement score: <strong>${s.avg_disagreement !== null ? s.avg_disagreement : '&mdash;'}</strong></div>
+      </div>
+      <div style="margin-bottom:16px;">
+        <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Shadow Delta Distribution</div>
+        ${deltaBars}
+      </div>
+      <div>
+        <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Early Correlation</div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead><tr>
+            <th style="text-align:left;padding:4px 8px;font-size:11px;color:var(--muted);font-weight:400;">Result</th>
+            <th style="text-align:left;padding:4px 8px;font-size:11px;color:var(--muted);font-weight:400;">Avg Shadow Delta</th>
+            <th style="text-align:left;padding:4px 8px;font-size:11px;color:var(--muted);font-weight:400;">N</th>
+          </tr></thead>
+          <tbody>${corrRows}</tbody>
+        </table>
+        <div style="margin-top:8px;font-size:11px;color:var(--amber);">&#9888; PRELIMINARY &mdash; sample size too small to draw conclusions</div>
+      </div>
+    </div>
+
+    <!-- Strategy Proposals -->
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;">
+      <h3 style="margin:0 0 14px;font-size:15px;">Strategy Proposals</h3>
+      ${suggestionsHtml}
+    </div>
+  `;
+}
+
+async function intelligenceSuggestionAction(id, action) {
+  try {
+    const res = await fetch(`/api/intelligence/suggestions/${id}`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action}),
+    });
+    const d = await res.json();
+    if (d.success) {
+      loadIntelligence();
+    } else {
+      alert('Action failed: ' + (d.error || 'unknown error'));
+    }
+  } catch(e) {
+    alert('Request failed: ' + e.message);
+  }
+}
 </script>
 
 <div id="guide-overlay" class="hidden">

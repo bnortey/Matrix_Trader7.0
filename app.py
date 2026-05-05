@@ -1915,7 +1915,109 @@ def enrich_signal(
                 sig["conviction"] = int(sig["conviction"] * 0.90)
         sig["conviction"] = max(0, min(100, sig["conviction"]))
 
+        # --- Agent Intelligence Layer (Phase 1 shadow mode) ---
+        # Agent deltas are recorded for forward testing, but are NOT applied to
+        # conviction in Phase 1. All blocks are shadow-tagged only — no conviction
+        # changes until Phase 2 validation is complete.
+        _agent_output = None
+        try:
+            from lib.agents import run_agent_pipeline
+
+            _exchange = (sig.get("exchange") or base.get("exchange") or "MEXC").upper()
+            _enriched = {
+                "rsi_1h": sig.get("rsi_1h"),
+                "trend_score": sig.get("trend_score"),
+                "atr_pct": sig.get("atr_pct"),
+                "volatility": sig.get("volatility"),
+                "direction": sig.get("direction"),
+                "change_4h_pct": sig.get("change_4h_pct"),
+                "change_1h_pct": sig.get("change_1h_pct"),
+                "basis_pct": sig.get("basis_pct") or base.get("basis_pct") or 0,
+                "kline_depth_1h": sig.get("kline_depth_1h"),
+                "kline_depth_4h": sig.get("kline_depth_4h"),
+                "data_quality": sig.get("data_quality"),
+                "leverage_cap": sig.get("leverage_cap"),
+            }
+            _agent_ticker = {
+                **base,
+                **sig,
+                "symbol": sig.get("symbol"),
+                "lastPrice": sig.get("price"),
+                "fairPrice": sig.get("price"),
+                "indexPrice": sig.get("price"),
+                "fundingRate": sig.get("funding_rate"),
+                "funding": sig.get("funding_rate"),
+                "holdVol": sig.get("open_interest"),
+                "openInterest": (
+                    (sig.get("open_interest") or 0) / sig.get("price")
+                    if _exchange == "HYPERLIQUID" and sig.get("price") else sig.get("open_interest")
+                ),
+                "volume24": sig.get("volume_24h"),
+                "dayNtlVlm": sig.get("volume_24h"),
+                "riseFallRate": (sig.get("change_24h_pct") or 0) / 100,
+                "markPx": sig.get("price"),
+                "oraclePx": sig.get("price"),
+                "midPx": sig.get("price"),
+                "name": sig.get("symbol", "").replace("_USDC", "").replace("_USDT", ""),
+                "maxLeverage": sig.get("leverage_cap"),
+            }
+            _agent_output = run_agent_pipeline(
+                exchange=_exchange,
+                ticker_data=_agent_ticker,
+                klines=df,
+                depth_data={
+                    "imbalance": imbalance,
+                    "bid_depth_usd": 0,
+                    "ask_depth_usd": 0,
+                },
+                enriched_fields=_enriched,
+                timeout=8.0,
+            )
+        except Exception as _ae:
+            print(f"[agents] {symbol}: {_ae}", file=sys.stderr)
+
+        if _agent_output:
+            # Phase 1 shadow mode: record blocks/tags but never touch conviction
+            if _agent_output.hard_blocked:
+                sig["tags"] = list(dict.fromkeys(
+                    sig["tags"] + ["agent_blocked"] + _agent_output.block_reasons
+                ))
+            else:
+                shadow_tags = [
+                    f"agent_shadow_{t}"
+                    for t in _agent_output.tags
+                    if not t.startswith("agent_shadow_")
+                ]
+                sig["tags"] = list(dict.fromkeys(sig["tags"] + shadow_tags))
+
+        sig.update({
+            "agent_exchange": _agent_output.exchange if _agent_output else None,
+            "agent_regime": _agent_output.detected_regime if _agent_output else None,
+            "agent_narrative_bull": (
+                _agent_output.narrative_bull_strength if _agent_output else None
+            ),
+            "agent_structural_bull": (
+                _agent_output.structural_bull_strength if _agent_output else None
+            ),
+            "agent_blocked": _agent_output.hard_blocked if _agent_output else None,
+            "agent_version": _agent_output.agent_version if _agent_output else None,
+            "agent_shadow_delta": _agent_output.shadow_delta if _agent_output else None,
+            "agent_shadow_narrative_delta": (
+                _agent_output.shadow_narrative_delta if _agent_output else None
+            ),
+            "agent_shadow_structural_delta": (
+                _agent_output.shadow_structural_delta if _agent_output else None
+            ),
+            "agent_shadow_disagreement": (
+                _agent_output.shadow_disagreement_score if _agent_output else None
+            ),
+        })
+
         sig["signal_why"] = why_signal(sig)
+        if _agent_output and _agent_output.composite_reasoning:
+            sig["signal_why"] = (
+                f"{sig['signal_why']} | [Agent] {_agent_output.composite_reasoning}"
+            )
         sig["ai_report"]  = generate_report(sig)
 
         # Sentiment enrichment — no API key needed; per-field failures are
@@ -2491,7 +2593,7 @@ def compute_trade_journey(sig: dict, pnl_pct: float | None = None) -> dict:
     Analyze the candle path between signal log and close.
 
     Uses Min15 candles to compute MAE/MFE, target timing, stop pressure, and
-    capture ratio. If MEXC no longer has the kline window, returns an
+    capture ratio. If the exchange no longer has the kline window, returns an
     unavailable journey instead of failing the detail route.
     """
     symbol = sig.get("symbol")
@@ -2509,18 +2611,19 @@ def compute_trade_journey(sig: dict, pnl_pct: float | None = None) -> dict:
     end_ts = int(result_dt.timestamp())
     limit = min(300, max(20, int((end_ts - start_ts) / 900) + 6))
 
-    klines = fetch_mexc(f"/contract/kline/{symbol}", params={
-        "interval": "Min15",
-        "start": start_ts,
-        "limit": limit,
-    })
-    if not klines or not isinstance(klines, dict):
+    klines = _fetch_klines_for_signal(
+        sig,
+        interval="Min15",
+        start_ts=start_ts,
+        limit=limit,
+    )
+    if klines.empty:
         return {"available": False, "reason": "kline history unavailable"}
 
-    raw_times = klines.get("time", [])
-    raw_highs = klines.get("high", [])
-    raw_lows = klines.get("low", [])
-    raw_closes = klines.get("close", [])
+    raw_times = klines["timestamp"].tolist()
+    raw_highs = klines["high"].tolist()
+    raw_lows = klines["low"].tolist()
+    raw_closes = klines["close"].tolist()
     candles: list[dict] = []
     for i, t in enumerate(raw_times):
         try:
@@ -2765,6 +2868,80 @@ def expire_stale_signals() -> int:
         return 0
 
 
+def _fetch_klines_for_signal(
+    sig: dict,
+    interval: str = "Min15",
+    limit: int = 300,
+    start_ts: int | None = None,
+) -> "pd.DataFrame":
+    """
+    Fetch klines for a signal using the correct exchange client.
+    Routes to Hyperliquid or MEXC based on sig.get('exchange').
+    Returns a DataFrame with columns: [timestamp, open, high, low, close, volume].
+    Returns empty DataFrame on any error — never raises.
+    Callers must check df.empty before using.
+    """
+    exchange = (sig.get("exchange") or "MEXC").upper()
+    symbol   = sig.get("symbol", "")
+
+    if exchange == "HYPERLIQUID":
+        coin = symbol.replace("_USDT", "").replace("_USDC", "")
+        interval_map = {
+            "Min1":  "1m",  "Min5":  "5m",  "Min15": "15m",
+            "Min30": "30m", "Min60": "1h",  "Hour4": "4h",
+            "Hour8": "8h",  "Day1":  "1d",
+        }
+        hl_interval = interval_map.get(interval, "15m")
+        hours_per_candle = {
+            "1m": 1/60, "5m": 5/60, "15m": 0.25, "30m": 0.5,
+            "1h": 1, "4h": 4, "8h": 8, "1d": 24,
+        }
+        lookback = int(limit * hours_per_candle.get(hl_interval, 0.25) * 1.2)
+        try:
+            raw = fetch_hl_klines(coin, hl_interval, lookback_hours=max(lookback, 24))
+            if not raw:
+                return pd.DataFrame()
+            df = pd.DataFrame(raw)
+            df = df.rename(columns={
+                "t": "timestamp", "o": "open", "h": "high",
+                "l": "low",       "c": "close", "v": "volume",
+            })
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.sort_values("timestamp").tail(limit).reset_index(drop=True)
+            print(f"[hl_klines] {symbol} fetched {len(df)} {hl_interval} candles", file=sys.stderr)
+            return df
+        except Exception as e:
+            print(f"[hl_klines] {symbol} error: {e}", file=sys.stderr)
+            return pd.DataFrame()
+
+    else:
+        # MEXC path — mirrors existing fetch_mexc kline call
+        try:
+            params: dict = {"interval": interval, "limit": limit}
+            if start_ts is not None:
+                params["start"] = start_ts
+            raw = fetch_mexc(f"/contract/kline/{symbol}", params=params)
+            if not raw or not isinstance(raw, dict):
+                return pd.DataFrame()
+            df = pd.DataFrame({
+                "timestamp": raw.get("time",  []),
+                "open":      raw.get("open",  []),
+                "high":      raw.get("high",  []),
+                "low":       raw.get("low",   []),
+                "close":     raw.get("close", []),
+                "volume":    raw.get("vol",   []),
+            })
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            print(f"[mexc_klines] {symbol} fetched {len(df)} {interval} candles", file=sys.stderr)
+            return df
+        except Exception as e:
+            print(f"[mexc_klines] {symbol} error: {e}", file=sys.stderr)
+            return pd.DataFrame()
+
+
 def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str | None] | None:
     """
     Fetch Min15 klines since the signal was logged and determine if stop or TP was hit.
@@ -2805,18 +2982,19 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
     if time.time() - start_ts < 900:
         return None
 
-    klines = fetch_mexc(f"/contract/kline/{symbol}", params={
-        "interval": "Min15",
-        "start":    start_ts,
-        "limit":    300,   # 300 × 15min = ~75 hours of coverage
-    })
-    if not klines or not isinstance(klines, dict):
+    klines = _fetch_klines_for_signal(
+        sig,
+        interval="Min15",
+        start_ts=start_ts,
+        limit=300,   # 300 × 15min = ~75 hours of coverage
+    )
+    if klines.empty:
         return None
 
-    raw_times  = klines.get("time",  [])
-    raw_highs  = klines.get("high",  [])
-    raw_lows   = klines.get("low",   [])
-    raw_closes = klines.get("close", [])
+    raw_times  = klines["timestamp"].tolist()
+    raw_highs  = klines["high"].tolist()
+    raw_lows   = klines["low"].tolist()
+    raw_closes = klines["close"].tolist()
     if not raw_times or not raw_highs or not raw_lows or not raw_closes:
         return None
 
@@ -2980,9 +3158,14 @@ def api_outcomes_check():
     try:
         con  = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT * FROM signals WHERE result IS NULL ORDER BY logged_at ASC"
-        ).fetchall()
+        rows = con.execute("""
+            SELECT id, symbol, exchange, direction,
+                   entry1, entry2, entry3, tp1, tp2, tp3, stop_loss,
+                   logged_at, entry_at, leverage, strategy_key, signal_json
+            FROM signals
+            WHERE result IS NULL
+            ORDER BY logged_at ASC
+        """).fetchall()
         con.close()
 
         open_sigs = [dict(r) for r in rows]
@@ -4232,6 +4415,311 @@ def api_account_balance():
         return jsonify({"success": True, "connected": True, "balance": assets})
     except Exception as e:
         return jsonify({"success": True, "connected": False, "balance": None, "reason": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Intelligence tab routes
+# ---------------------------------------------------------------------------
+
+@app.route('/api/intelligence/status')
+def api_intelligence_status():
+    """Shadow validation status and agent findings from signals.db."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        # Count closed signals with agent shadow data
+        cur.execute("""
+            SELECT COUNT(*) FROM signals
+            WHERE result IS NOT NULL
+            AND json_extract(signal_json, '$.agent_regime') IS NOT NULL
+        """)
+        shadow_signal_count = cur.fetchone()[0] or 0
+
+        shadow_target = 50
+        phase = 'shadow'
+        if shadow_signal_count >= shadow_target:
+            phase = 'validating'
+
+        # Criteria — null = insufficient data
+        enough_signals = shadow_signal_count >= shadow_target
+
+        positive_delta_better = None
+        negative_delta_worse = None
+        disagreement_penalty = None
+
+        if shadow_signal_count >= 10:
+            try:
+                cur.execute("""
+                    SELECT
+                        AVG(CASE WHEN json_extract(signal_json, '$.agent_shadow_delta') > 5
+                            AND result = 'WIN' THEN 1.0
+                            WHEN json_extract(signal_json, '$.agent_shadow_delta') > 5
+                            AND result IN ('LOSS','EXPIRED') THEN 0.0
+                            END) as pos_wr,
+                        AVG(CASE WHEN json_extract(signal_json, '$.agent_shadow_delta') <= 5
+                            AND result = 'WIN' THEN 1.0
+                            WHEN json_extract(signal_json, '$.agent_shadow_delta') <= 5
+                            AND result IN ('LOSS','EXPIRED') THEN 0.0
+                            END) as base_wr
+                    FROM signals
+                    WHERE result IS NOT NULL
+                    AND json_extract(signal_json, '$.agent_shadow_delta') IS NOT NULL
+                """)
+                row = cur.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    positive_delta_better = row[0] > row[1]
+            except Exception:
+                pass
+
+            try:
+                cur.execute("""
+                    SELECT
+                        AVG(CASE WHEN json_extract(signal_json, '$.agent_shadow_delta') < -5
+                            AND result = 'WIN' THEN 1.0
+                            WHEN json_extract(signal_json, '$.agent_shadow_delta') < -5
+                            AND result IN ('LOSS','EXPIRED') THEN 0.0
+                            END) as neg_wr,
+                        AVG(CASE WHEN json_extract(signal_json, '$.agent_shadow_delta') >= -5
+                            AND result = 'WIN' THEN 1.0
+                            WHEN json_extract(signal_json, '$.agent_shadow_delta') >= -5
+                            AND result IN ('LOSS','EXPIRED') THEN 0.0
+                            END) as base_wr
+                    FROM signals
+                    WHERE result IS NOT NULL
+                    AND json_extract(signal_json, '$.agent_shadow_delta') IS NOT NULL
+                """)
+                row = cur.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    negative_delta_worse = row[0] < row[1]
+            except Exception:
+                pass
+
+            try:
+                cur.execute("""
+                    SELECT
+                        AVG(CASE WHEN json_extract(signal_json, '$.agent_shadow_disagreement') > 0.4
+                            AND result = 'WIN' THEN 1.0
+                            WHEN json_extract(signal_json, '$.agent_shadow_disagreement') > 0.4
+                            AND result IN ('LOSS','EXPIRED') THEN 0.0
+                            END) as hi_dis_wr,
+                        AVG(CASE WHEN (json_extract(signal_json, '$.agent_shadow_disagreement') <= 0.4
+                            OR json_extract(signal_json, '$.agent_shadow_disagreement') IS NULL)
+                            AND result = 'WIN' THEN 1.0
+                            WHEN (json_extract(signal_json, '$.agent_shadow_disagreement') <= 0.4
+                            OR json_extract(signal_json, '$.agent_shadow_disagreement') IS NULL)
+                            AND result IN ('LOSS','EXPIRED') THEN 0.0
+                            END) as lo_dis_wr
+                    FROM signals
+                    WHERE result IS NOT NULL
+                    AND json_extract(signal_json, '$.agent_shadow_disagreement') IS NOT NULL
+                """)
+                row = cur.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    disagreement_penalty = row[0] < row[1]
+            except Exception:
+                pass
+
+        # scan_time_ok: placeholder — true if we have no evidence of timeout
+        scan_time_ok = True
+
+        if enough_signals and positive_delta_better and negative_delta_worse and disagreement_penalty and scan_time_ok:
+            phase = 'phase2_ready'
+
+        # Regime distribution
+        regime_distribution = {r: 0 for r in ['volatile_squeeze', 'news_catalyst', 'trending', 'choppy', 'institutional', 'unknown']}
+        try:
+            cur.execute("""
+                SELECT json_extract(signal_json, '$.agent_regime') as regime, COUNT(*) as cnt
+                FROM signals
+                WHERE json_extract(signal_json, '$.agent_regime') IS NOT NULL
+                GROUP BY regime
+            """)
+            for row in cur.fetchall():
+                regime = row[0] if row[0] in regime_distribution else 'unknown'
+                regime_distribution[regime] = regime_distribution.get(regime, 0) + row[1]
+        except Exception:
+            pass
+
+        # Narrative / structural averages
+        narrative_avg_bull = None
+        structural_avg_bull = None
+        avg_disagreement = None
+        try:
+            cur.execute("""
+                SELECT
+                    AVG(CAST(json_extract(signal_json, '$.agent_narrative_bull') AS REAL)),
+                    AVG(CAST(json_extract(signal_json, '$.agent_structural_bull') AS REAL)),
+                    AVG(CAST(json_extract(signal_json, '$.agent_shadow_disagreement') AS REAL))
+                FROM signals
+                WHERE json_extract(signal_json, '$.agent_regime') IS NOT NULL
+            """)
+            row = cur.fetchone()
+            if row:
+                narrative_avg_bull = round(row[0], 3) if row[0] is not None else None
+                structural_avg_bull = round(row[1], 3) if row[1] is not None else None
+                avg_disagreement = round(row[2], 3) if row[2] is not None else None
+        except Exception:
+            pass
+
+        # Delta distribution
+        delta_distribution = {'strong_boost': 0, 'mild_boost': 0, 'neutral': 0, 'mild_penalty': 0, 'strong_penalty': 0}
+        try:
+            cur.execute("""
+                SELECT json_extract(signal_json, '$.agent_shadow_delta') as d
+                FROM signals
+                WHERE json_extract(signal_json, '$.agent_shadow_delta') IS NOT NULL
+            """)
+            for row in cur.fetchall():
+                d = row[0]
+                if d is None:
+                    continue
+                d = float(d)
+                if d > 10:
+                    delta_distribution['strong_boost'] += 1
+                elif d > 1:
+                    delta_distribution['mild_boost'] += 1
+                elif d >= -1:
+                    delta_distribution['neutral'] += 1
+                elif d >= -10:
+                    delta_distribution['mild_penalty'] += 1
+                else:
+                    delta_distribution['strong_penalty'] += 1
+        except Exception:
+            pass
+
+        # Outcome correlation
+        outcome_correlation = {
+            'win': {'avg_delta': None, 'count': 0},
+            'loss': {'avg_delta': None, 'count': 0},
+            'partial': {'avg_delta': None, 'count': 0},
+        }
+        try:
+            cur.execute("""
+                SELECT result,
+                    AVG(CAST(json_extract(signal_json, '$.agent_shadow_delta') AS REAL)) as avg_d,
+                    COUNT(*) as cnt
+                FROM signals
+                WHERE result IS NOT NULL
+                AND json_extract(signal_json, '$.agent_shadow_delta') IS NOT NULL
+                AND result IN ('WIN','LOSS','PARTIAL')
+                GROUP BY result
+            """)
+            for row in cur.fetchall():
+                key = row[0].lower()
+                if key in outcome_correlation:
+                    outcome_correlation[key]['avg_delta'] = round(row[1], 3) if row[1] is not None else None
+                    outcome_correlation[key]['count'] = row[2]
+        except Exception:
+            pass
+
+        conn.close()
+        return jsonify({
+            'success': True,
+            'phase': phase,
+            'shadow_signal_count': shadow_signal_count,
+            'shadow_target': shadow_target,
+            'criteria': {
+                'enough_signals': enough_signals,
+                'positive_delta_better': positive_delta_better,
+                'negative_delta_worse': negative_delta_worse,
+                'disagreement_penalty': disagreement_penalty,
+                'scan_time_ok': scan_time_ok,
+            },
+            'regime_distribution': regime_distribution,
+            'narrative_avg_bull': narrative_avg_bull,
+            'structural_avg_bull': structural_avg_bull,
+            'avg_disagreement': avg_disagreement,
+            'delta_distribution': delta_distribution,
+            'outcome_correlation': outcome_correlation,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/intelligence/suggestions')
+def api_intelligence_suggestions():
+    """Read pending.json from the external learner service."""
+    pending_path = '/opt/mt-learner/suggestions/pending.json'
+    heartbeat_path = '/opt/mt-learner/logs/last_heartbeat.txt'
+    learner_running = False
+
+    if os.path.exists(heartbeat_path):
+        try:
+            mtime = os.path.getmtime(heartbeat_path)
+            learner_running = (datetime.utcnow().timestamp() - mtime) < 600
+        except Exception:
+            pass
+
+    if not os.path.exists(pending_path):
+        return jsonify({'success': True, 'suggestions': [], 'learner_running': learner_running})
+
+    try:
+        with open(pending_path, 'r') as f:
+            data = json.load(f)
+        suggestions = data.get('suggestions', [])
+        return jsonify({'success': True, 'suggestions': suggestions, 'learner_running': learner_running})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'suggestions': [], 'learner_running': learner_running})
+
+
+@app.route('/api/intelligence/suggestions/<suggestion_id>', methods=['PATCH'])
+def api_intelligence_suggestion_action(suggestion_id):
+    """Apply or dismiss a learner suggestion."""
+    pending_path = '/opt/mt-learner/suggestions/pending.json'
+    data = request.get_json() or {}
+    action = data.get('action')
+    if action not in ('apply', 'dismiss'):
+        return jsonify({'success': False, 'error': 'action must be apply or dismiss'}), 400
+
+    if not os.path.exists(pending_path):
+        return jsonify({'success': False, 'error': 'pending.json not found'}), 404
+
+    try:
+        with open(pending_path, 'r') as f:
+            pending = json.load(f)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'failed to read pending.json: {e}'}), 500
+
+    suggestions = pending.get('suggestions', [])
+    suggestion = next((s for s in suggestions if s.get('id') == suggestion_id), None)
+    if not suggestion:
+        return jsonify({'success': False, 'error': 'suggestion not found'}), 404
+
+    if action == 'dismiss':
+        suggestion['status'] = 'dismissed'
+    elif action == 'apply':
+        stype = suggestion.get('type')
+        payload = suggestion.get('api_payload', {})
+        strategy_key = suggestion.get('strategy')
+        try:
+            if stype == 'new_strategy':
+                with app.test_client() as c:
+                    r = c.post('/api/strategies/custom',
+                               data=json.dumps(payload),
+                               content_type='application/json')
+                    if r.status_code not in (200, 201):
+                        return jsonify({'success': False, 'error': 'failed to create strategy'}), 500
+            elif stype in ('threshold', 'regime_suppress') and strategy_key:
+                with app.test_client() as c:
+                    r = c.patch(f'/api/strategies/custom/{strategy_key}',
+                                data=json.dumps(payload),
+                                content_type='application/json')
+                    if r.status_code not in (200, 201):
+                        return jsonify({'success': False, 'error': 'failed to update strategy'}), 500
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+        suggestion['status'] = 'applied'
+
+    tmp_path = pending_path + '.tmp'
+    try:
+        with open(tmp_path, 'w') as f:
+            json.dump(pending, f, indent=2)
+        os.replace(tmp_path, pending_path)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'failed to write pending.json: {e}'}), 500
+
+    return jsonify({'success': True, 'applied': action == 'apply', 'suggestion_id': suggestion_id})
 
 
 # ---------------------------------------------------------------------------

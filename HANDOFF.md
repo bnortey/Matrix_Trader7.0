@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-03
-Last commit: 92514c2 feat: enrich_signal() routes klines/depth/daily to HL client when exchange=HYPERLIQUID
-app.py: 4275 lines
-index.html: 5755 lines
+Last updated: 2026-05-05
+Last commit: be2a9a2 feat: Hyperliquid integration — scan routes, account route, exchange selector, HL badge, connection status
+app.py: 4458 lines
+index.html: 5772 lines
 
 ---
 
@@ -96,6 +96,12 @@ Matrix_Trader_7.0/
 │   ├── signals.db         ← SQLite signal history; auto-created by init_db()
 │   └── backtest_results.json ← written by backtest.py
 └── lib/                   ← pure utility functions only; no Flask, no API calls
+    ├── agents.py          ← 8-analyst Phase 1 shadow agent layer
+    ├── exchange_context.py ← canonical exchange-agnostic data contract
+    ├── adapters/          ← exchange normalization registry
+    │   ├── __init__.py
+    │   ├── mexc.py
+    │   └── hyperliquid.py
     ├── indicators.py      ← RSI, EMA, VWAP, ATR
     ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
     ├── mexc_stream.py     ← WebSocket client — not used by SSE route (P3e used poll loop)
@@ -288,6 +294,18 @@ Full dict returned by `enrich_signal()` and sent to the frontend:
   "kline_depth_1h":       int,    # number of 1h candles available
   "kline_depth_4h":       int,    # number of 4h candles available
   "data_quality":         str,    # "low" if thin history; "current" otherwise
+
+  # Agent shadow layer (Phase 1 — stored, not applied to conviction)
+  "agent_exchange":                str | None,
+  "agent_regime":                  str | None,
+  "agent_narrative_bull":          float | None,
+  "agent_structural_bull":         float | None,
+  "agent_blocked":                 bool | None,   # deterministic Risk Manager block
+  "agent_version":                 str | None,    # "v2-phase1-shadow"
+  "agent_shadow_delta":            int | None,    # computed delta, not applied in Phase 1
+  "agent_shadow_narrative_delta":  int | None,
+  "agent_shadow_structural_delta": int | None,
+  "agent_shadow_disagreement":     float | None,
 }
 ```
 
@@ -549,10 +567,11 @@ Review that panel before beginning any execution phase. You decide when to proce
 the system surfaces the data, it does not block you.
 
 Next in priority order:
-1. Deploy P8 — account routes + readiness tracker (this session)
-2. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
-3. Review short_vol_short gate after 2+ more weeks of shadow data
-4. Run python3 analyze.py on VPS DB weekly to track strategy edge
+1. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes)
+2. Run `python3 analyze.py` on VPS DB weekly to track strategy edge
+3. Review `short_vol_short` gate after 2+ more weeks of shadow data
+4. Begin P9 (execution readiness layer) when agent shadow validation is ready
+5. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
 
 ---
 
@@ -583,6 +602,32 @@ Next in priority order:
 **QA fixes — exchange-scoped Signals and Market.** Signals now keeps separate result caches per exchange (`H.scanResultsByExchange`), so switching MEXC ↔ Hyperliquid swaps to that exchange's visible signals or a clean idle state instead of leaving stale signals from the previous exchange. Mid-scan exchange switches are guarded: completed results are stored under the exchange that launched the scan and do not overwrite the currently selected exchange view. Market tab now has the same MEXC / Hyperliquid exchange pills, exchange-keyed pair cache (`M.pairsByExchange`), and `GET /api/market?exchange=<key>` routing. Hyperliquid market rows use normalized HL tickers and show the blue `HL` badge; Market click-to-enrich passes `?exchange=<key>` so HL rows do not resolve through MEXC. Hyperliquid symbols now use `_USDC` in MT7 because Hyperliquid perps settle/quote in USDC; external sentiment lookup still maps major HL coins to USDT venues for cross-exchange context.
 
 **Auto-refresh.** Signals keep the manual Scan button, and after an exchange has been scanned once, the currently selected exchange auto-scans every 5 minutes (`SIGNAL_AUTO_REFRESH_MS`). Market keeps manual Load/Retry, and after the selected exchange has been loaded once, the active Market tab auto-refreshes the currently selected exchange every 60 seconds (`MARKET_AUTO_REFRESH_MS`). Auto-refresh skips while an existing scan/load is in progress and does not trigger for exchanges that have not been manually loaded/scanned yet.
+
+**Hyperliquid outcome evaluation.** Resolved the limitation where Hyperliquid signals stayed open because the background evaluator always fetched MEXC klines. Added `_fetch_klines_for_signal(sig, interval, limit, start_ts)` immediately before `evaluate_outcome()`; it routes MEXC signals to `fetch_mexc("/contract/kline/...")`, Hyperliquid signals to `fetch_hl_klines()`, and defaults missing/empty `exchange` to MEXC. `evaluate_outcome()` and `compute_trade_journey()` now consume the helper DataFrame instead of fetching klines directly. `/api/outcomes/check` now explicitly selects `exchange` for open signal evaluation. No evaluation, scoring, frontend, route, or `position_events` lifecycle logic changed.
+
+## Session Summary — 2026-05-05
+
+**Agent shadow mode fix.** Codex had introduced a contradiction: the comment said "Phase 1 shadow mode — deltas not applied to conviction" but the code did `sig["conviction"] -= 30` when `hard_blocked=True`. The MEXC adapter's `adl_risk = oi_vol_ratio >= 15` fires on many normal pairs, so nearly every signal was getting hard-blocked, dropping conviction below the 55 threshold, and producing zero signals on every scan. Fixed by removing the conviction penalty entirely — agent hard blocks now only add tags (`agent_blocked`, block reasons) and never touch conviction in Phase 1. **Do not re-add the -30 conviction penalty for hard blocks without a validated Phase 2 dataset.**
+
+**Tag tooltips.** Added hover descriptions to all signal tags on signal cards and in the detail panel. Previously only core tags had `title` attributes; agent shadow tags, risk gate shadow tags, and `agent_blocked` had no tooltip text. Added specific descriptions for all named agent shadow tags plus a generic fallback for any unknown `agent_shadow_*` tag.
+
+**README rewrite.** Updated README.md to reflect current state: Hyperliquid exchange, agent shadow layer, risk gates, CoinGlass, symbol penalties, Bot Readiness panel, correct `lib/` structure, and updated env var table.
+
+**analyze.py audit run.** 800 closed signals analyzed. Key findings: Funding Arb is the strongest strategy (27-31% win rate, positive at all volatility levels). Balanced only profitable at conviction 65+. Momentum Breakout bleeding at extreme vol. Zero signals have agent shadow data yet — all 800 were closed before the agent layer shipped. KAT_USDT is the top blacklist candidate (-$2,091 total P&L across 3 strategies, 15 trades).
+
+**Deployed to VPS** at commit `be2a9a2` base + May 5 fixes. All lib files confirmed present. Service active.
+
+---
+
+## Session Summary — 2026-05-04
+
+**Phase 1 Agent Shadow Layer.** Added the exchange adapter foundation for multi-venue agent intelligence: `lib/exchange_context.py` defines the canonical `ExchangeContext`, `lib/adapters/` normalizes MEXC and Hyperliquid into that contract, and `lib/agents.py` runs the 8-analyst hybrid pipeline through `call_ai()` only. Agents receive normalized context and already-computed enrich fields; they never import from `app.py` and never make exchange API calls.
+
+**Shadow behavior.** `enrich_signal()` now runs `run_agent_pipeline()` after existing stage-2 enrichment and CoinGlass adjustments, then stores `agent_exchange`, `agent_regime`, `agent_narrative_bull`, `agent_structural_bull`, `agent_version`, `agent_shadow_delta`, `agent_shadow_narrative_delta`, `agent_shadow_structural_delta`, and `agent_shadow_disagreement` in the signal dict so they persist inside `signal_json`. Phase 1 does not apply agent conviction deltas. Agent tags are prefixed as `agent_shadow_*`. Deterministic Risk Manager hard blocks still reduce conviction by 30 and add `agent_blocked` plus block reasons because those are math/risk checks, not LLM judgement.
+
+**Phase 2 unlock criteria.** Do not apply `agent_shadow_delta` to conviction until at least 50 closed forward-tested signals have agent shadow data, `shadow_delta > +5` shows higher win rate than baseline, `shadow_delta < -5` shows lower win rate than baseline, `shadow_disagreement > 0.4` correlates with worse outcomes, and scan time remains within 10 seconds of the pre-agent baseline.
+
+**TradingView Hyperliquid chart fix.** `toTVSymbol()` no longer uses invalid `HYPERLIQUID:` symbols. Hyperliquid rows now route to `BINANCE:<coin>USDT.PERP` as the closest valid TradingView approximation.
 
 ---
 
@@ -629,6 +674,14 @@ Recommended next step: deploy P6a, verify `COINGLASS_API_KEY` is present on the 
 - Do not write innerHTML directly to `$('detail-panel')` — write to `$('panel-body')` only.
 - Do not call MEXC kline endpoints for Hyperliquid signals — check `exchange` in `enrich_signal()` and route HYPERLIQUID klines to `fetch_hl_klines()`.
 - Do not mix `HL_WALLET_ADDRESS` with `MEXC_API_KEY` / `MEXC_API_SECRET` — these are separate read systems for separate exchanges.
+- Do not fetch klines directly inside `evaluate_outcome()` or `compute_trade_journey()` — always use `_fetch_klines_for_signal(sig, interval, limit, start_ts)` so exchange routing is handled in one place.
+- Do not assume `sig.exchange` is always set — default to MEXC when it is `None` or an empty string.
+- Do not let agents read raw exchange dicts directly — normalize through `lib/adapters` into `ExchangeContext` first.
+- Do not import from `app.py` inside `lib/agents.py`, `lib/exchange_context.py`, or any `lib/adapters/*` file.
+- Do not call LLM providers directly from agents — use `call_ai()` from `lib/ai_client.py` only.
+- Do not apply `agent_shadow_delta` to conviction in Phase 1. Store it in `signal_json` and validate it first.
+- Do not add SQLite columns for agent fields — all Phase 1 agent output belongs in the signal dict and persists through `signal_json`.
+- Do not make MEXC or Hyperliquid API calls inside agents — use data passed from `enrich_signal()` and adapter normalization.
 - Do not add `onclick="showClosedDetail(...)"` to open-positions rows — those use `showPositionDetail()`.
 - Do not call any AI provider directly from routes — always use `call_ai()` from `lib/ai_client.py`.
 - Do not write TP/SL events to `position_events` for signals without a prior `ENTRY_FILLED` event. `evaluate_outcome()` enforces this gate (`entry_hit` must be True before any TP/SL log call is reached). See P5c.
