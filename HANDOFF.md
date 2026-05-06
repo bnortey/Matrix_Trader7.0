@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-05
-Last commit: be2a9a2 feat: Hyperliquid integration — scan routes, account route, exchange selector, HL badge, connection status
-app.py: 4458 lines
-index.html: 5772 lines
+Last updated: 2026-05-06
+Last commit: 0014cc3 feat: raise conviction floors — balanced 55→65, funding_arb 60→76
+app.py: 4763 lines
+index.html: 6017 lines
 
 ---
 
@@ -563,7 +563,7 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P7a | CoinGlass signal enrichment: cross-exchange funding confirmation (Funding Arb), liquidation asymmetry soft modifier, OI/MCap fragility tag — all shadow-only, no hard gates | ✅ Done |
 | P7b | Strategy lifecycle controls: built-in pause/resume, direction lock filter, volatility allowlist filter for custom strategies | ✅ Done |
 | P4 | README updated and published to GitHub | ✅ Done (beta testers TBD) |
-| P8 | MEXC read-only account integration + Bot Readiness tracker panel in Strategies tab | ⏳ Pending |
+| P8 | MEXC read-only account integration + Bot Readiness tracker panel in Strategies tab | ✅ Done (MEXC private API blocked by Akamai/CDN from Hetzner VPS — routes fail-closed gracefully; works from local Mac) |
 | P9 | Execution readiness layer — pre-flight validation, position sizing, risk budget checks, max loss gate. New lib/execution_engine.py and lib/risk_controls.py. | ⏳ Pending |
 | P10 | Paper bot mode — simulated order lifecycle with fill simulation, fee/funding modeling. Distinct from current candle-based paper tracking. | ⏳ Pending |
 | P11 | Assisted live trading — user-approved order placement, tiny size, full execution logging, kill switch mandatory, one strategy only. | ⏳ Pending |
@@ -578,13 +578,29 @@ Review that panel before beginning any execution phase. You decide when to proce
 the system surfaces the data, it does not block you.
 
 Next in priority order:
-1. Monitor mt-learner — check `journalctl -u mt-learner` daily for the first week; confirm heartbeat file is updating
-2. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes)
-3. After 50+ closed signals with agent data, review Intelligence tab Shadow Validation section for Phase 2 readiness
+1. Begin P9 — execution readiness layer (brainstorm in progress)
+2. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes — at 0/50)
+3. After 50+ closed signals with agent data, review Intelligence tab Shadow Validation for Phase 2 readiness
 4. Run `python3 analyze.py` on VPS DB weekly to track strategy edge
 5. Review `short_vol_short` gate after 2+ more weeks of shadow data
-6. Begin P9 (execution readiness layer) when agent shadow validation is ready
+6. Monitor mt-learner — `journalctl -u mt-learner` weekly; learner re-analyzes automatically
 7. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
+
+---
+
+## Session Summary — 2026-05-06
+
+**VPS audit.** Confirmed agent shadow layer live (10 agent fields in scan output, `agent_version: v2-phase1-shadow`). 0 historical signals have agent data — expected, all 853 closed before May 4 deployment. Scan time flagged at 14.4s (exceeds 10s Phase 2 gate — agents make LLM calls per signal; deferred fix). TradingView Hyperliquid fix confirmed deployed. VPS healthy: 2.9 GB RAM free, 4% disk.
+
+**Intelligence tab shipped.** Added 6th tab to index.html with three sections: Shadow Validation status (phase badge, progress bar, 5 criterion rows), Agent Findings (regime distribution bars, narrative/structural alignment, shadow delta distribution, early outcome correlation), Strategy Proposals (learner suggestions with Apply/Dismiss). Backend: `GET /api/intelligence/status` reads agent fields from signal_json via json_extract; `GET /api/intelligence/suggestions` reads `/opt/mt-learner/suggestions/pending.json`; `PATCH /api/intelligence/suggestions/<id>` applies or dismisses suggestions. State object `const I = {}` added after A. Fixed `get_db()` → `sqlite3.connect(DB_PATH)` bug introduced by subagent. Committed `9256b30`.
+
+**External learner (mt-learner) deployed.** Created `/opt/mt-learner/` on VPS — standalone Python service reading signals.db read-only. `analyzer.py` computes feature weights, threshold optimization, regime performance. `suggester.py` generates `pending.json` only when shadow mode thresholds are met (80+ trades for threshold, 50+ for regime suppress, 100+ for new strategy). `learner.py` scheduler: job_feature every 30min, job_threshold every 2hr, job_regime every 6hr, job_proposal every 24hr. Systemd unit `mt-learner.service` active and running. First suggestion live: raise balanced min conviction 55→65 (98-trade high-confidence finding). Committed `01aaa1b`.
+
+**Learner findings actioned.** Applied two threshold changes based on 853-signal dataset: `balanced` min conviction raised 55→65 (net expectancy improves), `funding_arb` raised 60→76 (only strategy with positive net expectancy at +4.76; optimal at 76 per 46-trade medium-confidence finding). `momentum_breakout` confirmed still disabled (anti-correlated direction calls, -13.8 net expectancy at best threshold). Committed `0014cc3`.
+
+**MEXC private API blocked.** Akamai CDN returns 403 for all requests from Hetzner VPS IP. Not a signing or permission issue — CDN-level block. Routes fail-closed gracefully (`connected: false`). Works from local Mac. P8 marked done; VPS account panel stays grayed out unless VPS provider changes.
+
+**Key learner findings (853 signals, 800 with P&L):** Top predictors: trend_score (winners avg 9.3 vs losers 14.1 — lower is better, counterintuitive), atr_pct (winners 3.2% vs losers 5.5%), conviction (barely separates — 0.56 point divergence). RSI and funding_rate show no predictive divergence. Conviction score is not strongly predictive of outcomes — important signal for P9 design.
 
 ---
 
