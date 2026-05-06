@@ -64,7 +64,7 @@ Matrix_Trader_7.0/
 ├── .gitignore             ← covers .env, __pycache__, data/, *.db
 ├── .env                   ← secrets only; never read, never write, never commit
 ├── requirements.txt       ← all deps installed; add packages here if needed
-├── app.py                 ← entire Flask backend — 3,692 lines; keep flat, one file
+├── app.py                 ← entire Flask backend — 4,458 lines; keep flat, one file
 ├── backtest.py            ← standalone script; do NOT import from app.py
 ├── templates/
 │   └── index.html         ← entire frontend: HTML + CSS + JS; one file, no framework
@@ -80,10 +80,17 @@ Matrix_Trader_7.0/
 │   ├── risk_gates.json    ← live risk gate config (block/shadow/off per gate)
 │   └── backtest_results.json
 └── lib/                   ← pure utility functions only; no Flask, no API calls
+    ├── agents.py          ← 8-analyst Phase 1 shadow agent layer
+    ├── exchange_context.py ← canonical exchange-agnostic data contract
+    ├── adapters/          ← exchange normalization registry
+    │   ├── __init__.py
+    │   ├── mexc.py
+    │   └── hyperliquid.py
     ├── indicators.py      ← RSI, EMA, VWAP, ATR, volatility_regime, daily_trend_direction
     ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
     ├── mexc_stream.py     ← WebSocket client (built; not used by SSE route — SSE uses poll loop)
     ├── coinglass_client.py ← optional CoinGlass V4 client; fails closed if key is missing
+    ├── hyperliquid_client.py ← Hyperliquid public scan + read-only account client
     └── ai_client.py       ← AI provider fallback chain; call_ai() is the only public function
 ```
 
@@ -128,7 +135,18 @@ MATRIX_PORT=8080                  # optional — defaults to 8080
 MEXC_API_KEY=                     # optional — only needed for private endpoints (not currently used)
 MEXC_API_SECRET=                  # optional
 COINGLASS_API_KEY=                # optional — enables CoinGlass OI/liquidation enrichment
+HL_WALLET_ADDRESS=                # optional — Hyperliquid read-only account status
 ```
+
+---
+
+## Agent Shadow Layer
+
+Phase 1 of the Matrix Trader agent system is shadow-first. The 8-analyst pipeline runs from `enrich_signal()` through `lib.agents.run_agent_pipeline()`, but agent conviction deltas are not applied to signal conviction yet. Outputs are stored in `signal_json` under fields such as `agent_exchange`, `agent_regime`, `agent_narrative_bull`, `agent_structural_bull`, `agent_version`, `agent_shadow_delta`, `agent_shadow_narrative_delta`, `agent_shadow_structural_delta`, and `agent_shadow_disagreement`.
+
+Agent tags are prefixed with `agent_shadow_`. Deterministic Risk Manager hard blocks can still reduce conviction by 30 and add `agent_blocked` because those are math/risk gates, not LLM judgement.
+
+Phase 2 must not apply `agent_shadow_delta` until at least 50 closed forward-tested signals have agent data, positive shadow deltas beat baseline, negative shadow deltas underperform baseline, high disagreement correlates with worse outcomes, and scan time stays within 10 seconds of the pre-agent baseline.
 
 ---
 
@@ -325,6 +343,11 @@ A condensed version of HANDOFF.md's full list — the most critical items:
 - Do not place CoinGlass conviction adjustments in `score_ticker()` — they belong in `enrich_signal()`
 - Do not promote `fragility_high`/`fragility_extreme` thresholds to hard gates without 2+ weeks of data
 - Do not run `POST /api/backfill/pnl` from a browser — use `curl -X POST` from the VPS shell
+- Do not let agents read raw exchange dicts directly — normalize through `lib/adapters` into `ExchangeContext` first
+- Do not call LLM providers directly from agents — use `call_ai()` from `lib/ai_client.py` only
+- Do not make MEXC or Hyperliquid API calls inside agents — use data passed from `enrich_signal()`
+- Do not apply `agent_shadow_delta` to conviction in Phase 1
+- Do not add SQLite columns for agent fields — Phase 1 output belongs in `signal_json`
 
 ---
 

@@ -6,7 +6,7 @@
 
 ## What This Is
 
-**Matrix Trader 7.0** is a high-leverage crypto trading assistant for perpetual swap markets on MEXC.
+**Matrix Trader 7.0** is a high-leverage crypto trading assistant for perpetual swap markets on MEXC and Hyperliquid.
 
 It is a **local web application**: a Python Flask backend that serves a dark-themed HTML dashboard. You run it on your Mac with `python3 app.py` and open it in any browser — including on iPhone over local WiFi.
 
@@ -14,13 +14,13 @@ It is a **local web application**: a Python Flask backend that serves a dark-the
 - An execution bot yet — order placement is a staged future capability (P8–P12), currently disabled.
 - A prediction engine (no ARIMA, no price forecasting)
 - A SaaS product (local only for now)
-- A multi-exchange aggregator (MEXC-first; other exchanges are context only)
+- A blind multi-exchange aggregator (MEXC is primary; Hyperliquid is integrated through explicit exchange routing)
 
 **The core loop:**
 1. User opens the dashboard
 2. Hits "Scan All Perps" — fetches all 800+ MEXC futures tickers via public API
 3. Sees a ranked signal table (LONG/SHORT, conviction score, entry/TP/SL)
-4. Clicks a signal → requests an AI-generated trade brief (Codex API)
+4. Clicks a signal → requests an AI-generated trade brief through `lib/ai_client.py`
 5. Uses the risk calculator to size the position
 6. Executes manually on MEXC
 
@@ -63,14 +63,23 @@ Matrix_Trader_7.0/
 ├── static/
 │   └── style.css
 └── lib/                   ← ported MT6 components, cleaned up
+    ├── agents.py          ← 8-analyst Phase 1 shadow agent layer
+    ├── exchange_context.py ← canonical exchange-agnostic data contract
+    ├── adapters/          ← exchange normalization registry
+    │   ├── __init__.py
+    │   ├── mexc.py
+    │   └── hyperliquid.py
     ├── indicators.py      ← RSI, EMA, VWAP, ATR
     ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
+    ├── hyperliquid_client.py ← Hyperliquid public scan + read-only account client
     └── mexc_stream.py     ← WebSocket wrapper
 ```
 
 **Rules:**
 - `app.py` is the backend. Everything lives here until Phase 2.
 - `lib/` files are utilities only — no Flask routes, no API calls, pure functions.
+- `lib/agents.py` may call `call_ai()` only; it must not call providers or exchange APIs directly.
+- Exchange-specific schema handling belongs in `lib/adapters/*`; agents only read `ExchangeContext`.
 - `templates/index.html` is the entire frontend. One file.
 - No new files or folders without a specific reason.
 
@@ -204,7 +213,37 @@ These are the only MT6 components worth keeping. Everything else was discarded.
 ANTHROPIC_API_KEY=<your_anthropic_key>     # required for AI signal reports
 MEXC_API_KEY=                    # optional — only needed for private endpoints
 MEXC_API_SECRET=                 # optional
+HL_WALLET_ADDRESS=               # optional — Hyperliquid read-only account status
 ```
+
+---
+
+## Agent Shadow Layer
+
+Phase 1 of the Matrix Trader agent system is shadow-first. The 8-analyst pipeline runs from `enrich_signal()` through `lib.agents.run_agent_pipeline()`, but agent conviction deltas are not applied to signal conviction yet. Outputs are stored in `signal_json` under fields such as:
+
+```text
+agent_exchange
+agent_regime
+agent_narrative_bull
+agent_structural_bull
+agent_version
+agent_shadow_delta
+agent_shadow_narrative_delta
+agent_shadow_structural_delta
+agent_shadow_disagreement
+```
+
+Agent tags are prefixed with `agent_shadow_`. Deterministic Risk Manager hard blocks can still reduce conviction by 30 and add `agent_blocked` because those are math/risk gates, not LLM judgement.
+
+Phase 2 must not apply `agent_shadow_delta` until at least 50 closed forward-tested signals have agent data, positive shadow deltas beat baseline, negative shadow deltas underperform baseline, high disagreement correlates with worse outcomes, and scan time stays within 10 seconds of the pre-agent baseline.
+
+What not to do:
+- Do not let agents read raw MEXC or Hyperliquid dicts directly.
+- Do not call LLM providers directly; use `call_ai()` from `lib/ai_client.py`.
+- Do not make exchange API calls inside agents.
+- Do not add SQLite columns for agent fields; keep Phase 1 output in `signal_json`.
+- Do not apply `agent_shadow_delta` to conviction in Phase 1.
 
 ---
 
@@ -231,3 +270,83 @@ Opens at `http://192.168.x.x:5000` on iPhone (same WiFi).
 5. Update the checkbox in this file when a task is done
 
 Do not start a new task until the previous one works end-to-end.
+
+
+<claude-mem-context>
+# Memory Context
+
+# [Matrix_Trader_7.0] recent context, 2026-05-05 2:08am EDT
+
+Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
+Format: ID TIME TYPE TITLE
+Fetch details: get_observations([IDs]) | Search: mem-search skill
+
+Stats: 48 obs (21,359t read) | 1,125,167t work | 98% savings
+
+### Apr 30, 2026
+1 4:47p 🔵 Plugin hooks.json file missing in Matrix_Trader_7.0
+2 4:49p 🔵 No hooks.json files found anywhere in home directory
+3 " 🔵 hooks.json files located in Claude plugin cache and marketplace directories
+4 5:08p 🔵 Matrix Trader 7.0 project architecture and hard rules documented in HANDOFF.md
+5 " 🔵 Matrix Trader 7.0 phase status: all phases through P7b complete, current tasks focus on QA
+6 " 🔵 Matrix Trader 7.0 full Flask API surface and signal data shape documented
+7 5:12p 🔵 Matrix Trader 7.0 has uncommitted local changes spanning P5c through P7b not yet deployed to VPS
+8 " 🔵 Matrix Trader 7.0 local changes represent 3,346 insertions across 8 files — massive unreleased delta
+9 5:13p ✅ P5c–P7b committed as single commit 8bd6069 — 5,110 insertions across 11 files
+10 " ✅ Rsync to VPS transferred only 30 files — likely incomplete deploy of app.py and index.html
+11 " 🔵 Checksum rsync confirms VPS already has identical files — or rsync wrapper is not transferring large files
+12 " ✅ Matrix Trader 7.0 P5c–P7b successfully deployed to VPS and service restarted
+S11 Tasks 1–3 complete — all HANDOFF.md priority tasks executed except Task 4 (Strategy Lab QA) (Apr 30 at 5:13 PM)
+13 5:47p 🔵 Risk gate audit confirms long_vol_long block gate is justified — extreme-vol LONG losses average -169% pnl_pct
+S10 Task 3 post-filter audit complete — risk gate effectiveness confirmed with live signal data (Apr 30 at 5:47 PM)
+S13 User expects Manage button to handle pause/resume for built-in strategies — investigating UI for this capability (Apr 30 at 5:48 PM)
+14 5:49p 🔵 Momentum Breakout strategy disabled on VPS — stored in disabled_builtins in risk_gates.json
+15 " 🔵 VPS risk_gates.json contains full gate rationale from April 25–26 audits
+S12 Strategy Lab QA investigation — discovered Momentum Breakout is disabled on VPS via risk_gates.json (Apr 30 at 5:49 PM)
+S15 VPS DB statistics pull — signals issued, trades closed, P&L by strategy (Apr 30 at 5:50 PM)
+16 6:01p 🔵 Disabled built-in strategies are invisible in the strategy bar — loadStrategies() omits include_disabled param
+17 " 🔴 Fixed: disabled built-in strategies now visible in strategy bar via include_disabled=1
+S16 VPS DB stats pull — signals issued, trades closed, P&L by strategy; session wrapped with data synced locally (Apr 30 at 6:01 PM)
+S14 Matrix Trader 7.0 — Fix Momentum Breakout invisible in strategy bar + deploy to VPS (Apr 30 at 6:01 PM)
+### May 1, 2026
+S17 VPS DB stats pull + risk_gates.json state check — confirmed Mean Reversion is active (not disabled), only Momentum Breakout is paused (May 1 at 11:48 AM)
+18 11:49a 🟣 P8 Execution Roadmap — Bot readiness panel, account routes, mexc_private.py, docs update
+S19 User selected option "1" — subagent-driven development approach to execute the Hyperliquid integration plan (May 1 at 11:49 AM)
+19 4:33p 🔵 Pre-P8 state: CLAUDE.md, AGENTS.md, STRATEGIES.md, .env.example all need P8 updates
+20 4:34p 🟣 Matrix Trader P8 — MEXC Read-Only Account Integration
+21 " ✅ Matrix Trader P8 — Documentation Suite Updated
+22 " ⚖️ Execution Safety Rules — Immutable Gates for P8–P12
+23 " 🟣 Bot Readiness Panel — Job 3 UI (Pending)
+### May 2, 2026
+24 10:17p 🔵 Matrix Trader 7.0 Pre-Integration State Captured
+25 " 🔵 score_ticker() and enrich_signal() Integration Points for Hyperliquid
+27 " 🔵 MEXC vs Hyperliquid Kline Interval Name Mismatch
+26 10:18p 🔵 run_scan() Pipeline Structure and enrich_signal() MEXC Hardcoding Locations
+28 10:19p 🔵 Frontend S State and scanSignals() Structure Before Hyperliquid Addition
+29 " 🔵 Signal Card and Strategy Bar DOM Structure for Hyperliquid Badge Injection
+30 10:20p 🔵 Exact Signal Card HTML Template and Bot Readiness Panel for HL Additions
+31 10:21p ✅ Implementation Plan File Created for Hyperliquid Integration
+32 " 🟣 Complete Hyperliquid Integration Implementation Plan Written
+S18 MT7 — Hyperliquid Exchange Integration (Phase 1): Add Hyperliquid as a second exchange source with working scan + read-only account integration (May 2 at 10:24 PM)
+33 11:25p 🟣 hyperliquid_client.py code quality fixes — interval validation and wallet guard added
+34 " 🔵 Primary session stuck in restart loop — Task 1 re-dispatched multiple times, Tasks 2-10 not started
+### May 3, 2026
+35 11:36a 🟣 hyperliquid_client.py code quality fixes committed — commit 93deec0
+36 12:19p 🟣 Matrix Trader 8-Analyst Agent Intelligence Layer — Phase 1 Shadow Mode
+### May 4, 2026
+37 12:46a 🔵 Pre-implementation state: agent files not yet created, toTVSymbol bug confirmed present
+38 " 🟣 Exchange adapter layer created: lib/exchange_context.py, lib/adapters/__init__.py, lib/adapters/mexc.py, lib/adapters/hyperliquid.py
+39 " 🟣 Phase 1 Agent Shadow Layer Deployed to Production
+### May 5, 2026
+40 1:55a ⚖️ Matrix Trader Intelligence Layer — Three-Phase Architecture Plan
+41 1:56a 🔵 Agent Shadow Layer Files Confirmed Present on VPS
+42 " 🔵 Agent Shadow Layer Live and Producing Data — v2-phase1-shadow
+43 1:58a 🔵 TradingView Hyperliquid Fix Confirmed Deployed — No Agent Timeout Errors
+44 1:59a 🔵 VPS Scan Time 14.4s — Exceeds Phase 2 Criterion Threshold
+45 " 🔵 VPS Has No /opt/venv — Only System Python 3.12 Available
+46 2:00a 🔵 Full analyze.py Audit: Strategy Performance, Blacklist Candidates, Direction-Flip Warnings
+47 2:01a 🔵 VPS Audit Complete — Prompt 1 All 8 Checks Passed with One Flag
+48 " 🔵 index.html Structure Mapped — switchTab() Not showTab(), State Objects Located
+
+Access 1125k tokens of past work via get_observations([IDs]) or mem-search skill.
+</claude-mem-context>

@@ -224,7 +224,7 @@ def section_blacklist(rows: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Section 5: TP1-only counterfactual
+# Section 5: TP1-only counterfactual (confirmed TP1 hits only)
 # ---------------------------------------------------------------------------
 
 def compute_tp1_pnl(row: dict):
@@ -261,10 +261,34 @@ def compute_tp1_pnl(row: dict):
 
 
 def section_tp1_counterfactual(rows: list, strat_groups: list) -> dict:
-    result = {}
+    # Gate on confirmed TP1_HIT events only — not all signals with a tp1 column.
+    # rows is used only for the total-signal count note; actual computation uses DB.
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    confirmed_rows = con.execute("""
+        SELECT s.id, s.strategy_key, s.direction, s.entry1, s.tp1,
+               s.pnl_pct, s.leverage, s.signal_json
+        FROM signals s
+        WHERE EXISTS (
+            SELECT 1 FROM position_events pe
+            WHERE pe.signal_id = s.id
+              AND pe.event_type = 'TP1_HIT'
+        )
+        AND s.entry1 IS NOT NULL AND s.tp1 IS NOT NULL
+        AND s.pnl_pct IS NOT NULL
+        AND s.result NOT IN ('EXPIRED', 'SKIPPED')
+    """).fetchall()
+    con.close()
+
+    confirmed_rows = [dict(r) for r in confirmed_rows]
+    n_all_with_tp1 = sum(1 for r in rows if r.get("tp1") is not None)
+    n_confirmed    = len(confirmed_rows)
+
+    result = {"_note": f"confirmed TP1_HIT events: {n_confirmed} of {n_all_with_tp1} signals that have a tp1 value"}
+
     for strat_label in strat_groups:
-        subset = rows if strat_label == "ALL_STRATEGIES" else [
-            r for r in rows if r["strategy_key"] == strat_label
+        subset = confirmed_rows if strat_label == "ALL_STRATEGIES" else [
+            r for r in confirmed_rows if r["strategy_key"] == strat_label
         ]
         actual_total = 0.0
         cf_total     = 0.0
@@ -280,11 +304,11 @@ def section_tp1_counterfactual(rows: list, strat_groups: list) -> dict:
                 skipped += 1
 
         result[strat_label] = {
-            "n_computable":        computable,
-            "n_skipped":           skipped,
-            "actual_total":        actual_total   if computable else None,
-            "counterfactual_total": cf_total      if computable else None,
-            "delta":               (cf_total - actual_total) if computable else None,
+            "n_computable":         computable,
+            "n_skipped":            skipped,
+            "actual_total":         actual_total    if computable else None,
+            "counterfactual_total": cf_total        if computable else None,
+            "delta":                (cf_total - actual_total) if computable else None,
         }
     return result
 
@@ -399,9 +423,11 @@ def print_report(rows: list, excluded: int, all_data: dict) -> None:
 
     # --- Section 5 ---
     print(f"\n{'='*W}")
-    print(f"  SECTION 5 — TP1-Only Counterfactual  (+delta = TP1 would be better than laddered)")
-    sep()
+    print(f"  SECTION 5 — TP1-Only Counterfactual  (confirmed TP1 hits only; +delta = TP1 would be better than laddered)")
     tp1 = all_data["tp1_counterfactual"]
+    if tp1.get("_note"):
+        print(f"  NOTE: {tp1['_note']}")
+    sep()
     print(f"  {'strategy':<28} {'n_calc':>6}  {'actual_tot':>11}  {'cf_tp1_tot':>11}  {'delta':>9}")
     sep()
     for sl in ["ALL_STRATEGIES"] + sorted(set(r["strategy_key"] for r in rows)):
