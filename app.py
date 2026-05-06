@@ -456,7 +456,7 @@ STRATEGIES: dict = {
             "volume_mult": 1.1,
         },
         "leverage_cap":    20,
-        "min_conviction":  55,
+        "min_conviction":  65,
         "filters":         {},
         "risk_gates": {
             "block_short_volatility": ["extreme"],
@@ -473,7 +473,7 @@ STRATEGIES: dict = {
             "volume_mult": 1.0,
         },
         "leverage_cap":    10,
-        "min_conviction":  60,
+        "min_conviction":  76,
         "filters": {
             # Only fire if absolute funding rate exceeds 0.03%
             "min_funding_abs": 0.0003,
