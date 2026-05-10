@@ -1,0 +1,76 @@
+CREATE TABLE signals (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at    TEXT NOT NULL,
+            symbol       TEXT NOT NULL,
+            exchange     TEXT NOT NULL,
+            direction    TEXT NOT NULL,
+            strategy     TEXT NOT NULL,
+            conviction   INTEGER NOT NULL,
+            price        REAL NOT NULL,
+            entry1       REAL,
+            entry2       REAL,
+            entry3       REAL,
+            tp1          REAL,
+            tp2          REAL,
+            tp3          REAL,
+            stop_loss    REAL,
+            atr_pct      REAL,
+            volatility   TEXT,
+            funding_rate REAL,
+            rsi_1h       REAL,
+            trend_score  INTEGER,
+            tags         TEXT,
+            signal_why   TEXT,
+            result       TEXT DEFAULT NULL,
+            result_note  TEXT DEFAULT NULL,
+            result_at    TEXT DEFAULT NULL
+        , exit_price REAL DEFAULT NULL, entry_at TEXT DEFAULT NULL, signal_json TEXT DEFAULT NULL, data_quality TEXT DEFAULT NULL, evaluation_version TEXT DEFAULT NULL, strategy_key TEXT DEFAULT 'balanced', pnl_pct REAL DEFAULT NULL, leverage REAL DEFAULT NULL);
+CREATE TABLE sqlite_sequence(name,seq);
+CREATE TABLE custom_strategies (
+            key         TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            base_key    TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            config_json TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+CREATE INDEX idx_signals_open_dedupe
+        ON signals (symbol, direction, strategy_key, result)
+    ;
+CREATE TABLE filtered_candidates (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at    TEXT NOT NULL,
+            symbol       TEXT NOT NULL,
+            exchange     TEXT NOT NULL,
+            direction    TEXT NOT NULL,
+            strategy     TEXT NOT NULL,
+            strategy_key TEXT NOT NULL,
+            conviction   INTEGER,
+            price        REAL,
+            atr_pct      REAL,
+            volatility   TEXT,
+            funding_rate REAL,
+            tags         TEXT,
+            reason       TEXT NOT NULL,
+            signal_json  TEXT
+        , gate_key TEXT DEFAULT 'long_vol_long', gate_mode TEXT DEFAULT 'block');
+CREATE INDEX idx_filtered_candidates_lookup
+        ON filtered_candidates (strategy_key, direction, volatility, logged_at)
+    ;
+CREATE TABLE position_events (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id          INTEGER NOT NULL,
+            event_type         TEXT NOT NULL,
+            event_at           TEXT NOT NULL,
+            price              REAL,
+            realized_pct       REAL DEFAULT 0,
+            remaining_size_pct REAL DEFAULT 100,
+            note               TEXT,
+            created_at         TEXT NOT NULL,
+            UNIQUE(signal_id, event_type)
+        );
+CREATE INDEX idx_position_events_signal
+        ON position_events (signal_id, event_at)
+    ;
+813

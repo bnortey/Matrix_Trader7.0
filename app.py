@@ -59,9 +59,15 @@ HL_WALLET_ADDRESS = os.getenv("HL_WALLET_ADDRESS", "")
 CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
+AGENT_TOP_N = 10            # run agent pipeline only on the top N base signals
 ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
 DB_PATH = "data/signals.db"
 RISK_GATES_PATH = "data/risk_gates.json"
+STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
+
+# Daily kline cache: symbol → (fetched_at_ts, data)
+_daily_kline_cache: dict = {}
+_DAILY_KLINE_TTL = 300  # 5 minutes
 
 DEFAULT_RISK_GATES = {
     "long_vol_long": {
@@ -367,6 +373,88 @@ def get_risk_gate(gate_key: str) -> dict:
 
 def get_long_vol_gate() -> dict:
     return get_risk_gate("long_vol_long")
+
+
+def _load_extreme_vol_firebreak() -> bool:
+    """
+    Read extreme_vol_firebreak from risk_gates.json.
+    Returns True (gate ON) if the file is missing, malformed, or the key is absent.
+    Never raises — scan must never fail due to a missing settings file.
+    """
+    try:
+        if os.path.exists(RISK_GATES_PATH):
+            with open(RISK_GATES_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return bool(raw.get("extreme_vol_firebreak", True))
+    except Exception:
+        pass
+    return True
+
+
+def _save_extreme_vol_firebreak(val: bool) -> None:
+    """Persist extreme_vol_firebreak to risk_gates.json, preserving all existing keys."""
+    os.makedirs("data", exist_ok=True)
+    try:
+        with open(RISK_GATES_PATH, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}
+    existing["extreme_vol_firebreak"] = bool(val)
+    tmp = RISK_GATES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, sort_keys=True)
+    os.replace(tmp, RISK_GATES_PATH)
+
+
+def _load_strategy_overrides() -> dict:
+    """
+    Read data/strategy_overrides.json.
+    Returns {} if missing or malformed. Never raises.
+    Only min_conviction overrides are supported in this phase.
+    Structure: {"balanced": {"min_conviction": 65}, ...}
+    """
+    try:
+        if os.path.exists(STRATEGY_OVERRIDES_PATH):
+            with open(STRATEGY_OVERRIDES_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_strategy_override(strategy_key: str, field: str, value) -> None:
+    """
+    Persist a single field override for a built-in strategy.
+    Preserves all existing overrides. Atomic write.
+    Only permitted fields: ["min_conviction"]
+    """
+    PERMITTED = {"min_conviction"}
+    if field not in PERMITTED:
+        return
+    os.makedirs("data", exist_ok=True)
+    try:
+        with open(STRATEGY_OVERRIDES_PATH, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}
+    if strategy_key not in existing:
+        existing[strategy_key] = {}
+    existing[strategy_key][field] = value
+    tmp = STRATEGY_OVERRIDES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, sort_keys=True)
+    os.replace(tmp, STRATEGY_OVERRIDES_PATH)
+
+
+def _get_custom_strategy_keys() -> set:
+    """Return the set of keys in the custom_strategies table."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute("SELECT key FROM custom_strategies WHERE enabled=1").fetchall()
+        con.close()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
 
 
 def log_filtered_candidate(candidate: dict) -> None:
@@ -1060,6 +1148,7 @@ def score_ticker(
     strat = strategy or STRATEGIES["balanced"]
     w = strat["weights"]
     filters = strat.get("filters", {})
+    _strat_key = strat.get("key", "balanced")
 
     try:
         symbol = ticker.get("symbol", "")
@@ -1089,11 +1178,22 @@ def score_ticker(
         # strong tier = full weight, weak tier = half weight (preserves original proportions)
         mom_strong = w["momentum"]
         mom_weak   = w["momentum"] // 2
+        # Balanced LONG momentum reduction: audit shows strong_momentum LONG signals
+        # have 19.4% win rate vs baseline (-8,397 P&L delta, 309 signals).
+        # SHORT momentum (strong_dump) keeps full weight — data confirms it works.
+        if _strat_key == "balanced":
+            mom_long_strong = mom_strong // 2
+            mom_long_weak   = mom_weak   // 2
+        else:
+            mom_long_strong = mom_strong
+            mom_long_weak   = mom_weak
         if change_pct > 5:
-            long_score += mom_strong
+            long_score += mom_long_strong
             tags.append("strong_momentum")
+            if _strat_key == "balanced":
+                tags.append("long_momentum_reduced")
         elif change_pct > 2:
-            long_score += mom_weak
+            long_score += mom_long_weak
             tags.append("momentum")
         elif change_pct < -5:
             short_score += mom_strong
@@ -1108,8 +1208,15 @@ def score_ticker(
         fund_strong = w["funding"]
         fund_weak   = int(w["funding"] * 0.4)
         if funding < -0.001:
-            long_score += fund_strong
             tags.append("short_squeeze")
+            # Balanced only: require positive 24h momentum to award full squeeze score.
+            # Falling price + extreme negative funding = squeeze not yet materialising.
+            # Other strategies (Funding Arb) rely on funding as the primary signal — unchanged.
+            if _strat_key == "balanced" and change_pct <= 0:
+                long_score += fund_weak
+                tags.append("squeeze_unconfirmed")
+            else:
+                long_score += fund_strong
         elif funding < 0:
             long_score += fund_weak
         elif funding > 0.001:
@@ -1134,6 +1241,13 @@ def score_ticker(
         vol_mult = w["volume_mult"] if volume > 10_000_000 else 1.0
         if volume > 10_000_000:
             tags.append("high_volume")
+
+        # Balanced SHORT bias: audit shows systematic SHORT tag outperformance
+        # (+7,894 / +7,388 / +5,424 P&L deltas). Multiplier tips borderline cases
+        # toward SHORT; does not override strong LONG signals.
+        if _strat_key == "balanced" and short_score > 0:
+            short_score = int(short_score * 1.08)
+            tags.append("short_bias_applied")
 
         if long_score >= short_score:
             direction = "LONG"
@@ -1462,6 +1576,7 @@ def enrich_signal(
     base: dict,
     strategy: dict | None = None,
     filter_stats: dict | None = None,
+    agent_min_conviction: int | None = None,
 ) -> dict | None:
     """
     Stage 2: fetch klines and depth for one symbol, run RSI/ATR indicators,
@@ -1585,6 +1700,13 @@ def enrich_signal(
 
         atr_pct_val = calc_atr_pct(df, price, period=14)
         vol_regime = volatility_regime(atr_pct_val)
+
+        # Extreme vol firebreak — user-controlled gate, defaults ON.
+        # Blocks all extreme-vol signals before any strategy-specific gate logic.
+        # The ×0.85 conviction multiplier below is a secondary safeguard that
+        # still applies when this gate is OFF.
+        if vol_regime == "extreme" and _load_extreme_vol_firebreak():
+            return None
 
         gate_key = "short_vol_short" if direction == "SHORT" else "long_vol_long"
         vol_gate = get_risk_gate(gate_key)
@@ -1752,16 +1874,28 @@ def enrich_signal(
         daily_trend = None
         daily_trend_aligned = None
         try:
+            _now = time.time()
             if exchange == "HYPERLIQUID":
-                hl_daily = fetch_hl_klines(coin, "1d", 720)
-                # Convert to list-of-entry format that daily_trend_direction accepts:
-                # [timestamp, open, close, high, low, vol] (index 3=high, 4=low)
-                daily_klines = [[k["t"], k["o"], k["c"], k["h"], k["l"], k["v"]] for k in hl_daily] if hl_daily else None
+                _hl_key = f"HL:{symbol}"
+                _cached = _daily_kline_cache.get(_hl_key)
+                if _cached and (_now - _cached[0]) < _DAILY_KLINE_TTL:
+                    daily_klines = _cached[1]
+                else:
+                    hl_daily = fetch_hl_klines(coin, "1d", 720)
+                    # Convert to list-of-entry format that daily_trend_direction accepts:
+                    # [timestamp, open, close, high, low, vol] (index 3=high, 4=low)
+                    daily_klines = [[k["t"], k["o"], k["c"], k["h"], k["l"], k["v"]] for k in hl_daily] if hl_daily else None
+                    _daily_kline_cache[_hl_key] = (_now, daily_klines)
             else:
-                daily_klines = fetch_mexc(
-                    f"/contract/kline/{symbol}",
-                    params={"interval": "Day1", "limit": 30},
-                )
+                _cached = _daily_kline_cache.get(symbol)
+                if _cached and (_now - _cached[0]) < _DAILY_KLINE_TTL:
+                    daily_klines = _cached[1]
+                else:
+                    daily_klines = fetch_mexc(
+                        f"/contract/kline/{symbol}",
+                        params={"interval": "Day1", "limit": 30},
+                    )
+                    _daily_kline_cache[symbol] = (_now, daily_klines)
             if daily_klines:
                 dt = daily_trend_direction(daily_klines)
                 daily_trend = dt
@@ -1919,62 +2053,68 @@ def enrich_signal(
         # Agent deltas are recorded for forward testing, but are NOT applied to
         # conviction in Phase 1. All blocks are shadow-tagged only — no conviction
         # changes until Phase 2 validation is complete.
+        # Only run agents on the top AGENT_TOP_N signals — the rest get null fields.
+        _run_agents = (
+            base.get("_scan_rank", 99) < AGENT_TOP_N
+            and (agent_min_conviction is None or sig["conviction"] >= agent_min_conviction)
+        )
         _agent_output = None
-        try:
-            from lib.agents import run_agent_pipeline
+        if _run_agents:
+            try:
+                from lib.agents import run_agent_pipeline
 
-            _exchange = (sig.get("exchange") or base.get("exchange") or "MEXC").upper()
-            _enriched = {
-                "rsi_1h": sig.get("rsi_1h"),
-                "trend_score": sig.get("trend_score"),
-                "atr_pct": sig.get("atr_pct"),
-                "volatility": sig.get("volatility"),
-                "direction": sig.get("direction"),
-                "change_4h_pct": sig.get("change_4h_pct"),
-                "change_1h_pct": sig.get("change_1h_pct"),
-                "basis_pct": sig.get("basis_pct") or base.get("basis_pct") or 0,
-                "kline_depth_1h": sig.get("kline_depth_1h"),
-                "kline_depth_4h": sig.get("kline_depth_4h"),
-                "data_quality": sig.get("data_quality"),
-                "leverage_cap": sig.get("leverage_cap"),
-            }
-            _agent_ticker = {
-                **base,
-                **sig,
-                "symbol": sig.get("symbol"),
-                "lastPrice": sig.get("price"),
-                "fairPrice": sig.get("price"),
-                "indexPrice": sig.get("price"),
-                "fundingRate": sig.get("funding_rate"),
-                "funding": sig.get("funding_rate"),
-                "holdVol": sig.get("open_interest"),
-                "openInterest": (
-                    (sig.get("open_interest") or 0) / sig.get("price")
-                    if _exchange == "HYPERLIQUID" and sig.get("price") else sig.get("open_interest")
-                ),
-                "volume24": sig.get("volume_24h"),
-                "dayNtlVlm": sig.get("volume_24h"),
-                "riseFallRate": (sig.get("change_24h_pct") or 0) / 100,
-                "markPx": sig.get("price"),
-                "oraclePx": sig.get("price"),
-                "midPx": sig.get("price"),
-                "name": sig.get("symbol", "").replace("_USDC", "").replace("_USDT", ""),
-                "maxLeverage": sig.get("leverage_cap"),
-            }
-            _agent_output = run_agent_pipeline(
-                exchange=_exchange,
-                ticker_data=_agent_ticker,
-                klines=df,
-                depth_data={
-                    "imbalance": imbalance,
-                    "bid_depth_usd": 0,
-                    "ask_depth_usd": 0,
-                },
-                enriched_fields=_enriched,
-                timeout=8.0,
-            )
-        except Exception as _ae:
-            print(f"[agents] {symbol}: {_ae}", file=sys.stderr)
+                _exchange = (sig.get("exchange") or base.get("exchange") or "MEXC").upper()
+                _enriched = {
+                    "rsi_1h": sig.get("rsi_1h"),
+                    "trend_score": sig.get("trend_score"),
+                    "atr_pct": sig.get("atr_pct"),
+                    "volatility": sig.get("volatility"),
+                    "direction": sig.get("direction"),
+                    "change_4h_pct": sig.get("change_4h_pct"),
+                    "change_1h_pct": sig.get("change_1h_pct"),
+                    "basis_pct": sig.get("basis_pct") or base.get("basis_pct") or 0,
+                    "kline_depth_1h": sig.get("kline_depth_1h"),
+                    "kline_depth_4h": sig.get("kline_depth_4h"),
+                    "data_quality": sig.get("data_quality"),
+                    "leverage_cap": sig.get("leverage_cap"),
+                }
+                _agent_ticker = {
+                    **base,
+                    **sig,
+                    "symbol": sig.get("symbol"),
+                    "lastPrice": sig.get("price"),
+                    "fairPrice": sig.get("price"),
+                    "indexPrice": sig.get("price"),
+                    "fundingRate": sig.get("funding_rate"),
+                    "funding": sig.get("funding_rate"),
+                    "holdVol": sig.get("open_interest"),
+                    "openInterest": (
+                        (sig.get("open_interest") or 0) / sig.get("price")
+                        if _exchange == "HYPERLIQUID" and sig.get("price") else sig.get("open_interest")
+                    ),
+                    "volume24": sig.get("volume_24h"),
+                    "dayNtlVlm": sig.get("volume_24h"),
+                    "riseFallRate": (sig.get("change_24h_pct") or 0) / 100,
+                    "markPx": sig.get("price"),
+                    "oraclePx": sig.get("price"),
+                    "midPx": sig.get("price"),
+                    "name": sig.get("symbol", "").replace("_USDC", "").replace("_USDT", ""),
+                    "maxLeverage": sig.get("leverage_cap"),
+                }
+                _agent_output = run_agent_pipeline(
+                    exchange=_exchange,
+                    ticker_data=_agent_ticker,
+                    klines=df,
+                    depth_data={
+                        "imbalance": imbalance,
+                        "bid_depth_usd": 0,
+                        "ask_depth_usd": 0,
+                    },
+                    enriched_fields=_enriched,
+                    timeout=8.0,
+                )
+            except Exception as _ae:
+                print(f"[agents] {symbol}: {_ae}", file=sys.stderr)
 
         if _agent_output:
             # Phase 1 shadow mode: record blocks/tags but never touch conviction
@@ -2024,6 +2164,7 @@ def enrich_signal(
         # swallowed inside fetch_market_sentiment() so this never crashes a scan.
         sig.update(fetch_market_sentiment(symbol, price))
 
+        sig.pop("_scan_rank", None)
         return sig
     except Exception as e:
         print(f"enrich_signal error [{symbol}]: {e}", file=sys.stderr)
@@ -2067,6 +2208,15 @@ def run_scan(
     registry = get_strategy_registry()
     strat = registry.get(strategy_key, registry["balanced"])
     strategy_key = strat["key"]
+
+    # Apply runtime overrides for built-in strategies — read fresh, never mutate registry
+    overrides = _load_strategy_overrides()
+    if strategy_key in overrides:
+        strat = dict(strat)
+        for field, value in overrides[strategy_key].items():
+            if field == "min_conviction":
+                strat["min_conviction"] = int(value)
+
     effective_threshold = max(threshold, strat["min_conviction"])
     coinglass_snapshot = get_coin_market_snapshot()
 
@@ -2086,6 +2236,8 @@ def run_scan(
 
     base_signals.sort(key=lambda s: s["conviction_base"], reverse=True)
     top = base_signals[:ENRICH_TOP_N]
+    for i, s in enumerate(top):
+        s["_scan_rank"] = i  # 0 = highest conviction; used by enrich_signal() agent guard
 
     # Stage 2 — concurrent enrichment, strategy-aware
     filter_stats = {
@@ -2095,7 +2247,12 @@ def run_scan(
         "short_vol_refuse": 0,
         "short_vol_shadow": 0,
     }
-    enrich = partial(enrich_signal, strategy=strat, filter_stats=filter_stats)
+    enrich = partial(
+        enrich_signal,
+        strategy=strat,
+        filter_stats=filter_stats,
+        agent_min_conviction=effective_threshold,
+    )
     signals: list[dict] = []
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as executor:
         for sig in executor.map(enrich, top):
@@ -2170,14 +2327,21 @@ def api_scan_all():
         registry = get_strategy_registry()
         results: dict = {}
 
-        for key in registry:
-            signals, _ = run_scan(strategy_key=key, tickers=tickers)
-            log_signals(signals)
-            results[key] = {
-                "signals":     signals,
-                "total_pairs": total_pairs,
-                "strategy":    key,
-            }
+        def _scan_one_strategy(key):
+            sigs, _ = run_scan(strategy_key=key, tickers=tickers)
+            log_signals(sigs)
+            return key, sigs
+
+        from concurrent.futures import as_completed
+        with ThreadPoolExecutor(max_workers=len(registry)) as ex:
+            futs = {ex.submit(_scan_one_strategy, k): k for k in registry}
+            for f in as_completed(futs):
+                key, sigs = f.result()
+                results[key] = {
+                    "signals":     sigs,
+                    "total_pairs": total_pairs,
+                    "strategy":    key,
+                }
 
         scan_time = round(time.time() - t0, 2)
         return jsonify({
@@ -2789,6 +2953,54 @@ def _compute_leveraged_pnl(sig: dict, exit_price: float | None) -> float | None:
     return round(raw_pct * leverage, 2)
 
 
+def _persist_journey_to_signal_json(sig_id: int, sig: dict, pnl_pct: float | None) -> None:
+    """
+    Compute trade journey metrics and merge them into the stored signal_json
+    for a just-closed signal. Called once at close time by api_outcomes_check().
+
+    Persists 11 journey_* fields into signal_json. Never raises.
+    """
+    try:
+        journey = compute_trade_journey(sig, pnl_pct)
+        if not journey:
+            return
+
+        target_hits = journey.get("target_hits") or {}
+        journey_fields = {
+            "journey_available":          journey.get("available", False),
+            "journey_mae_pct":            journey.get("mae_pct"),
+            "journey_mfe_pct":            journey.get("mfe_pct"),
+            "journey_capture_ratio":      journey.get("capture_ratio_pct"),
+            "journey_stop_pressure":      journey.get("stop_pressure_pct"),
+            "journey_path_label":         journey.get("path_label"),
+            "journey_entry_delay_min":    journey.get("entry_delay_minutes"),
+            "journey_entry_to_close_min": journey.get("entry_to_close_minutes"),
+            "journey_tp1_hit":            "tp1" in target_hits,
+            "journey_tp2_hit":            "tp2" in target_hits,
+            "journey_tp3_hit":            "tp3" in target_hits,
+        }
+
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT signal_json FROM signals WHERE id=?", (sig_id,)
+        ).fetchone()
+        if row:
+            try:
+                existing = json.loads(row[0] or "{}")
+            except Exception:
+                existing = {}
+            existing.update(journey_fields)
+            con.execute(
+                "UPDATE signals SET signal_json=? WHERE id=?",
+                (json.dumps(existing, default=str), sig_id),
+            )
+            con.commit()
+        con.close()
+
+    except Exception as e:
+        print(f"[journey_persist] signal_id={sig_id} error: {e}", file=sys.stderr)
+
+
 def _leveraged_level_pnl(sig: dict, price: float | None, size_fraction: float = 1.0) -> float:
     """Incremental leveraged P&L contribution for a partial size at a price."""
     if price is None:
@@ -3218,6 +3430,18 @@ def api_outcomes_check():
             )
             con.commit()
             con.close()
+
+            # Persist journey metrics into signal_json for Research Firm analysis.
+            _journey_sig = {
+                **sig,
+                "result": result,
+                "result_at": result_at or datetime.utcnow().isoformat(),
+                "exit_price": exit_price,
+                "entry_at": entry_at,
+                "pnl_pct": pnl_pct,
+            }
+            _persist_journey_to_signal_json(sig["id"], _journey_sig, pnl_pct)
+
             tagged.append({"id": sig["id"], "symbol": sig["symbol"],
                            "direction": sig["direction"], "result": result, "note": note})
 
@@ -3344,11 +3568,14 @@ def api_strategies():
                     "avg_win_pnl": None, "avg_loss_pnl": None,
                 }
 
-    result = [
-        strategy_to_api(key, cfg, performance=perf.get(key, {}))
-        for key, cfg in registry.items()
-        if cfg.get("enabled", True) or include_disabled
-    ]
+    overrides = _load_strategy_overrides()
+    result = []
+    for key, cfg in registry.items():
+        if not cfg.get("enabled", True) and not include_disabled:
+            continue
+        s = strategy_to_api(key, cfg, performance=perf.get(key, {}))
+        s["conviction_override"] = overrides.get(key, {}).get("min_conviction")
+        result.append(s)
     return jsonify({"success": True, "strategies": result})
 
 
@@ -3768,8 +3995,23 @@ def api_risk_gates():
                 "symbols": penalty_symbols[:20],
                 "overrides": sym_overrides,
             },
+            "extreme_vol_firebreak": _load_extreme_vol_firebreak(),
         }
         return jsonify(response)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/risk-gates/extreme_vol_firebreak", methods=["PATCH"])
+def api_update_extreme_vol_firebreak():
+    """Toggle the extreme vol firebreak gate. Body: {"enabled": true|false}."""
+    try:
+        body = request.get_json(silent=True) or {}
+        if "enabled" not in body:
+            return jsonify({"success": False, "error": "enabled field required"}), 400
+        val = bool(body["enabled"])
+        _save_extreme_vol_firebreak(val)
+        return jsonify({"success": True, "extreme_vol_firebreak": val})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -4207,6 +4449,62 @@ def api_cleanup_phantom_events():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/backfill/journey", methods=["POST"])
+def api_backfill_journey():
+    """
+    MAINTENANCE — Backfill journey_* metrics into signal_json for closed signals
+    that predate the _persist_journey_to_signal_json() call.
+
+    Processes up to 500 signals per call. Safe to repeat — already-filled rows
+    are skipped. Run from VPS shell: curl -X POST http://localhost:8080/api/backfill/journey
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT id, symbol, exchange, direction,
+                   entry1, tp1, tp2, tp3, stop_loss,
+                   logged_at, result_at, entry_at,
+                   exit_price, pnl_pct, leverage,
+                   result, signal_json
+            FROM signals
+            WHERE result IS NOT NULL
+              AND result NOT IN ('EXPIRED', 'SKIPPED')
+              AND entry1 IS NOT NULL
+              AND (
+                signal_json IS NULL
+                OR json_extract(signal_json, '$.journey_available') IS NULL
+              )
+            ORDER BY logged_at DESC
+            LIMIT 500
+        """).fetchall()
+        con.close()
+
+        processed = 0
+        filled = 0
+        errors = 0
+
+        for row in rows:
+            sig = dict(row)
+            processed += 1
+            try:
+                _persist_journey_to_signal_json(sig["id"], sig, sig.get("pnl_pct"))
+                filled += 1
+            except Exception as e:
+                print(f"[backfill/journey] id={sig['id']} error: {e}", file=sys.stderr)
+                errors += 1
+
+        return jsonify({
+            "success": True,
+            "processed": processed,
+            "filled": filled,
+            "errors": errors,
+            "note": "Run again if processed=500 (batch limit) until processed=0",
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
 # P8 — Account integration + Bot Readiness
 # ---------------------------------------------------------------------------
@@ -4250,6 +4548,37 @@ def api_symbol_override_remove(symbol):
         return jsonify({'success': True, 'removed': symbol})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route("/api/strategy-overrides", methods=["GET"])
+def api_get_strategy_overrides():
+    """Return active strategy overrides with original values from the registry."""
+    try:
+        overrides = _load_strategy_overrides()
+        registry = get_strategy_registry()
+        result = {}
+        for key, vals in overrides.items():
+            original = registry.get(key, {}).get("min_conviction")
+            result[key] = {**vals, "original_min_conviction": original}
+        return jsonify({"success": True, "overrides": result})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/strategy-overrides/<strategy_key>", methods=["DELETE"])
+def api_revert_strategy_override(strategy_key: str):
+    """Remove the override for strategy_key from strategy_overrides.json. Idempotent."""
+    try:
+        existing = _load_strategy_overrides()
+        if strategy_key in existing:
+            del existing[strategy_key]
+            tmp = STRATEGY_OVERRIDES_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2, sort_keys=True)
+            os.replace(tmp, STRATEGY_OVERRIDES_PATH)
+        return jsonify({"success": True, "strategy_key": strategy_key, "reverted": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/account/readiness")
@@ -4701,12 +5030,24 @@ def api_intelligence_suggestion_action(suggestion_id):
                     if r.status_code not in (200, 201):
                         return jsonify({'success': False, 'error': 'failed to create strategy'}), 500
             elif stype in ('threshold', 'regime_suppress') and strategy_key:
-                with app.test_client() as c:
-                    r = c.patch(f'/api/strategies/custom/{strategy_key}',
-                                data=json.dumps(payload),
-                                content_type='application/json')
-                    if r.status_code not in (200, 201):
-                        return jsonify({'success': False, 'error': 'failed to update strategy'}), 500
+                registry = get_strategy_registry()
+                if strategy_key in registry and strategy_key not in _get_custom_strategy_keys():
+                    # Built-in strategy — apply via strategy_overrides.json
+                    min_conviction = payload.get("min_conviction")
+                    if min_conviction is not None:
+                        _save_strategy_override(strategy_key, "min_conviction", int(min_conviction))
+                    else:
+                        return jsonify({'success': False,
+                                        'error': 'min_conviction missing from payload'}), 400
+                else:
+                    # Custom strategy — use existing PATCH route
+                    with app.test_client() as c:
+                        r = c.patch(f'/api/strategies/custom/{strategy_key}',
+                                    data=json.dumps(payload),
+                                    content_type='application/json')
+                        if r.status_code not in (200, 201):
+                            return jsonify({'success': False,
+                                            'error': 'failed to update strategy'}), 500
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
         suggestion['status'] = 'applied'
@@ -4720,6 +5061,49 @@ def api_intelligence_suggestion_action(suggestion_id):
         return jsonify({'success': False, 'error': f'failed to write pending.json: {e}'}), 500
 
     return jsonify({'success': True, 'applied': action == 'apply', 'suggestion_id': suggestion_id})
+
+
+@app.route('/api/intelligence/research')
+def api_intelligence_research():
+    """Read strategy hypothesis briefs from the mt-learner research firm."""
+    try:
+        briefs_path = '/opt/mt-learner/research/briefs.json'
+        heartbeat_path = '/opt/mt-learner/logs/last_heartbeat.txt'
+
+        learner_running = False
+        try:
+            mtime = os.path.getmtime(heartbeat_path)
+            learner_running = (time.time() - mtime) < 600
+        except OSError:
+            pass
+
+        if not os.path.exists(briefs_path):
+            return jsonify({
+                'success': True, 'briefs': [],
+                'active_count': 0, 'learner_running': learner_running,
+            })
+
+        with open(briefs_path, 'r') as f:
+            data = json.load(f)
+
+        briefs = data.get('briefs', [])
+        active_count = sum(1 for b in briefs if b.get('status') == 'active')
+
+        return jsonify({
+            'success': True,
+            'briefs': briefs,
+            'active_count': active_count,
+            'learner_running': learner_running,
+            'total_signals_analyzed': data.get('total_signals_analyzed', 0),
+            'generated_at': data.get('generated_at'),
+        })
+    except Exception as e:
+        print(f'[api/intelligence/research] error: {e}', file=sys.stderr)
+        return jsonify({
+            'success': True, 'briefs': [],
+            'active_count': 0, 'learner_running': False,
+            'error': str(e),
+        })
 
 
 # ---------------------------------------------------------------------------

@@ -275,58 +275,25 @@ Do not start a new task until the previous one works end-to-end.
 <claude-mem-context>
 # Memory Context
 
-# [Matrix_Trader_7.0] recent context, 2026-05-05 2:08am EDT
+# [Matrix_Trader_7.0] recent context, 2026-05-07 3:34am EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 48 obs (21,359t read) | 1,125,167t work | 98% savings
+Stats: 50 obs (23,703t read) | 1,684,600t work | 99% savings
 
 ### Apr 30, 2026
-1 4:47p 🔵 Plugin hooks.json file missing in Matrix_Trader_7.0
-2 4:49p 🔵 No hooks.json files found anywhere in home directory
-3 " 🔵 hooks.json files located in Claude plugin cache and marketplace directories
-4 5:08p 🔵 Matrix Trader 7.0 project architecture and hard rules documented in HANDOFF.md
-5 " 🔵 Matrix Trader 7.0 phase status: all phases through P7b complete, current tasks focus on QA
-6 " 🔵 Matrix Trader 7.0 full Flask API surface and signal data shape documented
-7 5:12p 🔵 Matrix Trader 7.0 has uncommitted local changes spanning P5c through P7b not yet deployed to VPS
-8 " 🔵 Matrix Trader 7.0 local changes represent 3,346 insertions across 8 files — massive unreleased delta
-9 5:13p ✅ P5c–P7b committed as single commit 8bd6069 — 5,110 insertions across 11 files
-10 " ✅ Rsync to VPS transferred only 30 files — likely incomplete deploy of app.py and index.html
-11 " 🔵 Checksum rsync confirms VPS already has identical files — or rsync wrapper is not transferring large files
-12 " ✅ Matrix Trader 7.0 P5c–P7b successfully deployed to VPS and service restarted
-S11 Tasks 1–3 complete — all HANDOFF.md priority tasks executed except Task 4 (Strategy Lab QA) (Apr 30 at 5:13 PM)
-13 5:47p 🔵 Risk gate audit confirms long_vol_long block gate is justified — extreme-vol LONG losses average -169% pnl_pct
-S10 Task 3 post-filter audit complete — risk gate effectiveness confirmed with live signal data (Apr 30 at 5:47 PM)
-S13 User expects Manage button to handle pause/resume for built-in strategies — investigating UI for this capability (Apr 30 at 5:48 PM)
-14 5:49p 🔵 Momentum Breakout strategy disabled on VPS — stored in disabled_builtins in risk_gates.json
-15 " 🔵 VPS risk_gates.json contains full gate rationale from April 25–26 audits
-S12 Strategy Lab QA investigation — discovered Momentum Breakout is disabled on VPS via risk_gates.json (Apr 30 at 5:49 PM)
 S15 VPS DB statistics pull — signals issued, trades closed, P&L by strategy (Apr 30 at 5:50 PM)
-16 6:01p 🔵 Disabled built-in strategies are invisible in the strategy bar — loadStrategies() omits include_disabled param
-17 " 🔴 Fixed: disabled built-in strategies now visible in strategy bar via include_disabled=1
 S16 VPS DB stats pull — signals issued, trades closed, P&L by strategy; session wrapped with data synced locally (Apr 30 at 6:01 PM)
 S14 Matrix Trader 7.0 — Fix Momentum Breakout invisible in strategy bar + deploy to VPS (Apr 30 at 6:01 PM)
 ### May 1, 2026
 S17 VPS DB stats pull + risk_gates.json state check — confirmed Mean Reversion is active (not disabled), only Momentum Breakout is paused (May 1 at 11:48 AM)
-18 11:49a 🟣 P8 Execution Roadmap — Bot readiness panel, account routes, mexc_private.py, docs update
 S19 User selected option "1" — subagent-driven development approach to execute the Hyperliquid integration plan (May 1 at 11:49 AM)
-19 4:33p 🔵 Pre-P8 state: CLAUDE.md, AGENTS.md, STRATEGIES.md, .env.example all need P8 updates
-20 4:34p 🟣 Matrix Trader P8 — MEXC Read-Only Account Integration
-21 " ✅ Matrix Trader P8 — Documentation Suite Updated
-22 " ⚖️ Execution Safety Rules — Immutable Gates for P8–P12
-23 " 🟣 Bot Readiness Panel — Job 3 UI (Pending)
 ### May 2, 2026
-24 10:17p 🔵 Matrix Trader 7.0 Pre-Integration State Captured
-25 " 🔵 score_ticker() and enrich_signal() Integration Points for Hyperliquid
-27 " 🔵 MEXC vs Hyperliquid Kline Interval Name Mismatch
-26 10:18p 🔵 run_scan() Pipeline Structure and enrich_signal() MEXC Hardcoding Locations
-28 10:19p 🔵 Frontend S State and scanSignals() Structure Before Hyperliquid Addition
-29 " 🔵 Signal Card and Strategy Bar DOM Structure for Hyperliquid Badge Injection
-30 10:20p 🔵 Exact Signal Card HTML Template and Bot Readiness Panel for HL Additions
 31 10:21p ✅ Implementation Plan File Created for Hyperliquid Integration
 32 " 🟣 Complete Hyperliquid Integration Implementation Plan Written
+S21 Double-check Codex's completed coding work in Matrix_Trader_7.0 — verify correctness of agent layer, adapters, performance fixes, and Research Firm feature (May 2 at 10:24 PM)
 S18 MT7 — Hyperliquid Exchange Integration (Phase 1): Add Hyperliquid as a second exchange source with working scan + read-only account integration (May 2 at 10:24 PM)
 33 11:25p 🟣 hyperliquid_client.py code quality fixes — interval validation and wallet guard added
 34 " 🔵 Primary session stuck in restart loop — Task 1 re-dispatched multiple times, Tasks 2-10 not started
@@ -347,6 +314,43 @@ S18 MT7 — Hyperliquid Exchange Integration (Phase 1): Add Hyperliquid as a sec
 46 2:00a 🔵 Full analyze.py Audit: Strategy Performance, Blacklist Candidates, Direction-Flip Warnings
 47 2:01a 🔵 VPS Audit Complete — Prompt 1 All 8 Checks Passed with One Flag
 48 " 🔵 index.html Structure Mapped — switchTab() Not showTab(), State Objects Located
+52 2:05a 🟣 Intelligence Tab Frontend Implemented in index.html
+53 " 🔵 Subagent Ran Out of Usage Before Completing Intelligence Tab Tasks
+49 2:08a ⚖️ Dimensional Atlas — Project Specification Defined
+50 2:09a 🔵 Dimensional Atlas Project Directory Exists But Is Empty
+51 2:10a 🟣 Dimensional Atlas — P0 Foundation Docs Created
+### May 6, 2026
+54 4:38p 🔵 app.py Scan Architecture Pre-Change Baseline
+55 4:39p 🟣 AGENT_TOP_N = 10 Constant Added to app.py
+56 " ⚖️ Matrix Trader: Scan Performance Optimization Strategy Defined
+57 " 🟣 Research Firm: Deterministic Hypothesis Discovery Engine for mt-learner
+58 " 🟣 Research Firm Integrated into mt-learner Scheduler and Matrix Trader API
+59 " 🟣 Intelligence Tab: Research Firm Section Added as 4th Panel
+60 4:46p 🟣 AGENT_TOP_N Constant Limits Agent Pipeline to Top 10 Signals
+61 " 🟣 api_scan_all() Converted to Parallel Strategy Execution via ThreadPoolExecutor
+62 " 🟣 5-Minute TTL Cache Added for Daily Kline API Calls
+63 " 🟣 researcher.py Created: Deterministic Strategy Hypothesis Engine
+64 " 🟣 Two New Learner Jobs: job_hypothesis (6hr) and job_brief_reeval (daily 04:00 UTC)
+65 " 🟣 GET /api/intelligence/research Route Added to app.py
+66 " 🟣 Research Firm Section Added as 4th Panel in Intelligence Tab
+### May 7, 2026
+67 1:15a 🟣 Multi-Exchange Adapter Layer and AI Agent System Added to Matrix Trader 7.0
+68 1:16a 🟣 Research Firm UI and mt-learner Integration Added to Intelligence Tab
+69 " 🟣 Agent Pipeline Gated to Top-N Signals with Scan Rank and Daily Kline Cache
+70 " 🔵 lib/researcher.py Missing — Research Briefs Consumed Directly from mt-learner File Path
+71 " 🔵 mt-learner External Service Architecture and Research Briefs Contract Confirmed in HANDOFF.md
+72 1:17a 🔵 HANDOFF.md Current Task List Reveals Full Scope, Verification Results, and Performance Measurements
+73 " 🔵 Research PDF Corpus and Uncommitted Working Tree State Identified
+S20 Verify Codex completed the last bits of coding correctly in Matrix_Trader_7.0 (May 7 at 1:17 AM)
+S22 Verify Codex work then identify what's next — P9 Execution Readiness Layer identified as next phase, brainstorm proposed (May 7 at 1:18 AM)
+74 1:20a ⚖️ P9 Brainstorm Structured as 6-Step Design Workflow Before Any Code
+75 1:21a 🔵 P9 Formal Description Confirmed in HANDOFF.md Phase Table
+S23 P9 Execution Readiness Layer brainstorm — clarifying questions phase begun, first question posed to user about P9 output UX (May 7 at 1:21 AM)
+76 1:46a 🔵 May 7 analyze.py Audit Reveals Three Critical Signal Selection Problems Destroying P&L
+77 " ⚖️ Three Targeted score_ticker() Fixes Planned for Balanced Strategy Signal Quality
+78 " 🔵 score_ticker() Structure Mapped — TAG_META/TAG_TIPS Dicts Not Found by Name in app.py
+79 1:47a 🔵 TAG_TIPS and TAG_META Are JavaScript Dicts in index.html, Not Python Dicts in app.py
+80 " 🔴 Fix 1 Applied: short_squeeze LONG Now Requires Positive Price Momentum Before Awarding Full Score
 
-Access 1125k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 1685k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>

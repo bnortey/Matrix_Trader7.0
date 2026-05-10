@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-06
-Last commit: 0014cc3 feat: raise conviction floors — balanced 55→65, funding_arb 60→76
-app.py: 4763 lines
-index.html: 6017 lines
+Last updated: 2026-05-07
+Last commit: 8d35707 feat: add agent layer, adapters, updated docs and analyze.py
+app.py: 4987 lines
+index.html: 6245 lines
 
 ---
 
@@ -224,6 +224,8 @@ Sentiment APIs (no key needed):
 | `/api/account/positions` | GET | Live exchange positions from MEXC private API — P8 |
 | `/api/account/balance` | GET | Account balance and available margin — P8 |
 | `/api/account/readiness` | GET | Bot readiness metrics from signals DB — P8 |
+| `/api/intelligence/research` | GET | Reads `/opt/mt-learner/research/briefs.json`; returns strategy hypothesis briefs (active and retired) with confidence levels |
+| `/api/backfill/journey` | POST | **MAINTENANCE** — Backfills `journey_*` metrics into `signal_json` for closed signals. 500 per call, idempotent. VPS shell only: `curl -X POST http://localhost:8080/api/backfill/journey` |
 | `/api/backfill/pnl` | POST | **MAINTENANCE** — Re-evaluates historical signals (result NOT NULL, pnl_pct NULL) against live kline data; writes corrected exit_price, blended PARTIAL, and leveraged pnl_pct. Safe to call repeatedly (skips already-backfilled rows). |
 | `/api/cleanup/phantom-events` | POST | **MAINTENANCE** — Deletes TP/SL events in `position_events` for signals whose `entry_at IS NULL` (phantom events logged before entry was confirmed). Does NOT delete `ENTRY_FILLED` rows. Idempotent; returns `{deleted, affected_signals}`. |
 
@@ -562,6 +564,7 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P6a | Optional CoinGlass V4 market-data enrichment: all-coin futures snapshot when plan allows; per-symbol OI/funding/liquidation context for enriched signals | ✅ Done |
 | P7a | CoinGlass signal enrichment: cross-exchange funding confirmation (Funding Arb), liquidation asymmetry soft modifier, OI/MCap fragility tag — all shadow-only, no hard gates | ✅ Done |
 | P7b | Strategy lifecycle controls: built-in pause/resume, direction lock filter, volatility allowlist filter for custom strategies | ✅ Done |
+| Research Firm | researcher.py + 2 new learner jobs + `/api/intelligence/research` + Intelligence tab 4th section | ✅ Done |
 | P4 | README updated and published to GitHub | ✅ Done (beta testers TBD) |
 | P8 | MEXC read-only account integration + Bot Readiness tracker panel in Strategies tab | ✅ Done (MEXC private API blocked by Akamai/CDN from Hetzner VPS — routes fail-closed gracefully; works from local Mac) |
 | P9 | Execution readiness layer — pre-flight validation, position sizing, risk budget checks, max loss gate. New lib/execution_engine.py and lib/risk_controls.py. | ⏳ Pending |
@@ -578,17 +581,220 @@ Review that panel before beginning any execution phase. You decide when to proce
 the system surfaces the data, it does not block you.
 
 Next in priority order:
-1. Begin P9 — execution readiness layer (brainstorm in progress)
-2. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes — at 0/50)
-3. After 50+ closed signals with agent data, review Intelligence tab Shadow Validation for Phase 2 readiness
-4. Run `python3 analyze.py` on VPS DB weekly to track strategy edge
-5. Review `short_vol_short` gate after 2+ more weeks of shadow data
-6. Monitor mt-learner — `journalctl -u mt-learner` weekly; learner re-analyzes automatically
-7. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
+1. Deploy to VPS and test Apply + Revert buttons end-to-end
+2. Monitor balanced and funding_arb win rate over next 30-50 trades; use Revert if win rate degrades
+3. Monitor firebreak impact on signal count over next 5-10 scans
+3. Run full backfill: `python3 edge_lab_build.py --mode backfill --resume --batch-size 25 --max-runtime-minutes 45`
+4. Validate dataset: check candle counts per symbol in `edge_lab_symbol_status` after full backfill completes
+5. **Run factor engine on VPS after full backfill: `python3 edge_lab_factors.py --db data/edge_lab.db --out data/factor_report.json`** — expect ~2-3hr runtime on 5.7M rows; use `--template TP1_0_SL0_5` first for faster initial pass
+6. Interpret factor_report.json: identify top long/short states with positive edge_delta and high sample_quality
+7. Regime-aware ATR stop multiplier is next after factor engine validation
+6. Build shadow inversion research layer for `momentum_breakout`
+7. Expand path templates only after validating storage/runtime impact
+8. Begin P9 — execution readiness layer (brainstorm in progress)
+9. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes — at 0/50)
+10. After 50+ closed signals with agent data, review Intelligence tab Shadow Validation for Phase 2 readiness
+11. Run `python3 analyze.py` on VPS DB weekly to track strategy edge
+12. Review `short_vol_short` gate after 2+ more weeks of shadow data
+13. Monitor mt-learner — `journalctl -u mt-learner` weekly; learner re-analyzes automatically
+14. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
+
+---
+
+## Session Summary — 2026-05-07 (Strategy Override Revert)
+
+**STRATEGY OVERRIDE REVERT — UI CONTROL FOR LEARNER PROPOSALS.** Added revert capability so the trader can undo learner overrides without SSH access. No schema changes. No edge_lab changes. No learner logic changes.
+
+**`app.py` changes:**
+- Added `GET /api/strategy-overrides` — returns active overrides dict with `original_min_conviction` from the STRATEGIES registry for each overridden key.
+- Added `DELETE /api/strategy-overrides/<strategy_key>` — removes override atomically via tmp+replace pattern. Idempotent (returns success if key not present).
+
+**`templates/index.html` changes:**
+- `renderIntelligence()`: added Revert button to applied proposal cards (`sug.status === 'applied' && sug.strategy`). Button calls `revertStrategyOverride(sug.strategy)`.
+- Added `<div id="active-overrides-panel">` placeholder in `container.innerHTML` template, immediately above Strategy Proposals. Hidden by default; populated by `loadStrategyOverrides()`.
+- Added `showOverrideMsg(msg, isError)` — fixed-position toast that fades after 3s, no library. No existing toast function was present.
+- Added `loadStrategyOverrides()` — fetches `/api/strategy-overrides`, renders override rows (key, original→override conviction, Revert button) into `#active-overrides-list`. Hides panel if no overrides active.
+- Added `revertStrategyOverride(strategyKey)` — DELETEs override, calls `showOverrideMsg`, refreshes both `loadStrategyOverrides()` and `loadIntelligence()`.
+- Added `loadStrategyOverrides()` call in `loadIntelligence()` after `renderIntelligence()`.
+
+**Verification:** `python3 -m py_compile app.py` passes. `import app` passes. Both routes registered: `GET /api/strategy-overrides`, `DELETE /api/strategy-overrides/<strategy_key>`. No edge_lab/analyze.py changes.
+
+---
+
+## Session Summary — 2026-05-07 (Learner Apply Fix)
+
+**LEARNER APPLY FIX — STRATEGY THRESHOLD OVERRIDES.** Fixed the Apply button failure ("failed to update strategy") for built-in strategies. No STRATEGIES dict modified at runtime. No DB schema changes. No edge_lab changes.
+
+**`app.py` changes:**
+- Added `STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"` constant near `RISK_GATES_PATH`.
+- Added `_load_strategy_overrides()` — reads `data/strategy_overrides.json`, returns `{}` if missing/malformed, never raises. Only `min_conviction` overrides supported in this phase.
+- Added `_save_strategy_override(strategy_key, field, value)` — persists a single field override atomically via tmp+replace pattern; only `min_conviction` permitted; preserves all existing overrides.
+- Added `_get_custom_strategy_keys()` — queries `custom_strategies` table for enabled keys, returns set, never raises.
+- Fixed `run_scan()`: after `strategy_key = strat["key"]`, calls `_load_strategy_overrides()` fresh, shallow-copies `strat` before mutating, applies `min_conviction` override if present. `effective_threshold` line comes after override is applied.
+- Fixed `api_intelligence_suggestion_action()` `elif stype in ('threshold', 'regime_suppress')` block: built-in strategies (in registry, not in custom table) now apply via `_save_strategy_override()` instead of failing `PATCH /api/strategies/custom/<key>`. Custom strategies still use the existing PATCH route.
+- `api_strategies()`: loads overrides once, injects `conviction_override` (int or null) into each strategy result dict.
+
+**`templates/index.html` changes:**
+- `setStrategy()`: after setting `strat-lbl` innerHTML, looks up `H.strategies` for the active strategy's `conviction_override` and appends a dim note "⚙ Conviction threshold overridden to X by learner" when override is non-null. Frontend URL was already correct (`intelligenceSuggestionAction` → `PATCH /api/intelligence/suggestions/${id}`).
+
+**Verification:** `python3 -m py_compile app.py` passes. `import app` passes. `STRATEGIES['balanced']['min_conviction']` unchanged at 65. `_load_strategy_overrides()` returns `{}` when file absent. `_get_custom_strategy_keys()` returns `{'balanced_focus_short'}`. Registry not mutated by override application. No `learner/proposals` URL in frontend.
+
+---
+
+## Session Summary — 2026-05-07 (Factor Engine)
+
+**EDGE LAB FACTOR ENGINE — 3 new files.** Research-only layer. No app.py changes, no index.html changes, no signals.db writes.
+
+**`edge_lab/factor_engine.py`** — Core aggregate analysis module. Constants: `TEMPLATES`, `SIDES`, `TAGS`, `BASELINES`, `MIN_N=30`, `SLOW_QUERY_THRESHOLD=60.0`. Key functions:
+- `wilson_interval(n, k)` — 95% Wilson confidence interval, returns (lower, upper) as percentages
+- `sample_quality(n)` — `high_confidence` / `moderate_confidence` / `low_confidence` / `insufficient_data`
+- `_build_row()` — assembles one result row from a raw SQLite aggregate tuple; computes `tp_rate`, `edge_delta`, confidence interval, `sample_quality`
+- `analyze_factor_group()` — issues one SQLite aggregate query for a single (template, side) pair; binding order: [tp_key, mfe_key, mae_key, tp_key, ttp_key] + where_clause_params; filters by `HAVING COUNT(*) >= min_n`
+- `_run_for_templates()` — iterates all template × side combinations
+- 8 `analyze_*` functions: `volatility_regime`, `trend_state`, `compression_state`, `regime_x_trend`, `rsi_decile`, `volume_decile`, `tag_presence`, `atr_decile`. All accept optional `templates` list.
+- `tag_presence` uses `group_expr=f"'{tag}'"` (constant literal) with `WHERE json_extract(features_json, '$.tags') LIKE ?` pattern matching.
+
+**`edge_lab/factor_report.py`** — Orchestrates full analysis. `run_factor_analysis(db_path, top_n=10, templates=None, verbose=True)` → dict. Runs all 8 groups, prints per-group timing, warns if any query exceeds `SLOW_QUERY_THRESHOLD`. Flattens `tag_presence` (nested by tag) into `flat_results` before computing `top_long_states` / `top_short_states`. Each top-row gets a `source_group` field. Returns structured dict with `meta`, `top_long_states`, `top_short_states`, `groups`. Does not write any files.
+
+**`edge_lab_factors.py`** — CLI entrypoint. Args: `--db` (default `data/edge_lab.db`), `--out` (default `data/factor_report.json`), `--template` (repeatable, choices=TEMPLATES), `--top-n` (default 10), `--quiet`. Calls `run_factor_analysis()`, writes JSON report, prints formatted human-readable summary with top-N per side and group timing table.
+
+**Verification:** All 3 files compile clean (`python3 -m py_compile`). All imports resolve. No `signals.db` writes, no `app.py` or `backtest.py` imports (docstring mentions only). Single-query smoke test: `volatility_regime` group against local 691k-row DB returned 4 rows in 88.5s — expected (json_extract full-table scan, no JSON index). `_build_row()` output structure verified against real query data. Note: full run on VPS 5.7M rows will take significantly longer — use `--template` flag to run one template at a time.
+
+---
+
+## Session Summary — 2026-05-07 (Extreme Vol Firebreak)
+
+**EXTREME VOL FIREBREAK — USER-CONTROLLED RISK GATE.** Audit data confirmed persistent negative expectancy across all strategies in extreme volatility. Added a user-controlled firebreak gate defaulted ON.
+
+**Backend (`app.py`):**
+- Added `_load_extreme_vol_firebreak()` — reads `extreme_vol_firebreak` boolean from `data/risk_gates.json`, defaults `True` if missing or malformed, never raises.
+- Added `_save_extreme_vol_firebreak(val)` — writes atomically via temp file + `os.replace()`, preserves all existing keys in `risk_gates.json`.
+- Added firebreak check in `enrich_signal()` immediately after `vol_regime` is computed: if `vol_regime == "extreme"` and gate ON, returns None. Fires before the existing directional gate logic.
+- The existing `×0.85` conviction multiplier at line ~1798 is preserved as a secondary safeguard that applies even when the gate is OFF.
+- Extended the existing `GET /api/risk-gates` response to include `"extreme_vol_firebreak"` key.
+- Added `PATCH /api/risk-gates/extreme_vol_firebreak` route (registered before the wildcard `<gate_key>` route so Flask matches it first). Accepts `{"enabled": true|false}`. Returns `{"success": true, "extreme_vol_firebreak": val}`.
+
+**Frontend (`index.html`):**
+- Added "Block Extreme Vol" toggle row between strategy-bar and stat-bar. Amber label when ON, muted when OFF. Sub-label shows the audit rationale. Works on 375px mobile.
+- `_evfEnabled()`: reads `localStorage.mt7_extreme_vol_firebreak`, defaults `true`.
+- `initExtremeVolFirebreak()`: sets checkbox state, applies style, syncs server on page load. Called at init.
+- `setExtremeVolFirebreak(enabled)`: writes localStorage, syncs server via PATCH, shows 3-second inline confirmation.
+- Added `<p id="evf-empty-note">` inside empty-state: populated by `setPhase()` when `phase === 'empty'` and gate is ON.
+- Added `<div id="evf-stat-note">` below stat-bar: shown when `phase === 'results'` and signal count < 3 and gate is ON. Also updated from `updateStatBar()`.
+
+**No strategy scoring changed. No DB schema changed. No edge_lab files touched.**
+
+**Verification:** `app.py` compiles and imports clean. GET returns `extreme_vol_firebreak: true`. PATCH to false writes file and returns correctly. PATCH to re-enable restores `true`. `risk_gates.json` all existing keys preserved after write.
+
+---
+
+## Session Summary — 2026-05-07 (Edge Lab Bug Fix Pass)
+
+**EDGE LAB — BUG FIX PASS.** Four bugs fixed in `edge_lab/` and `analyze.py`. No changes to `app.py`, `templates/index.html`, `backtest.py`, or `data/signals.db`.
+
+**Fixed: chunked kline fetching (`edge_lab/mexc_data.py`).** `fetch_klines()` previously made a single API request with `limit=2000`, silently returning ~20 days instead of 90. Replaced with a backwards-walking chunk loop: each iteration requests `interval, limit=KLINE_LIMIT, end=<window_end>`, advances `window_end = df["timestamp"].min() - 1`, sleeps 0.3s between chunks, stops when earliest timestamp ≤ start or chunk is empty. Cap: `MAX_CHUNK_ATTEMPTS = 20`. First-chunk error returns empty DataFrame with error in meta (same contract as before). Result is concatenated, deduplicated on timestamp, sorted ascending, filtered to `>= start`. `partial_history` evaluated after full concatenation. Smoke test confirmed 8,640 candles per symbol (full 90-day target at Min15) vs. 2,000 previously.
+
+**Fixed: dead path labeler code (`edge_lab/path_labeler.py`).** Deleted `label_paths_for_index()` and `_label_side()` — zero callers confirmed before deletion. Only `label_paths_from_arrays()` and `_label_side_arrays()` remain. `PATH_TEMPLATES` unchanged.
+
+**Fixed: audit report JSON deduplication (`analyze.py`).** `run_audit()` was writing `deployment_recommendations`, `regime_survival`, `tag_combinations`, `extreme_volatility_firebreaks`, and `audit_summary` both inside `sections` and as top-level keys. Removed the five top-level duplicates. All sections now live under `sections` only. JSON structure verified: top-level keys are exactly `generated_at`, `total_analyzed`, `excluded_no_pnl`, `sections`.
+
+**Fixed: purity contract comment (`edge_lab/feature_engine.py`).** Added four-line comment above `from lib.indicators import ...` making the isolation guarantee explicit and self-documenting.
+
+**Verification:** All files compile clean. No `app.py` or `backtest.py` imports in `edge_lab/`. Dead code confirmed absent. Purity comment confirmed present. Smoke build: 3 symbols, 25,920 candles (8,640/symbol), 0 failures. `python3 analyze.py` exits 0. JSON structure assertion passes.
+
+---
+
+## Session Summary — 2026-05-07 (Universal Candle Labeling Engine)
+
+**UNIVERSAL CANDLE LABELING ENGINE.** Added isolated Edge Lab research layer under `edge_lab/` plus `edge_lab_build.py`. This is research-only market memory: no Flask routes, no frontend changes, no live scanner changes, no strategy scoring changes, no execution changes, and no `signals.db` schema changes.
+
+**Built:** Safe local MEXC ticker/kline fetchers with no `app.py` import; safe full-universe MEXC USDT perp discovery; symbol eligibility gates; rolling-normalized market-state feature extraction; deterministic long/short future path labeling for four templates; isolated `data/edge_lab.db` storage; idempotent `candle_labels`; `edge_lab_symbol_status` for resume/quarantine tracking; backfill/incremental modes; max runtime guard; CLI summary; smoke summary for path outcomes.
+
+**Runtime behavior:** P0 kline fetch uses MEXC's max available public kline window (`limit=2000`) and reports partial history when the 90-day target cannot be retrieved in one safe request. Full 90-day chunking was intentionally not forced because local smoke showed MEXC/network behavior could make chunked pulls fragile; safe partial-history labeling is preferred for this pass.
+
+**Verification:** `python3 -m py_compile edge_lab/*.py edge_lab_build.py` passed. Import guard checks for `app.py` and `backtest.py` imports returned no matches. Smoke command `python3 edge_lab_build.py --symbols BTC_USDT,ETH_USDT,SOL_USDT --max-symbols 3 --max-runtime-minutes 10` completed in 19.37s: 6,000 candles fetched, 5,355 rows labeled/inserted, 3 symbols complete, 0 failed. `data/edge_lab.db` exists with both required tables. Full safe command `python3 edge_lab_build.py --mode backfill --resume --batch-size 25 --max-runtime-minutes 45` stopped cleanly via `max_runtime_reached`: 779 eligible symbols, 377 processed this run, 380 complete total, 399 pending, 0 skipped, 0 failed, 747,639 candles fetched this run, 666,584 rows labeled/inserted this run. Current `candle_labels` row count: 685,224.
+
+**No live behavior changed:** No Edge Lab edits were made to `app.py` or `templates/index.html`. Those files already had unrelated uncommitted diffs before this session.
+
+---
+
+## Session Summary — 2026-05-07 (Audit Intelligence Upgrade)
+
+**Scope:** `analyze.py` only, plus this handoff note. No signal generation, frontend behavior, app routes, or database schema changed.
+
+**Audit structure changes:** Existing report sections are preserved: `regimes`, `conviction`, `tags`, `blacklist`, `tp1_counterfactual`, and `direction_flip`. Added Wilson 95% bounds and `sample_quality` to the shared aggregation helper, so regime, conviction, and tag win-rate objects now include `wilson_lower`, `wilson_upper`, and `sample_quality`. Blacklist candidates also include those fields.
+
+**New machine-readable sections:** Added `deployment_recommendations`, `regime_survival`, `tag_combinations`, `extreme_volatility_firebreaks`, and `audit_summary`. These are written under `sections` and also aliased at the JSON root for future agent ingestion. `direction_flip` now keeps the existing strategy keys and adds `strategy_tag` and `strategy_regime` arrays with `is_reverse_candidate`.
+
+**Verification:** `python3 -m py_compile analyze.py` passed. `python3 analyze.py` exits 0 locally and writes `data/audit_report.json`. JSON verification confirmed all previous sections still exist, all five new sections exist, Wilson/sample-quality fields exist in regimes, conviction, tags, and blacklist, and extreme-vol firebreak rows include `leverage_danger_state`.
+
+---
+
+## Session Summary — 2026-05-07 (Risk Gate Button Fix)
+
+**Bug:** Risk gate mode buttons (BLOCK / SHADOW / OFF) required a full page refresh to show the selected state. Root cause: `setRiskGateMode()` set `A.riskGateLoading = true` and triggered a full `renderStrategyAnalytics()` cycle, then fetched all gates again before re-rendering — no immediate DOM feedback.
+
+**Fix (index.html only):**
+- Added `data-gate-key` and `data-mode` attributes to the three mode buttons in the gate card render loop (line ~3959). Changed onclick to pass `this` as third argument.
+- Rewrote `setRiskGateMode(key, mode, buttonEl)` — now uses optimistic update: instantly updates button colors/borders on click, disables all buttons during fetch, confirms from `response.gate.mode` on success, reverts on error with inline error message, removes all `loadRiskGates()` and `renderStrategyAnalytics()` calls from the hot path.
+- No full re-render triggered on gate mode change.
+
+**Lines changed:** `setRiskGateMode` function (~3651–3669) fully replaced; button render line (~3958–3961) updated. Net: +29 lines.
+
+---
+
+## Session Summary — 2026-05-07 (Research Firm Data Enrichment)
+
+**Part A — Journey persistence (app.py):**
+- Added `_persist_journey_to_signal_json()` helper after `_compute_leveraged_pnl()` — computes `compute_trade_journey()` at close time and merges 11 `journey_*` fields into `signal_json`: `journey_available`, `journey_mae_pct`, `journey_mfe_pct`, `journey_capture_ratio`, `journey_stop_pressure`, `journey_path_label`, `journey_entry_delay_min`, `journey_entry_to_close_min`, `journey_tp1_hit`, `journey_tp2_hit`, `journey_tp3_hit`.
+- Called from `api_outcomes_check()` after each successful outcome write (single `_journey_sig` dict with fresh fields).
+- Added `POST /api/backfill/journey` maintenance route (500 signals per call, idempotent).
+- Backfill run: 829 signals filled across 2 batches (500 + 329), 0 errors. Journey data now present for all historical closed trades with available kline history.
+
+**Part B — Researcher.py new hypothesis types (VPS only):**
+- Added `_confidence_from_journey_trades()` — separate confidence thresholds for journey-data types (emerging at 20, not 30).
+- Added `_title_type4()` and `_title_type5()` title generators.
+- TYPE 4 (`capture_ratio_cluster`): fires when avg capture ratio < 25% on WIN/PARTIAL trades in a strategy × regime group (n ≥ 10 with journey data). `proposed_strategy=None` — fix is entry timing, not a new strategy.
+- TYPE 5 (`stop_pressure_pattern`): fires when avg stop pressure ≥ 80% on LOSS trades in a strategy × volatility group (n ≥ 10 with journey data). `proposed_strategy=None` — fix is stop distance in P9 execution engine.
+- Reeval: TYPE 4 retires when avg_capture rises ≥ 35%. TYPE 5 retires when avg_stop_pressure drops < 70%.
+- Added fallback log to `_load_feature_thresholds()` when feature_weights.json not found.
+- Dry-run: all 6 learner jobs passed, 8 briefs total, 0 TYPE 4/5 briefs yet (expected — journey data just became available).
+
+**Files changed:** `app.py` (+55 lines, 4871 → 4926), `HANDOFF.md` updated. VPS-only: `/opt/mt-learner/researcher.py` updated.
+
+---
+
+## Session Summary — 2026-05-07
+
+**Signal selection fixes applied to `score_ticker()` in `app.py` based on May 7 `analyze.py` audit findings (748 signals, 800 with P&L).**
+
+**Fix 1 — short_squeeze LONG gate (Balanced only):** `short_squeeze` LONG signals now require `change_pct <= 0` to be reduced to `fund_weak` score and fire `squeeze_unconfirmed` tag; rising price gets full `fund_strong`. Funding Arb unaffected — funding is its primary signal. Addresses: 256 signals, 19.9% win rate, -9,604 P&L delta.
+
+**Fix 2 — Balanced LONG momentum reduction:** For Balanced only, effective LONG momentum weight halved (`mom_long_strong = mom_strong // 2`, `mom_long_weak = mom_weak // 2`). SHORT momentum (`strong_dump`, `dump`) keeps full weight. Fires `long_momentum_reduced` tag on `strong_momentum` LONG in Balanced. Addresses: 309 signals, 19.4% win rate, -8,397 P&L delta.
+
+**Fix 3 — Balanced SHORT bias multiplier:** For Balanced only, `short_score *= 1.08` before direction determination. Tips borderline cases toward SHORT; does not override strong LONG signals (60 vs 20*1.08=21.6 still resolves LONG). Fires `short_bias_applied` tag. Addresses: systematic SHORT tag outperformance (+7,894 / +7,388 / +5,424 P&L deltas).
+
+**New tags:** `squeeze_unconfirmed`, `long_momentum_reduced`, `short_bias_applied`. Tags appear in signal output for tracking/audit. TAG_META/TAG_TIPS display entries in `index.html` to be added in a follow-up session.
+
+**Note:** `_strat_key = strat.get("key", "balanced")` added immediately after weight unpacking in `score_ticker()` — serves all three fixes.
+
+**Verification:** `python3 -m py_compile app.py` clean. Four smoke tests passed: unconfirmed squeeze, confirmed squeeze, SHORT bias on premium signal, Funding Arb unaffected.
+
+**Files changed:** `app.py` (+26 lines, 4845 → 4871), `HANDOFF.md` updated.
+
+**Next step after accumulating 50+ new closed signals with these fixes active:** Run `analyze.py` again. If fixes are working: `short_squeeze` win rate should rise above 25%; `strong_momentum` P&L delta should improve; direction distribution should shift toward more SHORTs in Balanced. Re-evaluate multiplier values if not improving after 50 signals.
 
 ---
 
 ## Session Summary — 2026-05-06
+
+**Performance fixes (Part A).** Added `AGENT_TOP_N = 10` to `app.py`; agent shadow pipeline now runs only when `base.get("_scan_rank", 99) < AGENT_TOP_N` and the enriched signal already meets the strategy's effective conviction floor, because agent output is shadow-only and cannot rescue a below-floor signal. `api_scan_all()` strategies now run concurrently with `ThreadPoolExecutor`. Added `_daily_kline_cache` with 5-minute TTL for Day1 klines. `run_scan()` stamps `_scan_rank` after the top-30 slice; `enrich_signal()` strips `_scan_rank` before returning. Measured scan time before: 14.4s. After: 7.07s on the VPS (`POST /api/scan/all`, 890 pairs). `/api/scan/all` verification showed `_scan_rank` does not leak in returned signals.
+
+**Research Firm (Part B).** Created `/opt/mt-learner/researcher.py` on the VPS. Added `job_hypothesis` (6hr) and `job_brief_reeval` (24hr) to `/opt/mt-learner/learner.py`; dry-run verified all six learner jobs execute without errors. Initialized `/opt/mt-learner/research/briefs.json`. Added `GET /api/intelligence/research` to `app.py`. Added Research Firm as the 4th section in `#intelligence-section`; `I.briefs` and `I.briefsLoading` were added to the Intelligence state object. First run found 0 active briefs because current closed signals have 0 agent shadow regime rows; confidence levels present: none yet. Route check returned `success:true`, `active_count:0`, `learner_running:true`, `total_signals_analyzed:800`.
+
+**Verification.** `PYTHONPYCACHEPREFIX=/tmp/mt-pycache python3 -m py_compile app.py` passed locally and on the VPS. Inline dashboard JavaScript parsed with `JS OK`. Live `GET /` and `GET /api/intelligence/research` returned 200. `mt-learner` and `matrix-trader` services are active. User will handle final browser/UI testing.
+
+**Files changed.** Repo: `app.py` (+82 lines from 4763 to 4845), `templates/index.html` (+228 lines from 6017 to 6245), `HANDOFF.md` updated. VPS-only: `/opt/mt-learner/researcher.py` created, `/opt/mt-learner/learner.py` updated, `/opt/mt-learner/research/briefs.json` initialized.
 
 **VPS audit.** Confirmed agent shadow layer live (10 agent fields in scan output, `agent_version: v2-phase1-shadow`). 0 historical signals have agent data — expected, all 853 closed before May 4 deployment. Scan time flagged at 14.4s (exceeds 10s Phase 2 gate — agents make LLM calls per signal; deferred fix). TradingView Hyperliquid fix confirmed deployed. VPS healthy: 2.9 GB RAM free, 4% disk.
 
@@ -737,6 +943,41 @@ Recommended next step: deploy P6a, verify `COINGLASS_API_KEY` is present on the 
 - Do not call `_load_symbol_performance_cache()` inside `score_ticker()` — call it once in `run_scan()` and pass the result as the `sym_perf_cache` kwarg. Calling it per-ticker would hit the DB 800+ times per scan.
 - Do not apply `sym_overrides` inside `_load_symbol_performance_cache()` — overrides are a scoring concern and belong in `score_ticker()` after the penalty block.
 - Do not use `signals.tp1 IS NOT NULL` as a proxy for "TP1 was hit" — that column is set at signal creation time. Always join to `position_events WHERE event_type = 'TP1_HIT'` for confirmed hits.
+- Do not run agents on signals ranked `>= AGENT_TOP_N` — guard is the `base.get("_scan_rank", 99) < AGENT_TOP_N` check in `enrich_signal()`. Do not remove it.
+- Do not call LLMs from `researcher.py` — all Research Firm analysis is SQL + arithmetic only.
+- Do not write `briefs.json` directly — always write to `briefs.json.tmp` then `os.replace()`.
+- Do not modify the three existing Intelligence tab sections when working on the Research Firm section.
+- Do not call `POST /api/backfill/journey` from a browser — it fetches Min15 klines for up to 500 signals sequentially and will time out. Use `curl -X POST` from VPS shell only.
+- Do not modify `compute_trade_journey()` — `_persist_journey_to_signal_json()` calls it as-is; changes affect both live UI and persistence.
+- Do not remove the `×0.85` extreme vol conviction multiplier in `enrich_signal()` — it is a secondary safeguard that applies even when the firebreak gate is OFF.
+- Do not cache `_load_extreme_vol_firebreak()` at module level — it must read fresh on every call so toggle changes take effect without restarting the app.
+- Do not use the firebreak toggle to trigger a rescan — it takes effect on the next manual scan only.
+- Do not make a single MEXC kline request expecting 90 days of data — MEXC caps at 2000 candles per request; chunked fetching is required (`fetch_klines()` in `edge_lab/mexc_data.py` handles this).
+- Do not maintain two implementations of path labeling logic in `path_labeler.py` — use `label_paths_from_arrays()` only; `label_paths_for_index()` and `_label_side()` were deleted as divergence risk.
+- Do not write new audit sections to both `sections` and the top-level output dict in `analyze.py` — all sections belong under `sections` only.
+- Do not add `journey_*` as direct DB columns — they belong in `signal_json` only (no ALTER TABLE, consistent with agent field pattern).
+- Do not generate `proposed_strategy` for TYPE 4 or TYPE 5 briefs — these are diagnostic findings (entry timing / stop distance), not strategy configuration proposals.
+- Do not change the Balanced SHORT bias multiplier above 1.15 without re-running `analyze.py` — too aggressive will suppress valid LONG signals.
+- Do not import `edge_lab.factor_engine` or `edge_lab.factor_report` from `app.py` — the factor engine is research-only and must never participate in live signal scoring.
+- Do not run `python3 edge_lab_factors.py` without `--template` on a small machine — each query is a full-table json_extract scan (~88s/query locally on 691k rows; much longer on 5.7M VPS rows). Run one template at a time on the VPS.
+- Do not expect factor_report.json to be real-time — it is a research snapshot; re-run manually after each full backfill to update.
+- Do not add JSON indexes to `edge_lab.db` for factor queries — the current design uses SQLite aggregate queries only; adding computed/generated columns for JSON fields is the correct optimization path if needed.
+- Do not call `con.row_factory = sqlite3.Row` in `factor_engine.py`'s `analyze_factor_group()` result unpacking — results are unpacked positionally by index, not by name.
+- Do not apply the SHORT bias multiplier or LONG momentum reduction to `funding_arb` or `mean_reversion` — those strategies have different signal mixes and the data does not support it.
+- Do not import app.py inside Edge Lab.
+- Do not import backtest.py inside Edge Lab.
+- Do not use global percentiles in Edge Lab — rolling normalization only.
+- Do not leak future data into feature generation; future candles belong only in path labels.
+- Do not connect Edge Lab output directly to live signal execution.
+- Do not use Edge Lab for autonomous live adaptation yet.
+- Do not write Edge Lab rows into `signals.db`.
+- Do not run full-universe Edge Lab backfills during active trading/scanning windows.
+- Do not mutate the STRATEGIES registry dict at runtime — always shallow-copy before applying overrides in run_scan().
+- Do not route built-in strategy threshold applies through PATCH /api/strategies/custom/<key> — built-ins are not in the custom_strategies table.
+- Do not call the suggestion apply route with POST — it is PATCH only.
+- Do not add new permitted fields to _save_strategy_override() without also updating run_scan() to apply them.
+- Do not leave applied learner overrides irreversible from the UI — always provide a Revert button so the trader can undo without SSH access.
+- Do not rebuild all historical Edge Lab labels repeatedly once incremental mode is available.
 
 ---
 
@@ -911,6 +1152,14 @@ Task prompts should ONLY cover:
 - [ ] Strategies tab Learn section shows core idea, best conditions, risks, read guidance, key signals, and weight concept chart
 - [ ] Strategies tab equity curve hover shows symbol, outcome, timestamp, trade P&L, and cumulative P&L
 - [ ] Strategies tab charts include short context descriptions explaining how to interpret the data
+- [ ] `GET /api/risk-gates` returns `extreme_vol_firebreak: true` in addition to `long_vol_long` and `short_vol_short`
+- [ ] `PATCH /api/risk-gates/extreme_vol_firebreak` with `{"enabled": false}` returns `{"success": true, "extreme_vol_firebreak": false}` and persists to `data/risk_gates.json`
+- [ ] "Block Extreme Vol" toggle visible in scan controls area between strategy bar and stat bar
+- [ ] Toggle defaults ON on fresh page load (localStorage key `mt7_extreme_vol_firebreak` absent → defaults true)
+- [ ] localStorage key `mt7_extreme_vol_firebreak` is written on load
+- [ ] Toggling OFF shows "Extreme vol gate OFF — signals will appear but carry elevated risk" confirmation fading after 3s
+- [ ] Empty state shows firebreak note when gate ON and 0 signals returned
+- [ ] Mobile: toggle visible and tappable on 375px
 - [ ] `GET /api/risk-gates` returns both `long_vol_long` and `short_vol_short`
 - [ ] Balanced strategy has `risk_gates.block_short_volatility = ["extreme"]`
 - [ ] Balanced SHORT extreme-vol candidates are tagged/logged with `short_vol_shadow` while `short_vol_short` mode is `shadow`

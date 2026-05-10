@@ -1052,6 +1052,17 @@
         <span id="strat-lbl"></span>
       </div>
 
+      <!-- Extreme vol firebreak toggle -->
+      <div id="evf-bar" style="display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;flex-shrink:0;">
+          <input type="checkbox" id="evf-toggle" onchange="setExtremeVolFirebreak(this.checked)"
+                 style="accent-color:var(--amber);width:14px;height:14px;cursor:pointer;">
+          <span id="evf-label" style="font-size:12px;font-weight:600;">Block Extreme Vol</span>
+        </label>
+        <span style="font-size:11px;color:var(--text3);flex:1;min-width:0;">Audit data: persistent negative expectancy across all strategies</span>
+        <span id="evf-msg" style="font-size:11px;flex-shrink:0;"></span>
+      </div>
+
       <!-- Stat bar -->
       <div id="stat-bar" class="hidden">
         <div class="stat"><span class="stat-val" id="sv-pairs">—</span><span class="stat-lbl">Scanned</span></div>
@@ -1059,6 +1070,9 @@
         <div class="stat"><span class="stat-val" id="sv-longs">—</span><span class="stat-lbl">Longs</span></div>
         <div class="stat"><span class="stat-val" id="sv-shorts">—</span><span class="stat-lbl">Shorts</span></div>
       </div>
+
+      <!-- Firebreak low-count note — shown below stat bar when < 3 signals and gate ON -->
+      <div id="evf-stat-note" style="display:none;font-size:11px;color:var(--text3);padding:3px 12px;">⚠ Extreme vol firebreak active</div>
 
       <!-- Filter bar -->
       <div id="filter-bar" class="hidden">
@@ -1137,6 +1151,7 @@
         <div id="sig-rows"></div>
         <div id="empty-state" class="hidden state-msg">
           <p id="empty-msg">No signals met the conviction threshold.</p>
+          <p id="evf-empty-note" style="font-size:12px;color:var(--text3);margin:4px 0 0;"></p>
           <div class="state-actions">
             <button class="btn-ghost" onclick="scanSignals()">Rescan all strategies</button>
             <button class="btn-green" onclick="scanSignals()">Rescan</button>
@@ -1855,6 +1870,19 @@ function setPhase(phase) {
   toggle('stat-bar',    results || empty);
   toggle('filter-bar',  results);
 
+  // Firebreak notes — additive only, no structural changes
+  const evfOn = _evfEnabled();
+  const evfEmptyNote = $('evf-empty-note');
+  if (evfEmptyNote) {
+    evfEmptyNote.textContent = (empty && evfOn)
+      ? "Extreme vol firebreak is active — some signals were suppressed. Toggle 'Block Extreme Vol' to see all signals."
+      : '';
+  }
+  const evfStatNote = $('evf-stat-note');
+  if (evfStatNote) {
+    evfStatNote.style.display = (results && evfOn && S.signals && S.signals.length < 3) ? '' : 'none';
+  }
+
   const btn = $('scan-btn');
   btn.disabled = scanning;
   btn.textContent = scanning ? 'Scanning...' : 'Scan';
@@ -2526,7 +2554,13 @@ async function setStrategy(key, fromUser = false) {
   });
   const meta = STRAT_META[key];
   const lbl = $('strat-lbl');
-  if (lbl && meta) lbl.innerHTML = `Max leverage: ${meta.cap}×  ·  ${esc(meta.desc)}  ·  <button class="strat-manage-btn" onclick="switchTab('strategies')">Manage in Strategies tab →</button>`;
+  if (lbl && meta) {
+    const stratData = (H.strategies || []).find(s => s.key === key);
+    const ovr = stratData && stratData.conviction_override != null
+      ? `<span style="color:var(--text3);font-size:11px;margin-left:8px;">&#9881; Conviction threshold overridden to ${stratData.conviction_override} by learner</span>`
+      : '';
+    lbl.innerHTML = `Max leverage: ${meta.cap}×  ·  ${esc(meta.desc)}  ·  <button class="strat-manage-btn" onclick="switchTab('strategies')">Manage in Strategies tab →</button>${ovr}`;
+  }
 
   // Load from scan cache instantly — no rescan needed
   const exchangeCache = H.scanResultsByExchange[S.exchange] || {};
@@ -2983,6 +3017,10 @@ function updateStatBar() {
   $('sv-sigs').textContent   = S.signals.length;
   $('sv-longs').textContent  = longs;
   $('sv-shorts').textContent = shorts;
+  const evfStatNote = $('evf-stat-note');
+  if (evfStatNote && S.phase === 'results') {
+    evfStatNote.style.display = (_evfEnabled() && S.signals.length < 3) ? '' : 'none';
+  }
 }
 
 /* ============================================================
@@ -3563,6 +3601,8 @@ const I = {
   status:       null,
   suggestions:  [],
   learnerRunning: false,
+  briefs:       [],
+  briefsLoading: false,
 };
 
 const STRATEGY_LEARN = {
@@ -3646,24 +3686,62 @@ async function loadRiskGates(rerender = true) {
   }
 }
 
-async function setRiskGateMode(key, mode) {
-  A.riskGateLoading = true;
-  renderStrategyAnalytics();
-  try {
-    const resp = await fetch('/api/risk-gates/' + encodeURIComponent(key), {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
+function setRiskGateMode(key, mode, buttonEl) {
+  // Find all mode buttons for this gate via data-gate-key attribute
+  const allBtns = Array.from(document.querySelectorAll(`[data-gate-key="${CSS.escape(key)}"][data-mode]`));
+  const modeColor = m => m === 'block' ? 'var(--amber)' : m === 'shadow' ? 'var(--blue)' : 'var(--text3)';
+
+  // Read current active mode from DOM before optimistic update
+  const previousMode = (allBtns.find(b => b.style.borderColor && b.style.borderColor !== 'var(--border)' && b.style.borderColor !== '') || {dataset: {mode: 'block'}}).dataset.mode;
+
+  // Step 1: optimistic update — instantly reflect clicked mode
+  allBtns.forEach(btn => {
+    const isActive = btn.dataset.mode === mode;
+    btn.style.color = isActive ? modeColor(mode) : 'var(--text2)';
+    btn.style.borderColor = isActive ? modeColor(mode) : 'var(--border)';
+    btn.disabled = true;
+  });
+
+  // Step 2: PATCH and confirm from server response
+  fetch('/api/risk-gates/' + encodeURIComponent(key), {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode}),
+  })
+  .then(r => r.json())
+  .then(data => {
+    allBtns.forEach(btn => { btn.disabled = false; });
+    const confirmed = data.success && data.gate ? data.gate.mode : (data.success ? mode : previousMode);
+    allBtns.forEach(btn => {
+      const isActive = btn.dataset.mode === confirmed;
+      btn.style.color = isActive ? modeColor(confirmed) : 'var(--text2)';
+      btn.style.borderColor = isActive ? modeColor(confirmed) : 'var(--border)';
     });
-    const data = await resp.json();
-    if (!data.success) throw new Error(data.error || 'Could not update risk gate');
-    await loadRiskGates(false);
-  } catch (e) {
-    A.riskGates = { success:false, error:e.message };
-  } finally {
-    A.riskGateLoading = false;
-    renderStrategyAnalytics();
-  }
+    if (data.success) {
+      // Update A state so next full render is consistent
+      if (A.riskGates && A.riskGates.gates && A.riskGates.gates[key] && data.gate) {
+        A.riskGates.gates[key].mode = data.gate.mode;
+      }
+    } else {
+      // Show inline error near button group
+      const container = buttonEl ? buttonEl.parentElement : null;
+      if (container) {
+        let errEl = container.querySelector('.gate-error');
+        if (!errEl) { errEl = document.createElement('div'); errEl.className = 'gate-error'; container.appendChild(errEl); }
+        errEl.style.cssText = 'color:var(--red);font-size:11px;margin-top:4px;';
+        errEl.textContent = data.error || 'Failed to update gate';
+        setTimeout(() => errEl.remove(), 3000);
+      }
+    }
+  })
+  .catch(() => {
+    allBtns.forEach(btn => { btn.disabled = false; });
+    allBtns.forEach(btn => {
+      const isActive = btn.dataset.mode === previousMode;
+      btn.style.color = isActive ? modeColor(previousMode) : 'var(--text2)';
+      btn.style.borderColor = isActive ? modeColor(previousMode) : 'var(--border)';
+    });
+  });
 }
 
 async function loadPortfolioSimulation(rerender = true) {
@@ -3954,8 +4032,9 @@ function renderRiskGatesPanel() {
       collect_data: 'collect data',
     }[h.recommendation] || 'collect data';
     const buttons = ['block', 'shadow', 'off'].map(m => `
-      <button class="sa-refresh" style="color:${m === mode ? modeColor : 'var(--text2)'};border-color:${m === mode ? modeColor : 'var(--border)'}"
-        onclick="setRiskGateMode('${esc(key)}', '${m}')" ${A.riskGateLoading ? 'disabled' : ''}>${m.toUpperCase()}</button>
+      <button class="sa-refresh" data-gate-key="${esc(key)}" data-mode="${m}"
+        style="color:${m === mode ? modeColor : 'var(--text2)'};border-color:${m === mode ? modeColor : 'var(--border)'}"
+        onclick="setRiskGateMode('${esc(key)}', '${m}', this)" ${A.riskGateLoading ? 'disabled' : ''}>${m.toUpperCase()}</button>
     `).join('');
     const scope = h.strategy_scope ? ` · ${h.strategy_scope}` : '';
     return `
@@ -5727,6 +5806,53 @@ setPhase('idle');
 setMktPhase('idle');
 setExchange(S.exchange);
 setStrategy('balanced');
+/* ============================================================
+   EXTREME VOL FIREBREAK
+   ============================================================ */
+function _evfEnabled() {
+  const raw = localStorage.getItem('mt7_extreme_vol_firebreak');
+  return raw === null ? true : raw === 'true';
+}
+
+function _applyEvfStyle(enabled) {
+  const lbl = $('evf-label');
+  if (lbl) lbl.style.color = enabled ? 'var(--amber)' : 'var(--text3)';
+}
+
+function initExtremeVolFirebreak() {
+  if (localStorage.getItem('mt7_extreme_vol_firebreak') === null) {
+    localStorage.setItem('mt7_extreme_vol_firebreak', 'true');
+  }
+  const enabled = _evfEnabled();
+  const cb = $('evf-toggle');
+  if (cb) cb.checked = enabled;
+  _applyEvfStyle(enabled);
+  // Sync server on load so VPS state matches the user's preference
+  fetch('/api/risk-gates/extreme_vol_firebreak', {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled}),
+  }).catch(() => {});
+}
+
+function setExtremeVolFirebreak(enabled) {
+  localStorage.setItem('mt7_extreme_vol_firebreak', String(enabled));
+  _applyEvfStyle(enabled);
+  fetch('/api/risk-gates/extreme_vol_firebreak', {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled}),
+  }).catch(() => {});
+  const msg = $('evf-msg');
+  if (!msg) return;
+  msg.textContent = enabled
+    ? 'Extreme vol gate ON'
+    : 'Extreme vol gate OFF — signals will appear but carry elevated risk';
+  msg.style.color = enabled ? 'var(--amber)' : 'var(--text3)';
+  setTimeout(() => { if (msg) msg.textContent = ''; }, 3000);
+}
+
+initExtremeVolFirebreak();
 renderStrategyButtons();  // async: fetches /api/strategies, renders buttons + populates history filter
 // Set initial sort indicator
 const initSi = document.getElementById('si-conviction_base');
@@ -5765,6 +5891,17 @@ async function loadIntelligence() {
     I.suggestions = suggestionsRes.suggestions || [];
     I.learnerRunning = suggestionsRes.learner_running || false;
     renderIntelligence();
+    loadStrategyOverrides();
+    // Load research firm briefs after main render
+    I.briefsLoading = true;
+    fetch('/api/intelligence/research')
+      .then(r => r.json())
+      .then(d => {
+        I.briefs = d.briefs || [];
+        I.briefsLoading = false;
+        renderResearchFirm();
+      })
+      .catch(() => { I.briefsLoading = false; renderResearchFirm(); });
   } catch(e) {
     if (container) container.innerHTML = '<div style="color:var(--red);padding:2rem;">Failed to load intelligence data.</div>';
   } finally {
@@ -5885,6 +6022,10 @@ journalctl -u mt-learner -f</pre>`;
         <div style="display:flex;gap:8px;margin-top:10px;">
           <button onclick="intelligenceSuggestionAction('${sug.id}','apply')" style="background:var(--green);color:#000;border:none;padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;">Apply</button>
           <button onclick="intelligenceSuggestionAction('${sug.id}','dismiss')" style="background:var(--border);color:var(--text);border:none;padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;">Dismiss</button>
+        </div>`
+        : sug.status === 'applied' && sug.strategy ? `
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <button onclick="revertStrategyOverride('${esc(sug.strategy)}')" style="background:var(--border);color:var(--text);border:none;padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;">Revert</button>
         </div>` : '';
       const newStratExtra = isNewStrategy ? `
         <div style="font-size:12px;color:var(--muted);margin-top:6px;">
@@ -5948,12 +6089,298 @@ journalctl -u mt-learner -f</pre>`;
       </div>
     </div>
 
+    <!-- Active Strategy Overrides (populated by loadStrategyOverrides) -->
+    <div id="active-overrides-panel" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
+      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px;">
+        <h3 style="margin:0;font-size:15px;">Active Strategy Overrides</h3>
+        <span style="font-size:12px;color:var(--text3);">Applied by learner. Revert to restore original values.</span>
+      </div>
+      <div id="active-overrides-list"></div>
+    </div>
+
     <!-- Strategy Proposals -->
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
       <h3 style="margin:0 0 14px;font-size:15px;">Strategy Proposals</h3>
       ${suggestionsHtml}
     </div>
+
+    <!-- Research Firm (populated by renderResearchFirm) -->
+    <div id="intelligence-research"></div>
   `;
+  renderResearchFirm();
+}
+
+// Track retired section toggle state locally
+let _researchRetiredOpen = false;
+
+function renderResearchFirm() {
+  const el = document.getElementById('intelligence-research');
+  if (!el) return;
+
+  const CONF_BADGE = {
+    watching: {bg: 'rgba(255,255,255,0.06)', color: 'var(--text2)', label: 'WATCHING'},
+    emerging: {bg: 'rgba(255,171,64,0.12)',  color: 'var(--amber)',  label: 'EMERGING'},
+    proposal: {bg: 'rgba(68,138,255,0.12)',  color: '#4a9eff',      label: 'PROPOSAL'},
+    ready:    {bg: 'rgba(0,230,118,0.12)',   color: 'var(--green)',  label: 'READY'},
+    retired:  {bg: 'rgba(255,255,255,0.04)', color: 'var(--muted)',  label: 'RETIRED'},
+  };
+  const TYPE_BADGE = {
+    regime_edge:               'REGIME EDGE',
+    vol_conviction_sweet_spot: 'VOL × CONVICTION',
+    feature_divergence:        'FEATURE SIGNAL',
+  };
+
+  const dismissedRaw = localStorage.getItem('mt7_dismissed_briefs');
+  const dismissed = dismissedRaw ? JSON.parse(dismissedRaw) : [];
+
+  const activeBriefs = I.briefs.filter(b => b.status === 'active' && !dismissed.includes(b.id));
+  const retiredBriefs = I.briefs.filter(b => b.status === 'retired');
+  const dismissedBriefs = I.briefs.filter(b => b.status === 'active' && dismissed.includes(b.id));
+
+  const CONF_ORDER = {ready: 0, proposal: 1, emerging: 2, watching: 3};
+  activeBriefs.sort((a, b) => (CONF_ORDER[a.confidence] ?? 9) - (CONF_ORDER[b.confidence] ?? 9));
+
+  function pctFmt(v) { return v != null ? (v * 100).toFixed(1) + '%' : '—'; }
+  function pnlFmt(v) { return v != null ? (v >= 0 ? '+' : '') + v.toFixed(1) + '%' : '—'; }
+  function deltaPp(cl, bl) {
+    if (cl == null || bl == null) return null;
+    return ((cl - bl) * 100).toFixed(0);
+  }
+
+  function progressNote(conf, n) {
+    if (conf === 'watching') return `<div style="font-size:12px;color:var(--muted);margin-top:8px;">${n} trades logged — need ${30 - n} more to reach EMERGING</div>`;
+    if (conf === 'emerging') return `<div style="font-size:12px;color:var(--muted);margin-top:8px;">${n} trades logged — need ${50 - n} more to reach PROPOSAL</div>`;
+    if (conf === 'proposal') return `<div style="font-size:12px;color:var(--muted);margin-top:8px;">${n} trades logged — need ${100 - n} more to reach READY</div>`;
+    return '';
+  }
+
+  function briefCard(brief, showDismiss) {
+    const ev = brief.evidence || {};
+    const cb = CONF_BADGE[brief.confidence] || CONF_BADGE.watching;
+    const typeLbl = TYPE_BADGE[brief.type] || (brief.type || '').toUpperCase();
+    const dp = deltaPp(ev.cluster_win_rate, ev.baseline_win_rate);
+    const dpPnl = ev.cluster_avg_pnl != null && ev.baseline_avg_pnl != null
+      ? (ev.cluster_avg_pnl - ev.baseline_avg_pnl).toFixed(1) : null;
+    const dpColor = dp !== null ? (parseFloat(dp) >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+    const pnlColor = dpPnl !== null ? (parseFloat(dpPnl) >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+    const n = ev.cluster_trades || 0;
+
+    let applyBtn = '';
+    if ((brief.confidence === 'proposal' || brief.confidence === 'ready') && brief.proposed_strategy) {
+      const isReady = brief.confidence === 'ready';
+      applyBtn = `<button
+        onclick="researchApplyBrief('${brief.id}')"
+        id="rf-apply-${brief.id}"
+        style="background:${isReady ? 'var(--green)' : 'rgba(68,138,255,0.18)'};color:${isReady ? '#000' : '#4a9eff'};border:1px solid ${isReady ? 'var(--green)' : '#4a9eff'};padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;margin-right:8px;">
+        Apply Strategy
+      </button>`;
+    }
+
+    const dismissBtn = showDismiss
+      ? `<button onclick="researchDismissBrief('${brief.id}')" style="background:transparent;color:var(--muted);border:1px solid var(--border);padding:6px 12px;border-radius:4px;font-size:12px;cursor:pointer;">Dismiss</button>`
+      : '';
+
+    return `<div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:10px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+        <span style="background:${cb.bg};color:${cb.color};padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;letter-spacing:0.04em;">${cb.label}</span>
+        <span style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:2px 7px;border-radius:3px;font-size:10px;font-family:monospace;">${typeLbl}</span>
+      </div>
+      <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:6px;">${brief.title || '—'}</div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:12px;">${brief.thesis || ''}</div>
+
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">Evidence</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:3px;">Baseline: &nbsp;Win ${pctFmt(ev.baseline_win_rate)} &nbsp;|&nbsp; Avg P&L ${pnlFmt(ev.baseline_avg_pnl)} &nbsp;|&nbsp; ${ev.baseline_trades || 0} trades</div>
+      <div style="font-size:12px;color:var(--text);margin-bottom:3px;">Cluster: &nbsp;&nbsp;Win ${pctFmt(ev.cluster_win_rate)} &nbsp;|&nbsp; Avg P&L ${pnlFmt(ev.cluster_avg_pnl)} &nbsp;|&nbsp; ${n} trades</div>
+      <div style="font-size:12px;margin-bottom:10px;">Delta: &nbsp;&nbsp;&nbsp;&nbsp;<span style="color:${dpColor};">${dp !== null ? (parseFloat(dp) >= 0 ? '+' : '') + dp + 'pp win rate' : '—'}</span> &nbsp;|&nbsp; <span style="color:${pnlColor};">${dpPnl !== null ? (parseFloat(dpPnl) >= 0 ? '+' : '') + dpPnl + '% avg P&L' : '—'}</span></div>
+
+      ${brief.what_is_novel ? `<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">What's Novel</div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:10px;">${brief.what_is_novel}</div>` : ''}
+
+      ${(brief.confidence === 'watching' || brief.confidence === 'emerging') ? progressNote(brief.confidence, n) : ''}
+
+      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:10px;">
+        ${applyBtn}${dismissBtn}
+      </div>
+      <div id="rf-result-${brief.id}" style="font-size:12px;margin-top:6px;"></div>
+    </div>`;
+  }
+
+  let body = '';
+
+  if (I.briefsLoading) {
+    body = '<div style="color:var(--muted);font-size:13px;">Loading research briefs...</div>';
+  } else if (I.briefs.length === 0) {
+    body = `<div style="color:var(--muted);font-size:13px;margin-bottom:12px;">The research firm is analyzing your trade history.</div>
+    <div style="color:var(--muted);font-size:13px;margin-bottom:12px;">Check back after mt-learner has completed its first analysis run.</div>
+    <pre style="background:var(--border);padding:12px;border-radius:4px;font-size:12px;overflow-x:auto;color:var(--text);">journalctl -u mt-learner -n 20 --no-pager</pre>`;
+  } else {
+    if (activeBriefs.length > 0) {
+      body += activeBriefs.map(b => briefCard(b, true)).join('');
+    } else {
+      body += '<div style="color:var(--muted);font-size:13px;margin-bottom:12px;">No active hypotheses yet — more closed trades needed.</div>';
+    }
+
+    if (retiredBriefs.length > 0) {
+      const retiredToggle = _researchRetiredOpen
+        ? `<button onclick="_researchRetiredOpen=false;renderResearchFirm();" style="background:transparent;color:var(--muted);border:none;font-size:12px;cursor:pointer;padding:0;margin-bottom:8px;">&#9660; ${retiredBriefs.length} retired hypotheses</button>`
+        : `<button onclick="_researchRetiredOpen=true;renderResearchFirm();" style="background:transparent;color:var(--muted);border:none;font-size:12px;cursor:pointer;padding:0;margin-bottom:8px;">&#9654; ${retiredBriefs.length} retired hypotheses</button>`;
+      body += `<div style="margin-top:10px;">${retiredToggle}`;
+      if (_researchRetiredOpen) {
+        body += retiredBriefs.map(b => briefCard(b, false)).join('');
+      }
+      body += '</div>';
+    }
+
+    if (dismissedBriefs.length > 0) {
+      body += `<div style="margin-top:8px;"><button onclick="researchShowDismissed()" style="background:transparent;color:var(--muted);border:none;font-size:12px;cursor:pointer;padding:0;text-decoration:underline;">Show dismissed (${dismissedBriefs.length})</button></div>`;
+    }
+  }
+
+  el.innerHTML = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
+    <div style="margin-bottom:14px;">
+      <h3 style="margin:0 0 4px;font-size:15px;">Research Firm</h3>
+      <div style="font-size:12px;color:var(--muted);">Strategy hypotheses discovered from your closed trade data. No Apply button appears until 50+ trades confirm the pattern.</div>
+    </div>
+    ${body}
+  </div>`;
+}
+
+async function researchApplyBrief(briefId) {
+  const brief = I.briefs.find(b => b.id === briefId);
+  if (!brief || !brief.proposed_strategy) return;
+  const btn = document.getElementById(`rf-apply-${briefId}`);
+  const resultEl = document.getElementById(`rf-result-${briefId}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Creating strategy...'; }
+  try {
+    const res = await fetch('/api/strategies/custom', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(brief.proposed_strategy.api_payload),
+    });
+    const d = await res.json();
+    if (d.success) {
+      if (btn) btn.style.display = 'none';
+      if (resultEl) resultEl.innerHTML = '<span style="color:var(--green);">&#10003; Strategy created — check Strategies tab</span>';
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = 'Apply Strategy'; }
+      if (resultEl) resultEl.innerHTML = `<span style="color:var(--red);">${d.error || 'Failed to create strategy'}</span>`;
+    }
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Apply Strategy'; }
+    if (resultEl) resultEl.innerHTML = `<span style="color:var(--red);">Request failed: ${e.message}</span>`;
+  }
+}
+
+function researchDismissBrief(briefId) {
+  const dismissedRaw = localStorage.getItem('mt7_dismissed_briefs');
+  const dismissed = dismissedRaw ? JSON.parse(dismissedRaw) : [];
+  if (!dismissed.includes(briefId)) dismissed.push(briefId);
+  localStorage.setItem('mt7_dismissed_briefs', JSON.stringify(dismissed));
+  renderResearchFirm();
+}
+
+function researchShowDismissed() {
+  const dismissedRaw = localStorage.getItem('mt7_dismissed_briefs');
+  const dismissed = dismissedRaw ? JSON.parse(dismissedRaw) : [];
+  const el = document.getElementById('intelligence-research');
+  if (!el) return;
+  const dismissedBriefs = I.briefs.filter(b => dismissed.includes(b.id));
+  const CONF_BADGE = {
+    watching: {bg: 'rgba(255,255,255,0.06)', color: 'var(--text2)', label: 'WATCHING'},
+    emerging: {bg: 'rgba(255,171,64,0.12)',  color: 'var(--amber)',  label: 'EMERGING'},
+    proposal: {bg: 'rgba(68,138,255,0.12)',  color: '#4a9eff',      label: 'PROPOSAL'},
+    ready:    {bg: 'rgba(0,230,118,0.12)',   color: 'var(--green)',  label: 'READY'},
+    retired:  {bg: 'rgba(255,255,255,0.04)', color: 'var(--muted)',  label: 'RETIRED'},
+  };
+  const TYPE_BADGE = {
+    regime_edge: 'REGIME EDGE',
+    vol_conviction_sweet_spot: 'VOL × CONVICTION',
+    feature_divergence: 'FEATURE SIGNAL',
+  };
+  const cards = dismissedBriefs.map(b => {
+    const cb = CONF_BADGE[b.confidence] || CONF_BADGE.watching;
+    const typeLbl = TYPE_BADGE[b.type] || (b.type || '').toUpperCase();
+    return `<div style="border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:8px;opacity:0.5;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <span style="background:${cb.bg};color:${cb.color};padding:2px 8px;border-radius:3px;font-size:11px;">${cb.label}</span>
+        <span style="font-size:10px;font-family:monospace;color:var(--muted);">${typeLbl}</span>
+      </div>
+      <div style="font-size:13px;font-weight:600;">${b.title || '—'}</div>
+      <div style="font-size:12px;color:var(--muted);margin-top:4px;">${b.thesis || ''}</div>
+    </div>`;
+  }).join('');
+  const overlay = document.createElement('div');
+  overlay.innerHTML = `<div style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:999;display:flex;align-items:center;justify-content:center;padding:16px;" onclick="this.remove()">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;max-width:480px;width:100%;max-height:80vh;overflow-y:auto;" onclick="event.stopPropagation()">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+        <h3 style="margin:0;font-size:15px;">Dismissed Hypotheses</h3>
+        <button onclick="this.closest('[onclick]').click()" style="background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:16px;">&#x2715;</button>
+      </div>
+      ${cards || '<div style="color:var(--muted);font-size:13px;">None dismissed.</div>'}
+    </div>
+  </div>`;
+  document.body.appendChild(overlay.firstElementChild);
+}
+
+function showOverrideMsg(msg, isError) {
+  let el = document.getElementById('override-msg-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'override-msg-toast';
+    el.style.cssText = 'position:fixed;bottom:24px;right:24px;padding:10px 18px;border-radius:4px;font-size:13px;z-index:9999;transition:opacity 0.3s;';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.background = isError ? 'var(--red)' : 'var(--surface)';
+  el.style.color = isError ? '#fff' : 'var(--text)';
+  el.style.border = isError ? 'none' : '1px solid var(--border)';
+  el.style.opacity = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.opacity = '0'; }, 3000);
+}
+
+async function loadStrategyOverrides() {
+  try {
+    const r = await fetch('/api/strategy-overrides');
+    const d = await r.json();
+    const panel = document.getElementById('active-overrides-panel');
+    const list = document.getElementById('active-overrides-list');
+    if (!panel || !list) return;
+    const overrides = d.overrides || {};
+    const keys = Object.keys(overrides);
+    if (keys.length === 0) {
+      panel.style.display = 'none';
+      return;
+    }
+    panel.style.display = '';
+    list.innerHTML = keys.map(key => {
+      const o = overrides[key];
+      return `<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);">
+        <span style="font-weight:600;min-width:120px;">${esc(key)}</span>
+        <span style="color:var(--text2);font-size:12px;">conviction: ${o.original_min_conviction ?? '?'} → <span style="color:var(--amber);">${o.min_conviction}</span></span>
+        <button style="background:var(--border);color:var(--text);border:none;padding:3px 10px;border-radius:3px;font-size:11px;cursor:pointer;"
+          onclick="revertStrategyOverride('${esc(key)}')">Revert</button>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    // fail silently — panel stays hidden
+  }
+}
+
+async function revertStrategyOverride(strategyKey) {
+  try {
+    const r = await fetch(`/api/strategy-overrides/${strategyKey}`, {method: 'DELETE'});
+    const d = await r.json();
+    if (d.success) {
+      showOverrideMsg(`Override reverted for ${strategyKey}`);
+      loadStrategyOverrides();
+      loadIntelligence();
+    } else {
+      showOverrideMsg(`Revert failed: ${d.error || 'unknown error'}`, true);
+    }
+  } catch(e) {
+    showOverrideMsg('Revert failed: network error', true);
+  }
 }
 
 async function intelligenceSuggestionAction(id, action) {
