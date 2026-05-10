@@ -2430,6 +2430,9 @@ const TAG_TIPS = {
   'agent_shadow_float_fragile':   'Agent layer: tokenomics analyst flagged high float fragility — supply concentration or unlock risk present.',
   'agent_shadow_funding_squeeze_risk': 'Agent layer: funding analyst flagged squeeze risk — ADL or extreme funding conditions detected.',
   'agent_shadow_exchange_stress': 'Agent layer: news analyst detected exchange stress indicators — abnormal funding interval or macro risk present.',
+  // Regime-aware counter-trend boost tags (factor engine validated)
+  'regime_counter_long':  'Counter-trend LONG in bearish EMA structure (price below ema20 below ema50). Factor engine: +4–6 edge_delta at high confidence across 5.7M candles. Conviction boosted +5–8.',
+  'regime_counter_short': 'Counter-trend SHORT in bullish EMA structure (price above ema20 above ema50). Factor engine: +3–5 edge_delta at high confidence across 5.7M candles. Conviction boosted +5–8.',
 };
 
 const TAG_META = {
@@ -2443,6 +2446,8 @@ const TAG_META = {
   'sym_penalty_moderate': { label: 'Symbol ⚠ Moderate', cls: 'tag-amber' },
   'sym_penalty_mild':     { label: 'Symbol ⚠ Mild',     cls: 'tag-amber' },
   'sym_exempt':           { label: 'Symbol Exempt',      cls: 'tag-blue'  },
+  'regime_counter_long':  { label: 'Counter-Trend ↑',   cls: 'tag-green' },
+  'regime_counter_short': { label: 'Counter-Trend ↓',   cls: 'tag-green' },
 };
 
 async function loadStrategies() {

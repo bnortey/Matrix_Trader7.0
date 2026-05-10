@@ -1844,6 +1844,25 @@ def enrich_signal(
                 conviction += 10
                 tags.append("ask_heavy")
 
+        # --- Regime-aware counter-trend boost ---
+        # Factor engine (5.7M labeled candles): counter-trend setups in a
+        # bearish EMA structure (LONG) or bullish EMA structure (SHORT)
+        # outperform baseline by +3.9 to +5.6 edge_delta at high confidence.
+        # trend_score < -20  → price below ema20 below ema50  (bearish structure)
+        # trend_score > +20  → price above ema20 above ema50  (bullish structure)
+        # Extreme vol is excluded — firebreak already gates those; the ×0.85
+        # multiplier below handles any that pass through.
+        _bearish_structure = trend_score < -20
+        _bullish_structure = trend_score > 20
+        if direction == "LONG" and _bearish_structure and vol_regime != "extreme":
+            boost = 8 if vol_regime in ("medium", "high") else 5
+            conviction += boost
+            tags.append("regime_counter_long")
+        elif direction == "SHORT" and _bullish_structure and vol_regime != "extreme":
+            boost = 8 if vol_regime in ("medium", "high") else 5
+            conviction += boost
+            tags.append("regime_counter_short")
+
         # Extreme volatility: high ATR% means the signal is real but the trade
         # is more dangerous — discount conviction so it ranks below calmer setups.
         if vol_regime == "extreme":
