@@ -1193,6 +1193,14 @@
       <!-- Market ready -->
       <div id="mkt-ready" class="hidden">
 
+        <!-- Market Summary -->
+        <div id="mkt-summary" style="padding:12px 16px 0;border-bottom:1px solid #1e2530;">
+          <!-- BTC/ETH context bar -->
+          <div id="mkt-ctx-bar" style="display:flex;gap:20px;align-items:center;margin-bottom:10px;font-size:12px;flex-wrap:wrap;"></div>
+          <!-- Summary grid -->
+          <div id="mkt-summary-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;padding-bottom:12px;"></div>
+        </div>
+
         <!-- Controls -->
         <div id="mkt-controls">
           <div class="mkt-search-wrap">
@@ -1306,6 +1314,21 @@
           </div>
 
         </div><!-- /tool-grid -->
+
+        <!-- AI Model Selector -->
+        <div class="tool-card" style="margin-top:24px;" id="ai-model-card">
+          <div class="tool-title">AI Model</div>
+          <div class="tool-subtitle">Select which model generates trade reports and analysis</div>
+          <div id="ai-model-status" style="margin-bottom:12px;font-size:12px;color:#888;">Loading...</div>
+          <div class="field-group">
+            <label class="field-lbl">Active Model</label>
+            <select class="field-input" id="ai-model-select" onchange="saveAIModel()">
+            </select>
+          </div>
+          <div id="ai-model-key-warning" class="hidden" style="margin-top:8px;font-size:12px;color:#f59e0b;"></div>
+          <div id="ai-model-save-msg" class="hidden" style="margin-top:8px;font-size:12px;color:#22c55e;"></div>
+        </div>
+
       </div><!-- /tools-inner -->
     </div><!-- /tools-section -->
 
@@ -1338,13 +1361,13 @@
         <!-- Performance summary banner -->
         <div id="perf-banner">
           <div class="perf-stat">
-            <div class="perf-val" id="pb-total">—</div>
-            <div class="perf-lbl">SIGNALS</div>
+            <div class="perf-val" id="pb-open">—</div>
+            <div class="perf-lbl">OPEN</div>
           </div>
           <div class="perf-divider"></div>
           <div class="perf-stat">
-            <div class="perf-val" id="pb-winrate">—</div>
-            <div class="perf-lbl">WIN RATE</div>
+            <div class="perf-val" id="pb-streak">—</div>
+            <div class="perf-lbl">STREAK</div>
           </div>
           <div class="perf-divider"></div>
           <div class="perf-stat">
@@ -1353,18 +1376,8 @@
           </div>
           <div class="perf-divider"></div>
           <div class="perf-stat">
-            <div class="perf-val" id="pb-open">—</div>
-            <div class="perf-lbl">OPEN</div>
-          </div>
-          <div class="perf-divider"></div>
-          <div class="perf-stat">
             <div class="perf-val" id="pb-best-r">—</div>
             <div class="perf-lbl">BEST P&amp;L%</div>
-          </div>
-          <div class="perf-divider"></div>
-          <div class="perf-stat">
-            <div class="perf-val" id="pb-streak">—</div>
-            <div class="perf-lbl">STREAK</div>
           </div>
           <div class="perf-divider"></div>
           <div class="perf-stat">
@@ -1412,9 +1425,25 @@
               <option value="momentum_breakout">Momentum</option>
               <option value="mean_reversion">Mean Rev</option>
             </select>
+            <span class="pos-updated" style="margin-left:8px">Exchange</span>
+            <select id="pos-exchange-filter" onchange="H.posExchangeFilter=this.value; renderOpenPositions();"
+              style="background:rgba(255,255,255,0.04);border:1px solid var(--border);color:var(--text2);
+                     padding:3px 6px;border-radius:4px;font-size:11px;outline:none">
+              <option value="">All</option>
+              <option value="MEXC">MEXC</option>
+              <option value="HYPERLIQUID">Hyperliquid</option>
+            </select>
             <input id="pos-symbol-filter" class="hist-filter-input" type="search"
               placeholder="Search symbol" style="width:110px;margin-left:8px"
               oninput="H.posSymbolFilter=this.value.trim().toUpperCase(); renderOpenPositions()">
+            <button id="kill-switch-btn" onclick="triggerKillSwitch()"
+              style="margin-left:auto;padding:4px 12px;background:#ff5252;border:none;border-radius:4px;
+                     color:#fff;font-size:11px;font-weight:700;letter-spacing:0.06em;cursor:pointer;
+                     opacity:0.85;transition:opacity 0.15s"
+              onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.85"
+              title="Cancel all open orders and close all Hyperliquid positions immediately">
+              KILL SWITCH
+            </button>
           </div>
           <div id="open-positions-body">
             <div class="hist-loading">Switch to this tab after a scan to see open positions.</div>
@@ -1436,6 +1465,12 @@
             <span class="hist-filter-lbl">Strategy</span>
             <select id="hf-strategy" class="hist-filter-select" onchange="filterClosedHistory()">
               <option value="">All</option>
+            </select>
+            <span class="hist-filter-lbl" style="margin-left:6px">Exchange</span>
+            <select id="hf-exchange" class="hist-filter-select" onchange="filterClosedHistory()">
+              <option value="">All</option>
+              <option value="MEXC">MEXC</option>
+              <option value="HYPERLIQUID">Hyperliquid</option>
             </select>
             <span class="hist-filter-lbl" style="margin-left:6px">Direction</span>
             <select id="hf-dir" class="hist-filter-select" onchange="filterClosedHistory()">
@@ -1495,6 +1530,35 @@
 <div id="overlay" onclick="closePanel()"></div>
 
 <!-- Chart modal -->
+<!-- P11 Order Confirmation Modal -->
+<div id="order-modal" class="hidden" onclick="closeOrderModal(event)"
+  style="position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;display:flex;align-items:center;justify-content:center">
+  <div onclick="event.stopPropagation()"
+    style="background:var(--bg2);border:1px solid rgba(255,255,255,0.12);border-radius:8px;
+           padding:24px;width:340px;max-width:94vw">
+    <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;color:var(--text2);margin-bottom:16px">
+      PLACE ORDER — HYPERLIQUID
+    </div>
+    <div id="order-modal-body" style="font-size:13px;line-height:1.9"></div>
+    <div style="margin-top:8px;padding:8px;background:rgba(255,82,82,0.08);border-radius:4px;
+                font-size:11px;color:var(--red)">
+      ⚠ This will place a REAL order with real funds.
+    </div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button onclick="closeOrderModal()"
+        style="flex:1;padding:8px;background:rgba(255,255,255,0.06);border:1px solid var(--border);
+               border-radius:4px;color:var(--text2);cursor:pointer;font-size:12px">
+        CANCEL
+      </button>
+      <button id="order-confirm-btn" onclick="submitOrder()"
+        style="flex:1;padding:8px;background:#00e676;border:none;border-radius:4px;
+               color:#000;font-weight:700;cursor:pointer;font-size:12px">
+        CONFIRM ORDER
+      </button>
+    </div>
+  </div>
+</div>
+
 <div id="chart-modal" class="hidden" onclick="closeChartModal(event)">
   <div id="chart-modal-inner">
     <div id="chart-modal-header">
@@ -1573,6 +1637,7 @@ const M = {
 let currentTab = 'signals';
 let currentTVSymbol   = null;
 let currentTVInterval = '60';
+let currentTVExchange = 'MEXC';
 
 function switchTab(tab) {
   if (tab !== 'history') { stopPosTimers(); unsubscribePositionStream(); }
@@ -1594,6 +1659,7 @@ function switchTab(tab) {
   if (tab === 'market') applyMarketExchangeState();
   if (tab === 'strategies') loadStrategyAnalytics();
   if (tab === 'intelligence') loadIntelligence();
+  if (tab === 'tools') loadAIModels();
 }
 
 /* ============================================================
@@ -1721,7 +1787,8 @@ function toTVSymbol(mexcSymbol, exchange) {
 }
 
 function loadTVChart(mexcSymbol, exchange) {
-  currentTVSymbol = mexcSymbol;
+  currentTVSymbol   = mexcSymbol;
+  currentTVExchange = exchange || 'MEXC';
   const container = $('tv-chart-container');
   if (!container) return;
   container.innerHTML = '';
@@ -1790,7 +1857,7 @@ function _loadModalChart() {
   script.async = true;
   script.textContent = JSON.stringify({
     autosize: true,
-    symbol: toTVSymbol(currentTVSymbol, 'MEXC'),
+    symbol: toTVSymbol(currentTVSymbol, currentTVExchange),
     interval: currentTVInterval,
     timezone: 'Etc/UTC',
     theme: 'dark',
@@ -1812,7 +1879,7 @@ function _loadModalChart() {
   setTimeout(() => {
     if (currentTVSymbol !== snapSymbol) return;
     if (body && !body.querySelector('iframe')) {
-      const tvSym = toTVSymbol(snapSymbol, 'MEXC');
+      const tvSym = toTVSymbol(snapSymbol, currentTVExchange);
       body.innerHTML = `<div style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--text2);font-size:12px;text-align:center;padding:16px">
         <div style="color:var(--text3);font-size:11px">Chart unavailable on TradingView for this pair</div>
         <a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSym)}" target="_blank"
@@ -1927,7 +1994,7 @@ function rowHTML(sig, i) {
   if (sig.daily_trend_aligned === false) tags.push('counter_trend');
   const tagsHtml = tags.length
     ? `<div class="row-tags">${tags.map(t => {
-        const tipText = TAG_TIPS[t] || (t.startsWith('agent_shadow_') ? 'Agent shadow layer tag — recorded for forward-testing. Not applied to conviction in Phase 1.' : '');
+        const tipText = TAG_TIPS[t] || (t.startsWith('agent_shadow_') ? 'Agent shadow tag (historical — Phase 1 forward-test data).' : (t.startsWith('agent_') ? 'Agent layer (live) — conviction delta applied.' : ''));
         const tip = tipText ? ` title="${esc(tipText)}"` : '';
         const tm = TAG_META[t];
         return `<span class="tag${tm ? ' ' + tm.cls : ''}"${tip}>${esc(tm ? tm.label : t.replace(/_/g,' '))}</span>`;
@@ -2005,6 +2072,9 @@ function renderDetail(sig) {
   <div class="d-price" id="detail-live-price">${fmtPrice(livePrice)}</div>
   <div id="detail-live-status">${sig._positionDetail ? '' : signalLiveStatusHTML(sig, livePrice)}</div>
 
+  <div id="readiness-section" style="margin:10px 0 2px 0"></div>
+  <div id="execute-section" style="margin:0 0 10px 0"></div>
+
   <div class="d-section">
     <div class="d-lbl">Trade Plan</div>
     ${ladderHTML(sig)}
@@ -2026,7 +2096,7 @@ function renderDetail(sig) {
     <div class="tags-wrap">
       ${displayTags.length
         ? displayTags.map(t => {
-            const tipText = TAG_TIPS[t] || (t.startsWith('agent_shadow_') ? 'Agent shadow layer tag — recorded for forward-testing. Not applied to conviction in Phase 1.' : '');
+            const tipText = TAG_TIPS[t] || (t.startsWith('agent_shadow_') ? 'Agent shadow tag (historical — Phase 1 forward-test data).' : (t.startsWith('agent_') ? 'Agent layer (live) — conviction delta applied.' : ''));
             const tip = tipText ? ` title="${esc(tipText)}"` : '';
             return `<span class="tag"${tip}>${esc(t.replace(/_/g,' '))}</span>`;
           }).join('')
@@ -2040,6 +2110,7 @@ function renderDetail(sig) {
 </div>`;
 
   loadTVChart(sig.symbol, sig.exchange || 'MEXC');
+  loadTradeReadiness(sig);
   if (window.innerWidth >= 768) panel.classList.remove('hidden');
 
   // Auto-fill risk calculator from signal levels
@@ -2048,6 +2119,135 @@ function renderDetail(sig) {
   if (sig.exits && sig.exits[0])     $('rc-tp').value    = sig.exits[0];
   calcRisk();
   startCountdown(sig);
+}
+
+// ---------------------------------------------------------------------------
+// P9 Trade Readiness Panel
+// ---------------------------------------------------------------------------
+let _readinessDailyPnl = null;
+let _readinessDailyPnlTs = 0;
+
+async function loadTradeReadiness(sig) {
+  const el = $('readiness-section');
+  if (!el) return;
+
+  // Only show for live/scan signals — not for logged closed signals
+  // (closed signals already have a result; readiness is pre-trade only)
+  if (sig.result) { el.innerHTML = ''; return; }
+
+  // Cache daily pnl for 60s so every panel open doesn't hit the DB
+  const now = Date.now();
+  if (!_readinessDailyPnl || now - _readinessDailyPnlTs > 60000) {
+    try {
+      const r = await fetch('/api/account/daily-pnl');
+      const d = await r.json();
+      _readinessDailyPnl = d.success ? d : { total_pnl_pct: 0, wins: 0, losses: 0, count: 0 };
+      _readinessDailyPnlTs = now;
+    } catch(_) {
+      _readinessDailyPnl = { total_pnl_pct: 0, wins: 0, losses: 0, count: 0 };
+    }
+  }
+  const daily = _readinessDailyPnl;
+
+  // Client-side readiness checks (mirrors lib/risk_controls.py logic)
+  const checks = [];
+
+  // 1. Signal age
+  const entryAt = sig.entry_at;
+  let ageStatus = 'green', ageDetail = 'Fresh scan signal';
+  if (entryAt) {
+    const ageMins = (Date.now() - new Date(entryAt + 'Z').getTime()) / 60000;
+    if (ageMins <= 5)       { ageStatus = 'green'; ageDetail = `Signal age ${ageMins.toFixed(0)}m`; }
+    else if (ageMins <= 15) { ageStatus = 'amber'; ageDetail = `Signal age ${ageMins.toFixed(0)}m — verify still valid`; }
+    else                    { ageStatus = 'red';   ageDetail = `Signal age ${ageMins.toFixed(0)}m — rescan before trading`; }
+  }
+  checks.push({ label: 'Signal age', status: ageStatus, detail: ageDetail });
+
+  // 2. Trend score
+  const ts = sig.trend_score != null ? Math.abs(sig.trend_score) : null;
+  if (ts == null) {
+    checks.push({ label: 'Trend setup', status: 'amber', detail: 'No trend data' });
+  } else if (ts <= 12) {
+    checks.push({ label: 'Trend setup', status: 'green', detail: `trend_score ${ts} ≤ 12 (winner avg 9)` });
+  } else if (ts <= 16) {
+    checks.push({ label: 'Trend setup', status: 'amber', detail: `trend_score ${ts} — borderline` });
+  } else {
+    checks.push({ label: 'Trend setup', status: 'red',   detail: `trend_score ${ts} > 16 (loser avg 14)` });
+  }
+
+  // 3. ATR
+  const atr = sig.atr_pct != null ? parseFloat(sig.atr_pct) : null;
+  if (atr == null) {
+    checks.push({ label: 'ATR', status: 'amber', detail: 'No ATR data' });
+  } else if (atr <= 3.5) {
+    checks.push({ label: 'ATR', status: 'green', detail: `ATR ${atr.toFixed(1)}% ≤ 3.5% (winner avg 3.2%)` });
+  } else if (atr <= 5.5) {
+    checks.push({ label: 'ATR', status: 'amber', detail: `ATR ${atr.toFixed(1)}% — wider stops needed` });
+  } else {
+    checks.push({ label: 'ATR', status: 'red',   detail: `ATR ${atr.toFixed(1)}% > 5.5% (loser avg 5.5%)` });
+  }
+
+  // 4. Volatility regime
+  const vol = (sig.volatility || '').toLowerCase();
+  const volMap = { low: 'green', medium: 'green', high: 'amber', extreme: 'red', choppy: 'amber' };
+  const volStatus = volMap[vol] || 'amber';
+  const volDetail = { green: `${vol} volatility — favorable`, amber: `${vol} volatility — reduce size`, red: `${vol} volatility — extreme noise risk` }[volStatus];
+  checks.push({ label: 'Volatility', status: volStatus, detail: volDetail });
+
+  // 5. Daily P&L gate
+  const dpnl = daily.total_pnl_pct;
+  let dpStatus = 'green', dpDetail = `Today: ${dpnl >= 0 ? '+' : ''}${dpnl.toFixed(1)}%`;
+  if (dpnl < -4)       { dpStatus = 'red';   dpDetail += ' — daily loss limit reached'; }
+  else if (dpnl < -2)  { dpStatus = 'amber'; dpDetail += ' — approaching loss limit'; }
+  checks.push({ label: 'Daily P&L', status: dpStatus, detail: dpDetail });
+
+  // Verdict
+  const reds   = checks.filter(c => c.status === 'red').length;
+  const ambers = checks.filter(c => c.status === 'amber').length;
+  let verdict, vColor;
+  if (reds >= 2 || (reds === 1 && dpnl <= -4)) { verdict = 'PASS';   vColor = '#ff5252'; }
+  else if (reds === 1 || ambers >= 3)           { verdict = 'REVIEW'; vColor = '#ffab40'; }
+  else                                           { verdict = 'READY';  vColor = '#00e676'; }
+
+  // Position sizing
+  const acct = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+  let sizeHTML = '';
+  if (acct > 0 && sig.entries && sig.entries[0] && sig.stop_loss) {
+    const stopDist = Math.abs(sig.entries[0] - sig.stop_loss) / sig.entries[0];
+    if (stopDist > 0) {
+      const riskDollars = acct * 0.01;
+      const notional = riskDollars / stopDist;
+      sizeHTML = `<div style="margin-top:8px;font-size:11px;color:var(--text2)">
+        Recommended size @ 1% risk: <span style="color:var(--text);font-weight:600">$${notional.toLocaleString('en-US',{maximumFractionDigits:0})}</span> notional
+        &nbsp;·&nbsp; Risk: <span style="color:var(--amber)">$${riskDollars.toFixed(0)}</span>
+      </div>`;
+    }
+  }
+
+  const iconMap = { green: '✓', amber: '⚠', red: '✕' };
+  const colorMap = { green: 'var(--green)', amber: 'var(--amber)', red: 'var(--red)' };
+
+  const checkRows = checks.map(c => `
+    <div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;font-size:12px">
+      <span style="color:${colorMap[c.status]};font-weight:700;min-width:12px">${iconMap[c.status]}</span>
+      <span style="color:var(--text2);min-width:90px">${c.label}</span>
+      <span style="color:var(--text)">${c.detail}</span>
+    </div>`).join('');
+
+  el.innerHTML = `
+    <div style="border:1px solid rgba(255,255,255,0.07);border-radius:6px;padding:10px 12px;margin-bottom:10px;background:var(--bg2)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <span style="font-size:11px;font-weight:700;letter-spacing:0.06em;color:var(--text2)">TRADE READINESS</span>
+        <span style="font-size:12px;font-weight:700;color:${vColor}">${verdict}</span>
+      </div>
+      ${checkRows}
+      ${sizeHTML}
+    </div>`;
+
+  // Store signal reference for order modal, then render execute button
+  S.detailSignal = sig;
+  H.detailSignal = sig;
+  renderExecuteButton(sig);
 }
 
 function ladderHTML(sig) {
@@ -2270,19 +2470,14 @@ async function scanSignals(opts = {}) {
 
   try {
     const scanExchange = S.exchange;
-    const isHL = scanExchange === 'hyperliquid';
-    const url = isHL
-      ? `/api/hl/scan?strategy=${encodeURIComponent(S.strategy)}`
-      : '/api/scan/all';
-    const resp = await fetch(url, isHL ? {} : { method: 'POST' });
+    const url = scanExchange === 'hyperliquid' ? '/api/hl/scan' : '/api/scan/all';
+    const resp = await fetch(url, { method: 'POST' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     if (!data.success) throw new Error(data.error || 'Unknown error');
 
     stopProgress();
-    const exchangeResults = isHL
-      ? { [data.strategy || S.strategy]: { signals: data.signals || [], total_pairs: data.total_pairs || 0, strategy: data.strategy || S.strategy } }
-      : (data.results || {});
+    const exchangeResults = data.results || {};
     H.scanResultsByExchange[scanExchange] = exchangeResults;
     if (S.exchange !== scanExchange) {
       applySignalExchangeState();
@@ -2430,6 +2625,17 @@ const TAG_TIPS = {
   'agent_shadow_float_fragile':   'Agent layer: tokenomics analyst flagged high float fragility — supply concentration or unlock risk present.',
   'agent_shadow_funding_squeeze_risk': 'Agent layer: funding analyst flagged squeeze risk — ADL or extreme funding conditions detected.',
   'agent_shadow_exchange_stress': 'Agent layer: news analyst detected exchange stress indicators — abnormal funding interval or macro risk present.',
+  // Phase 2 live agent tags — conviction delta applied
+  'agent_confirmed':        'Agent layer (live): narrative and structural analysts agree — conviction boosted.',
+  'agent_disagreement':     'Agent layer (live): narrative and structural analysts disagree — conviction penalized.',
+  'agent_imbalance_long':   'Agent layer (live): orderbook imbalance favors the long side — supports LONG conviction.',
+  'agent_imbalance_short':  'Agent layer (live): orderbook imbalance favors the short side — supports SHORT conviction.',
+  'agent_microprice_aligned': 'Agent layer (live): microprice deviation confirms trade direction — conviction boosted.',
+  'agent_basis_dislocation': 'Agent layer (live): cross-venue basis dislocated — potential mean-reversion risk.',
+  'agent_late_move_detected': 'Agent layer (live): potentially late entry — price may have moved significantly already.',
+  'agent_float_fragile':    'Agent layer (live): high float fragility — supply concentration or unlock risk.',
+  'agent_funding_squeeze_risk': 'Agent layer (live): funding squeeze risk — ADL or extreme funding conditions detected.',
+  'agent_exchange_stress':  'Agent layer (live): exchange stress indicators — abnormal funding or macro risk.',
   // Regime-aware counter-trend boost tags (factor engine validated)
   'regime_counter_long':  'Counter-trend LONG in bearish EMA structure (price below ema20 below ema50). Factor engine: +4–6 edge_delta at high confidence across 5.7M candles. Conviction boosted +5–8.',
   'regime_counter_short': 'Counter-trend SHORT in bullish EMA structure (price above ema20 above ema50). Factor engine: +3–5 edge_delta at high confidence across 5.7M candles. Conviction boosted +5–8.',
@@ -3138,6 +3344,7 @@ async function loadMarket(opts = {}) {
     setMktPhase('ready');
     mktFilterAndSort();
     ensureMarketAutoRefresh();
+    loadMarketSummary();
 
     if (!_mktScrollBound) {
       _mktScrollBound = true;
@@ -4386,11 +4593,13 @@ const H = {
   posSort:            'age',  // active sort column for open positions table
   posSortDir:         'asc',  // 'asc' | 'desc'
   posStratFilter:     '',     // '' = all strategies
+  posExchangeFilter:  '',     // '' = all exchanges; 'MEXC' | 'HYPERLIQUID'
   posSymbolFilter:    '',     // '' = all symbols; uppercased substring match
   closedAll:          [],     // all tagged signals before closed-table filters
   closedSort:         'logged_at',
   closedSortDir:      'desc',
   priceStream:        null,   // EventSource handle for SSE price stream (/api/stream/prices)
+  allStats:           null,   // aggregate stats from /api/signals/stats (full dataset, no limit)
   strategies:         null,   // array from GET /api/strategies — populated on page load
   scanResults:        {},     // {strategy_key: {signals, total_pairs, strategy}} from POST /api/scan/all
   scanExchange:       null,   // exchange for scanResults cache
@@ -4476,16 +4685,21 @@ async function loadHistory(force = false) {
   $('open-positions-body').innerHTML = '<div class="hist-loading">Loading…</div>';
 
   try {
-    // Fetch all signals — split client-side into open (null result) and closed.
-    // No server-side result filter so we get both in one call.
-    const resp = await fetch('/api/signals/history?limit=500');
+    // Fetch recent signals + aggregate stats in parallel
+    const [resp, statsResp] = await Promise.all([
+      fetch('/api/signals/history?limit=500'),
+      fetch('/api/signals/stats'),
+    ]);
     const data = await resp.json();
+    const statsData = await statsResp.json();
     H.loading = false;
     if (!data.success) {
       $('hist-body').innerHTML = '<div class="hist-empty">Error loading history.</div>';
       $('open-positions-body').innerHTML = '<div class="hist-empty">Error loading positions.</div>';
       return;
     }
+
+    H.allStats = statsData.success ? statsData : null;
 
     const all = (data.signals || []).map(hydrateHistorySignal);
 
@@ -4545,12 +4759,14 @@ function sortClosedHistory(col) {
 
 function filterClosedHistory() {
   const strategy = $('hf-strategy') ? $('hf-strategy').value : '';
+  const exchange = $('hf-exchange') ? $('hf-exchange').value : '';
   const dir      = $('hf-dir')      ? $('hf-dir').value      : '';
   const result   = $('hf-result')   ? $('hf-result').value   : '';
   const symbolQ  = ($('hf-symbol')  ? $('hf-symbol').value   : '').trim().toUpperCase();
 
   let closed = [...H.closedAll];
   if (strategy) closed = closed.filter(s => s.strategy === strategy);
+  if (exchange) closed = closed.filter(s => (s.exchange || 'MEXC').toUpperCase() === exchange);
   if (dir)      closed = closed.filter(s => s.direction === dir);
   if (result)   closed = closed.filter(s => s.result === result.toUpperCase());
   if (symbolQ) {
@@ -4683,9 +4899,7 @@ function getFilteredClosed() {
 }
 
 function updatePerfBanner(closed, open) {
-  const tagged  = closed.filter(s => s.result && s.result !== 'SKIPPED' && s.result !== 'EXPIRED');
-  const wins    = tagged.filter(s => s.result === 'WIN' || s.result === 'FULL_WIN');
-  const winRate = tagged.length ? Math.round(wins.length / tagged.length * 100) : null;
+  const tagged = closed.filter(s => s.result && s.result !== 'SKIPPED' && s.result !== 'EXPIRED');
 
   const acct         = parseFloat(localStorage.getItem('mt7_account_size') || '0');
   const pnlTagged    = closed.filter(hasRealPnl);
@@ -4715,11 +4929,6 @@ function updatePerfBanner(closed, open) {
     el.style.color = color || '';
   };
 
-  set('pb-total',   tagged.length > 0 ? tagged.length : '0');
-  set('pb-winrate',
-    winRate !== null ? winRate + '%' : '—',
-    winRate === null ? '' : winRate >= 55 ? 'var(--green)' : winRate >= 40 ? 'var(--amber)' : 'var(--red)'
-  );
   set('pb-pnl',
     acct > 0 && pnlTagged.length
       ? (totalDollar >= 0 ? '+' : '') + '$' + totalDollar.toFixed(2)
@@ -4767,27 +4976,40 @@ function updatePerfBanner(closed, open) {
 }
 
 function renderHistorySummary(sigs) {
-  const total   = sigs.length;
-  const tagged  = sigs.filter(s => s.result).length;
-  const wins    = sigs.filter(s => s.result === 'WIN');
-  const losses  = sigs.filter(s => s.result === 'LOSS');
-  const partials= sigs.filter(s => s.result === 'PARTIAL');
-  const denom   = wins.length + losses.length + partials.length;
-  const winRate = denom > 0 ? Math.round(wins.length / denom * 100) : null;
-  const avgC = arr => arr.length
+  // Use full-dataset stats from /api/signals/stats when no filter is active.
+  // Fall back to computing from the loaded sigs when filters narrow the view.
+  const hasFilter = ($('hf-strategy') && $('hf-strategy').value) ||
+                    ($('hf-exchange') && $('hf-exchange').value) ||
+                    ($('hf-dir')      && $('hf-dir').value)      ||
+                    ($('hf-result')   && $('hf-result').value)   ||
+                    ($('hf-symbol')   && $('hf-symbol').value.trim());
+  const st = (!hasFilter && H.allStats) ? H.allStats : null;
+
+  const total    = st ? st.total    : sigs.length;
+  const nWins    = st ? st.wins    : sigs.filter(s => s.result === 'WIN').length;
+  const nLosses  = st ? st.losses  : sigs.filter(s => s.result === 'LOSS').length;
+  const nPartials= st ? st.partials: sigs.filter(s => s.result === 'PARTIAL').length;
+  const tagged   = st ? (st.wins + st.losses + st.partials + st.expired) : sigs.filter(s => s.result).length;
+  const denom    = nWins + nLosses + nPartials;
+  const winRateStrict   = st ? st.win_rate_strict   : (denom > 0 ? Math.round(nWins / denom * 100) : null);
+  const winRatePositive = st ? st.win_rate_positive : (denom > 0 ? Math.round((nWins + nPartials) / denom * 100) : null);
+
+  const avgC = arr => arr.length && arr[0] && arr[0].conviction != null
     ? Math.round(arr.reduce((a, s) => a + s.conviction, 0) / arr.length)
     : null;
-  const avgW = avgC(wins);
-  const avgL = avgC(losses);
+  const winsArr    = st ? [] : sigs.filter(s => s.result === 'WIN');
+  const lossesArr  = st ? [] : sigs.filter(s => s.result === 'LOSS');
+  const avgW = st ? (st.avg_conv_win  != null ? Math.round(st.avg_conv_win)  : null) : avgC(winsArr);
+  const avgL = st ? (st.avg_conv_loss != null ? Math.round(st.avg_conv_loss) : null) : avgC(lossesArr);
 
-  const positivePnl = sigs.filter(s => s.pnl_pct != null && s.pnl_pct > 0);
-  const negativePnl = sigs.filter(s => s.pnl_pct != null && s.pnl_pct <= 0);
-  const avgWinPnl  = positivePnl.length
-    ? (positivePnl.reduce((a, s) => a + s.pnl_pct, 0) / positivePnl.length).toFixed(1)
-    : null;
-  const avgLossPnl = negativePnl.length
-    ? (negativePnl.reduce((a, s) => a + s.pnl_pct, 0) / negativePnl.length).toFixed(1)
-    : null;
+  const posSigs = sigs.filter(s => s.pnl_pct != null && ['WIN','PARTIAL'].includes(s.result));
+  const negSigs = sigs.filter(s => s.pnl_pct != null && s.result === 'LOSS');
+  const avgPosPnl  = st ? (st.avg_pos_pnl  != null ? parseFloat(st.avg_pos_pnl).toFixed(1)  : null)
+    : (posSigs.length ? (posSigs.reduce((a, s) => a + s.pnl_pct, 0) / posSigs.length).toFixed(1) : null);
+  const avgLossPnl = st ? (st.avg_loss_pnl != null ? parseFloat(st.avg_loss_pnl).toFixed(1) : null)
+    : (negSigs.length  ? (negSigs.reduce((a, s) => a + s.pnl_pct, 0)  / negSigs.length).toFixed(1)  : null);
+  const avgPnlAll = st ? (st.avg_pnl != null ? parseFloat(st.avg_pnl).toFixed(2) : null)
+    : (() => { const r = sigs.filter(s => s.pnl_pct != null && !['EXPIRED','SKIPPED'].includes(s.result)); return r.length ? (r.reduce((a,s)=>a+s.pnl_pct,0)/r.length).toFixed(2) : null; })();
 
   const acctRaw  = parseFloat(localStorage.getItem('mt7_account_size') || '0');
   const acct     = acctRaw > 0 ? acctRaw : 0;
@@ -4805,38 +5027,39 @@ function renderHistorySummary(sigs) {
     ? `<span style="color:${pnlColor}">${pnlSign}$${totalDollar.toFixed(2)}</span> <span style="color:var(--text3);font-size:11px">(actual pnl_pct, 1% account slice, $${acct} acct)</span>`
     : `<span style="color:var(--text3)">—</span>`;
 
+  const avgPnlColor = avgPnlAll == null ? 'var(--text)' : parseFloat(avgPnlAll) >= 0 ? 'var(--green)' : 'var(--red)';
   $('hist-bar').innerHTML = `
     <div class="hist-stat">
       <span class="hist-stat-val">${total}</span>
-      <span class="hist-stat-lbl">Logged</span>
+      <span class="hist-stat-lbl">${st ? 'All Closed' : 'Filtered'}</span>
     </div>
     <div class="hist-stat">
-      <span class="hist-stat-val">${tagged}</span>
-      <span class="hist-stat-lbl">Tagged</span>
-    </div>
-    <div class="hist-stat">
-      <span class="hist-stat-val" style="color:var(--green)">${winRate !== null ? winRate + '%' : '—'}</span>
-      <span class="hist-stat-lbl">Win Rate</span>
-    </div>
-    <div class="hist-stat">
-      <span class="hist-stat-val">${wins.length}W · ${losses.length}L · ${partials.length}P</span>
+      <span class="hist-stat-val"><span style="color:var(--green)">${nWins}W</span> · <span style="color:var(--amber)">${nPartials}P</span> · <span style="color:var(--red)">${nLosses}L</span></span>
       <span class="hist-stat-lbl">Outcomes</span>
     </div>
-    <div class="hist-stat">
-      <span class="hist-stat-val">${avgW !== null ? avgW : '—'}</span>
-      <span class="hist-stat-lbl">Avg Conv (W)</span>
+    <div class="hist-stat" title="(WIN + PARTIAL) ÷ (WIN + PARTIAL + LOSS) — any profitable outcome">
+      <span class="hist-stat-val" style="color:var(--green)">${winRatePositive !== null ? winRatePositive + '%' : '—'}</span>
+      <span class="hist-stat-lbl">Positive Rate</span>
+    </div>
+    <div class="hist-stat" title="WIN only ÷ (WIN + PARTIAL + LOSS) — full TP hits only">
+      <span class="hist-stat-val" style="color:var(--text2)">${winRateStrict !== null ? winRateStrict + '%' : '—'}</span>
+      <span class="hist-stat-lbl">Strict Win Rate</span>
+    </div>
+    <div class="hist-stat" title="Average pnl_pct across all outcomes with real P&L data">
+      <span class="hist-stat-val" style="color:${avgPnlColor}">${avgPnlAll != null ? (parseFloat(avgPnlAll) >= 0 ? '+' : '') + avgPnlAll + '%' : '—'}</span>
+      <span class="hist-stat-lbl">Avg P&amp;L / Trade</span>
     </div>
     <div class="hist-stat">
-      <span class="hist-stat-val">${avgL !== null ? avgL : '—'}</span>
-      <span class="hist-stat-lbl">Avg Conv (L)</span>
-    </div>
-    <div class="hist-stat">
-      <span class="hist-stat-val" style="color:var(--green)">${avgWinPnl != null ? '+' + avgWinPnl + '%' : '—'}</span>
-      <span class="hist-stat-lbl">Avg Win P&amp;L</span>
+      <span class="hist-stat-val" style="color:var(--green)">${avgPosPnl != null ? '+' + avgPosPnl + '%' : '—'}</span>
+      <span class="hist-stat-lbl">Avg W+P P&amp;L</span>
     </div>
     <div class="hist-stat">
       <span class="hist-stat-val" style="color:var(--red)">${avgLossPnl != null ? avgLossPnl + '%' : '—'}</span>
       <span class="hist-stat-lbl">Avg Loss P&amp;L</span>
+    </div>
+    <div class="hist-stat">
+      <span class="hist-stat-val">${avgW !== null ? avgW : '—'} / ${avgL !== null ? avgL : '—'}</span>
+      <span class="hist-stat-lbl">Avg Conv W/L</span>
     </div>
     <div class="hist-stat">
       <span class="hist-stat-lbl" style="margin-bottom:4px">Actual P&L</span>
@@ -5548,11 +5771,14 @@ function renderOpenPositions() {
   if (H.posStratFilter) positions = positions.filter(p =>
     (p.strategy_key || strategyNameToKey(p.strategy || '')) === H.posStratFilter
   );
+  if (H.posExchangeFilter) positions = positions.filter(p =>
+    (p.exchange || 'MEXC').toUpperCase() === H.posExchangeFilter
+  );
   if (H.posSymbolFilter) positions = positions.filter(p =>
     (p.symbol || '').toUpperCase().replace(/_USD[TC]$/, '').includes(H.posSymbolFilter)
   );
 
-  const isFiltered = H.posStratFilter || H.posSymbolFilter;
+  const isFiltered = H.posStratFilter || H.posExchangeFilter || H.posSymbolFilter;
   if (!positions.length) {
     if (countEl) countEl.textContent = isFiltered
       ? `0/${H.openPositions.length}`
@@ -6177,7 +6403,7 @@ function renderResearchFirm() {
         onclick="researchApplyBrief('${brief.id}')"
         id="rf-apply-${brief.id}"
         style="background:${isReady ? 'var(--green)' : 'rgba(68,138,255,0.18)'};color:${isReady ? '#000' : '#4a9eff'};border:1px solid ${isReady ? 'var(--green)' : '#4a9eff'};padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;margin-right:8px;">
-        Apply Strategy
+        ${isReady ? 'Graduate →' : 'Apply Strategy'}
       </button>`;
     }
 
@@ -6403,6 +6629,325 @@ async function intelligenceSuggestionAction(id, action) {
     }
   } catch(e) {
     alert('Request failed: ' + e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P11 — Execution (Hyperliquid)
+// ---------------------------------------------------------------------------
+
+let _executionStatus = null;  // cached from /api/execution/status
+let _pendingOrder    = null;  // order payload staged for confirmation
+
+async function loadExecutionStatus() {
+  try {
+    const r = await fetch('/api/execution/status');
+    _executionStatus = await r.json();
+  } catch(_) {
+    _executionStatus = { success: false, live_trading: false, keys_configured: false };
+  }
+}
+
+// Called from loadTradeReadiness — render Execute button if live mode is on
+async function renderExecuteButton(sig) {
+  const el = $('execute-section');
+  if (!el) return;
+  if (sig.result) { el.innerHTML = ''; return; }
+  if ((sig.exchange || 'MEXC').toUpperCase() !== 'HYPERLIQUID') { el.innerHTML = ''; return; }
+
+  if (!_executionStatus) await loadExecutionStatus();
+  const st = _executionStatus || {};
+  if (!st.live_trading || !st.keys_configured) { el.innerHTML = ''; return; }
+
+  const acct = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+  const entry = sig.entries && sig.entries[0];
+  const stop  = sig.stop_loss;
+  let sizeInfo = '';
+  if (acct > 0 && entry && stop) {
+    const stopDist = Math.abs(entry - stop) / entry;
+    if (stopDist > 0) {
+      const notional  = (acct * 0.01) / stopDist;
+      const contracts = notional / entry;
+      sizeInfo = ` · ${contracts.toFixed(4)} contracts`;
+    }
+  }
+
+  el.innerHTML = `
+    <button onclick="openOrderModal()" style="width:100%;padding:9px;background:rgba(0,230,118,0.12);
+      border:1px solid var(--green);border-radius:6px;color:var(--green);font-weight:700;
+      font-size:12px;letter-spacing:0.05em;cursor:pointer;margin-bottom:2px">
+      EXECUTE ON HYPERLIQUID${sizeInfo}
+    </button>`;
+}
+
+function openOrderModal() {
+  const sig   = H.detailSignal || S.detailSignal;
+  if (!sig) return;
+
+  const acct     = parseFloat(localStorage.getItem('mt7_account_size') || '0');
+  const entry    = sig.entries && sig.entries[0];
+  const stop     = sig.stop_loss;
+  const coin     = (sig.symbol || '').replace(/_USD[TC]$/, '');
+  const isBuy    = sig.direction === 'LONG';
+  const riskDollars = acct > 0 ? (acct * 0.01) : 0;
+
+  let contracts = 0, notional = 0;
+  if (acct > 0 && entry && stop) {
+    const stopDist = Math.abs(entry - stop) / entry;
+    if (stopDist > 0) {
+      notional  = riskDollars / stopDist;
+      contracts = notional / entry;
+    }
+  }
+
+  _pendingOrder = { coin, is_buy: isBuy, size: contracts, limit_px: entry, signal_id: sig.id };
+
+  $('order-modal-body').innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;color:var(--text2)">
+      <span>Symbol</span>   <span style="color:var(--text);font-weight:600">${esc(coin)}</span>
+      <span>Side</span>     <span style="color:${isBuy ? 'var(--green)' : 'var(--red)'};font-weight:700">${sig.direction}</span>
+      <span>Size</span>     <span style="color:var(--text)">${contracts.toFixed(4)} ${esc(coin)} (~$${notional.toFixed(0)})</span>
+      <span>Entry</span>    <span style="color:var(--text)">Limit @ $${fmtNum(entry)}</span>
+      <span>Stop</span>     <span style="color:var(--red)">$${fmtNum(stop)}</span>
+      <span>Risk</span>     <span style="color:var(--amber)">$${riskDollars.toFixed(0)} (1% of $${acct})</span>
+    </div>`;
+
+  $('order-modal').classList.remove('hidden');
+}
+
+function closeOrderModal(e) {
+  if (e && e.target !== $('order-modal')) return;
+  $('order-modal').classList.add('hidden');
+  _pendingOrder = null;
+}
+
+async function submitOrder() {
+  if (!_pendingOrder) return;
+  const btn = $('order-confirm-btn');
+  btn.disabled = true;
+  btn.textContent = 'Placing…';
+  try {
+    const r = await fetch('/api/execution/place', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_pendingOrder),
+    });
+    const d = await r.json();
+    $('order-modal').classList.add('hidden');
+    _pendingOrder = null;
+    if (d.success) {
+      const oid = d.order_id ? ` (OID: ${d.order_id})` : '';
+      alert(`Order placed — ${d.status}${oid}`);
+    } else {
+      alert(`Order failed: ${d.error || 'unknown error'}`);
+    }
+  } catch(e) {
+    alert('Order request failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'CONFIRM ORDER';
+  }
+}
+
+async function triggerKillSwitch() {
+  const confirmed = confirm(
+    'KILL SWITCH\n\nThis will immediately cancel ALL open Hyperliquid orders and close ALL open positions at market price.\n\nAre you sure?'
+  );
+  if (!confirmed) return;
+
+  const btn = $('kill-switch-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'EXECUTING…'; }
+
+  try {
+    const r = await fetch('/api/execution/kill-switch', { method: 'POST' });
+    const d = await r.json();
+    const msg = d.success
+      ? `Kill switch executed.\nOrders cancelled: ${d.orders_cancelled}\nPositions closed: ${d.positions_closed}`
+      : `Kill switch error: ${d.error || 'unknown'}\n${(d.errors || []).join('\n')}`;
+    alert(msg);
+    // Refresh History tab data
+    if (typeof loadHistory === 'function') loadHistory(true);
+  } catch(e) {
+    alert('Kill switch request failed: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'KILL SWITCH'; }
+  }
+}
+
+// ── Market Summary ────────────────────────────────────────────────────────
+
+async function loadMarketSummary() {
+  const grid   = $('mkt-summary-grid');
+  const ctxBar = $('mkt-ctx-bar');
+  if (!grid) return;
+  grid.innerHTML   = '<span style="color:#555;font-size:12px">Loading summary...</span>';
+  ctxBar.innerHTML = '';
+  try {
+    const ex = S.exchange || 'mexc';
+    const r  = await fetch(`/api/market/summary?exchange=${encodeURIComponent(ex)}`);
+    const d  = await r.json();
+    if (!d.success) { grid.innerHTML = ''; return; }
+
+    // BTC/ETH context bar
+    const ctx = d.market_context;
+    if (ctx) {
+      const trendColor = t => t === 'BULLISH' ? '#22c55e' : t === 'BEARISH' ? '#ef4444' : '#888';
+      const rsiColor   = v => v == null ? '#888' : v > 70 ? '#ef4444' : v < 30 ? '#22c55e' : '#ccc';
+      ctxBar.innerHTML = `
+        <span style="color:#888;font-size:11px;letter-spacing:.06em">MACRO</span>
+        <span>BTC <b style="color:#f7931a">${ctx.btc_price ? '$'+fmt(ctx.btc_price) : '—'}</b>
+          <span style="color:${trendColor(ctx.btc_trend)}">${ctx.btc_trend||'—'}</span>
+          RSI <span style="color:${rsiColor(ctx.btc_rsi_1h)}">${ctx.btc_rsi_1h ? ctx.btc_rsi_1h.toFixed(1) : '—'}</span>
+          ${ctx.btc_change_24h != null ? `<span style="color:${ctx.btc_change_24h>=0?'#22c55e':'#ef4444'}">${ctx.btc_change_24h>=0?'+':''}${ctx.btc_change_24h.toFixed(2)}%</span>` : ''}
+        </span>
+        <span style="color:#333">|</span>
+        <span>ETH <b style="color:#627eea">${ctx.eth_price ? '$'+fmt(ctx.eth_price) : '—'}</b>
+          <span style="color:${trendColor(ctx.eth_trend)}">${ctx.eth_trend||'—'}</span>
+          RSI <span style="color:${rsiColor(ctx.eth_rsi_1h)}">${ctx.eth_rsi_1h ? ctx.eth_rsi_1h.toFixed(1) : '—'}</span>
+        </span>
+        ${d.has_history ? `<span style="color:#555;margin-left:auto;font-size:11px">${d.snapshot_symbols} symbols tracked</span>` : '<span style="color:#555;margin-left:auto;font-size:11px">Building history…</span>'}
+      `;
+    }
+
+    // Helper: render a summary card
+    function summaryCard(title, items, valueKey, valueFormat, accent) {
+      if (!items || !items.length) return '';
+      const rows = items.map(s => {
+        const sym   = (s.symbol||'').replace('_USDC','').replace('_USDT','');
+        const val   = valueFormat(s);
+        const dir   = s.direction === 'LONG'
+          ? '<span style="color:#22c55e;font-size:10px">L</span>'
+          : '<span style="color:#ef4444;font-size:10px">S</span>';
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #1a1f28">
+          <span style="font-size:12px;color:#ccc">${dir} ${sym}</span>
+          <span style="font-size:12px;color:${accent};font-weight:600">${val}</span>
+        </div>`;
+      }).join('');
+      return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px;">
+        <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#555;margin-bottom:6px;text-transform:uppercase">${title}</div>
+        ${rows}
+      </div>`;
+    }
+
+    const fmtChange  = s => { const v = s.change_24h_pct||0; return `<span style="color:${v>=0?'#22c55e':'#ef4444'}">${v>=0?'+':''}${v.toFixed(2)}%</span>`; };
+    const fmtVol     = s => fmtVolume(s.volume_24h||0);
+    const fmtFunding = s => { const v = (s.funding_rate||0)*100; return `<span style="color:${v>=0?'#ef4444':'#22c55e'}">${v>=0?'+':''}${v.toFixed(4)}%</span>`; };
+    const fmtSpike   = s => `<span style="color:#f59e0b">${s.vol_spike_ratio}×</span>`;
+
+    let html = '';
+    html += summaryCard('Top Movers',  d.top_movers,               'change_24h_pct', fmtChange,  '#22c55e');
+    html += summaryCard('Top Losers',  d.top_losers,               'change_24h_pct', fmtChange,  '#ef4444');
+    html += summaryCard('Top Volume',  d.top_volume,               'volume_24h',     fmtVol,     '#60a5fa');
+    html += summaryCard('Funding +',   d.extreme_funding_positive, 'funding_rate',   fmtFunding, '#ef4444');
+    html += summaryCard('Funding −',   d.extreme_funding_negative, 'funding_rate',   fmtFunding, '#22c55e');
+    html += summaryCard('Volatility Watch', d.volatility_watch,    'change_24h_pct', fmtChange,  '#f59e0b');
+    if (d.volume_spikes && d.volume_spikes.length) {
+      html += summaryCard('Volume Spikes', d.volume_spikes, 'vol_spike_ratio', fmtSpike, '#f59e0b');
+    }
+
+    grid.innerHTML = html;
+  } catch(e) {
+    if (grid) grid.innerHTML = '';
+    console.error('loadMarketSummary', e);
+  }
+}
+
+function fmtVolume(v) {
+  if (v >= 1e9) return '$' + (v/1e9).toFixed(2) + 'B';
+  if (v >= 1e6) return '$' + (v/1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
+  return '$' + v.toFixed(0);
+}
+
+// ── AI Model Settings ──────────────────────────────────────────────────────
+
+async function loadAIModels() {
+  try {
+    const r   = await fetch('/api/settings/ai');
+    const d   = await r.json();
+    if (!d.success) return;
+
+    const sel  = document.getElementById('ai-model-select');
+    const warn = document.getElementById('ai-model-key-warning');
+    const stat = document.getElementById('ai-model-status');
+    if (!sel) return;
+
+    sel.innerHTML = '';
+
+    // Group by provider
+    const providers = [...new Set(d.models.map(m => m.provider))];
+    providers.forEach(prov => {
+      const grp = document.createElement('optgroup');
+      grp.label = prov.charAt(0).toUpperCase() + prov.slice(1);
+      d.models.filter(m => m.provider === prov).forEach(m => {
+        const opt = document.createElement('option');
+        opt.value   = JSON.stringify({provider: m.provider, model: m.model});
+        opt.text    = m.available ? m.label : m.label + ' (no API key)';
+        opt.disabled = !m.available;
+        if (m.provider === d.current.provider && m.model === d.current.model) {
+          opt.selected = true;
+        }
+        grp.appendChild(opt);
+      });
+      sel.appendChild(grp);
+    });
+
+    // Status line
+    const cur = d.models.find(m => m.provider === d.current.provider && m.model === d.current.model);
+    stat.textContent = cur
+      ? 'Active: ' + cur.label + (cur.available ? '' : ' — API key missing, will fall back')
+      : 'Active: ' + d.current.provider + ' / ' + d.current.model;
+
+    // Key warning for selected model
+    updateAIModelWarning(d.models);
+  } catch (e) {
+    console.error('loadAIModels', e);
+  }
+}
+
+function updateAIModelWarning(models) {
+  const sel  = document.getElementById('ai-model-select');
+  const warn = document.getElementById('ai-model-key-warning');
+  if (!sel || !warn) return;
+  const val = sel.value;
+  if (!val) return;
+  let chosen;
+  try { chosen = JSON.parse(val); } catch { return; }
+  const info = (models || []).find(m => m.provider === chosen.provider && m.model === chosen.model);
+  if (info && !info.available) {
+    warn.textContent = 'No API key found for ' + info.provider.charAt(0).toUpperCase() + info.provider.slice(1) + '. Add ' + info.key_env + ' to .env.';
+    warn.classList.remove('hidden');
+  } else {
+    warn.classList.add('hidden');
+  }
+}
+
+async function saveAIModel() {
+  const sel = document.getElementById('ai-model-select');
+  const msg = document.getElementById('ai-model-save-msg');
+  if (!sel) return;
+  let chosen;
+  try { chosen = JSON.parse(sel.value); } catch { return; }
+
+  try {
+    const r = await fetch('/api/settings/ai', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(chosen),
+    });
+    const d = await r.json();
+    if (d.success) {
+      msg.textContent = 'Saved.';
+      msg.classList.remove('hidden');
+      setTimeout(() => msg.classList.add('hidden'), 2000);
+      loadAIModels();  // refresh status line
+    } else {
+      msg.textContent = 'Error: ' + (d.error || 'unknown');
+      msg.style.color = '#f87171';
+      msg.classList.remove('hidden');
+    }
+  } catch (e) {
+    if (msg) { msg.textContent = 'Save failed: ' + e.message; msg.classList.remove('hidden'); }
   }
 }
 </script>

@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-07
-Last commit: 8d35707 feat: add agent layer, adapters, updated docs and analyze.py
-app.py: 4987 lines
-index.html: 6245 lines
+Last updated: 2026-05-13
+Last commit: d8315ca feat: regime-aware counter-trend conviction boost from factor engine
+app.py: 5166 lines
+index.html: 6466 lines
 
 ---
 
@@ -580,24 +580,103 @@ Execution readiness is tracked live in the Bot Readiness panel in the Strategies
 Review that panel before beginning any execution phase. You decide when to proceed —
 the system surfaces the data, it does not block you.
 
+**COMPLETED THIS SESSION:**
+- ✅ Diagnosed 0-signal bug: nested ThreadPoolExecutor overwhelmed MEXC kline endpoint → sequential strategy execution fix
+- ✅ P9 Trade Readiness Panel shipped: lib/risk_controls.py, /api/account/daily-pnl, checklist in signal detail
+- ✅ Agent Phase 2 unlocked: shadow_delta now applied to conviction, real agent tags (not shadow-prefixed)
+- ✅ History tab: true full-dataset stats via /api/signals/stats (no limit), dual win rate (strict + positive), perf banner streamlined to live-operational stats only
+- ✅ P11 Execution layer shipped (Hyperliquid):
+  - lib/hl_execution.py: place_limit_order, cancel_all_orders, close_all_positions, kill_switch, get_positions, get_open_orders
+  - app.py: GET /api/execution/status, POST /api/execution/place (gated by LIVE_TRADING_ENABLED), POST /api/execution/kill-switch
+  - index.html: KILL SWITCH button, EXECUTE ON HYPERLIQUID button in detail panel, order confirmation modal
+  - eth-account + msgpack installed on VPS and local
+
+**To activate P11 live trading:** add to VPS .env:
+```
+HL_PRIVATE_KEY=0x<64-char-hex-private-key>
+LIVE_TRADING_ENABLED=true
+```
+Kill switch works regardless of LIVE_TRADING_ENABLED. Order placement blocked until flag is set.
+
 Next in priority order:
-1. Deploy to VPS and test Apply + Revert buttons end-to-end
-2. Monitor balanced and funding_arb win rate over next 30-50 trades; use Revert if win rate degrades
-3. Monitor firebreak impact on signal count over next 5-10 scans
-3. Run full backfill: `python3 edge_lab_build.py --mode backfill --resume --batch-size 25 --max-runtime-minutes 45`
-4. Validate dataset: check candle counts per symbol in `edge_lab_symbol_status` after full backfill completes
-5. **Run factor engine on VPS after full backfill: `python3 edge_lab_factors.py --db data/edge_lab.db --out data/factor_report.json`** — expect ~2-3hr runtime on 5.7M rows; use `--template TP1_0_SL0_5` first for faster initial pass
-6. Interpret factor_report.json: identify top long/short states with positive edge_delta and high sample_quality
-7. Regime-aware ATR stop multiplier is next after factor engine validation
-6. Build shadow inversion research layer for `momentum_breakout`
-7. Expand path templates only after validating storage/runtime impact
-8. Begin P9 — execution readiness layer (brainstorm in progress)
-9. Accumulate 50+ closed signals with agent shadow data (trade normally, tag outcomes — at 0/50)
-10. After 50+ closed signals with agent data, review Intelligence tab Shadow Validation for Phase 2 readiness
-11. Run `python3 analyze.py` on VPS DB weekly to track strategy edge
-12. Review `short_vol_short` gate after 2+ more weeks of shadow data
-13. Monitor mt-learner — `journalctl -u mt-learner` weekly; learner re-analyzes automatically
-14. Monitor clone strategies — Balanced Focus Short and Funding Arb Focus Short
+1. **User action required**: Add HL_PRIVATE_KEY to VPS .env to enable kill switch and live order placement
+2. **User action required**: Top up Anthropic credits at console.anthropic.com — Claude briefs falling back to Gemini/Groq
+3. **Monitor Phase 2 agent delta impact** — do agent_confirmed signals win more? agent_disagreement lose more? Revert to shadow mode if win rate degrades
+4. **Monitor `regime_counter_long` / `regime_counter_short`** tags over next 20-30 trades
+5. Run `python3 analyze.py` weekly — watch momentum_breakout (anti-correlated, paused) and funding_arb edge
+6. Monitor mt-learner — `journalctl -u mt-learner` weekly
+
+---
+
+## Session Summary — 2026-05-13 (Phase 2 agents + History stats + P11 execution layer)
+
+**Phase 2 agents live:** `agent_shadow_delta` now applied to conviction. Tags no longer shadow-prefixed. `agent_version` = v2-phase2-live. Phase 2 was unlocked after Shadow Validation showed PHASE 2 READY in Intelligence tab.
+
+**History tab stats overhaul:** `/api/signals/stats` route aggregates all 1,148 closed signals with no limit. Summary bar now shows: Positive Rate (W+P), Strict Win Rate, Avg P&L/Trade, Avg W+P P&L, Avg Loss P&L, Avg Conv W/L. Perf banner stripped to live-operational only (OPEN, STREAK, P&L, BEST, SIM ACCOUNT, RETURN).
+
+**analyze.py key findings (1,055 signals):** Total P&L +1,182. Momentum Breakout anti-correlated (already paused). Extreme vol = money loser (-19.6 avg). Conviction 65-74 is sweet spot. Funding Arb strongest strategy (+971). Laddering beats TP1-only by +4,337.
+
+**P11 execution layer (Hyperliquid):** Full execution stack built. Signing uses EIP-712 via `eth_account.Account.sign_typed_data`. Kill switch always available with keys. Order placement gated by `LIVE_TRADING_ENABLED=true`. Confirmation modal required before every order.
+
+---
+
+## Session Summary — 2026-05-12 (0-signal bug fix + P9 Trade Readiness Panel)
+
+**Root cause of 0-signal bug:** `api_scan_all()` used a ThreadPoolExecutor to run all 5 strategies in parallel. Each strategy internally used a 10-worker enrichment pool × 8-agent pipeline = up to 400 concurrent threads, all hitting MEXC public kline endpoint. Rate-limiting caused kline responses to return None → enrichment returned None → 0 signals. Fix: strategies now run sequentially in `api_scan_all()` and `api_hl_scan()`.
+
+**P9 Trade Readiness Panel (shipped):**
+- `lib/risk_controls.py`: pure functions — `compute_daily_pnl()`, `compute_position_size()`, `get_readiness_verdict()`. Thresholds from mt-learner findings: winners avg trend_score 9.3 vs losers 14.1; winners avg atr_pct 3.2% vs losers 5.5%.
+- `GET /api/account/daily-pnl`: new route returning today's realized P&L from signals DB.
+- `loadTradeReadiness(sig)` in index.html: 5-item checklist (signal age, trend score, ATR, volatility regime, daily P&L) + READY/REVIEW/PASS verdict badge + 1%-risk position size recommendation. Renders in `#readiness-section` div in every open signal detail panel. Skips for closed signals.
+- Named `loadTradeReadiness` to avoid collision with Strategies tab `loadReadiness()`.
+
+**Anthropic API credits depleted on VPS** — fallback chain (Gemini + Groq keys present) is active. User needs to top up at console.anthropic.com.
+
+---
+
+## Session Summary — 2026-05-10 (HL parallel scan + TV chart fix + History exchange filter)
+
+**HYPERLIQUID PARALLEL SCAN.** `api_hl_scan()` rewritten to match `api_scan_all()` exactly: fetch tickers once, run all enabled strategies in parallel via `ThreadPoolExecutor`, return `results` dict (same shape as MEXC). Frontend `scanSignals()` simplified — `isHL` ternary removed, both exchanges POST to their endpoint and consume `data.results` identically. Standard pattern established for future exchange integrations.
+
+**TRADINGVIEW CHART FIX.** HL signals were mapping to `BINANCE:XYZUSDT.PERP` which doesn't exist for most HL altcoins. Fixed `toTVSymbol()` HYPERLIQUID case to use `HYPERLIQUID:XYZUSD.P`. Added `let currentTVExchange = 'MEXC'` module-level variable. `loadTVChart()` now sets `currentTVExchange`. Both `toTVSymbol(currentTVSymbol, 'MEXC')` calls in `_loadModalChart()` replaced with `currentTVExchange`.
+
+**HISTORY TAB EXCHANGE FILTER.** Added Exchange select (All / MEXC / Hyperliquid) to both panels:
+- Open Positions header: `id="pos-exchange-filter"`, wires to `H.posExchangeFilter`, filters `(p.exchange || 'MEXC').toUpperCase()` in `renderOpenPositions()`
+- Closed Signals filter bar: `id="hf-exchange"` between Strategy and Direction, reads in `filterClosedHistory()` and filters `(s.exchange || 'MEXC').toUpperCase()`
+- `posExchangeFilter: ''` added to H state object
+
+**Pattern rule established:** Any future exchange integration must implement `POST /api/<exchange>/scan` returning `{ success, results, total_pairs, scan_time }` with `results` keyed by strategy. Frontend needs zero changes.
+
+---
+
+## Session Summary — 2026-05-10 (Regime-Aware Counter-Trend Boost)
+
+**REGIME-AWARE COUNTER-TREND CONVICTION BOOST.** Factor engine analysis of 5,704,400 labeled 15m candles identified that counter-trend setups in aligned EMA structure outperform baseline by +3.9 to +5.6 edge_delta at high confidence. Implemented as a Stage 2 conviction boost in `enrich_signal()`.
+
+**Factor engine key findings (`data/factor_report.json` on VPS):**
+- LONG in `medium_bearish` regime×trend: **+5.64 delta** (n=348k, TP2_0_SL1_0)
+- LONG in `high_bearish`: **+5.05 delta** (n=49k, TP2_0_SL1_0)
+- LONG in `low_bearish`: **+3.88 delta** (n=1.68M, TP0_5_SL0_5)
+- SHORT in `medium_bullish`: **+4.41 delta** (n=389k, TP2_0_SL1_0)
+- SHORT in `low_bullish`: **+3.34 delta** (n=1.33M, TP0_5_SL0_5)
+- All findings: high_confidence sample quality (CI tight, n>300k except high_bearish)
+- The market **mean-reverts more than it trends** on 15m resolution. Counter-trend > trend-following.
+
+**`app.py` change (enrich_signal, Stage 2 only):**
+- `trend_score < -20` = bearish EMA structure (price < ema20 < ema50) — exact proxy for factor engine's "bearish" trend_state
+- `trend_score > +20` = bullish EMA structure — exact proxy for "bullish"
+- LONG + bearish structure + medium/high vol → +8 conviction, tag `regime_counter_long`
+- LONG + bearish structure + low vol → +5 conviction, tag `regime_counter_long`
+- SHORT + bullish structure + medium/high vol → +8 conviction, tag `regime_counter_short`
+- SHORT + bullish structure + low vol → +5 conviction, tag `regime_counter_short`
+- Extreme vol excluded from boost (firebreak + ×0.85 handle those)
+- No Stage 1 changes. No STRATEGIES dict changes. No schema changes.
+
+**`templates/index.html`:** TAG_TIPS and TAG_META entries added for both new tags. Green badge "Counter-Trend ↑/↓".
+
+**Also deployed this session:** Edge Lab materializer (5.7M rows → candle_features, 8 indexes), factor engine full run (280s on VPS), learner Apply/Revert buttons, strategy override panel.
+
+**Verification:** `import app` clean. Both tags appear on signals with counter-trend EMA structure. Committed `d8315ca`.
 
 ---
 

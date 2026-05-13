@@ -88,7 +88,7 @@ class AgentOutput:
     structural_bull_strength: float = 50.0
     detected_regime: str = "unknown"
     exchange: str = ""
-    agent_version: str = "v2-phase1-shadow"
+    agent_version: str = "v2-phase2-live"
     shadow_delta: int = 0
     shadow_narrative_delta: int = 0
     shadow_structural_delta: int = 0

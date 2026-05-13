@@ -27,6 +27,7 @@ from lib.indicators import (
 )
 from lib.laddering import generate_ladders
 from lib.ai_client import call_ai
+from lib.risk_controls import compute_daily_pnl, compute_position_size, get_readiness_verdict
 from lib.coinglass_client import (
     coinglass_enabled,
     enrich_symbol_with_coinglass,
@@ -55,7 +56,9 @@ BYBIT_BASE   = "https://api.bybit.com"
 SENTIMENT_PAIRS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"}
 
 PORT = int(os.getenv("MATRIX_PORT", "8080"))
-HL_WALLET_ADDRESS = os.getenv("HL_WALLET_ADDRESS", "")
+HL_WALLET_ADDRESS    = os.getenv("HL_WALLET_ADDRESS", "")
+HL_PRIVATE_KEY       = os.getenv("HL_PRIVATE_KEY", "")
+LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
@@ -64,6 +67,7 @@ ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
 DB_PATH = "data/signals.db"
 RISK_GATES_PATH = "data/risk_gates.json"
 STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
+AI_SETTINGS_PATH = "data/ai_settings.json"
 
 # Daily kline cache: symbol → (fetched_at_ts, data)
 _daily_kline_cache: dict = {}
@@ -265,7 +269,142 @@ def init_db() -> None:
         )
     """)
     con.commit()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ticker_snapshots (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             TEXT NOT NULL,
+            symbol         TEXT NOT NULL,
+            exchange       TEXT NOT NULL DEFAULT 'MEXC',
+            price          REAL,
+            volume_24h     REAL,
+            funding_rate   REAL,
+            change_24h_pct REAL,
+            open_interest  REAL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_ticker_snap_sym_ts ON ticker_snapshots (symbol, ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_ticker_snap_ts    ON ticker_snapshots (ts)")
+    con.commit()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS market_context_snapshots (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             TEXT NOT NULL,
+            btc_price      REAL,
+            btc_rsi_1h     REAL,
+            btc_trend      TEXT,
+            btc_change_24h REAL,
+            eth_price      REAL,
+            eth_rsi_1h     REAL,
+            eth_trend      TEXT,
+            btc_ls_ratio   REAL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_mktctx_ts ON market_context_snapshots (ts)")
+    con.commit()
     con.close()
+
+
+def _snapshot_tickers() -> int:
+    """Snapshot all MEXC tickers into ticker_snapshots. Returns row count. Prunes rows older than 7 days."""
+    try:
+        tickers = fetch_mexc("/contract/ticker")
+        if not tickers or not isinstance(tickers, list):
+            return 0
+        ts = datetime.utcnow().isoformat()
+        rows = []
+        for t in tickers:
+            symbol = t.get("symbol", "")
+            if not symbol:
+                continue
+            price  = float(t.get("lastPrice") or t.get("fairPrice") or 0)
+            volume = float(t.get("volume24") or t.get("vol24h") or t.get("amount24") or 0)
+            funding = float(t.get("fundingRate") or 0)
+            change  = float(t.get("riseFallRate") or 0) * 100
+            oi      = float(t.get("holdVol") or 0)
+            rows.append((ts, symbol, "MEXC", price, volume, funding, change, oi))
+        con = sqlite3.connect(DB_PATH)
+        con.executemany(
+            "INSERT INTO ticker_snapshots (ts,symbol,exchange,price,volume_24h,funding_rate,change_24h_pct,open_interest) VALUES (?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        con.execute("DELETE FROM ticker_snapshots WHERE ts < ?", (cutoff,))
+        con.commit()
+        con.close()
+        return len(rows)
+    except Exception as e:
+        print(f"[snapshot_tickers] {e}", file=sys.stderr)
+        return 0
+
+
+def _snapshot_market_context() -> bool:
+    """Fetch BTC+ETH 1h RSI/trend and store in market_context_snapshots. Prunes rows older than 30 days."""
+    try:
+        def _coin_ctx(symbol):
+            data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": "Min60", "limit": 100})
+            if not data or not isinstance(data, dict):
+                return None, None, None, None
+            df = pd.DataFrame({
+                "open":   data.get("open", []),
+                "high":   data.get("high", []),
+                "low":    data.get("low", []),
+                "close":  data.get("close", []),
+                "volume": data.get("vol", []),
+            }).astype(float)
+            if len(df) < 16:
+                return None, None, None, None
+            price = float(df["close"].iloc[-1])
+            rsi_s = calc_rsi(df, 14).dropna()
+            rsi   = float(rsi_s.iloc[-1]) if not rsi_s.empty else None
+            try:
+                ema20 = float(calc_ema(df, 20).dropna().iloc[-1])
+                ema50 = float(calc_ema(df, 50).dropna().iloc[-1])
+                trend = "BULLISH" if ema20 > ema50 else "BEARISH"
+            except Exception:
+                trend = "NEUTRAL"
+            change_24h = None
+            if len(df) >= 25:
+                old = float(df["close"].iloc[-25])
+                if old > 0:
+                    change_24h = round((price - old) / old * 100, 4)
+            return price, rsi, trend, change_24h
+
+        ts = datetime.utcnow().isoformat()
+        btc_price, btc_rsi, btc_trend, btc_change = _coin_ctx("BTC_USDT")
+        eth_price, eth_rsi, eth_trend, _           = _coin_ctx("ETH_USDT")
+
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT INTO market_context_snapshots (ts,btc_price,btc_rsi_1h,btc_trend,btc_change_24h,eth_price,eth_rsi_1h,eth_trend) VALUES (?,?,?,?,?,?,?,?)",
+            (ts, btc_price, btc_rsi, btc_trend, btc_change, eth_price, eth_rsi, eth_trend),
+        )
+        cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        con.execute("DELETE FROM market_context_snapshots WHERE ts < ?", (cutoff,))
+        con.commit()
+        con.close()
+        return True
+    except Exception as e:
+        print(f"[snapshot_market_context] {e}", file=sys.stderr)
+        return False
+
+
+def get_latest_market_context() -> dict | None:
+    """Return the most recent market_context_snapshots row as a dict, or None."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT ts,btc_price,btc_rsi_1h,btc_trend,btc_change_24h,eth_price,eth_rsi_1h,eth_trend FROM market_context_snapshots ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+        if not row:
+            return None
+        return {
+            "ts": row[0], "btc_price": row[1], "btc_rsi_1h": row[2],
+            "btc_trend": row[3], "btc_change_24h": row[4],
+            "eth_price": row[5], "eth_rsi_1h": row[6], "eth_trend": row[7],
+        }
+    except Exception:
+        return None
 
 
 def log_signals(signals: list[dict]) -> None:
@@ -1999,6 +2138,8 @@ def enrich_signal(
             "kline_depth_4h": n4h,
             # "low" when history is thin (50–99 1h or 20–49 4h candles); "current" otherwise
             "data_quality": "low" if (n1h < 100 or n4h < 50) else "current",
+            # BTC/ETH macro context at signal generation time (from latest snapshot)
+            "btc_context": get_latest_market_context(),
         }
         cg_context = get_symbol_derivatives_context(symbol)
         if cg_context.get("coinglass_available"):
@@ -2068,10 +2209,9 @@ def enrich_signal(
                 sig["conviction"] = int(sig["conviction"] * 0.90)
         sig["conviction"] = max(0, min(100, sig["conviction"]))
 
-        # --- Agent Intelligence Layer (Phase 1 shadow mode) ---
-        # Agent deltas are recorded for forward testing, but are NOT applied to
-        # conviction in Phase 1. All blocks are shadow-tagged only — no conviction
-        # changes until Phase 2 validation is complete.
+        # --- Agent Intelligence Layer (Phase 2 live mode) ---
+        # Phase 2 unlocked: shadow_delta is applied to conviction; real (non-shadow)
+        # tags are added. Hard blocks from Risk Manager still use the same logic.
         # Only run agents on the top AGENT_TOP_N signals — the rest get null fields.
         _run_agents = (
             base.get("_scan_rank", 99) < AGENT_TOP_N
@@ -2136,18 +2276,19 @@ def enrich_signal(
                 print(f"[agents] {symbol}: {_ae}", file=sys.stderr)
 
         if _agent_output:
-            # Phase 1 shadow mode: record blocks/tags but never touch conviction
+            # Phase 2 live mode: apply delta + real tags
             if _agent_output.hard_blocked:
                 sig["tags"] = list(dict.fromkeys(
                     sig["tags"] + ["agent_blocked"] + _agent_output.block_reasons
                 ))
             else:
-                shadow_tags = [
-                    f"agent_shadow_{t}"
+                agent_tags = [
+                    t if t.startswith("agent_") else f"agent_{t}"
                     for t in _agent_output.tags
-                    if not t.startswith("agent_shadow_")
                 ]
-                sig["tags"] = list(dict.fromkeys(sig["tags"] + shadow_tags))
+                sig["tags"] = list(dict.fromkeys(sig["tags"] + agent_tags))
+                if _agent_output.shadow_delta:
+                    sig["conviction"] = max(0, min(100, sig["conviction"] + _agent_output.shadow_delta))
 
         sig.update({
             "agent_exchange": _agent_output.exchange if _agent_output else None,
@@ -2331,8 +2472,10 @@ def api_scan():
 
 @app.route("/api/scan/all", methods=["POST"])
 def api_scan_all():
-    """Fetch tickers once, score and enrich for every enabled strategy in
-    parallel, log results, and return all signals grouped by strategy key.
+    """Fetch tickers once, score and enrich for every enabled strategy sequentially,
+    log results, and return all signals grouped by strategy key.
+    Strategies run one-at-a-time to avoid overwhelming the MEXC public API with
+    concurrent kline requests (each strategy enriches 30 signals × 3 API calls).
     The frontend caches the results so strategy switching is instant."""
     try:
         t0 = time.time()
@@ -2346,21 +2489,14 @@ def api_scan_all():
         registry = get_strategy_registry()
         results: dict = {}
 
-        def _scan_one_strategy(key):
+        for key in registry:
             sigs, _ = run_scan(strategy_key=key, tickers=tickers)
             log_signals(sigs)
-            return key, sigs
-
-        from concurrent.futures import as_completed
-        with ThreadPoolExecutor(max_workers=len(registry)) as ex:
-            futs = {ex.submit(_scan_one_strategy, k): k for k in registry}
-            for f in as_completed(futs):
-                key, sigs = f.result()
-                results[key] = {
-                    "signals":     sigs,
-                    "total_pairs": total_pairs,
-                    "strategy":    key,
-                }
+            results[key] = {
+                "signals":     sigs,
+                "total_pairs": total_pairs,
+                "strategy":    key,
+            }
 
         scan_time = round(time.time() - t0, 2)
         return jsonify({
@@ -2373,40 +2509,39 @@ def api_scan_all():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/api/hl/scan")
+@app.route("/api/hl/scan", methods=["POST"])
 def api_hl_scan():
-    """Scan Hyperliquid perps with the existing MT7 strategy engine."""
+    """Fetch Hyperliquid tickers once, score and enrich for every enabled strategy
+    sequentially, log results, and return all signals grouped by strategy key.
+    Same shape as /api/scan/all — standard pattern for all exchange integrations."""
     try:
-        threshold    = request.args.get("threshold", CONVICTION_THRESHOLD, type=int)
-        strategy_key = request.args.get("strategy", "balanced")
-        registry = get_strategy_registry(include_disabled=True)
-        strat = registry.get(strategy_key)
-        if strat and not strat.get("enabled", True) and strategy_key != "balanced":
-            return jsonify({"success": False, "error": f"Strategy '{strategy_key}' is disabled"}), 400
-        if strategy_key not in registry:
-            strategy_key = "balanced"
-
+        t0 = time.time()
         expire_stale_signals()
+
         universe, asset_ctxs = fetch_hl_meta_and_ctxs()
         tickers = normalize_hl_tickers(universe, asset_ctxs)
         if not tickers:
             return jsonify({"success": False, "error": "Hyperliquid ticker feed unavailable"}), 502
 
-        signals, total_pairs = run_scan(
-            threshold=threshold,
-            strategy_key=strategy_key,
-            tickers=tickers,
-        )
-        strat = registry.get(strategy_key, registry["balanced"])
-        log_signals(signals)
+        total_pairs = len(tickers)
+        registry = get_strategy_registry()
+        results: dict = {}
+
+        for key in registry:
+            sigs, _ = run_scan(strategy_key=key, tickers=tickers)
+            log_signals(sigs)
+            results[key] = {
+                "signals":     sigs,
+                "total_pairs": total_pairs,
+                "strategy":    key,
+            }
+
+        scan_time = round(time.time() - t0, 2)
         return jsonify({
-            "success":       True,
-            "signals":       signals,
-            "count":         len(signals),
-            "total_pairs":   total_pairs,
-            "strategy":      strategy_key,
-            "strategy_name": strat["name"],
-            "exchange":      "HYPERLIQUID",
+            "success":     True,
+            "results":     results,
+            "total_pairs": total_pairs,
+            "scan_time":   scan_time,
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -2444,6 +2579,80 @@ def api_market():
             "exchange": exchange_label,
             "coinglass_enabled": coinglass_enabled(),
             "coinglass_pairs": len(coinglass_snapshot),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/market/summary")
+def api_market_summary():
+    """
+    Live market summary: top movers, losers, volume, extreme funding, volatility watch,
+    volume spikes (requires snapshot history), and latest BTC/ETH market context.
+    """
+    try:
+        exchange_param = request.args.get("exchange", "mexc").strip().lower()
+
+        if exchange_param == "hyperliquid":
+            universe, asset_ctxs = fetch_hl_meta_and_ctxs()
+            tickers = normalize_hl_tickers(universe, asset_ctxs)
+            exchange_label = "HYPERLIQUID"
+        else:
+            tickers = fetch_mexc("/contract/ticker")
+            exchange_label = "MEXC"
+
+        if not tickers or not isinstance(tickers, list):
+            return jsonify({"success": False, "error": "no ticker data"}), 502
+
+        coinglass_snapshot = get_coin_market_snapshot()
+        scored = [s for t in tickers if (s := score_ticker(t, coinglass_snapshot=coinglass_snapshot))]
+
+        # 7-day avg volume from snapshots for spike detection
+        vol_avgs: dict[str, float] = {}
+        try:
+            cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat()
+            con = sqlite3.connect(DB_PATH)
+            rows = con.execute("""
+                SELECT symbol, AVG(volume_24h), COUNT(*)
+                FROM ticker_snapshots
+                WHERE ts > ? AND exchange = ?
+                GROUP BY symbol HAVING COUNT(*) >= 3
+            """, (cutoff_7d, exchange_label)).fetchall()
+            con.close()
+            vol_avgs = {r[0]: r[1] for r in rows}
+        except Exception:
+            pass
+
+        def _change(s):  return s.get("change_24h_pct") or 0
+        def _vol(s):     return s.get("volume_24h") or 0
+        def _funding(s): return s.get("funding_rate") or 0
+
+        # Volume spikes: current vol > 1.5× 7-day avg (only once history exists)
+        volume_spikes = []
+        for s in scored:
+            avg = vol_avgs.get(s["symbol"])
+            cur = _vol(s)
+            if avg and avg > 0 and cur > avg * 1.5:
+                volume_spikes.append({**s, "vol_spike_ratio": round(cur / avg, 2)})
+        volume_spikes.sort(key=lambda x: x["vol_spike_ratio"], reverse=True)
+
+        # Volatility watch: combined score from |change| + |funding| magnitude
+        def _vwatch(s):
+            return abs(_change(s)) * 10 + abs(_funding(s)) * 5000
+
+        return jsonify({
+            "success":                  True,
+            "exchange":                 exchange_label,
+            "top_movers":               sorted(scored, key=_change, reverse=True)[:6],
+            "top_losers":               sorted(scored, key=_change)[:6],
+            "top_volume":               sorted(scored, key=_vol, reverse=True)[:6],
+            "extreme_funding_positive": sorted(scored, key=_funding, reverse=True)[:5],
+            "extreme_funding_negative": sorted(scored, key=_funding)[:5],
+            "volatility_watch":         sorted(scored, key=_vwatch, reverse=True)[:8],
+            "volume_spikes":            volume_spikes[:6],
+            "market_context":           get_latest_market_context(),
+            "has_history":              len(vol_avgs) > 0,
+            "snapshot_symbols":         len(vol_avgs),
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -2581,6 +2790,57 @@ def api_signal_result():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/signals/stats")
+def api_signals_stats():
+    """Aggregate stats over ALL closed signals — no limit. Used by History tab summary bar."""
+    try:
+        strategy = request.args.get("strategy", None)
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        where = "WHERE result IS NOT NULL"
+        params: list = []
+        if strategy:
+            where += " AND strategy=?"
+            params.append(strategy)
+        cur.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN result='WIN'     THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN result='LOSS'    THEN 1 ELSE 0 END) as losses,
+                SUM(CASE WHEN result='PARTIAL' THEN 1 ELSE 0 END) as partials,
+                SUM(CASE WHEN result='EXPIRED' THEN 1 ELSE 0 END) as expired,
+                AVG(CASE WHEN result IN ('WIN','PARTIAL') AND pnl_pct IS NOT NULL THEN pnl_pct END) as avg_pos_pnl,
+                AVG(CASE WHEN result='LOSS' AND pnl_pct IS NOT NULL THEN pnl_pct END) as avg_loss_pnl,
+                AVG(CASE WHEN result IN ('WIN','PARTIAL') THEN conviction END) as avg_conv_win,
+                AVG(CASE WHEN result='LOSS' THEN conviction END) as avg_conv_loss,
+                AVG(CASE WHEN pnl_pct IS NOT NULL AND result NOT IN ('EXPIRED','SKIPPED') THEN pnl_pct END) as avg_pnl
+            FROM signals {where}
+        """, params)
+        row = cur.fetchone()
+        con.close()
+        total, wins, losses, partials, expired, avg_pos_pnl, avg_loss_pnl, avg_conv_win, avg_conv_loss, avg_pnl = row
+        denom = (wins or 0) + (losses or 0) + (partials or 0)
+        win_rate_strict   = round((wins or 0) / denom * 100) if denom > 0 else None
+        win_rate_positive = round(((wins or 0) + (partials or 0)) / denom * 100) if denom > 0 else None
+        return jsonify({
+            "success": True,
+            "total": total or 0,
+            "wins": wins or 0,
+            "losses": losses or 0,
+            "partials": partials or 0,
+            "expired": expired or 0,
+            "win_rate_strict":   win_rate_strict,
+            "win_rate_positive": win_rate_positive,
+            "avg_pos_pnl":  round(avg_pos_pnl,  2) if avg_pos_pnl  is not None else None,
+            "avg_loss_pnl": round(avg_loss_pnl,  2) if avg_loss_pnl is not None else None,
+            "avg_conv_win":  round(avg_conv_win,  1) if avg_conv_win  is not None else None,
+            "avg_conv_loss": round(avg_conv_loss, 1) if avg_conv_loss is not None else None,
+            "avg_pnl": round(avg_pnl, 2) if avg_pnl is not None else None,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/signals/history")
 def api_signals_history():
     """Return logged signal history with optional filters."""
@@ -2627,6 +2887,90 @@ def api_signals_history():
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _generate_coach_review(
+    sig: dict,
+    signal_id: int,
+    sig_json_obj: dict,
+    journey: dict,
+    journey_prompt: str,
+    tags_raw: str,
+    entry1,
+    exit_price,
+    duration_minutes,
+) -> str | None:
+    """
+    Return a coach review string for a closed signal.
+    Returns the cached value from signal_json if already generated.
+    Otherwise calls the AI, persists the result back to signal_json, and returns it.
+    Never raises — returns None on any failure.
+    """
+    cached = sig_json_obj.get("coach_review")
+    if cached:
+        return cached
+
+    # Pull Research Firm findings for this strategy
+    research_context = ""
+    try:
+        briefs_path = "/opt/mt-learner/research/briefs.json"
+        if os.path.exists(briefs_path):
+            with open(briefs_path) as _f:
+                _rd = json.load(_f)
+            skey = sig.get("strategy_key") or strategy_name_to_key(sig.get("strategy", ""))
+            relevant = [
+                b for b in _rd.get("briefs", [])
+                if b.get("strategy_key") == skey and b.get("status") == "active"
+            ][:3]
+            if relevant:
+                research_context = "\n\nResearch Firm findings for this strategy:\n" + "".join(
+                    f"- [{b['confidence'].upper()}] {b['title']}: {b['thesis']}"
+                    + (f" Suggestion: {b['what_is_novel']}" if b.get("what_is_novel") else "")
+                    + "\n"
+                    for b in relevant
+                )
+    except Exception:
+        pass
+
+    direction = sig.get("direction", "")
+    user_msg = (
+        f"Trade review:\n"
+        f"Symbol: {sig.get('symbol')} | Direction: {direction} | Strategy: {sig.get('strategy')}\n"
+        f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Result: {sig.get('result')}\n"
+        f"Stop: {sig.get('stop_loss')} | TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
+        f"Duration: {duration_minutes or 'unknown'} minutes\n"
+        f"Trade journey stats:\n{journey_prompt}\n"
+        f"Signal reason: {sig.get('signal_why')}\n"
+        f"Tags: {tags_raw}\n"
+        f"Result note: {sig.get('result_note')}\n"
+        f"{research_context}\n"
+        f"Write a concise but useful coach review in 2 short paragraphs. "
+        f"First describe the price journey from signal/entry to close using the journey stats. "
+        f"Then explain what the signal got right or wrong and one specific thing to watch next time. "
+        f"If Research Firm findings above are relevant to this trade's outcome, reference them specifically. "
+        f"Do not claim the strategy should change based on a single trade; frame learning as evidence to aggregate."
+    )
+    review = call_ai(
+        system="You are a trading coach reviewing a completed trade. "
+               "Be direct, specific, and grounded only in the supplied trade data. "
+               "Explain MAE/MFE/capture in plain trader language. No fluff.",
+        user=user_msg,
+        max_tokens=900,
+    )
+
+    if review:
+        try:
+            sig_json_obj["coach_review"]    = review
+            sig_json_obj["coach_review_at"] = datetime.utcnow().isoformat()
+            _con = sqlite3.connect(DB_PATH)
+            _con.execute("UPDATE signals SET signal_json=? WHERE id=?",
+                         (json.dumps(sig_json_obj, default=str), signal_id))
+            _con.commit()
+            _con.close()
+        except Exception as _e:
+            print(f"[coach_review persist] {_e}", file=sys.stderr)
+
+    return review
 
 
 @app.route("/api/signal/detail/<int:signal_id>")
@@ -2678,29 +3022,13 @@ def api_signal_detail(signal_id: int):
         journey = compute_trade_journey(sig, pnl_pct)
         journey_prompt = format_journey_for_prompt(journey)
 
-        # AI trade coach review — gracefully skipped if no provider key or call fails
-        user_msg = (
-            f"Trade review:\n"
-            f"Symbol: {sig.get('symbol')} | Direction: {direction} | Strategy: {sig.get('strategy')}\n"
-            f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Result: {sig.get('result')}\n"
-            f"Stop: {sig.get('stop_loss')} | TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
-            f"Duration: {duration_minutes or 'unknown'} minutes\n"
-            f"Trade journey stats:\n{journey_prompt}\n"
-            f"Signal reason: {sig.get('signal_why')}\n"
-            f"Tags: {tags_raw}\n"
-            f"Result note: {sig.get('result_note')}\n\n"
-            f"Write a concise but useful coach review in 2 short paragraphs. "
-            f"First describe the price journey from signal/entry to close using the journey stats. "
-            f"Then explain what the signal got right or wrong and one specific thing to watch next time. "
-            f"Do not claim the strategy should change based on a single trade; frame learning as evidence to aggregate."
-        )
-        ai_analysis = call_ai(
-            system="You are a trading coach reviewing a completed trade. "
-                   "Be direct, specific, and grounded only in the supplied trade data. "
-                   "Explain MAE/MFE/capture in plain trader language. No fluff.",
-            user=user_msg,
-            max_tokens=900,
-        )
+        sig_json_obj = {}
+        try:
+            sig_json_obj = json.loads(sig.get("signal_json") or "{}")
+        except Exception:
+            pass
+        ai_analysis = _generate_coach_review(sig, signal_id, sig_json_obj, journey, journey_prompt,
+                                              tags_raw, entry1, exit_price, duration_minutes)
 
         return jsonify({
             "success":          True,
@@ -4600,6 +4928,16 @@ def api_revert_strategy_override(strategy_key: str):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/account/daily-pnl")
+def api_account_daily_pnl():
+    """Today's realized P&L summary — used by P9 trade readiness panel."""
+    try:
+        result = compute_daily_pnl(DB_PATH)
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "total_pnl_pct": 0.0, "wins": 0, "losses": 0, "count": 0})
+
+
 @app.route("/api/account/readiness")
 def api_account_readiness():
     """Bot readiness metrics computed from signals.db. No MEXC auth needed."""
@@ -5126,6 +5464,133 @@ def api_intelligence_research():
 
 
 # ---------------------------------------------------------------------------
+# P11 — Execution routes (Hyperliquid)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/execution/status")
+def api_execution_status():
+    """Live trading status — positions, open orders, and whether live mode is on."""
+    try:
+        from lib.hl_execution import get_positions, get_open_orders
+        wallet = HL_WALLET_ADDRESS.strip()
+        keys_ok = bool(wallet and HL_PRIVATE_KEY)
+        positions = get_positions(wallet)["positions"] if keys_ok else []
+        orders    = get_open_orders(wallet)["orders"]  if keys_ok else []
+        return jsonify({
+            "success":             True,
+            "live_trading":        LIVE_TRADING_ENABLED,
+            "keys_configured":     keys_ok,
+            "positions":           positions,
+            "open_orders":         orders,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/execution/place", methods=["POST"])
+def api_execution_place():
+    """
+    Place a limit order on Hyperliquid.
+    Requires LIVE_TRADING_ENABLED=true in .env.
+    Body: {coin, is_buy, size, limit_px, signal_id (optional)}
+    All safety gates enforced here — signal age, key presence, live mode.
+    """
+    if not LIVE_TRADING_ENABLED:
+        return jsonify({"success": False, "error": "Live trading is disabled. Set LIVE_TRADING_ENABLED=true in .env to enable."}), 403
+    if not HL_PRIVATE_KEY or not HL_WALLET_ADDRESS:
+        return jsonify({"success": False, "error": "HL_PRIVATE_KEY and HL_WALLET_ADDRESS must be set in .env"}), 400
+    try:
+        from lib.hl_execution import place_limit_order
+        body      = request.get_json(force=True) or {}
+        coin      = str(body.get("coin", "")).strip().upper()
+        is_buy    = bool(body.get("is_buy", True))
+        size      = float(body.get("size", 0))
+        limit_px  = float(body.get("limit_px", 0))
+        signal_id = body.get("signal_id")
+
+        if not coin or size <= 0 or limit_px <= 0:
+            return jsonify({"success": False, "error": "coin, size, and limit_px are required"}), 400
+
+        # Signal age gate — never execute on a stale signal
+        if signal_id:
+            try:
+                con = sqlite3.connect(DB_PATH)
+                row = con.execute("SELECT entry_at, logged_at FROM signals WHERE id=?", (signal_id,)).fetchone()
+                con.close()
+                if row:
+                    ts_str = row[0] or row[1]
+                    if ts_str:
+                        ts = datetime.fromisoformat(ts_str)
+                        age_min = (datetime.utcnow() - ts).total_seconds() / 60
+                        if age_min > 5:
+                            return jsonify({"success": False,
+                                "error": f"Signal is {age_min:.0f}m old — must be < 5 minutes to execute"}), 400
+            except Exception:
+                pass
+
+        result = place_limit_order(
+            coin=coin, is_buy=is_buy, size=size,
+            limit_px=limit_px, private_key=HL_PRIVATE_KEY,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/execution/kill-switch", methods=["POST"])
+def api_execution_kill_switch():
+    """
+    Emergency kill switch — cancel all open orders and close all positions.
+    Available regardless of LIVE_TRADING_ENABLED. Requires keys in .env.
+    """
+    if not HL_PRIVATE_KEY or not HL_WALLET_ADDRESS:
+        return jsonify({"success": False, "error": "HL_PRIVATE_KEY and HL_WALLET_ADDRESS not configured"}), 400
+    try:
+        from lib.hl_execution import kill_switch
+        result = kill_switch(HL_WALLET_ADDRESS.strip(), HL_PRIVATE_KEY.strip())
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# AI Model Settings
+# ---------------------------------------------------------------------------
+
+@app.route("/api/settings/ai")
+def api_ai_settings_get():
+    """Return available models (with key availability) and current selection."""
+    try:
+        from lib.ai_client import AVAILABLE_MODELS, load_ai_settings
+        settings = load_ai_settings()
+        models = [
+            {**m, "available": bool(os.getenv(m["key_env"], ""))}
+            for m in AVAILABLE_MODELS
+        ]
+        return jsonify({"success": True, "current": settings, "models": models})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/settings/ai", methods=["PATCH"])
+def api_ai_settings_patch():
+    """Update the active AI model. Body: {provider, model}."""
+    try:
+        from lib.ai_client import AVAILABLE_MODELS, save_ai_settings
+        body = request.get_json(silent=True) or {}
+        provider = body.get("provider", "").strip()
+        model    = body.get("model", "").strip()
+        valid = any(m["provider"] == provider and m["model"] == model for m in AVAILABLE_MODELS)
+        if not valid:
+            return jsonify({"success": False, "error": "unknown provider/model combination"}), 400
+        settings = {"provider": provider, "model": model}
+        save_ai_settings(settings)
+        return jsonify({"success": True, "current": settings})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -5143,6 +5608,109 @@ def _outcome_loop():
 
 _outcome_thread = threading.Thread(target=_outcome_loop, daemon=True)
 _outcome_thread.start()
+
+
+def _snapshot_loop():
+    """Hourly background job: snapshot all MEXC tickers + BTC/ETH market context."""
+    import time as _time
+    _time.sleep(180)  # wait 3 minutes after startup before first snapshot
+    while True:
+        try:
+            n = _snapshot_tickers()
+            ok = _snapshot_market_context()
+            print(f"[snapshot_loop] tickers={n} ctx={'ok' if ok else 'err'}", file=sys.stderr)
+        except Exception as e:
+            print(f"[snapshot_loop] error: {e}", file=sys.stderr)
+        _time.sleep(3600)  # every hour
+
+_snapshot_thread = threading.Thread(target=_snapshot_loop, daemon=True)
+_snapshot_thread.start()
+
+
+def _coach_review_loop():
+    """
+    Background job: generate coach reviews for closed trades that don't have one yet.
+    Processes 5 trades per run, every 10 minutes. Uses the shared _generate_coach_review()
+    helper so reviews are identical to on-demand ones (Research Firm context included).
+    Skips EXPIRED and SKIPPED outcomes — no useful journey data there.
+    """
+    import time as _time
+    _time.sleep(300)  # wait 5 minutes after startup
+    while True:
+        try:
+            con = sqlite3.connect(DB_PATH)
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+                SELECT * FROM signals
+                WHERE result IS NOT NULL
+                  AND result NOT IN ('EXPIRED', 'SKIPPED')
+                  AND (
+                      signal_json IS NULL
+                      OR json_extract(signal_json, '$.coach_review') IS NULL
+                  )
+                ORDER BY logged_at DESC
+                LIMIT 5
+            """).fetchall()
+            con.close()
+
+            if not rows:
+                _time.sleep(600)
+                continue
+
+            generated = 0
+            for row in rows:
+                try:
+                    sig = dict(row)
+                    signal_id = sig["id"]
+                    sig_json_obj = {}
+                    try:
+                        sig_json_obj = json.loads(sig.get("signal_json") or "{}")
+                    except Exception:
+                        pass
+
+                    pnl_pct = sig.get("pnl_pct")
+                    entry1  = sig.get("entry1")
+                    exit_px = sig.get("exit_price")
+                    if pnl_pct is None and entry1 and exit_px and entry1 != 0:
+                        direction = sig.get("direction", "")
+                        pnl_pct = round(
+                            ((exit_px - entry1) / entry1 * 100) if direction == "LONG"
+                            else ((entry1 - exit_px) / entry1 * 100),
+                            2,
+                        )
+
+                    duration_minutes = None
+                    if sig.get("logged_at") and sig.get("result_at"):
+                        try:
+                            t0 = datetime.fromisoformat(sig["logged_at"])
+                            t1 = datetime.fromisoformat(sig["result_at"])
+                            duration_minutes = int((t1 - t0).total_seconds() / 60)
+                        except Exception:
+                            pass
+
+                    tags_raw     = sig.get("tags") or ""
+                    journey      = compute_trade_journey(sig, pnl_pct)
+                    journey_prompt = format_journey_for_prompt(journey)
+
+                    review = _generate_coach_review(
+                        sig, signal_id, sig_json_obj, journey, journey_prompt,
+                        tags_raw, entry1, exit_px, duration_minutes,
+                    )
+                    if review:
+                        generated += 1
+                        print(f"[coach_review_loop] generated for signal {signal_id} ({sig.get('symbol')})", file=sys.stderr)
+
+                    _time.sleep(4)  # brief pause between calls — respect Groq rate limits
+                except Exception as _e:
+                    print(f"[coach_review_loop] signal {sig.get('id')} error: {_e}", file=sys.stderr)
+
+            print(f"[coach_review_loop] batch done — generated={generated}", file=sys.stderr)
+        except Exception as e:
+            print(f"[coach_review_loop] error: {e}", file=sys.stderr)
+        _time.sleep(600)  # 10 minutes between batches
+
+_coach_review_thread = threading.Thread(target=_coach_review_loop, daemon=True)
+_coach_review_thread.start()
 
 
 if __name__ == "__main__":

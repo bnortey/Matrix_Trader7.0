@@ -275,57 +275,27 @@ Do not start a new task until the previous one works end-to-end.
 <claude-mem-context>
 # Memory Context
 
-# [Matrix_Trader_7.0] recent context, 2026-05-07 3:34am EDT
+# [Matrix_Trader_7.0] recent context, 2026-05-11 8:30am EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (23,703t read) | 1,684,600t work | 99% savings
+Stats: 50 obs (19,360t read) | 1,021,701t work | 98% savings
 
 ### Apr 30, 2026
-S15 VPS DB statistics pull — signals issued, trades closed, P&L by strategy (Apr 30 at 5:50 PM)
 S16 VPS DB stats pull — signals issued, trades closed, P&L by strategy; session wrapped with data synced locally (Apr 30 at 6:01 PM)
 S14 Matrix Trader 7.0 — Fix Momentum Breakout invisible in strategy bar + deploy to VPS (Apr 30 at 6:01 PM)
 ### May 1, 2026
 S17 VPS DB stats pull + risk_gates.json state check — confirmed Mean Reversion is active (not disabled), only Momentum Breakout is paused (May 1 at 11:48 AM)
 S19 User selected option "1" — subagent-driven development approach to execute the Hyperliquid integration plan (May 1 at 11:49 AM)
 ### May 2, 2026
-31 10:21p ✅ Implementation Plan File Created for Hyperliquid Integration
-32 " 🟣 Complete Hyperliquid Integration Implementation Plan Written
 S21 Double-check Codex's completed coding work in Matrix_Trader_7.0 — verify correctness of agent layer, adapters, performance fixes, and Research Firm feature (May 2 at 10:24 PM)
 S18 MT7 — Hyperliquid Exchange Integration (Phase 1): Add Hyperliquid as a second exchange source with working scan + read-only account integration (May 2 at 10:24 PM)
-33 11:25p 🟣 hyperliquid_client.py code quality fixes — interval validation and wallet guard added
-34 " 🔵 Primary session stuck in restart loop — Task 1 re-dispatched multiple times, Tasks 2-10 not started
-### May 3, 2026
-35 11:36a 🟣 hyperliquid_client.py code quality fixes committed — commit 93deec0
-36 12:19p 🟣 Matrix Trader 8-Analyst Agent Intelligence Layer — Phase 1 Shadow Mode
-### May 4, 2026
-37 12:46a 🔵 Pre-implementation state: agent files not yet created, toTVSymbol bug confirmed present
-38 " 🟣 Exchange adapter layer created: lib/exchange_context.py, lib/adapters/__init__.py, lib/adapters/mexc.py, lib/adapters/hyperliquid.py
-39 " 🟣 Phase 1 Agent Shadow Layer Deployed to Production
-### May 5, 2026
-40 1:55a ⚖️ Matrix Trader Intelligence Layer — Three-Phase Architecture Plan
-41 1:56a 🔵 Agent Shadow Layer Files Confirmed Present on VPS
-42 " 🔵 Agent Shadow Layer Live and Producing Data — v2-phase1-shadow
-43 1:58a 🔵 TradingView Hyperliquid Fix Confirmed Deployed — No Agent Timeout Errors
-44 1:59a 🔵 VPS Scan Time 14.4s — Exceeds Phase 2 Criterion Threshold
-45 " 🔵 VPS Has No /opt/venv — Only System Python 3.12 Available
-46 2:00a 🔵 Full analyze.py Audit: Strategy Performance, Blacklist Candidates, Direction-Flip Warnings
-47 2:01a 🔵 VPS Audit Complete — Prompt 1 All 8 Checks Passed with One Flag
-48 " 🔵 index.html Structure Mapped — switchTab() Not showTab(), State Objects Located
-52 2:05a 🟣 Intelligence Tab Frontend Implemented in index.html
-53 " 🔵 Subagent Ran Out of Usage Before Completing Intelligence Tab Tasks
-49 2:08a ⚖️ Dimensional Atlas — Project Specification Defined
-50 2:09a 🔵 Dimensional Atlas Project Directory Exists But Is Empty
-51 2:10a 🟣 Dimensional Atlas — P0 Foundation Docs Created
 ### May 6, 2026
-54 4:38p 🔵 app.py Scan Architecture Pre-Change Baseline
-55 4:39p 🟣 AGENT_TOP_N = 10 Constant Added to app.py
-56 " ⚖️ Matrix Trader: Scan Performance Optimization Strategy Defined
+56 4:39p ⚖️ Matrix Trader: Scan Performance Optimization Strategy Defined
 57 " 🟣 Research Firm: Deterministic Hypothesis Discovery Engine for mt-learner
 58 " 🟣 Research Firm Integrated into mt-learner Scheduler and Matrix Trader API
-59 " 🟣 Intelligence Tab: Research Firm Section Added as 4th Panel
 60 4:46p 🟣 AGENT_TOP_N Constant Limits Agent Pipeline to Top 10 Signals
 61 " 🟣 api_scan_all() Converted to Parallel Strategy Execution via ThreadPoolExecutor
 62 " 🟣 5-Minute TTL Cache Added for Daily Kline API Calls
@@ -343,14 +313,41 @@ S18 MT7 — Hyperliquid Exchange Integration (Phase 1): Add Hyperliquid as a sec
 73 " 🔵 Research PDF Corpus and Uncommitted Working Tree State Identified
 S20 Verify Codex completed the last bits of coding correctly in Matrix_Trader_7.0 (May 7 at 1:17 AM)
 S22 Verify Codex work then identify what's next — P9 Execution Readiness Layer identified as next phase, brainstorm proposed (May 7 at 1:18 AM)
+S23 P9 Execution Readiness Layer brainstorm — clarifying questions phase begun, first question posed to user about P9 output UX (May 7 at 1:20 AM)
 74 1:20a ⚖️ P9 Brainstorm Structured as 6-Step Design Workflow Before Any Code
 75 1:21a 🔵 P9 Formal Description Confirmed in HANDOFF.md Phase Table
-S23 P9 Execution Readiness Layer brainstorm — clarifying questions phase begun, first question posed to user about P9 output UX (May 7 at 1:21 AM)
 76 1:46a 🔵 May 7 analyze.py Audit Reveals Three Critical Signal Selection Problems Destroying P&L
 77 " ⚖️ Three Targeted score_ticker() Fixes Planned for Balanced Strategy Signal Quality
 78 " 🔵 score_ticker() Structure Mapped — TAG_META/TAG_TIPS Dicts Not Found by Name in app.py
 79 1:47a 🔵 TAG_TIPS and TAG_META Are JavaScript Dicts in index.html, Not Python Dicts in app.py
 80 " 🔴 Fix 1 Applied: short_squeeze LONG Now Requires Positive Price Momentum Before Awarding Full Score
+81 9:03a 🔵 Matrix_Trader_7.0 Recent Development History
+82 " 🟣 Agent Layer Added: 8-Analyst Shadow Pipeline
+83 " 🟣 Three Signal Scoring Fixes Applied to score_ticker() Based on analyze.py Audit
+84 " 🟣 Symbol Conviction Penalty System Added to score_ticker()
+85 " 🔵 Key Learner Findings: Conviction Score Weakly Predicts Outcomes
+86 " 🔵 P8 Complete, P9 Execution Readiness Layer Is Next
+87 9:04a 🔵 Large Uncommitted Diff Exists — Codex Work Not Yet Committed
+88 " 🟣 Edge Lab Research Layer: Universal Candle Labeling Engine
+89 " 🟣 analyze.py Upgraded: Wilson Confidence Intervals + 5 New Machine-Readable Sections
+90 " 🟣 Journey Metrics Persisted to signal_json at Close Time
+91 " 🟣 Performance Optimizations: Agent Guard, Daily Kline Cache, Concurrent Strategy Scans
+92 " 🔴 Risk Gate Mode Buttons Fixed: Optimistic Update Replaces Full Re-render
+93 " 🟣 Research Firm Section Added to Intelligence Tab
+94 " 🔵 New Signal Tags Missing from TAG_META/TAG_TIPS in index.html
+95 " 🔵 MEXC Private API Blocked by Akamai CDN on Hetzner VPS
+S24 Codex session audit — double-check codebase and report on work completed (May 7 at 9:06 AM)
+96 10:23a 🔵 Four Edge Lab Bugs Identified for Fix Pass
+97 " 🔵 mexc_data.py fetch_klines() Confirmed: Single Request, No Chunking
+98 " 🔵 path_labeler.py Dead Code Confirmed: Two Parallel Implementations
+99 " 🔵 Dead Code Has No External Callers — Safe to Delete
+100 10:24a 🔵 analyze.py Top-Level Duplicate Keys Confirmed, No Frontend Consumers
+101 " 🔴 Fix 1 Started: MAX_CHUNK_ATTEMPTS Constant Added to mexc_data.py
+102 10:25a 🔴 Fix 1 Complete: fetch_klines() Rewritten with Backwards Time-Walk Chunking
+103 " 🔄 Fix 2 Partial: label_paths_for_index() Deleted from path_labeler.py
+104 " 🔴 _label_side() Still Present After label_paths_for_index() Deletion
+105 " 🔄 Fix 2 Complete: _label_side() Deleted, path_labeler.py Now Single Implementation
+106 " 🔴 Fix 3 Complete: Top-Level Duplicate Keys Removed from audit_report.json Output
 
-Access 1685k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 1022k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>
