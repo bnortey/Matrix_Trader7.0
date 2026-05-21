@@ -93,6 +93,12 @@ class AgentOutput:
     shadow_narrative_delta: int = 0
     shadow_structural_delta: int = 0
     shadow_disagreement_score: float = 0.0
+    # True when fewer than the minimum number of analysts returned parseable
+    # LLM JSON. When set, callers must NOT apply conviction_delta — it's the
+    # all-neutral fallback, not a real assessment. Audit §02 fix.
+    llm_unavailable: bool = False
+    llm_ok_count: int = 0
+    llm_analyst_total: int = 0
 
 
 REGIME_WEIGHTS = {
@@ -102,6 +108,111 @@ REGIME_WEIGHTS = {
     "news_catalyst": {"narrative": 0.70, "structural": 0.30},
     "low_liquidity": {"narrative": 0.35, "structural": 0.65},
     "institutional": {"narrative": 0.45, "structural": 0.55},
+}
+
+AGENT_ROSTER = {
+    "trader": {
+        "name": "Thomas Reeves",
+        "title": "Chief Investment Officer",
+        "division": "leadership",
+        "specialty": "Synthesizes all research into the final conviction delta",
+        "voice": 'Quiet, decisive, sees patterns. "The conviction is there. We move."',
+        "exchanges": ["MEXC", "HYPERLIQUID", "BYBIT"],
+    },
+    "risk_manager": {
+        "name": "Harper Cross",
+        "title": "Chief Risk Officer",
+        "division": "leadership",
+        "specialty": "Hard blocks, position gates, independent veto on any signal",
+        "voice": 'Ruthless gatekeeper. "This trade doesn\'t pass. Full stop."',
+        "exchanges": ["MEXC", "HYPERLIQUID", "BYBIT"],
+    },
+    "narrative_debate": {
+        "name": "Daria Wren",
+        "title": "Head of Narrative Research",
+        "division": "narrative",
+        "specialty": "Narrative debate chair — synthesizes macro, fundamentals, and sentiment",
+        "voice": 'Cold, precise, intimidating. "Three data points confirm it."',
+        "exchanges": ["MEXC", "HYPERLIQUID", "BYBIT"],
+    },
+    "tokenomics": {
+        "name": "Priya Nair",
+        "title": "Tokenomics Lead",
+        "division": "narrative",
+        "specialty": "On-chain supply, unlock risk, float fragility, tokenomics pressure",
+        "voice": "Methodical. Flags unlock risk before anyone else.",
+        "exchanges": ["MEXC", "HYPERLIQUID"],
+    },
+    "sentiment": {
+        "name": "Hari Stern",
+        "title": "Sentiment & Social Intelligence",
+        "division": "narrative",
+        "specialty": "Social momentum, sentiment credibility, crowd psychology",
+        "voice": 'Eager, anxious, loyal. "Sentiment is... complicated. Leaning bullish."',
+        "exchanges": ["MEXC", "HYPERLIQUID"],
+    },
+    "news": {
+        "name": "Yasmin Cole",
+        "title": "News & Catalyst Lead",
+        "division": "narrative",
+        "specialty": "Event-driven signals, macro catalysts, news-driven regime shifts",
+        "voice": 'Socially intelligent. "The catalyst is real. Market knows."',
+        "exchanges": ["MEXC", "HYPERLIQUID"],
+    },
+    "technical": {
+        "name": "Rishi Sackey",
+        "title": "Technical Strategy Lead",
+        "division": "narrative",
+        "specialty": "Price structure, EMA alignment, RSI context, late-move detection",
+        "voice": 'Grinding detail. "RSI 34.2, EMA crossover confirmed, trend score -12."',
+        "exchanges": ["MEXC", "HYPERLIQUID", "BYBIT"],
+    },
+    "structural_debate": {
+        "name": "Eric Tao",
+        "title": "Head of Market Structure",
+        "division": "structural",
+        "specialty": "Structural debate chair — synthesizes order flow, funding, and regime",
+        "voice": 'Commanding, strategic. "Structure is holding. The desk agrees."',
+        "exchanges": ["MEXC", "HYPERLIQUID", "BYBIT"],
+    },
+    "microstructure": {
+        "name": "Niobe Reyes",
+        "title": "Microstructure & Order Flow",
+        "division": "structural",
+        "specialty": "Book imbalance, microprice deviation, spread pressure, aggressive flow",
+        "voice": 'Skeptical, precise. "Order book says one thing. I don\'t trust it."',
+        "exchanges": ["MEXC", "HYPERLIQUID"],
+    },
+    "funding": {
+        "name": "Kenny Hassan",
+        "title": "Funding & Positioning Strategist",
+        "division": "structural",
+        "specialty": "Funding rates, OI delta trends, liquidation proximity, crowded positioning",
+        "voice": 'Old hand. "Funding negative three sessions running. Shorts are getting squeezed."',
+        "exchanges": ["MEXC", "HYPERLIQUID"],
+    },
+    "cross_venue": {
+        "name": "Ghost Kimura",
+        "title": "Cross-Venue Intelligence Lead",
+        "division": "structural",
+        "specialty": "MEXC vs Hyperliquid vs Bybit basis, venue-leader detection, arb pressure",
+        "voice": 'Cool, detached. "MEXC and HL diverging 0.3%. That\'s meaningful."',
+        "exchanges": ["MEXC", "HYPERLIQUID", "BYBIT"],
+    },
+    "regime": {
+        "name": "Nadia Okonkwo",
+        "title": "Volatility & Regime Specialist",
+        "division": "structural",
+        "specialty": "Regime classification, ATR context, BTC correlation, no-trade-zone detection",
+        "voice": 'Calm authority. "We\'re in volatile squeeze. Treat accordingly."',
+        "exchanges": ["MEXC", "HYPERLIQUID", "BYBIT"],
+    },
+}
+
+FIRM_META = {
+    "name": "Cipher Research Group",
+    "tagline": "We read the market's structure. Not its noise.",
+    "exchange_coverage": ["MEXC", "HYPERLIQUID", "BYBIT"],
 }
 
 
@@ -122,6 +233,17 @@ def _classify_regime(ctx: ExchangeContext, ns: NarrativeMarketState) -> str:
 
 
 def _analyst_call(system_msg: str, data_subset: dict, output_schema: dict) -> dict:
+    """
+    Run one analyst LLM call. Always returns a dict with a sentinel '_llm_ok'
+    key so run_agent_pipeline() can distinguish "all analysts said neutral"
+    (LLM was up; conviction_delta=0 is a real assessment) from "LLM was down"
+    (conviction_delta=0 is information-free and must not be trusted).
+
+    Audit §02 finding agents_silent_fallback_001 documented the prior behavior
+    where this function returned {} on both 'no response' and 'parse error',
+    making all 8 analysts default to neutral and the trader emit
+    conviction_delta=0 as if it were a real signal.
+    """
     prompt = (
         "Analyze this market data and return ONLY a JSON object. "
         "No text outside JSON. No markdown. No explanation.\n\n"
@@ -135,15 +257,19 @@ def _analyst_call(system_msg: str, data_subset: dict, output_schema: dict) -> di
     )
     raw = call_ai(system=system_msg, user=prompt, max_tokens=400)
     if not raw:
-        return {}
+        return {"_llm_ok": False}
     try:
         clean = raw.strip()
         if clean.startswith("```"):
             clean = clean.removeprefix("```json").removeprefix("```")
             clean = clean.removesuffix("```").strip()
-        return json.loads(clean)
+        parsed = json.loads(clean)
+        if isinstance(parsed, dict):
+            parsed["_llm_ok"] = True
+            return parsed
+        return {"_llm_ok": False}
     except Exception:
-        return {}
+        return {"_llm_ok": False}
 
 
 def _run_with_deadline(fn, timeout: float) -> dict:
@@ -687,9 +813,29 @@ def run_agent_pipeline(
     trader = _run_trader(ns, ss, ctx)
     risk = _run_risk_manager(ss, ctx)
 
+    # Count how many of the 8 analysts actually received parseable LLM
+    # responses. The trader+debate stages aggregate analyst outputs by
+    # pulling specific fields with .get(..., default); when every analyst
+    # returns {"_llm_ok": False}, every downstream value collapses to its
+    # neutral default and the trader emits conviction_delta = 0 by
+    # construction. That zero is mathematically indistinguishable from
+    # "real neutral assessment" without this counter. Audit §02 fix.
+    _llm_ok_count = sum(
+        1 for r in analyst_results.values()
+        if isinstance(r, dict) and r.get("_llm_ok")
+    )
+    _llm_unavailable = _llm_ok_count < 2  # require ≥2/8 analysts to trust delta
+
+    # Risk Manager hard blocks remain authoritative regardless of LLM status —
+    # they are deterministic math/risk gates (premium_z, ADL, oracle deviation,
+    # vol regime), not LLM judgement. Keep block_reasons intact.
+    tags = list(trader["tags"]) + (risk["block_reasons"] if risk["hard_blocked"] else [])
+    if _llm_unavailable:
+        tags.append("agent_unavailable")
+
     return AgentOutput(
         conviction_delta=trader["conviction_delta"],
-        tags=trader["tags"] + (risk["block_reasons"] if risk["hard_blocked"] else []),
+        tags=tags,
         hard_blocked=risk["hard_blocked"],
         block_reasons=risk["block_reasons"],
         composite_reasoning=trader["composite_reasoning"],
@@ -702,4 +848,7 @@ def run_agent_pipeline(
         shadow_narrative_delta=trader["shadow_narrative_delta"],
         shadow_structural_delta=trader["shadow_structural_delta"],
         shadow_disagreement_score=trader["shadow_disagreement_score"],
+        llm_unavailable=_llm_unavailable,
+        llm_ok_count=_llm_ok_count,
+        llm_analyst_total=len(analyst_results),
     )
