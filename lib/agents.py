@@ -307,8 +307,10 @@ def _run_tokenomics_analyst(ctx: ExchangeContext) -> dict:
             "supply_concentration": "unknown",
             "tokenomics_reasoning": "insufficient data",
         }
+        persona = AGENT_ROSTER["tokenomics"]
         system = (
-            "You are a tokenomics analyst for a crypto perp trading system. "
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
             "Assess float fragility from available market structure data. "
             "Output only JSON."
         )
@@ -335,9 +337,12 @@ def _run_sentiment_analyst(ctx: ExchangeContext) -> dict:
             "sentiment_credibility": "low",
             "sentiment_reasoning": "inferred from price/volume only",
         }
+        persona = AGENT_ROSTER["sentiment"]
         system = (
-            "You are a sentiment analyst. Infer market sentiment from price and "
-            "volume data only. Output only JSON."
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
+            "Infer market sentiment from price and volume data. "
+            "Output only JSON."
         )
         return _analyst_call(system, data, schema)
     except Exception:
@@ -362,10 +367,13 @@ def _run_news_analyst(ctx: ExchangeContext) -> dict:
             "macro_risk": "neutral",
             "news_reasoning": "no catalyst data available",
         }
+        persona = AGENT_ROSTER["news"]
         system = (
-            "You are a news and catalyst analyst for a crypto trading system. "
-            "Detect exchange stress from market structure. Hyperliquid hourly "
-            "funding is normal, not exchange stress. Output only JSON."
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
+            "Assess news and catalyst risk for a crypto perp trading system. "
+            "Hyperliquid hourly funding is normal, not exchange stress. "
+            "Output only JSON."
         )
         return _analyst_call(system, data, schema)
     except Exception:
@@ -391,9 +399,12 @@ def _run_technical_analyst(ctx: ExchangeContext) -> dict:
             "rsi_context": "neutral",
             "technical_reasoning": "neutral setup",
         }
+        persona = AGENT_ROSTER["technical"]
         system = (
-            "You are a technical analyst for a crypto perp trading system. "
-            "Assess trend, RSI context, and late-move risk. Output only JSON."
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
+            "Assess technical structure for a crypto perp trading system. "
+            "Output only JSON."
         )
         return _analyst_call(system, data, schema)
     except Exception:
@@ -428,9 +439,12 @@ def _run_microstructure_analyst(ctx: ExchangeContext) -> dict:
             "microstructure_pressure": "neutral",
             "microstructure_reasoning": "neutral book",
         }
+        persona = AGENT_ROSTER["microstructure"]
         system = (
-            "You are a microstructure analyst. Assess order book pressure for "
-            "a perp trade. Output only JSON."
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
+            "Assess order book pressure for a crypto perp trading system. "
+            "Output only JSON."
         )
         result = _analyst_call(system, data, schema)
         result["imbalance"] = round(ctx.imbalance, 4)
@@ -466,9 +480,12 @@ def _run_funding_analyst(ctx: ExchangeContext) -> dict:
             "funding_signal": "neutral",
             "funding_reasoning": "neutral funding",
         }
+        persona = AGENT_ROSTER["funding"]
         system = (
-            "You are a funding and positioning analyst. Hyperliquid always uses "
-            "hourly funding; this is normal, not stress. Output only JSON."
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
+            "Assess funding and positioning signals. Hyperliquid hourly funding "
+            "is normal, not exchange stress. Output only JSON."
         )
         result = _analyst_call(system, data, schema)
         result["funding_rate"] = ctx.funding_rate
@@ -500,9 +517,12 @@ def _run_cross_venue_analyst(ctx: ExchangeContext) -> dict:
             "basis_signal": "neutral",
             "cross_venue_reasoning": "no basis data",
         }
+        persona = AGENT_ROSTER["cross_venue"]
         system = (
-            "You are a cross-venue pressure analyst. Hyperliquid is USDC-settled "
-            "and its basis field has already had USDC/USDT noise filtered. "
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
+            "Assess cross-venue price and basis divergence. Hyperliquid is "
+            "USDC-settled and its basis field has already had USDC/USDT noise filtered. "
             "Output only JSON."
         )
         result = _analyst_call(system, data, schema)
@@ -538,10 +558,12 @@ def _run_regime_analyst(ctx: ExchangeContext, ns_partial: dict) -> dict:
             "no_trade_zone": False,
             "regime_reasoning": "choppy low-signal environment",
         }
+        persona = AGENT_ROSTER["regime"]
         system = (
-            "You are a volatility and regime analyst. Classify regime as "
-            "trending, choppy, volatile_squeeze, news_catalyst, low_liquidity, "
-            "or institutional. Output only JSON."
+            f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+            f"Personality: {persona['voice']} "
+            "Classify volatility regime as: trending, choppy, volatile_squeeze, "
+            "news_catalyst, low_liquidity, institutional. Output only JSON."
         )
         result = _analyst_call(system, data, schema)
         result["atr_pct"] = ctx.atr_pct
@@ -569,9 +591,11 @@ def _run_narrative_debate(ns: NarrativeMarketState, ctx: ExchangeContext) -> dic
         "narrative_key_disagreement": "",
         "narrative_reasoning": "",
     }
+    persona = AGENT_ROSTER["narrative_debate"]
     system = (
-        "You are both a Bull Researcher and Bear Researcher evaluating "
-        "narrative signals. Output only JSON."
+        f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+        f"Personality: {persona['voice']} "
+        "Chair a bull/bear debate on narrative signals. Output only JSON."
     )
     return _analyst_call(system, data, schema)
 
@@ -598,9 +622,11 @@ def _run_structural_debate(ss: StructuralMarketState, ctx: ExchangeContext) -> d
         "structural_key_disagreement": "",
         "structural_reasoning": "",
     }
+    persona = AGENT_ROSTER["structural_debate"]
     system = (
-        "You are both a Bull Researcher and Bear Researcher evaluating "
-        "structural signals. Output only JSON."
+        f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
+        f"Personality: {persona['voice']} "
+        "Chair a bull/bear debate on structural signals. Output only JSON."
     )
     return _analyst_call(system, data, schema)
 
