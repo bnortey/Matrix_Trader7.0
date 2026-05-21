@@ -110,6 +110,7 @@ DEFAULT_RISK_GATES = {
 def init_db() -> None:
     """Create the signals history table if it doesn't exist."""
     os.makedirs("data", exist_ok=True)
+    os.makedirs("data/reports", exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS signals (
@@ -5461,6 +5462,446 @@ def api_intelligence_research():
             'active_count': 0, 'learner_running': False,
             'error': str(e),
         })
+
+
+REPORTS_DIR = "data/reports"
+
+
+def _report_classify_session(utc_iso: str) -> str:
+    """Classify a UTC timestamp into the crypto desk session buckets."""
+    try:
+        dt = datetime.fromisoformat(str(utc_iso).replace("Z", "").split(".")[0])
+        h = dt.hour
+        if 0 <= h < 8:
+            return "ASIA"
+        if 8 <= h < 13:
+            return "LONDON"
+        if 13 <= h < 21:
+            return "NY"
+        return "ASIA"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _report_db_rows(table: str, date_col: str | None = None, date_value: str | None = None,
+                    days_back: int | None = None, limit: int = 500) -> list[dict]:
+    """Best-effort SQLite reader for report sections; returns [] on schema drift."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        exists = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            con.close()
+            return []
+        cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+        where = ""
+        params: list = []
+        if date_col and date_col in cols and date_value:
+            if days_back:
+                where = f"WHERE date({date_col}) >= date(?, ?)"
+                params = [date_value, f"-{days_back} days"]
+            else:
+                where = f"WHERE date({date_col}) = date(?)"
+                params = [date_value]
+        order = f"ORDER BY {date_col} DESC" if date_col and date_col in cols else ""
+        rows = con.execute(
+            f"SELECT * FROM {table} {where} {order} LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[report_db_rows] {table}: {e}", file=sys.stderr)
+        return []
+
+
+def _report_signal_json(row: dict) -> dict:
+    try:
+        raw = row.get("signal_json") or "{}"
+        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:
+        return {}
+
+
+def _report_fetch_ticker_snapshot() -> list[dict]:
+    """Fetch MEXC tickers for market pulse, funding heatmap, movers, and coiling."""
+    try:
+        resp = requests.get(f"{MEXC_BASE}/contract/ticker", timeout=10)
+        payload = resp.json()
+        if payload.get("success") and isinstance(payload.get("data"), list):
+            return payload["data"]
+    except Exception as e:
+        print(f"[report_ticker] {e}", file=sys.stderr)
+    return []
+
+
+def _report_symbol(row: dict) -> str:
+    return row.get("symbol") or row.get("contract") or row.get("ticker") or ""
+
+
+def _report_float(value, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _report_percent_change(row: dict) -> float:
+    if "change_24h_pct" in row:
+        return _report_float(row.get("change_24h_pct"))
+    return _report_float(row.get("riseFallRate")) * 100
+
+
+def _report_funding(row: dict) -> float:
+    return _report_float(row.get("funding_rate", row.get("fundingRate")))
+
+
+def _report_volume(row: dict) -> float:
+    return _report_float(row.get("volume_24h", row.get("volume24", row.get("amount24"))))
+
+
+def _report_empty_narrative() -> dict:
+    return {
+        "trader_open": "",
+        "regime_forecast": "",
+        "risk_close": "",
+        "funding_autopsy": "",
+        "microstructure_autopsy": "",
+        "cross_venue_autopsy": "",
+        "week_ahead": "",
+        "spotlight": "",
+    }
+
+
+def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool]:
+    """Generate concise cached report notes. Data sections remain useful without AI."""
+    narrative = _report_empty_narrative()
+    try:
+        from lib.agents import AGENT_ROSTER, FIRM_META
+        compact = {
+            "date": data.get("date"),
+            "week": data.get("week"),
+            "market_pulse": data.get("market_pulse"),
+            "top_gainers": data.get("top_gainers", [])[:3],
+            "top_losers": data.get("top_losers", [])[:3],
+            "explosive_move": data.get("explosive_move"),
+            "disagreements": data.get("disagreements", [])[:4],
+            "strategy_regime_perf": data.get("strategy_regime_perf", [])[:8],
+            "paper_desk": data.get("paper_desk", {}),
+        }
+        system = (
+            f"You are the editorial desk for {FIRM_META['name']}. Return only JSON. "
+            "Write concise institutional crypto research notes for retail traders. "
+            "Do not imitate copyrighted dialogue; use the broad voice traits provided."
+        )
+        requested = [
+            ("trader_open", AGENT_ROSTER["trader"]),
+            ("regime_forecast", AGENT_ROSTER["regime"]),
+            ("risk_close", AGENT_ROSTER["risk_manager"]),
+            ("funding_autopsy", AGENT_ROSTER["funding"]),
+            ("microstructure_autopsy", AGENT_ROSTER["microstructure"]),
+            ("cross_venue_autopsy", AGENT_ROSTER["cross_venue"]),
+        ]
+        if weekly:
+            requested.extend([
+                ("week_ahead", AGENT_ROSTER["trader"]),
+                ("spotlight", AGENT_ROSTER.get(data.get("spotlight_key", "funding"), AGENT_ROSTER["funding"])),
+            ])
+        user = (
+            "Use this data:\n"
+            f"{json.dumps(compact, default=str)}\n\n"
+            "Return this JSON object with one 35-80 word string per key:\n"
+            f"{json.dumps({k: v['voice'] for k, v in requested}, indent=2)}"
+        )
+        raw = call_ai(system=system, user=user, max_tokens=900)
+        if not raw:
+            return narrative, False
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(clean)
+        if isinstance(parsed, dict):
+            for key in narrative:
+                if isinstance(parsed.get(key), str):
+                    narrative[key] = parsed[key].strip()
+            return narrative, True
+    except Exception as e:
+        print(f"[report_ai] {e}", file=sys.stderr)
+    return narrative, False
+
+
+def _build_daily_data(date_str: str, ticker_snapshot: list[dict] | None = None) -> dict:
+    """Build template-driven daily report data from Matrix Trader state."""
+    signals = _report_db_rows("signals", "logged_at", date_str, limit=1000)
+    blocked = _report_db_rows("filtered_candidates", "logged_at", date_str, limit=500)
+    paper = _report_db_rows("paper_trades", "opened_at", date_str, days_back=7, limit=500)
+    tickers = ticker_snapshot if ticker_snapshot is not None else _report_fetch_ticker_snapshot()
+
+    exchange_breakdown: dict[str, int] = {}
+    regime_counts: dict[str, int] = {}
+    sessions = {k: {"count": 0, "symbols": []} for k in ("ASIA", "LONDON", "NY", "UNKNOWN")}
+    disagreements = []
+
+    for sig in signals:
+        exchange = sig.get("exchange") or "MEXC"
+        symbol = _report_symbol(sig)
+        exchange_breakdown[exchange] = exchange_breakdown.get(exchange, 0) + 1
+        session = _report_classify_session(sig.get("logged_at", ""))
+        sessions.setdefault(session, {"count": 0, "symbols": []})
+        sessions[session]["count"] += 1
+        if symbol:
+            sessions[session]["symbols"].append(symbol)
+
+        sj = _report_signal_json(sig)
+        regime = sj.get("agent_regime") or sj.get("regime") or "unknown"
+        regime_counts[regime] = regime_counts.get(regime, 0) + 1
+        score = _report_float(sj.get("agent_shadow_disagreement", sj.get("agent_disagreement")), 0)
+        if score > 0.4:
+            disagreements.append({
+                "symbol": symbol,
+                "exchange": exchange,
+                "direction": sig.get("direction"),
+                "conviction": sig.get("conviction"),
+                "disagreement_score": round(score, 3),
+                "narrative_bull": sj.get("agent_narrative_bull"),
+                "structural_bull": sj.get("agent_structural_bull"),
+            })
+
+    def ticker_item(t: dict) -> dict:
+        return {
+            "symbol": _report_symbol(t),
+            "exchange": t.get("exchange") or "MEXC",
+            "change_24h_pct": round(_report_percent_change(t), 2),
+            "volume_24h": round(_report_volume(t), 0),
+            "funding_rate": _report_funding(t),
+        }
+
+    ticker_items = [ticker_item(t) for t in tickers if _report_symbol(t)]
+    ticker_items.sort(key=lambda x: x["change_24h_pct"], reverse=True)
+    top_gainers = ticker_items[:5]
+    top_losers = sorted(ticker_items, key=lambda x: x["change_24h_pct"])[:5]
+
+    heatmap = sorted(
+        [{"symbol": t["symbol"], "exchange": t["exchange"], "funding_rate": t["funding_rate"]}
+         for t in ticker_items if t["funding_rate"] is not None],
+        key=lambda x: x["funding_rate"],
+    )
+    funding_heatmap = {
+        "extreme_negative": [h for h in heatmap if h["funding_rate"] < -0.001][:10],
+        "mild_negative": [h for h in heatmap if -0.001 <= h["funding_rate"] < -0.00025][:10],
+        "neutral": [h for h in heatmap if abs(h["funding_rate"]) <= 0.00025][:8],
+        "mild_positive": [h for h in heatmap if 0.00025 < h["funding_rate"] <= 0.001][:10],
+        "extreme_positive": [h for h in heatmap if h["funding_rate"] > 0.001][:10],
+    }
+    coiling = [
+        {
+            "symbol": t["symbol"],
+            "exchange": t["exchange"],
+            "funding_rate": t["funding_rate"],
+            "change_24h_pct": t["change_24h_pct"],
+            "watch": "SHORT SQUEEZE" if t["funding_rate"] < 0 else "LONG FLUSH",
+        }
+        for t in ticker_items
+        if abs(t["funding_rate"]) > 0.0008 and abs(t["change_24h_pct"]) < 3
+    ][:8]
+
+    explosive_move = None
+    if ticker_items:
+        explosive_move = max(ticker_items, key=lambda x: abs(x["change_24h_pct"]))
+
+    perf_rows = _report_db_rows("signals", "logged_at", date_str, days_back=7, limit=2000)
+    perf: dict[tuple[str, str], dict] = {}
+    for row in perf_rows:
+        result = str(row.get("result") or "").lower()
+        if result not in ("win", "loss", "partial"):
+            continue
+        regime = _report_signal_json(row).get("agent_regime") or "unknown"
+        strategy = row.get("strategy_key") or row.get("strategy") or "unknown"
+        bucket = perf.setdefault((strategy, regime), {"win": 0, "loss": 0, "partial": 0})
+        bucket[result] += 1
+
+    closed_paper = [p for p in paper if str(p.get("status") or "").lower() == "closed"]
+    pnl_values = [_report_float(p.get("pnl_pct")) for p in closed_paper if p.get("pnl_pct") is not None]
+    paper_desk = {
+        "open": len([p for p in paper if str(p.get("status") or "").lower() == "open"]),
+        "closed": len(closed_paper),
+        "wins": len([p for p in closed_paper if str(p.get("result") or "").upper() in ("WIN", "TP3")]),
+        "avg_pnl_pct": round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else 0,
+        "total_pnl_pct": round(sum(pnl_values), 2) if pnl_values else 0,
+    }
+
+    dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
+    return {
+        "date": date_str,
+        "market_pulse": {
+            "signals": len(signals),
+            "blocked": len(blocked),
+            "dominant_regime": dominant_regime,
+            "desk_agreement": "high" if not disagreements else "mixed",
+            "exchange_breakdown": exchange_breakdown,
+        },
+        "signals_today": signals[:100],
+        "blocked": blocked[:100],
+        "sessions": sessions,
+        "regime_counts": regime_counts,
+        "funding_heatmap": funding_heatmap,
+        "top_gainers": top_gainers,
+        "top_losers": top_losers,
+        "explosive_move": explosive_move,
+        "whats_coiling": coiling,
+        "liquidation_clusters": [],
+        "disagreements": disagreements[:10],
+        "strategy_regime_perf": [
+            {"strategy": k[0], "regime": k[1], **v}
+            for k, v in sorted(perf.items())
+        ],
+        "desk_wrong": [],
+        "paper_desk": paper_desk,
+        "learner": _report_read_learner_files(),
+    }
+
+
+def _report_read_learner_files() -> dict:
+    data = {"briefs": [], "suggestions": []}
+    for key, path in (
+        ("briefs", "/opt/mt-learner/research/briefs.json"),
+        ("suggestions", "/opt/mt-learner/suggestions/pending.json"),
+    ):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                data[key] = payload.get(key, payload.get("briefs", payload if isinstance(payload, list) else []))
+        except Exception:
+            pass
+    return data
+
+
+def _build_weekly_data(week_key: str) -> dict:
+    try:
+        year, week_num = week_key.split("-W", 1)
+        start = datetime.fromisocalendar(int(year), int(week_num), 1)
+    except Exception:
+        start = datetime.utcnow() - timedelta(days=6)
+        year, week_num, _ = start.isocalendar()
+        week_key = f"{year}-W{week_num:02d}"
+    ticker_snapshot = _report_fetch_ticker_snapshot()
+    days = []
+    for offset in range(7):
+        d = (start + timedelta(days=offset)).strftime("%Y-%m-%d")
+        daily = _build_daily_data(d, ticker_snapshot=ticker_snapshot)
+        days.append({
+            "date": d,
+            "market_pulse": daily["market_pulse"],
+            "top_gainers": daily["top_gainers"][:3],
+            "top_losers": daily["top_losers"][:3],
+        })
+    latest = _build_daily_data(datetime.utcnow().strftime("%Y-%m-%d"), ticker_snapshot=ticker_snapshot)
+    spotlight_order = ["funding", "microstructure", "cross_venue", "regime", "technical",
+                       "sentiment", "news", "tokenomics", "narrative_debate",
+                       "structural_debate", "risk_manager", "trader"]
+    spotlight_key = spotlight_order[int(week_num) % len(spotlight_order)]
+    latest.update({
+        "week": week_key,
+        "daily_rollup": days,
+        "spotlight_key": spotlight_key,
+        "weekly_move_patterns": [],
+        "upcoming_events": latest.get("learner", {}).get("briefs", [])[:5],
+    })
+    return latest
+
+
+def _report_cache_path(report_type: str, key: str) -> str:
+    safe_key = re.sub(r"[^0-9A-Za-z_-]", "-", key)
+    return os.path.join(REPORTS_DIR, f"{report_type}_{safe_key}.json")
+
+
+def _load_or_build_report(report_type: str, key: str, force: bool = False) -> dict:
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    path = _report_cache_path(report_type, key)
+    if not force and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    data = _build_weekly_data(key) if report_type == "weekly" else _build_daily_data(key)
+    narrative, ai_available = _call_report_ai(data, weekly=(report_type == "weekly"))
+    report = {
+        "success": True,
+        "type": report_type,
+        "key": key,
+        "date": data.get("date"),
+        "week": data.get("week"),
+        "data": data,
+        "narrative": narrative,
+        "ai_available": ai_available,
+        "generated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str)
+    except Exception as e:
+        print(f"[report_cache] {e}", file=sys.stderr)
+    return report
+
+
+@app.route('/api/intelligence/roster')
+def api_intelligence_roster():
+    """Return Cipher Research Group analyst roster and firm metadata."""
+    try:
+        from lib.agents import AGENT_ROSTER, FIRM_META
+        return jsonify({
+            'success': True,
+            'firm': FIRM_META,
+            'agents': AGENT_ROSTER,
+        })
+    except Exception as e:
+        print(f'[api/intelligence/roster] error: {e}', file=sys.stderr)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/intelligence/reports/daily')
+def api_intelligence_report_daily():
+    """Generate or serve a cached Cipher daily brief."""
+    key = request.args.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        return jsonify(_load_or_build_report("daily", key))
+    except Exception as e:
+        print(f"[api/intelligence/reports/daily] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/reports/weekly')
+def api_intelligence_report_weekly():
+    """Generate or serve a cached Cipher weekly report."""
+    iso = datetime.utcnow().isocalendar()
+    key = request.args.get("week") or f"{iso.year}-W{iso.week:02d}"
+    try:
+        return jsonify(_load_or_build_report("weekly", key))
+    except Exception as e:
+        print(f"[api/intelligence/reports/weekly] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/reports/regenerate', methods=['POST'])
+def api_intelligence_report_regenerate():
+    """Force a cached Cipher report to regenerate."""
+    try:
+        body = request.get_json(force=True) or {}
+        report_type = body.get("type")
+        key = body.get("key")
+        if report_type not in ("daily", "weekly") or not key:
+            return jsonify({"success": False, "error": "type and key required"}), 400
+        return jsonify(_load_or_build_report(report_type, key, force=True))
+    except Exception as e:
+        print(f"[api/intelligence/reports/regenerate] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------

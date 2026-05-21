@@ -3815,6 +3815,11 @@ const I = {
   learnerRunning: false,
   briefs:       [],
   briefsLoading: false,
+  activeSubTab: localStorage.getItem('mt7_intel_subtab') || 'overview',
+  roster:       null,
+  reportType:   'daily',
+  report:       null,
+  reportLoading:false,
 };
 
 const STRATEGY_LEARN = {
@@ -6114,13 +6119,15 @@ async function loadIntelligence() {
   const container = document.getElementById('intelligence-content');
   if (container) container.innerHTML = '<div style="color:var(--muted);padding:2rem;">Loading...</div>';
   try {
-    const [statusRes, suggestionsRes] = await Promise.all([
+    const [statusRes, suggestionsRes, rosterRes] = await Promise.all([
       fetch('/api/intelligence/status').then(r => r.json()),
       fetch('/api/intelligence/suggestions').then(r => r.json()),
+      fetch('/api/intelligence/roster').then(r => r.json()).catch(() => null),
     ]);
     I.status = statusRes.success ? statusRes : null;
     I.suggestions = suggestionsRes.suggestions || [];
     I.learnerRunning = suggestionsRes.learner_running || false;
+    if (rosterRes && rosterRes.success) I.roster = rosterRes;
     renderIntelligence();
     loadStrategyOverrides();
     // Load research firm briefs after main render
@@ -6148,6 +6155,16 @@ function renderIntelligence() {
     return;
   }
   const s = I.status;
+  const subTabs = renderIntelSubTabs();
+  if (I.activeSubTab === 'firm') {
+    container.innerHTML = subTabs + renderFirm();
+    return;
+  }
+  if (I.activeSubTab === 'reports') {
+    container.innerHTML = subTabs + renderReportPanel();
+    if (!I.report && !I.reportLoading) loadIntelligenceReport(I.reportType);
+    return;
+  }
 
   // Phase badge
   const phaseBadge = s.phase === 'phase2_ready'
@@ -6277,7 +6294,7 @@ journalctl -u mt-learner -f</pre>`;
     }).join('');
   }
 
-  container.innerHTML = `
+  container.innerHTML = subTabs + `
     <!-- Shadow Validation -->
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
@@ -6339,6 +6356,207 @@ journalctl -u mt-learner -f</pre>`;
     <div id="intelligence-research"></div>
   `;
   renderResearchFirm();
+}
+
+function renderIntelSubTabs() {
+  const tabs = [
+    ['overview', 'Overview'],
+    ['firm', 'The Firm'],
+    ['reports', 'Reports'],
+  ];
+  const firm = I.roster && I.roster.firm ? I.roster.firm : {name:'Cipher Research Group', tagline:'We read the market structure. Not its noise.'};
+  return `<div style="max-width:1180px;margin:0 auto 14px;">
+    <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:10px;flex-wrap:wrap;">
+      <div>
+        <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">${esc(firm.name)}</div>
+        <div style="font-size:13px;color:var(--text2);margin-top:2px;">${esc(firm.tagline || '')}</div>
+      </div>
+      <div style="display:flex;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px;">
+        ${tabs.map(([key,label]) => `<button onclick="switchIntelTab('${key}')" style="background:${I.activeSubTab===key?'var(--blue)':'transparent'};color:${I.activeSubTab===key?'#000':'var(--text2)'};border:none;padding:7px 12px;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;">${label}</button>`).join('')}
+      </div>
+    </div>
+  </div>`;
+}
+
+function switchIntelTab(tab) {
+  I.activeSubTab = tab;
+  localStorage.setItem('mt7_intel_subtab', tab);
+  renderIntelligence();
+}
+
+function agentListByDivision(division) {
+  const agents = I.roster && I.roster.agents ? I.roster.agents : {};
+  return Object.entries(agents).filter(([, a]) => a.division === division);
+}
+
+function renderAgentCard(key, a) {
+  const ex = (a.exchanges || []).map(x => `<span style="border:1px solid var(--border);border-radius:3px;padding:2px 5px;font-size:10px;color:var(--muted);">${esc(x.replace('HYPERLIQUID','HL'))}</span>`).join('');
+  return `<div style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:12px;min-height:150px;">
+    <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+      <div>
+        <div style="font-size:14px;font-weight:700;color:var(--text);">${esc(a.name)}</div>
+        <div style="font-size:11px;color:var(--blue);text-transform:uppercase;letter-spacing:.05em;margin-top:2px;">${esc(a.title)}</div>
+      </div>
+      <span style="font-size:10px;color:var(--muted);font-family:monospace;">${esc(key)}</span>
+    </div>
+    <div style="font-size:12px;color:var(--text2);line-height:1.45;margin-top:10px;">${esc(a.specialty || '')}</div>
+    <div style="font-size:12px;color:var(--muted);line-height:1.45;margin-top:10px;border-left:2px solid var(--border);padding-left:9px;">${esc(a.voice || '')}</div>
+    <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:10px;">${ex}</div>
+  </div>`;
+}
+
+function renderOrgRow(title, division) {
+  const agents = agentListByDivision(division);
+  return `<div style="margin-top:16px;">
+    <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">${title}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">${agents.map(([k,a]) => renderAgentCard(k,a)).join('')}</div>
+  </div>`;
+}
+
+function renderFirm() {
+  if (!I.roster || !I.roster.agents) {
+    return `<div style="max-width:1180px;margin:0 auto;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;color:var(--muted);">Loading firm roster...</div>`;
+  }
+  const agents = I.roster.agents;
+  return `<div style="max-width:1180px;margin:0 auto;">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:14px;">
+      <div style="display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;">
+        <div>
+          <h3 style="margin:0 0 4px;font-size:16px;">Cipher Research Group</h3>
+          <div style="font-size:13px;color:var(--muted);">12 analysts split across Narrative, Structural, and independent Risk. MEXC + Hyperliquid live; Bybit-ready where the role needs cross-venue coverage.</div>
+        </div>
+        <div style="font-size:12px;color:var(--muted);">CIO -> Research pods -> signal pipeline</div>
+      </div>
+      <div style="margin-top:16px;display:grid;grid-template-columns:1fr;gap:8px;text-align:center;">
+        <div style="justify-self:center;max-width:360px;width:100%;">${renderAgentCard('trader', agents.trader)}</div>
+        <div style="color:var(--muted);font-size:18px;">|</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;">
+          ${renderAgentCard('narrative_debate', agents.narrative_debate)}
+          ${renderAgentCard('risk_manager', agents.risk_manager)}
+          ${renderAgentCard('structural_debate', agents.structural_debate)}
+        </div>
+      </div>
+    </div>
+    ${renderOrgRow('Narrative Desk', 'narrative')}
+    ${renderOrgRow('Structural Desk', 'structural')}
+    <div style="font-size:12px;color:var(--muted);line-height:1.5;margin:14px 0 24px;">Harper Cross sits outside the research pods because risk can veto any signal. The analyst names are personality anchors for the UI and prompts; the underlying inputs remain the same exchange-normalized Matrix Trader data.</div>
+  </div>`;
+}
+
+function reportMetric(label, value) {
+  return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;">
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">${label}</div>
+    <div style="font-size:18px;font-weight:700;margin-top:3px;">${value}</div>
+  </div>`;
+}
+
+function reportTable(rows, cols, emptyText) {
+  if (!rows || rows.length === 0) return `<div style="color:var(--muted);font-size:13px;">${emptyText || 'No data yet.'}</div>`;
+  return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
+    <thead><tr>${cols.map(c => `<th style="text-align:left;color:var(--muted);font-weight:400;padding:6px;border-bottom:1px solid var(--border);">${c.label}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map(r => `<tr>${cols.map(c => `<td style="padding:7px 6px;border-bottom:1px solid rgba(255,255,255,.04);">${esc(c.format ? c.format(r[c.key], r) : (r[c.key] ?? '—'))}</td>`).join('')}</tr>`).join('')}</tbody>
+  </table></div>`;
+}
+
+function sectionBlock(title, body) {
+  return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:12px;">
+    <h3 style="margin:0 0 10px;font-size:15px;">${title}</h3>${body}
+  </div>`;
+}
+
+async function loadIntelligenceReport(type) {
+  I.reportType = type || I.reportType || 'daily';
+  I.reportLoading = true;
+  renderIntelligence();
+  const now = new Date();
+  const url = I.reportType === 'weekly'
+    ? '/api/intelligence/reports/weekly'
+    : `/api/intelligence/reports/daily?date=${now.toISOString().slice(0,10)}`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    I.report = data.success ? data : null;
+  } catch(e) {
+    I.report = null;
+  } finally {
+    I.reportLoading = false;
+    renderIntelligence();
+  }
+}
+
+async function regenerateIntelReport() {
+  if (!I.report) return;
+  I.reportLoading = true;
+  renderIntelligence();
+  try {
+    const key = I.report.type === 'weekly' ? I.report.week : I.report.date;
+    const res = await fetch('/api/intelligence/reports/regenerate', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({type: I.report.type, key}),
+    });
+    const data = await res.json();
+    I.report = data.success ? data : I.report;
+  } catch(e) {}
+  I.reportLoading = false;
+  renderIntelligence();
+}
+
+function renderFundingHeatmap(map) {
+  const groups = [
+    ['extreme_negative', 'Shorts Crowded', '#22c55e'],
+    ['mild_negative', 'Mild Negative', '#7ecf88'],
+    ['neutral', 'Neutral', 'var(--muted)'],
+    ['mild_positive', 'Mild Positive', '#f59e0b'],
+    ['extreme_positive', 'Longs Crowded', '#ef4444'],
+  ];
+  return `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;">
+    ${groups.map(([key,label,color]) => `<div>
+      <div style="font-size:10px;color:${color};text-transform:uppercase;margin-bottom:5px;">${label}</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;">${((map && map[key]) || []).slice(0,8).map(x => `<span style="background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:3px;padding:3px 5px;font-size:11px;">${esc(x.symbol)} ${Number(x.funding_rate||0).toFixed(4)}</span>`).join('') || '<span style="color:var(--muted);font-size:12px;">—</span>'}</div>
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderReportPanel() {
+  const btn = t => `<button onclick="I.report=null;loadIntelligenceReport('${t}')" style="background:${I.reportType===t?'var(--blue)':'var(--surface)'};color:${I.reportType===t?'#000':'var(--text2)'};border:1px solid var(--border);border-radius:4px;padding:7px 11px;font-size:12px;font-weight:700;cursor:pointer;">${t === 'daily' ? 'Daily Brief' : 'Weekly Report'}</button>`;
+  if (I.reportLoading) {
+    return `<div style="max-width:1180px;margin:0 auto;">${btn('daily')} ${btn('weekly')}<div style="color:var(--muted);padding:24px 0;">Loading report...</div></div>`;
+  }
+  if (!I.report) {
+    return `<div style="max-width:1180px;margin:0 auto;">${btn('daily')} ${btn('weekly')}<div style="color:var(--muted);padding:24px 0;">No report loaded.</div></div>`;
+  }
+  const d = I.report.data || {};
+  const n = I.report.narrative || {};
+  const pulse = d.market_pulse || {};
+  return `<div style="max-width:1180px;margin:0 auto;">
+    <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+      <div style="display:flex;gap:6px;">${btn('daily')}${btn('weekly')}</div>
+      <button onclick="regenerateIntelReport()" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);border-radius:4px;padding:7px 11px;font-size:12px;cursor:pointer;">Regenerate</button>
+    </div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px;">Generated ${esc(I.report.generated_at || '—')} · AI narrative ${I.report.ai_available ? 'available' : 'unavailable'}</div>
+    ${sectionBlock('Thomas Reeves — Opening Note', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.trader_open || 'Data-only report. Narrative will appear when an AI key is available.')}</div>`)}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">
+      ${reportMetric('Signals', pulse.signals ?? 0)}
+      ${reportMetric('Blocked', pulse.blocked ?? 0)}
+      ${reportMetric('Regime', esc(pulse.dominant_regime || 'unknown'))}
+      ${reportMetric('Desk Agreement', esc(pulse.desk_agreement || 'unknown'))}
+    </div>
+    ${sectionBlock('Funding Heatmap', renderFundingHeatmap(d.funding_heatmap))}
+    ${sectionBlock('Top Movers / Losers', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;">
+      <div>${reportTable(d.top_gainers, [{key:'symbol',label:'Pair'},{key:'change_24h_pct',label:'Move %',format:v=>Number(v||0).toFixed(2)},{key:'funding_rate',label:'Funding',format:v=>Number(v||0).toFixed(5)}], 'No gainers available.')}</div>
+      <div>${reportTable(d.top_losers, [{key:'symbol',label:'Pair'},{key:'change_24h_pct',label:'Move %',format:v=>Number(v||0).toFixed(2)},{key:'funding_rate',label:'Funding',format:v=>Number(v||0).toFixed(5)}], 'No losers available.')}</div>
+    </div>`)}
+    ${sectionBlock('Session Breakdown', reportTable(Object.entries(d.sessions || {}).map(([session,v]) => ({session, count:v.count, symbols:(v.symbols||[]).slice(0,5).join(', ')})), [{key:'session',label:'Session'},{key:'count',label:'Signals'},{key:'symbols',label:'Leaders'}], 'No session data yet.'))}
+    ${sectionBlock('Explosive Move Autopsy', d.explosive_move ? `<div style="font-size:13px;line-height:1.6;"><b>${esc(d.explosive_move.symbol)}</b> moved ${Number(d.explosive_move.change_24h_pct||0).toFixed(2)}% with funding ${Number(d.explosive_move.funding_rate||0).toFixed(5)}.</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:10px;"><div style="color:var(--muted);font-size:12px;">Kenny: ${esc(n.funding_autopsy || 'No AI note yet.')}</div><div style="color:var(--muted);font-size:12px;">Niobe: ${esc(n.microstructure_autopsy || 'No AI note yet.')}</div><div style="color:var(--muted);font-size:12px;">Ghost: ${esc(n.cross_venue_autopsy || 'No AI note yet.')}</div></div>` : '<div style="color:var(--muted);font-size:13px;">No live mover snapshot available.</div>')}
+    ${sectionBlock("What's Coiling", reportTable(d.whats_coiling, [{key:'symbol',label:'Pair'},{key:'funding_rate',label:'Funding',format:v=>Number(v||0).toFixed(5)},{key:'change_24h_pct',label:'Move %',format:v=>Number(v||0).toFixed(2)},{key:'watch',label:'Watch'}], 'No coiling setups detected.'))}
+    ${sectionBlock('Agent Disagreement Log', reportTable(d.disagreements, [{key:'symbol',label:'Pair'},{key:'direction',label:'Side'},{key:'conviction',label:'Conviction'},{key:'disagreement_score',label:'Score'}], 'No major disagreements logged.'))}
+    ${sectionBlock('Strategy Performance by Regime', reportTable(d.strategy_regime_perf, [{key:'strategy',label:'Strategy'},{key:'regime',label:'Regime'},{key:'win',label:'W'},{key:'loss',label:'L'},{key:'partial',label:'P'}], 'No closed strategy/regime outcomes yet.'))}
+    ${sectionBlock('Paper Desk Performance', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;">${reportMetric('Open', (d.paper_desk||{}).open ?? 0)}${reportMetric('Closed', (d.paper_desk||{}).closed ?? 0)}${reportMetric('Wins', (d.paper_desk||{}).wins ?? 0)}${reportMetric('Avg P&L', Number((d.paper_desk||{}).avg_pnl_pct||0).toFixed(2)+'%')}</div>`)}
+    ${I.report.type === 'weekly' ? sectionBlock('Week Ahead', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.week_ahead || 'Week-ahead note unavailable.')}</div>`) : ''}
+    ${sectionBlock('Nadia — Regime Forecast', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.regime_forecast || 'Regime forecast unavailable.')}</div>`)}
+    ${sectionBlock('Harper Cross — Closing Note', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.risk_close || 'Risk note unavailable.')}</div>`)}
+  </div>`;
 }
 
 // Track retired section toggle state locally
