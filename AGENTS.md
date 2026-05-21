@@ -275,79 +275,77 @@ Do not start a new task until the previous one works end-to-end.
 <claude-mem-context>
 # Memory Context
 
-# [Matrix_Trader_7.0] recent context, 2026-05-11 8:30am EDT
+# [Matrix_Trader_7.0] recent context, 2026-05-21 2:24pm EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (19,360t read) | 1,021,701t work | 98% savings
+Stats: 50 obs (18,853t read) | 510,090t work | 96% savings
 
-### Apr 30, 2026
-S16 VPS DB stats pull — signals issued, trades closed, P&L by strategy; session wrapped with data synced locally (Apr 30 at 6:01 PM)
-S14 Matrix Trader 7.0 — Fix Momentum Breakout invisible in strategy bar + deploy to VPS (Apr 30 at 6:01 PM)
-### May 1, 2026
-S17 VPS DB stats pull + risk_gates.json state check — confirmed Mean Reversion is active (not disabled), only Momentum Breakout is paused (May 1 at 11:48 AM)
-S19 User selected option "1" — subagent-driven development approach to execute the Hyperliquid integration plan (May 1 at 11:49 AM)
-### May 2, 2026
-S21 Double-check Codex's completed coding work in Matrix_Trader_7.0 — verify correctness of agent layer, adapters, performance fixes, and Research Firm feature (May 2 at 10:24 PM)
-S18 MT7 — Hyperliquid Exchange Integration (Phase 1): Add Hyperliquid as a second exchange source with working scan + read-only account integration (May 2 at 10:24 PM)
-### May 6, 2026
-56 4:39p ⚖️ Matrix Trader: Scan Performance Optimization Strategy Defined
-57 " 🟣 Research Firm: Deterministic Hypothesis Discovery Engine for mt-learner
-58 " 🟣 Research Firm Integrated into mt-learner Scheduler and Matrix Trader API
-60 4:46p 🟣 AGENT_TOP_N Constant Limits Agent Pipeline to Top 10 Signals
-61 " 🟣 api_scan_all() Converted to Parallel Strategy Execution via ThreadPoolExecutor
-62 " 🟣 5-Minute TTL Cache Added for Daily Kline API Calls
-63 " 🟣 researcher.py Created: Deterministic Strategy Hypothesis Engine
-64 " 🟣 Two New Learner Jobs: job_hypothesis (6hr) and job_brief_reeval (daily 04:00 UTC)
-65 " 🟣 GET /api/intelligence/research Route Added to app.py
-66 " 🟣 Research Firm Section Added as 4th Panel in Intelligence Tab
-### May 7, 2026
-67 1:15a 🟣 Multi-Exchange Adapter Layer and AI Agent System Added to Matrix Trader 7.0
-68 1:16a 🟣 Research Firm UI and mt-learner Integration Added to Intelligence Tab
-69 " 🟣 Agent Pipeline Gated to Top-N Signals with Scan Rank and Daily Kline Cache
-70 " 🔵 lib/researcher.py Missing — Research Briefs Consumed Directly from mt-learner File Path
-71 " 🔵 mt-learner External Service Architecture and Research Briefs Contract Confirmed in HANDOFF.md
-72 1:17a 🔵 HANDOFF.md Current Task List Reveals Full Scope, Verification Results, and Performance Measurements
-73 " 🔵 Research PDF Corpus and Uncommitted Working Tree State Identified
-S20 Verify Codex completed the last bits of coding correctly in Matrix_Trader_7.0 (May 7 at 1:17 AM)
-S22 Verify Codex work then identify what's next — P9 Execution Readiness Layer identified as next phase, brainstorm proposed (May 7 at 1:18 AM)
-S23 P9 Execution Readiness Layer brainstorm — clarifying questions phase begun, first question posed to user about P9 output UX (May 7 at 1:20 AM)
-74 1:20a ⚖️ P9 Brainstorm Structured as 6-Step Design Workflow Before Any Code
-75 1:21a 🔵 P9 Formal Description Confirmed in HANDOFF.md Phase Table
-76 1:46a 🔵 May 7 analyze.py Audit Reveals Three Critical Signal Selection Problems Destroying P&L
-77 " ⚖️ Three Targeted score_ticker() Fixes Planned for Balanced Strategy Signal Quality
-78 " 🔵 score_ticker() Structure Mapped — TAG_META/TAG_TIPS Dicts Not Found by Name in app.py
-79 1:47a 🔵 TAG_TIPS and TAG_META Are JavaScript Dicts in index.html, Not Python Dicts in app.py
-80 " 🔴 Fix 1 Applied: short_squeeze LONG Now Requires Positive Price Momentum Before Awarding Full Score
-81 9:03a 🔵 Matrix_Trader_7.0 Recent Development History
-82 " 🟣 Agent Layer Added: 8-Analyst Shadow Pipeline
-83 " 🟣 Three Signal Scoring Fixes Applied to score_ticker() Based on analyze.py Audit
-84 " 🟣 Symbol Conviction Penalty System Added to score_ticker()
-85 " 🔵 Key Learner Findings: Conviction Score Weakly Predicts Outcomes
-86 " 🔵 P8 Complete, P9 Execution Readiness Layer Is Next
-87 9:04a 🔵 Large Uncommitted Diff Exists — Codex Work Not Yet Committed
-88 " 🟣 Edge Lab Research Layer: Universal Candle Labeling Engine
-89 " 🟣 analyze.py Upgraded: Wilson Confidence Intervals + 5 New Machine-Readable Sections
-90 " 🟣 Journey Metrics Persisted to signal_json at Close Time
-91 " 🟣 Performance Optimizations: Agent Guard, Daily Kline Cache, Concurrent Strategy Scans
-92 " 🔴 Risk Gate Mode Buttons Fixed: Optimistic Update Replaces Full Re-render
-93 " 🟣 Research Firm Section Added to Intelligence Tab
-94 " 🔵 New Signal Tags Missing from TAG_META/TAG_TIPS in index.html
-95 " 🔵 MEXC Private API Blocked by Akamai CDN on Hetzner VPS
-S24 Codex session audit — double-check codebase and report on work completed (May 7 at 9:06 AM)
-96 10:23a 🔵 Four Edge Lab Bugs Identified for Fix Pass
-97 " 🔵 mexc_data.py fetch_klines() Confirmed: Single Request, No Chunking
-98 " 🔵 path_labeler.py Dead Code Confirmed: Two Parallel Implementations
-99 " 🔵 Dead Code Has No External Callers — Safe to Delete
-100 10:24a 🔵 analyze.py Top-Level Duplicate Keys Confirmed, No Frontend Consumers
-101 " 🔴 Fix 1 Started: MAX_CHUNK_ATTEMPTS Constant Added to mexc_data.py
-102 10:25a 🔴 Fix 1 Complete: fetch_klines() Rewritten with Backwards Time-Walk Chunking
-103 " 🔄 Fix 2 Partial: label_paths_for_index() Deleted from path_labeler.py
-104 " 🔴 _label_side() Still Present After label_paths_for_index() Deletion
-105 " 🔄 Fix 2 Complete: _label_side() Deleted, path_labeler.py Now Single Implementation
-106 " 🔴 Fix 3 Complete: Top-Level Duplicate Keys Removed from audit_report.json Output
+### May 19, 2026
+249 10:19a 🔵 Live Balanced Strategy Scan Returns Zero Signals Across 884 Pairs
+250 10:20a 🔵 Direction Lock Filtering Nearly All Signals — balanced_focus_short Blocking LONG Entries
+251 " 🔵 enrich_signal Returns None for Top Candidate — Root Cause of Zero Paper Trades Found
+252 " 🔵 enrich_signal Silently Returns None — Internal Failure Path Not Yet Isolated
+253 10:21a 🔵 Root Cause Found: fetch_klines Returns None for RON_USDT — All enrich_signal Calls Fail
+254 10:37a 🔵 fetch_klines Not Defined in app.py — Import Error Causing enrich_signal Failures
+255 " 🔵 fetch_klines Lives in lib/exchange_data.py — Imported into app.py at Line 35
+256 " 🔵 fetch_klines MEXC Path Calls fetch_mexc — Failure Traced to fetch_mexc Returning Non-Dict
+257 " 🔵 MEXC Kline API Works With "Min60" But fetch_klines Uses "Hour1" — Interval Mismatch Bug
+258 " 🔵 fetch_mexc Returns None When MEXC API Returns success=False — Interval "Hour1" Likely Invalid
+259 " 🔵 MEXC Kline API Rejects "Hour1" Interval — _MEXC_INTERVAL Mapping Is Wrong
+260 10:38a 🔵 MEXC Kline Interval Values Confirmed — Only "Hour1" Is Invalid
+261 " 🔴 Fixed MEXC Kline Interval Mapping — "Hour1" → "Min60" in lib/exchange_data.py
+262 10:39a 🔴 Deployed exchange_data.py Fix to Production VPS — Paper Bot Kline Fetch Now Working
+263 " 🔴 Paper Bot Pipeline Fully Unblocked — Enriched Signals With ATR% Now Flowing
+### May 20, 2026
+264 11:57p 🔵 Matrix Trader 7.0 — Project State and Roadmap Discovery
+265 " 🔵 Matrix Trader 7.0 — Full API Surface and External Learner Architecture
+266 " 🔵 Matrix Trader 7.0 — Signal Schema, DB Columns, Journey Metrics, and P8+ Table Plan
+267 " 🔵 Matrix Trader 7.0 — Phase Status: P9 Done, P10–P12 Pending, P11 Execution Layer Shipped
+268 " 🔵 Matrix Trader 7.0 — Current Next Actions and Pending User Steps
+269 " 🔵 0-Signal Bug Root Cause: ThreadPoolExecutor Overloading MEXC Kline Endpoint
+### May 21, 2026
+270 12:13a ⚖️ Matrix Trader Strategic Direction: Market Structure Intelligence Over Signal Generation
+271 " ⚖️ Research Firm Persona Upgrade: Named Agents, Job Titles, Org Chart, and Daily/Weekly/Quarterly Reports
+272 " ⚖️ New Signal Logging Fields Proposed: Market Structure Metadata for Backtesting
+273 12:14a 🔵 lib/ Directory Contains bybit_client.py and mexc_client.py Not Previously Documented
+274 " ⚖️ Multi-Exchange Architecture Standing Rule Codified in Project Memory
+275 12:15a ✅ MEMORY.md Updated With Multi-Exchange Standing Rule Entry
+276 12:21a 🔵 lib/agents.py Internal Structure: 8-Analyst Layer With NarrativeMarketState and StructuralMarketState Dataclasses
+277 12:22a 🔵 agents.py: AgentOutput Dataclass, REGIME_WEIGHTS, LLM Availability Sentinel, and Pipeline Entry Point
+278 " 🔵 All 8 Analyst Function Names Identified in agents.py for Persona Mapping
+279 " 🔵 Intelligence Tab JS: loadIntelligence() Fetches 3 APIs, renderIntelligence() Builds All UI at Line 6578
+280 12:23a 🔵 renderResearchFirm() Already Exists at Line 6782 — Research Firm Section Has Prior Implementation
+281 " 🔵 renderResearchFirm() Brief Card Structure: 5 Confidence Levels, Progress Bar, Evidence Stats
+282 " 🟣 Visual Companion Server Started, Layout Options Mockup Presented at localhost:52341
+S88 Report structure v2 — significantly richer Daily Brief and Weekly Report mockup created with top movers table, explosive move autopsy, and "What's Coiling" forward-looking section (May 21 at 12:47 AM)
+S89 Report structure v2 presented — richer Daily Brief with Top Movers, Explosive Move Autopsy, What's Coiling, and Weekly Move Patterns sections, awaiting user approval (May 21 at 12:54 AM)
+S90 Report enhancement brainstorm — identified high-value additions to Daily Brief and Weekly Report, categorized by data availability and implementation cost (May 21 at 12:55 AM)
+S91 Report structure v3 — full intelligence treatment with 11 sections implemented and served, awaiting user approval before spec writing (May 21 at 12:56 AM)
+283 1:03a ⚖️ Report enhancements confirmed — incorporating Tier 1 + high-value sections into design before spec
+S92 Additional weekly report sections proposed — paper desk performance, events calendar, agent spotlight, week ahead outlook — plus decision point on "The Firm" org chart mockup (May 21 at 1:03 AM)
+S93 Data source mapping finalized — each report section mapped to its system data source, full context available for AI narrative calls, design phase complete and ready for spec writing (May 21 at 1:05 AM)
+S94 Cipher Research Group spec written, committed, and Task 6 completed — ready for user review before implementation planning (May 21 at 1:07 AM)
+284 1:08a ✅ Task 5 marked completed — design sections presentation phase done
+285 " ✅ Spec writing phase started — docs/superpowers/specs/ directory created
+286 1:10a 🟣 Cipher Research Group design spec written — comprehensive implementation reference document
+287 " ✅ Spec updated — AI call strategy batched to minimize credit usage (2 calls daily, 3 weekly)
+288 " ✅ Spec updated — Agent Spotlight rotation state persisted to spotlight_state.json (not gitignored)
+289 1:11a 🟣 Cipher Research Group design spec committed to git — commit b52edac
+S95 Deployment clarification — reports run on same Flask app (local + VPS), but real data only on VPS; user ready to move to implementation plan (May 21 at 1:11 AM)
+S96 Public release architecture discussion — three data layers identified, Docker/SaaS path considered, mt-learner integration decision needed before implementation (May 21 at 1:14 AM)
+S97 mt-learner architecture decision — keep separate service, bring into repo as learner/ directory, parallel task to research firm build (May 21 at 1:18 AM)
+290 1:20a ✅ Task 7 started — writing implementation plan for Cipher Research Group feature
+291 " 🔵 Existing /api/intelligence routes confirmed in app.py — new routes will extend this pattern
+292 1:21a 🔵 Reference implementation for fail-closed mt-learner reads confirmed at app.py line 6001
+293 " 🟣 Cipher Research Group Implementation Plan Created
+294 12:39p 🟣 AGENT_ROSTER and FIRM_META added to lib/agents.py
+295 " 🔴 Audit §02 fix: LLM silent-fallback ambiguity resolved in agent pipeline
+296 12:48p 🔵 AGENT_ROSTER voice strings use mixed quote styles to avoid escaping
+297 12:50p 🔵 Code quality review passed for lib/agents.py Task 1 changes
+298 " ✅ Task 8 closed, Task 9 started in Matrix Trader 7.0 development pipeline
 
-Access 1022k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 510k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>

@@ -46,8 +46,58 @@
 
 See **HANDOFF.md** — that file is updated every session and is authoritative.
 
-As of April 27, 2026: phases P0 through P7a are complete. `app.py` is 3,692 lines.
-`index.html` is 5,296 lines. The app is live on a VPS at `root@62.238.15.113`.
+As of May 21, 2026 (Paper Trader + Cipher Research Group reconciliation):
+`app.py` is 7,375 lines. `templates/index.html` is 8,391 lines. The app is live on a VPS at
+`root@62.238.15.113`.
+
+**Signal count (live SQLite at this date): 814 total** — 165 WIN, 366 LOSS,
+233 PARTIAL, 50 EXPIRED-with-NULL-pnl. 764 closed with terminal outcomes.
+The 50 NULL-pnl EXPIRED rows pre-date the outcome evaluator's 75h→84h fix
+(see "Audit fixes applied" section below) and may be recoverable via
+`curl -X POST http://localhost:8080/api/backfill/pnl` on the VPS.
+
+Prior CLAUDE.md / HANDOFF.md sessions cited 800 / 853 / 1,055 / 1,148.
+None of those reconcile to the live DB. The audit (§04) flagged this
+specifically. Use this section as the source of truth until the next
+reconciliation.
+
+### Audit fixes applied 2026-05-15
+
+External meta-analysis report verified 13/14 specific claims as accurate.
+Surgical fixes shipped this session:
+
+1. **Outcome evaluator 75h→84h** — `app.py` `limit=300 → 336` so kline
+   coverage exceeds the 80h EXPIRED threshold. Backfill recovers the 50
+   NULL-pnl EXPIRED rows.
+2. **Paper bot `min_flow_score`** — was loaded but never passed to
+   `_flow_confirm()`. Now plumbed through.
+3. **`/api/paper/config` override surfacing** — response now includes
+   `effective_thresholds[strategy_key]` so the Paper UI can show
+   "you set 55 but Balanced floors to 65 by override".
+4. **`llm_unavailable` flag in agents** — `_analyst_call` tags responses
+   with `_llm_ok`; `run_agent_pipeline` aggregates and sets
+   `AgentOutput.llm_unavailable=True` when <2/8 analysts returned
+   parseable JSON. `enrich_signal` skips shadow_delta in that state and
+   adds `agent_unavailable` tag.
+5. **MEXC false `exchange_stress_notice`** — no longer fires during the
+   routine 70-minute pre-settlement window. Only anomalous funding
+   magnitudes (`|funding| > 0.002`) raise the flag now.
+6. **Hyperliquid `adl_risk`** — threshold raised from 0.001/hr to
+   0.005/hr (~12% annualised). Stops firing on normal trends.
+7. **`SCORE_VERSION` env var** — v1 (default, legacy step) and v2
+   (continuous saturating ramp) live side-by-side in `score_ticker`.
+   Signals tagged with `score_version` for A/B analysis. Run
+   `python3 scripts/reconstruct_conviction.py` to see whether v2
+   widens the winner/loser conviction divergence before flipping
+   `SCORE_VERSION=v2` in `.env`.
+8. **Bybit disabled in SUPPORTED_EXCHANGES** — was listed as supported
+   but no adapter existed, so signals routed through agents with zero
+   enhancement. Re-enable by uncommenting in `lib/exchange_data.py` AND
+   building `lib/adapters/bybit.py`.
+9. **`app.py` import-safe** — background thread `.start()` calls moved
+   inside the `__main__` guard. `backtest.py` and offline scripts can
+   now import `score_ticker` and `STRATEGIES` from `app.py` without
+   spawning four background workers. Closes audit §05 finding.
 
 ---
 
@@ -64,7 +114,7 @@ Matrix_Trader_7.0/
 ├── .gitignore             ← covers .env, __pycache__, data/, *.db
 ├── .env                   ← secrets only; never read, never write, never commit
 ├── requirements.txt       ← all deps installed; add packages here if needed
-├── app.py                 ← entire Flask backend — 4,458 lines; keep flat, one file
+├── app.py                 ← entire Flask backend — 7,375 lines; keep flat, one file
 ├── backtest.py            ← standalone script; do NOT import from app.py
 ├── templates/
 │   └── index.html         ← entire frontend: HTML + CSS + JS; one file, no framework

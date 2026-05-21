@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-13
-Last commit: d8315ca feat: regime-aware counter-trend conviction boost from factor engine
-app.py: 5166 lines
-index.html: 6466 lines
+Last updated: 2026-05-21
+Last commit: 0a568f4 feat: reconcile deployed Paper Trader and exchange runtime
+app.py: 7,375 lines
+index.html: 8,391 lines
 
 ---
 
@@ -1294,6 +1294,56 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 > Keep the last three sessions verbatim. After that, extract gotchas into
 > "What NOT To Do", DOM structure into "Dashboard Structure", and delete
 > the raw note. Knowledge graduates into permanent sections.
+
+### 2026-05-19/20 — Session summary (signal quality research + scoring improvements + paper bot simulation fix)
+
+**Deep research on crypto perp signal quality (academic + practitioner sources):**
+Commissioned a full web research pass across 10 signal categories. Key validated findings:
+- Funding rate has a ±0.025% exchange deadband — rates within it are definitionally noise (BIS WP 1087, SSRN Inan 2026). Current system was scoring them as real signal.
+- Amihud illiquidity proxy (|return%| / (vol/$1M)) is one of the three dominant cross-sectional predictors of crypto returns (ScienceDirect ML 2024). Not implemented.
+- Volume spike ratio (current 1h vs avg prior 23h) more predictive than raw 24h volume.
+- L/S ratio at extremes (>65% or <35%) is a contrarian warning, not a confirmation.
+- Vol-of-vol (ATR stdev / ATR mean) degrades signal quality — models break in "volatile volatility" regimes.
+- Trend extension (abs(trend_score) > 35) corresponds to late entries — data: winners avg trend_score 9.3 vs losers 14.1.
+
+**6 scoring improvements deployed to VPS (app.py):**
+1. **Funding deadband** (`score_ticker`, Stage 1): `abs(funding) < 0.00025` → scores zero. Eliminates exchange noise zone. Both v1 and v2 paths.
+2. **Illiquidity penalty** (`score_ticker`, Stage 1): `|change_pct| / max(vol/$1M, 0.01)` > 20 → -10 conviction (`illiq_extreme`); > 8 → -5 (`illiq_high`). 246/877 MEXC pairs penalized on first run (28%).
+3. **Vol-of-vol** (`enrich_signal`, Stage 2): `std(ATR[-10:]) / mean(ATR[-10:]) > 0.3` → -5 conviction + `vol_unstable` tag.
+4. **Volume spike ratio** (`enrich_signal`, Stage 2): computed from 1h klines. >2× avg → +5 + `vol_spike`; <0.5× → -5 + `vol_low_participation`. Stored in signal dict as `vol_spike_ratio` for analysis.
+5. **Trend extension penalty** (`enrich_signal`, Stage 2): `abs(trend_score) > 60` → -8 (`trend_extended`); > 35 → -4 (`trend_extended_mild`). Directly addresses the 9.3 vs 14.1 winners/losers finding.
+6. **L/S ratio contrarian** (`enrich_signal`, Stage 2): OKX L/S > 65% + LONG direction → -5 (`ls_crowd_long`); < 35% + SHORT → -5 (`ls_crowd_short`). SENTIMENT_PAIRS only (BTC/ETH/SOL etc).
+
+**Paper bot exit evaluation fixed to simulate live trading:**
+- Root issue: paper bot used Min15 klines for stop/TP evaluation. A 1-min wick hitting the stop would not close the position until the 15-min candle confirmed it — not how live stop orders work.
+- Fix: `evaluate_outcome()` gained `interval` and `kline_limit` parameters (default: Min15/336, backward-compatible). `_paper_check_exits()` now calls `evaluate_outcome(fake_sig, interval="Min1", kline_limit=1440)` — 1440 × 1min = 24 hours. Any 1-minute candle touching stop/TP closes the position immediately on the next 60s check.
+- Main signal evaluator (`_outcome_loop`) unchanged — still Min15.
+
+Watch out for: `vol_spike_ratio` is stored in signal dict but not in a dedicated DB column — lives in `signal_json`. The L/S ratio contrarian adjustment runs after `fetch_market_sentiment()` so `sig["conviction"]` must be re-clamped to 0–100 after (it is).
+
+### 2026-05-18/19 — Session summary (paper bot unblocked + HL scan fix + paper bot quality gates)
+
+**Root cause: paper bot entered 0 trades for days.**
+Three layered issues:
+1. `_MEXC_INTERVAL["1h"] = "Hour1"` — MEXC API rejects "Hour1"; correct value is "Min60". Every `fetch_klines()` call in Stage 2 returned None → every `enrich_signal()` returned None → paper bot had no enriched signals to enter. Fixed in `lib/exchange_data.py` line 77.
+2. `balanced_focus_short` custom strategy direction_lock=SHORT was filtering all LONG signals from the paper bot scan.
+3. EMA-200 gate (`EMA200_GATE_ENABLED`) was blocking all signals in downtrend conditions. Disabled on VPS via `.env`: `EMA200_GATE_ENABLED=false`.
+
+**HL scan always returned 0 signals.**
+Root cause: `api_hl_scan()` called `run_scan(strategy_key=key, tickers=tickers)` without `exchange="HYPERLIQUID"`. Default exchange="MEXC" caused MEXC normalizer to be applied to HL tickers → `enrich_signal` tried MEXC klines for `_USDC` symbols → returned None every time.
+Fix: Added `exchange="HYPERLIQUID"` to `run_scan()` call in `api_hl_scan()`. HL pipeline now works end-to-end. Current HL market flat (top score 44 < 55 threshold) — not a bug.
+
+**Paper bot quality gates (data-driven, not conviction-based):**
+Added two hard filters in `_paper_bot_scan()` and `_PAPER_CONFIG_DEFAULT`:
+- `max_atr_pct = 4.0` — winners avg 3.2% vs losers 5.5% (from analyze.py on 1,148 signals)
+- `max_trend_score_abs = 25` — winners avg 9.3 vs losers 14.1
+Both configurable via `/api/paper/config` PATCH. UI updated with data context notes.
+`min_conviction` lowered to 55 on VPS; `strategy_overrides.json` balanced key set to 55.
+
+**Conviction score analysis:**
+0.56-point winner/loser divergence confirmed across 1,148 signals — conviction barely predicts outcomes. Decision: keep conviction as a ranking/filter mechanism but don't trust it as a quality gate. Better predictors are structural (atr_pct, trend_score).
+
+Watch out for: `effective_threshold = max(threshold, strat["min_conviction"])` silently floors the paper bot threshold to the strategy's minimum even if paper config sets lower. The `/api/paper/config` response now includes `effective_thresholds` per strategy to surface this.
 
 ### 2026-04-28 — Session summary (strategy management moved to Strategies tab)
 Moved: `#strategy-explainer` was removed from `#signals-section` and placed inside `#strategies-section` above `#sa-body`, so Signals now keeps only strategy pills and scan controls. `setStrategy()` no longer toggles the explainer; it only updates `S.strategy`, active pill styling, cached scan results, and the subtitle line. The subtitle now includes a "Manage in Strategies tab →" link that switches tabs.
