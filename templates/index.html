@@ -6964,13 +6964,16 @@ function renderReportPanel() {
   const d = I.report.data || {};
   const n = I.report.narrative || {};
   const pulse = d.market_pulse || {};
+  const narrativeLabel = I.report.narrative_source === 'ai'
+    ? 'AI-polished'
+    : 'deterministic desk notes';
   return `<div style="max-width:1180px;margin:0 auto;">
     <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
       <div style="display:flex;gap:6px;">${btn('daily')}${btn('weekly')}</div>
       <button onclick="regenerateIntelReport()" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);border-radius:4px;padding:7px 11px;font-size:12px;cursor:pointer;">Regenerate</button>
     </div>
-    <div style="font-size:12px;color:var(--muted);margin-bottom:10px;">Generated ${esc(I.report.generated_at || '—')} · AI narrative ${I.report.ai_available ? 'available' : 'unavailable'}</div>
-    ${sectionBlock('Thomas Reeves — Opening Note', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.trader_open || 'Data-only report. Narrative will appear when an AI key is available.')}</div>`)}
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px;">Generated ${esc(I.report.generated_at || '—')} · Narrative: ${esc(narrativeLabel)}</div>
+    ${sectionBlock('Thomas Reeves — Opening Note', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.trader_open || 'Data-only report. Narrative generated from Matrix Trader data.')}</div>`)}
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">
       ${reportMetric('Signals', pulse.signals ?? 0)}
       ${reportMetric('Blocked', pulse.blocked ?? 0)}
@@ -6983,7 +6986,7 @@ function renderReportPanel() {
       <div>${reportTable(d.top_losers, [{key:'symbol',label:'Pair'},{key:'change_24h_pct',label:'Move %',format:v=>Number(v||0).toFixed(2)},{key:'funding_rate',label:'Funding',format:v=>Number(v||0).toFixed(5)}], 'No losers available.')}</div>
     </div>`)}
     ${sectionBlock('Session Breakdown', reportTable(Object.entries(d.sessions || {}).map(([session,v]) => ({session, count:v.count, symbols:(v.symbols||[]).slice(0,5).join(', ')})), [{key:'session',label:'Session'},{key:'count',label:'Signals'},{key:'symbols',label:'Leaders'}], 'No session data yet.'))}
-    ${sectionBlock('Explosive Move Autopsy', d.explosive_move ? `<div style="font-size:13px;line-height:1.6;"><b>${esc(d.explosive_move.symbol)}</b> moved ${Number(d.explosive_move.change_24h_pct||0).toFixed(2)}% with funding ${Number(d.explosive_move.funding_rate||0).toFixed(5)}.</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:10px;"><div style="color:var(--muted);font-size:12px;">Kenny: ${esc(n.funding_autopsy || 'No AI note yet.')}</div><div style="color:var(--muted);font-size:12px;">Niobe: ${esc(n.microstructure_autopsy || 'No AI note yet.')}</div><div style="color:var(--muted);font-size:12px;">Ghost: ${esc(n.cross_venue_autopsy || 'No AI note yet.')}</div></div>` : '<div style="color:var(--muted);font-size:13px;">No live mover snapshot available.</div>')}
+    ${sectionBlock('Explosive Move Autopsy', d.explosive_move ? `<div style="font-size:13px;line-height:1.6;"><b>${esc(d.explosive_move.symbol)}</b> moved ${Number(d.explosive_move.change_24h_pct||0).toFixed(2)}% with funding ${Number(d.explosive_move.funding_rate||0).toFixed(5)}.</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:10px;"><div style="color:var(--muted);font-size:12px;">Kenny: ${esc(n.funding_autopsy || 'Funding note generated from report data.')}</div><div style="color:var(--muted);font-size:12px;">Niobe: ${esc(n.microstructure_autopsy || 'Microstructure note generated from report data.')}</div><div style="color:var(--muted);font-size:12px;">Ghost: ${esc(n.cross_venue_autopsy || 'Cross-venue note generated from report data.')}</div></div>` : '<div style="color:var(--muted);font-size:13px;">No live mover snapshot available.</div>')}
     ${sectionBlock("What's Coiling", reportTable(d.whats_coiling, [{key:'symbol',label:'Pair'},{key:'funding_rate',label:'Funding',format:v=>Number(v||0).toFixed(5)},{key:'change_24h_pct',label:'Move %',format:v=>Number(v||0).toFixed(2)},{key:'watch',label:'Watch'}], 'No coiling setups detected.'))}
     ${sectionBlock('Agent Disagreement Log', reportTable(d.disagreements, [{key:'symbol',label:'Pair'},{key:'direction',label:'Side'},{key:'conviction',label:'Conviction'},{key:'disagreement_score',label:'Score'}], 'No major disagreements logged.'))}
     ${sectionBlock('Strategy Performance by Regime', reportTable(d.strategy_regime_perf, [{key:'strategy',label:'Strategy'},{key:'regime',label:'Regime'},{key:'win',label:'W'},{key:'loss',label:'L'},{key:'partial',label:'P'}], 'No closed strategy/regime outcomes yet.'))}

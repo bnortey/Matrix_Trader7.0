@@ -143,6 +143,8 @@ RISK_GATES_PATH = "data/risk_gates.json"
 STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
 AI_SETTINGS_PATH   = "data/ai_settings.json"
 PAPER_CONFIG_PATH  = "data/paper_config.json"
+REPORT_NARRATIVE_MODE = (os.getenv("REPORT_NARRATIVE_MODE") or "free").strip().lower()
+REPORT_FREE_AI_PROVIDERS = {"gemini", "groq", "ollama"}
 
 _PAPER_CONFIG_DEFAULT = {
     "enabled":               False,
@@ -6156,9 +6158,154 @@ def _report_empty_narrative() -> dict:
     }
 
 
-def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool]:
-    """Generate concise cached report notes. Data sections remain useful without AI."""
+def _report_fmt_symbol(item: dict | None) -> str:
+    if not item:
+        return "the watchlist"
+    return str(item.get("symbol") or "the watchlist")
+
+
+def _report_fmt_move(item: dict | None) -> str:
+    if not item:
+        return "0.00%"
+    return f"{_report_float(item.get('change_24h_pct')):.2f}%"
+
+
+def _report_count_funding_extremes(data: dict) -> tuple[int, int]:
+    heatmap = data.get("funding_heatmap") or {}
+    neg = len(heatmap.get("extreme_negative") or [])
+    pos = len(heatmap.get("extreme_positive") or [])
+    return neg, pos
+
+
+def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> dict:
+    """
+    No-cost Cipher desk notes built directly from report data.
+
+    This is the baseline narrative layer. Paid/free hosted LLMs can polish it,
+    but reports should never go blank because a provider key is missing or a
+    free-tier quota is exhausted.
+    """
     narrative = _report_empty_narrative()
+    pulse = data.get("market_pulse") or {}
+    paper = data.get("paper_desk") or {}
+    top_gainers = data.get("top_gainers") or []
+    top_losers = data.get("top_losers") or []
+    coiling = data.get("whats_coiling") or []
+    disagreements = data.get("disagreements") or []
+    explosive = data.get("explosive_move") or {}
+    neg_funding, pos_funding = _report_count_funding_extremes(data)
+
+    top_gain = top_gainers[0] if top_gainers else None
+    top_loss = top_losers[0] if top_losers else None
+    signals = int(pulse.get("signals") or 0)
+    blocked = int(pulse.get("blocked") or 0)
+    regime = str(pulse.get("dominant_regime") or "unknown").replace("_", " ")
+    agreement = str(pulse.get("desk_agreement") or "unknown")
+
+    pressure_bits = []
+    if neg_funding:
+        pressure_bits.append(f"{neg_funding} names with extreme negative funding")
+    if pos_funding:
+        pressure_bits.append(f"{pos_funding} names with extreme positive funding")
+    if coiling:
+        pressure_bits.append(f"{len(coiling)} coiling setups")
+    pressure = ", ".join(pressure_bits) if pressure_bits else "no major funding extremes"
+
+    narrative["trader_open"] = (
+        f"The desk logged {signals} signals with {blocked} blocked candidates. "
+        f"Regime reads {regime}; agreement is {agreement}. "
+        f"Leadership is watching {_report_fmt_symbol(top_gain)} on strength ({_report_fmt_move(top_gain)}) "
+        f"and {_report_fmt_symbol(top_loss)} on weakness ({_report_fmt_move(top_loss)}). "
+        f"The useful read is not direction alone; it is whether the move cleared funding, volume, and risk gates."
+    )
+
+    if coiling:
+        lead = coiling[0]
+        narrative["regime_forecast"] = (
+            f"Nadia flags a pressure build rather than a clean trend. "
+            f"{_report_fmt_symbol(lead)} is coiling with funding at {_report_float(lead.get('funding_rate')):.5f} "
+            f"while price has moved only {_report_fmt_move(lead)}. "
+            f"That combination can precede forced movement, but leverage should stay reduced until volume confirms."
+        )
+    else:
+        narrative["regime_forecast"] = (
+            f"Nadia sees a {regime} tape with {pressure}. "
+            f"Without a visible coiling list, the better posture is selective: require clean participation, "
+            f"avoid thin books, and let weak signals pass."
+        )
+
+    if blocked or disagreements:
+        narrative["risk_close"] = (
+            f"Harper's close: {blocked} candidates were blocked and {len(disagreements)} material disagreements "
+            f"showed up in the analyst layer. That is not a mandate to trade less forever; it is a mandate "
+            f"to size smaller until the desk sees alignment across structure, funding, and tape."
+        )
+    else:
+        narrative["risk_close"] = (
+            "Harper's close: no major internal conflict is showing in today's report, but that is not permission "
+            "to chase. Keep stops mechanical, avoid stale signals, and do not increase leverage just because the dashboard is quiet."
+        )
+
+    if explosive:
+        narrative["funding_autopsy"] = (
+            f"Kenny reads {_report_fmt_symbol(explosive)} as a funding-context move: "
+            f"{_report_fmt_move(explosive)} with funding at {_report_float(explosive.get('funding_rate')):.5f}. "
+            f"If funding is stretched in the direction of the move, late entries are lower quality."
+        )
+        narrative["microstructure_autopsy"] = (
+            f"Niobe cares less about the headline candle and more about whether depth held during {_report_fmt_symbol(explosive)}. "
+            f"A sharp move without durable volume is often a trap; a sharp move with participation can become continuation."
+        )
+        narrative["cross_venue_autopsy"] = (
+            f"Ghost wants venue confirmation before trusting {_report_fmt_symbol(explosive)}. "
+            f"If MEXC, Hyperliquid, and eventually Bybit agree, the move is cleaner. If one venue leads alone, treat it as suspect."
+        )
+    else:
+        narrative["funding_autopsy"] = "Kenny has no single explosive move to dissect. Funding still matters: crowded carry is a warning, not a trade by itself."
+        narrative["microstructure_autopsy"] = "Niobe has no move autopsy today. The standing rule holds: no depth, no confidence."
+        narrative["cross_venue_autopsy"] = "Ghost has no venue-leader event to call out. Cross-venue agreement remains a future edge layer as Bybit comes online."
+
+    if weekly:
+        wins = int(paper.get("wins") or 0)
+        closed = int(paper.get("closed") or 0)
+        avg_pnl = _report_float(paper.get("avg_pnl_pct"))
+        narrative["week_ahead"] = (
+            f"Thomas's week-ahead view: keep studying whether the Paper Desk is proving the filters. "
+            f"It closed {closed} trades with {wins} wins and {avg_pnl:.2f}% average P&L. "
+            f"Next week, prioritize regimes where paper results, funding behavior, and analyst agreement point the same way."
+        )
+        spotlight_key = data.get("spotlight_key") or "funding"
+        narrative["spotlight"] = (
+            f"This week's spotlight is {spotlight_key.replace('_', ' ')}. "
+            f"The desk should use that analyst's domain to explain not just what moved, but what condition appeared before the move."
+        )
+
+    return narrative
+
+
+def _merge_report_narrative(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in (override or {}).items():
+        if key in merged and isinstance(value, str) and value.strip():
+            merged[key] = value.strip()
+    return merged
+
+
+def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool, str]:
+    """Generate concise cached report notes. Deterministic notes are the free fallback."""
+    narrative = _build_deterministic_report_narrative(data, weekly=weekly)
+    mode = REPORT_NARRATIVE_MODE
+    if mode in {"deterministic", "off", "none"}:
+        return narrative, False, "deterministic"
+    allowed_providers = None
+    if mode in {"free", "free_only", "free-only"}:
+        allowed_providers = REPORT_FREE_AI_PROVIDERS
+    elif mode in {"auto", "any"}:
+        allowed_providers = None
+    elif mode:
+        # Future-friendly: REPORT_NARRATIVE_MODE=ollama or =gemini restricts
+        # report polishing to that provider while keeping deterministic fallback.
+        allowed_providers = {mode}
     try:
         from lib.agents import AGENT_ROSTER, FIRM_META
         compact = {
@@ -6196,21 +6343,23 @@ def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool]:
             "Return this JSON object with one 35-80 word string per key:\n"
             f"{json.dumps({k: v['voice'] for k, v in requested}, indent=2)}"
         )
-        raw = call_ai(system=system, user=user, max_tokens=900)
+        raw = call_ai(
+            system=system,
+            user=user,
+            max_tokens=900,
+            allowed_providers=allowed_providers,
+        )
         if not raw:
-            return narrative, False
+            return narrative, False, "deterministic"
         clean = raw.strip()
         if clean.startswith("```"):
             clean = clean.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         parsed = json.loads(clean)
         if isinstance(parsed, dict):
-            for key in narrative:
-                if isinstance(parsed.get(key), str):
-                    narrative[key] = parsed[key].strip()
-            return narrative, True
+            return _merge_report_narrative(narrative, parsed), True, "ai"
     except Exception as e:
         print(f"[report_ai] {e}", file=sys.stderr)
-    return narrative, False
+    return narrative, False, "deterministic"
 
 
 def _build_daily_data(date_str: str, ticker_snapshot: list[dict] | None = None) -> dict:
@@ -6405,11 +6554,25 @@ def _load_or_build_report(report_type: str, key: str, force: bool = False) -> di
     if not force and os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+            if "narrative_source" not in cached:
+                data = cached.get("data") or {}
+                weekly = cached.get("type") == "weekly"
+                cached["narrative"] = _merge_report_narrative(
+                    _build_deterministic_report_narrative(data, weekly=weekly),
+                    cached.get("narrative") or {},
+                )
+                cached["narrative_source"] = "ai" if cached.get("ai_available") else "deterministic"
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(cached, f, indent=2, default=str)
+                except Exception:
+                    pass
+            return cached
         except Exception:
             pass
     data = _build_weekly_data(key) if report_type == "weekly" else _build_daily_data(key)
-    narrative, ai_available = _call_report_ai(data, weekly=(report_type == "weekly"))
+    narrative, ai_available, narrative_source = _call_report_ai(data, weekly=(report_type == "weekly"))
     report = {
         "success": True,
         "type": report_type,
@@ -6419,6 +6582,7 @@ def _load_or_build_report(report_type: str, key: str, force: bool = False) -> di
         "data": data,
         "narrative": narrative,
         "ai_available": ai_available,
+        "narrative_source": narrative_source,
         "generated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
     }
     try:
@@ -6662,6 +6826,33 @@ def api_execution_kill_switch():
 # ---------------------------------------------------------------------------
 # AI Model Settings
 # ---------------------------------------------------------------------------
+
+@app.route("/api/ai/health")
+def api_ai_health():
+    """Return AI provider readiness without exposing API keys."""
+    try:
+        from lib.ai_client import load_ai_settings, provider_status
+        settings = load_ai_settings()
+        providers = provider_status()
+        active = next((p for p in providers if p["provider"] == settings.get("provider")), None)
+        any_hosted_or_local = any(p.get("available") for p in providers)
+        return jsonify({
+            "success": True,
+            "current": settings,
+            "providers": providers,
+            "active_available": bool(active and active.get("available")),
+            "any_provider_available": any_hosted_or_local,
+            "report_narrative_mode": REPORT_NARRATIVE_MODE,
+            "report_free_providers": sorted(REPORT_FREE_AI_PROVIDERS),
+            "report_fallback": "deterministic",
+            "note": (
+                "Cipher reports always render deterministic desk notes for free. "
+                "Hosted or local LLMs only polish the narrative when available."
+            ),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/api/settings/ai")
 def api_ai_settings_get():

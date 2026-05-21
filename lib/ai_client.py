@@ -7,6 +7,7 @@ PROVIDERS = [
     {"name": "gemini",   "key_env": "GEMINI_API_KEY"},
     {"name": "deepseek", "key_env": "DEEPSEEK_API_KEY"},
     {"name": "groq",     "key_env": "GROQ_API_KEY"},
+    {"name": "ollama",   "key_env": "OLLAMA_BASE_URL"},
 ]
 
 AVAILABLE_MODELS = [
@@ -25,12 +26,42 @@ AVAILABLE_MODELS = [
     {"provider": "groq",     "model": "meta-llama/llama-4-scout-17b-16e-instruct","label": "Llama 4 Scout (Groq free)",    "key_env": "GROQ_API_KEY"},
     {"provider": "groq",     "model": "llama-3.3-70b-versatile",                 "label": "Llama 3.3 70B (Groq free)",    "key_env": "GROQ_API_KEY"},
     {"provider": "groq",     "model": "llama-3.1-8b-instant",                    "label": "Llama 3.1 8B Instant (Groq free)", "key_env": "GROQ_API_KEY"},
+    # Local/free. Set OLLAMA_BASE_URL=http://localhost:11434 and pull the model locally.
+    {"provider": "ollama",   "model": "llama3.1:8b",                         "label": "Llama 3.1 8B (Ollama local)", "key_env": "OLLAMA_BASE_URL"},
+    {"provider": "ollama",   "model": "qwen2.5:7b",                          "label": "Qwen 2.5 7B (Ollama local)", "key_env": "OLLAMA_BASE_URL"},
 ]
 
 _DEFAULT_SETTINGS = {"provider": "claude", "model": "claude-sonnet-4-6"}
 _AI_SETTINGS_PATH = "data/ai_settings.json"
 
 _KEY_ENV = {p["name"]: p["key_env"] for p in PROVIDERS}
+
+
+def _provider_available(provider: str) -> bool:
+    key_env = _KEY_ENV.get(provider, "")
+    if provider == "ollama":
+        return bool(os.getenv(key_env, "").strip())
+    return bool(os.getenv(key_env, "").strip())
+
+
+def provider_status() -> list[dict]:
+    """Return provider availability without exposing secrets."""
+    out = []
+    for provider in PROVIDERS:
+        name = provider["name"]
+        key_env = provider["key_env"]
+        models = [
+            {"model": m["model"], "label": m["label"]}
+            for m in AVAILABLE_MODELS
+            if m["provider"] == name
+        ]
+        out.append({
+            "provider": name,
+            "key_env": key_env,
+            "available": _provider_available(name),
+            "models": models,
+        })
+    return out
 
 
 def load_ai_settings() -> dict:
@@ -49,14 +80,20 @@ def save_ai_settings(settings: dict) -> None:
         json.dump(settings, f)
 
 
-def call_ai(system: str, user: str, max_tokens: int = 512) -> str | None:
+def call_ai(
+    system: str,
+    user: str,
+    max_tokens: int = 512,
+    allowed_providers: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> str | None:
     settings = load_ai_settings()
     cfg_provider = settings.get("provider")
     cfg_model    = settings.get("model")
+    allowed = set(allowed_providers) if allowed_providers else None
 
     # Try the configured model first
-    if cfg_provider and cfg_model:
-        api_key = os.getenv(_KEY_ENV.get(cfg_provider, ""), "")
+    if cfg_provider and cfg_model and (allowed is None or cfg_provider in allowed):
+        api_key = os.getenv(_KEY_ENV.get(cfg_provider, ""), "").strip()
         if api_key:
             fn = _DISPATCH.get(cfg_provider)
             if fn:
@@ -68,6 +105,8 @@ def call_ai(system: str, user: str, max_tokens: int = 512) -> str | None:
     # Fallback chain — skip the already-tried provider
     for provider in PROVIDERS:
         if provider["name"] == cfg_provider:
+            continue
+        if allowed is not None and provider["name"] not in allowed:
             continue
         api_key = os.getenv(provider["key_env"], "")
         if not api_key:
@@ -140,9 +179,31 @@ def _call_groq(system: str, user: str, max_tokens: int, api_key: str, model: str
     return response.choices[0].message.content
 
 
+def _call_ollama(system: str, user: str, max_tokens: int, base_url: str, model: str) -> str:
+    import requests
+    base = base_url.rstrip("/")
+    response = requests.post(
+        f"{base}/api/chat",
+        json={
+            "model": model,
+            "stream": False,
+            "options": {"num_predict": max_tokens},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return (data.get("message") or {}).get("content") or data.get("response") or ""
+
+
 _DISPATCH = {
     "claude":   _call_claude,
     "gemini":   _call_gemini,
     "deepseek": _call_deepseek,
     "groq":     _call_groq,
+    "ollama":   _call_ollama,
 }
