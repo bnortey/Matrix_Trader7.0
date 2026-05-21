@@ -65,7 +65,12 @@ class HyperliquidAdapter:
                 abs(raw_basis_bps) - self.USDC_USDT_NOISE_FLOOR_BPS
             )
 
-        adl_risk = abs(funding_rate) > 0.0010
+        # adl_risk gates Hyperliquid signals. HL funding is hourly, and 0.1%/hr
+        # is routine for trending markets — the old 0.0010 threshold fired
+        # constantly and the Risk Manager hard-blocked valid signals. 0.005/hr
+        # (≈ 12% annualised) corresponds to genuinely anomalous funding pressure.
+        # Audit §02 finding HL_adl_001.
+        adl_risk = abs(funding_rate) > 0.005
         max_leverage = int(t.get("maxLeverage") or t.get("leverage") or 20)
 
         return ExchangeContext(

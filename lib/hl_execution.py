@@ -226,7 +226,27 @@ def close_all_positions(wallet_address: str, private_key: str) -> dict:
 
             is_long  = szi > 0
             size     = abs(szi)
-            mark_px  = mark_prices.get(coin) or float(pos.get("entryPx") or 1)
+            # AUDIT FIX §07 ioc_fallback_001: prior fallback chain ended at
+            # `or 1`, so when mark_prices lookup failed AND entryPx was
+            # missing, close_px became (1 * 0.95) = $0.95 — i.e. an IOC
+            # order at $1 against an asset that might trade at $50,000.
+            # Now: refuse to close THIS position if no real reference price
+            # is available, log the skip, and let the loop move on to the
+            # next position. The kill switch's job is to be safe, not to
+            # guarantee 100% close rate at any price.
+            mark_px = mark_prices.get(coin)
+            if not mark_px:
+                entry_px = float(pos.get("entryPx") or 0)
+                if entry_px > 0:
+                    mark_px = entry_px
+            if not mark_px or mark_px <= 0:
+                import sys
+                print(
+                    f"[kill_switch] skipping {coin}: no mark_px or entryPx "
+                    f"available — refusing to place IOC at fallback $1",
+                    file=sys.stderr,
+                )
+                continue
 
             # IOC at aggressive slippage to guarantee fill
             close_px = mark_px * (1 - _SLIPPAGE) if is_long else mark_px * (1 + _SLIPPAGE)

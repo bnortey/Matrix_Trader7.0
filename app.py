@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import json
 import socket
 import sqlite3
@@ -28,6 +29,16 @@ from lib.indicators import (
 from lib.laddering import generate_ladders
 from lib.ai_client import call_ai
 from lib.risk_controls import compute_daily_pnl, compute_position_size, get_readiness_verdict
+from lib.order_flow import flow_confirm as _flow_confirm
+from lib.exchange_data import (
+    normalize_ticker_for_scoring,
+    fetch_klines,
+    fetch_depth,
+    fetch_next_funding_minutes,
+    fetch_daily_klines_raw,
+    fetch_tickers as _fetch_exchange_tickers,
+    SUPPORTED_EXCHANGES,
+)
 from lib.coinglass_client import (
     coinglass_enabled,
     enrich_symbol_with_coinglass,
@@ -44,8 +55,64 @@ from lib.hyperliquid_client import (
 
 load_dotenv()
 
+# Stage 1 scoring version. v1 = step-function (legacy; 5.1% rally and 50%
+# rally get the same momentum score). v2 = continuous saturating ramp so
+# magnitude matters. Default v1 until A/B reconstruction on closed signals
+# shows v2 widens the winner/loser conviction divergence beyond the
+# current 0.56-point floor. Audit §02 structural fix.
+# Set SCORE_VERSION=v2 in .env to activate. Signals are tagged with the
+# version that scored them so analyze.py can split apart the two cohorts.
+SCORE_VERSION = (os.getenv("SCORE_VERSION") or "v1").strip().lower()
+if SCORE_VERSION not in ("v1", "v2"):
+    print(f"[score] Unknown SCORE_VERSION={SCORE_VERSION!r}, falling back to v1", file=sys.stderr)
+    SCORE_VERSION = "v1"
+
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+
+# ---------------------------------------------------------------------------
+# Bearer-token auth middleware (audit §07 fix)
+# ---------------------------------------------------------------------------
+#
+# Behavior:
+#   - If MT7_API_TOKEN env var is empty/unset, no auth required (default;
+#     preserves local-dev workflow and existing VPS behavior on rollout).
+#   - When MT7_API_TOKEN is set, every mutating request (POST/PATCH/PUT/DELETE)
+#     must carry  Authorization: Bearer <MT7_API_TOKEN>  or it gets 401.
+#   - GET/HEAD/OPTIONS stay open so the dashboard can still load read-only
+#     analytics and the iPhone-on-LAN flow keeps working without a config change.
+#   - "/" and "/static/*" stay open so the SPA itself can load; the JS wrapper
+#     in templates/index.html then attaches the token to every fetch().
+#
+# Bootstrap: generate a token with
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+# and set MT7_API_TOKEN=... in .env on the VPS. Then visit the dashboard once
+# with  ?token=YOUR_TOKEN  in the URL; the JS captures it into sessionStorage
+# and re-uses it for the session.
+#
+import hmac as _hmac
+
+@app.before_request
+def _enforce_bearer_token():
+    if not MT7_API_TOKEN:
+        return None
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if request.path == "/" or request.path.startswith("/static/"):
+        return None
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({
+            "success": False,
+            "error": "auth required: send Authorization: Bearer <MT7_API_TOKEN>",
+        }), 401
+    presented = auth_header[len("Bearer "):].strip()
+    # Constant-time comparison to avoid timing oracle.
+    if not _hmac.compare_digest(presented, MT7_API_TOKEN):
+        return jsonify({"success": False, "error": "invalid token"}), 401
+    return None
+
 
 MEXC_BASE    = "https://contract.mexc.com/api/v1"
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -59,6 +126,13 @@ PORT = int(os.getenv("MATRIX_PORT", "8080"))
 HL_WALLET_ADDRESS    = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY       = os.getenv("HL_PRIVATE_KEY", "")
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+MT7_API_TOKEN        = (os.getenv("MT7_API_TOKEN") or "").strip()
+MAX_DAILY_LOSS_USDT  = float(os.getenv("MAX_DAILY_LOSS_USDT") or "0")
+# Kill-switch cooldown: in-memory timestamp of last kill_switch invocation.
+# Within 60 seconds of a kill switch firing, /api/execution/place refuses
+# new orders. Audit §07 kill_switch_cooldown_001.
+_KILL_SWITCH_LAST_FIRED_TS: float = 0.0
+_KILL_SWITCH_COOLDOWN_S: int = 60
 CONVICTION_THRESHOLD = 55   # signals below this are filtered from results
 KLINE_INTERVAL = "Min60"    # 1h candles — 100 candles default = ~4 days, plenty for 14-period indicators
 ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API calls
@@ -67,7 +141,24 @@ ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
 DB_PATH = "data/signals.db"
 RISK_GATES_PATH = "data/risk_gates.json"
 STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
-AI_SETTINGS_PATH = "data/ai_settings.json"
+AI_SETTINGS_PATH   = "data/ai_settings.json"
+PAPER_CONFIG_PATH  = "data/paper_config.json"
+
+_PAPER_CONFIG_DEFAULT = {
+    "enabled":               False,
+    "size_usd":              100,
+    "disabled_strategies":   [],       # list of strategy keys to skip; empty = run all
+    "min_conviction":        55,
+    "flow_required":         True,
+    "min_flow_score":        50.0,
+    "scan_interval_minutes": 5,
+    "max_open_positions":    5,
+    # Data-driven gates from analyze.py: winners avg atr_pct=3.2% vs losers 5.5%;
+    # winners avg trend_score=9.3 vs losers 14.1. These outpredict conviction score
+    # (0.56-point separation) by a wide margin.
+    "max_atr_pct":           4.0,
+    "max_trend_score_abs":   25,
+}
 
 # Daily kline cache: symbol → (fetched_at_ts, data)
 _daily_kline_cache: dict = {}
@@ -182,6 +273,16 @@ def init_db() -> None:
         con.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN flow_score REAL DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN flow_confirmed INTEGER DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
     # Backfill leverage from signal_json for existing rows that have it
     con.execute("""
         UPDATE signals
@@ -301,6 +402,35 @@ def init_db() -> None:
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_mktctx_ts ON market_context_snapshots (ts)")
+    con.commit()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            opened_at      TEXT NOT NULL,
+            symbol         TEXT NOT NULL,
+            strategy_key   TEXT NOT NULL,
+            direction      TEXT NOT NULL,
+            entry_px       REAL NOT NULL,
+            size_usd       REAL NOT NULL DEFAULT 100,
+            tp1            REAL,
+            tp2            REAL,
+            tp3            REAL,
+            stop_loss      REAL,
+            leverage       REAL DEFAULT 1,
+            conviction     INTEGER,
+            flow_confirmed INTEGER DEFAULT 0,
+            flow_score     REAL DEFAULT 0,
+            flow_reasons   TEXT,
+            status         TEXT DEFAULT 'open',
+            closed_at      TEXT,
+            exit_px        REAL,
+            result         TEXT,
+            pnl_pct        REAL,
+            signal_id      INTEGER,
+            note           TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades (status, opened_at)")
     con.commit()
     con.close()
 
@@ -435,8 +565,9 @@ def log_signals(signals: list[dict]) -> None:
                 (logged_at, symbol, exchange, direction, strategy, strategy_key, conviction,
                  price, entry1, entry2, entry3, tp1, tp2, tp3, stop_loss,
                  atr_pct, volatility, funding_rate, rsi_1h, trend_score,
-                 tags, signal_why, signal_json, data_quality, leverage)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 tags, signal_why, signal_json, data_quality, leverage,
+                 flow_score, flow_confirmed)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 datetime.utcnow().isoformat(),
                 sig["symbol"],
@@ -459,6 +590,8 @@ def log_signals(signals: list[dict]) -> None:
                 json.dumps(sig, default=str),
                 sig.get("data_quality") or "current",
                 leverage_val,
+                sig.get("flow_score"),
+                1 if sig.get("flow_confirmed") else (0 if sig.get("flow_confirmed") is False else None),
             ))
         con.commit()
         con.close()
@@ -1265,6 +1398,46 @@ def fetch_market_sentiment(mexc_symbol: str, price: float) -> dict:
 # Stage 1: lightweight ticker scoring
 # ---------------------------------------------------------------------------
 
+def _ramp_score(
+    value: float,
+    weak_threshold: float,
+    strong_threshold: float,
+    weak_weight: float,
+    strong_weight: float,
+    saturation: float = 1.4,
+) -> float:
+    """
+    Continuous saturating-ramp score on |value|. Returns a non-negative
+    float (caller decides which side it credits).
+
+    - |value| < weak_threshold              → 0
+    - weak_threshold ≤ |value| < strong     → linear from weak_weight to strong_weight
+    - |value| ≥ strong_threshold            → log-saturating from strong_weight
+                                              toward saturation * strong_weight
+
+    Designed so the legacy step-function tier boundaries (weak/strong) sit
+    at the same input values but the OUTPUT is continuous: a 5.1% rally
+    scores essentially the same as today, a 50% rally scores ~40% more.
+    Audit §02 structural fix.
+    """
+    a = abs(value)
+    if a < weak_threshold:
+        return 0.0
+    if a < strong_threshold:
+        span = strong_threshold - weak_threshold
+        if span <= 0:
+            return float(weak_weight)
+        frac = (a - weak_threshold) / span
+        return float(weak_weight + frac * (strong_weight - weak_weight))
+    # Saturating tail: log1p compresses extreme outliers without making
+    # them indistinguishable from "merely strong".
+    if strong_threshold <= 0:
+        return float(strong_weight)
+    excess_frac = (a - strong_threshold) / strong_threshold
+    cap = strong_weight * saturation
+    return float(min(cap, strong_weight + math.log1p(excess_frac) * (cap - strong_weight)))
+
+
 def score_ticker(
     ticker: dict,
     strategy: dict | None = None,
@@ -1291,15 +1464,13 @@ def score_ticker(
     _strat_key = strat.get("key", "balanced")
 
     try:
-        symbol = ticker.get("symbol", "")
-        price = float(ticker.get("lastPrice") or 0)
-        fair_price = float(ticker.get("fairPrice") or price)
-        change_pct = float(ticker.get("riseFallRate") or 0) * 100  # decimal → percent
-        funding = float(ticker.get("fundingRate") or 0)
-        volume = float(
-            ticker.get("volume24") or ticker.get("vol24h") or ticker.get("amount24") or 0
-        )
-        open_interest = float(ticker.get("holdVol") or 0)
+        symbol        = ticker.get("symbol", "")
+        price         = float(ticker.get("price") or 0)
+        fair_price    = float(ticker.get("fair_price") or price)
+        change_pct    = float(ticker.get("change_24h_pct") or 0)  # already percent
+        funding       = float(ticker.get("funding_rate") or 0)
+        volume        = float(ticker.get("volume_24h") or 0)
+        open_interest = float(ticker.get("open_interest") or 0)
 
         if price <= 0 or not symbol:
             return None
@@ -1318,64 +1489,117 @@ def score_ticker(
         # strong tier = full weight, weak tier = half weight (preserves original proportions)
         mom_strong = w["momentum"]
         mom_weak   = w["momentum"] // 2
-        # Balanced LONG momentum reduction: audit shows strong_momentum LONG signals
-        # have 19.4% win rate vs baseline (-8,397 P&L delta, 309 signals).
-        # SHORT momentum (strong_dump) keeps full weight — data confirms it works.
-        if _strat_key == "balanced":
-            mom_long_strong = mom_strong // 2
-            mom_long_weak   = mom_weak   // 2
+        mom_long_strong = mom_strong
+        mom_long_weak   = mom_weak
+
+        if SCORE_VERSION == "v2":
+            # Continuous saturating-ramp: magnitude matters. Tag boundaries
+            # (2%, 5%) preserved so downstream tag-based filters still work.
+            if change_pct > 0:
+                long_score += _ramp_score(
+                    change_pct, 2.0, 5.0, mom_long_weak, mom_long_strong
+                )
+                if change_pct > 5:
+                    tags.append("strong_momentum")
+                elif change_pct > 2:
+                    tags.append("momentum")
+            elif change_pct < 0:
+                short_score += _ramp_score(
+                    change_pct, 2.0, 5.0, mom_weak, mom_strong
+                )
+                if change_pct < -5:
+                    tags.append("strong_dump")
+                elif change_pct < -2:
+                    tags.append("dump")
         else:
-            mom_long_strong = mom_strong
-            mom_long_weak   = mom_weak
-        if change_pct > 5:
-            long_score += mom_long_strong
-            tags.append("strong_momentum")
-            if _strat_key == "balanced":
-                tags.append("long_momentum_reduced")
-        elif change_pct > 2:
-            long_score += mom_long_weak
-            tags.append("momentum")
-        elif change_pct < -5:
-            short_score += mom_strong
-            tags.append("strong_dump")
-        elif change_pct < -2:
-            short_score += mom_weak
-            tags.append("dump")
+            # v1 legacy step function — preserved for A/B comparison.
+            if change_pct > 5:
+                long_score += mom_long_strong
+                tags.append("strong_momentum")
+            elif change_pct > 2:
+                long_score += mom_long_weak
+                tags.append("momentum")
+            elif change_pct < -5:
+                short_score += mom_strong
+                tags.append("strong_dump")
+            elif change_pct < -2:
+                short_score += mom_weak
+                tags.append("dump")
 
         # Funding rate
         # Negative funding = shorts paying longs = short-squeeze setup
         # strong tier = full weight, weak tier = 40% (original 10/25 ratio)
+        # Deadband ±0.00025 (±0.025%): exchanges zero out funding within this
+        # band — any signal below it is pure noise from the fee mechanism.
         fund_strong = w["funding"]
         fund_weak   = int(w["funding"] * 0.4)
-        if funding < -0.001:
-            tags.append("short_squeeze")
-            # Balanced only: require positive 24h momentum to award full squeeze score.
-            # Falling price + extreme negative funding = squeeze not yet materialising.
-            # Other strategies (Funding Arb) rely on funding as the primary signal — unchanged.
-            if _strat_key == "balanced" and change_pct <= 0:
-                long_score += fund_weak
-                tags.append("squeeze_unconfirmed")
-            else:
-                long_score += fund_strong
-        elif funding < 0:
-            long_score += fund_weak
-        elif funding > 0.001:
-            short_score += fund_strong
-            tags.append("long_squeeze")
-        elif funding > 0:
-            short_score += fund_weak
+        _FUNDING_DEADBAND = 0.00025
 
-        # Basis spread — full weight or nothing (no weak tier)
+        if abs(funding) >= _FUNDING_DEADBAND:
+            if SCORE_VERSION == "v2":
+                # Continuous ramp from |funding|=0.0001 (weak) to 0.001 (strong),
+                # saturating above. Sign of funding determines side credited.
+                fund_score = _ramp_score(
+                    funding, 0.0001, 0.001, fund_weak, fund_strong
+                )
+                if funding < 0:
+                    if funding < -0.001:
+                        tags.append("short_squeeze")
+                        # Balanced only: squeeze without confirming 24h move
+                        # is degraded, not awarded full points.
+                        if _strat_key == "balanced" and change_pct <= 0:
+                            fund_score *= 0.4
+                            tags.append("squeeze_unconfirmed")
+                    long_score += fund_score
+                else:
+                    if funding > 0.001:
+                        tags.append("long_squeeze")
+                    short_score += fund_score
+            else:
+                # v1 legacy step function.
+                if funding < -0.001:
+                    tags.append("short_squeeze")
+                    if _strat_key == "balanced" and change_pct <= 0:
+                        long_score += fund_weak
+                        tags.append("squeeze_unconfirmed")
+                    else:
+                        long_score += fund_strong
+                elif funding < 0:
+                    long_score += fund_weak
+                elif funding > 0.001:
+                    short_score += fund_strong
+                    tags.append("long_squeeze")
+                elif funding > 0:
+                    short_score += fund_weak
+
+        # Basis spread
         # Premium (price > fair): longs paying more, bearish lean
         # Discount (price < fair): shorts paying more, bullish lean
         if fair_price > 0:
             basis_pct = (price - fair_price) / fair_price * 100
-            if basis_pct > 0.1:
-                short_score += w["basis"]
-                tags.append("premium")
-            elif basis_pct < -0.1:
-                long_score += w["basis"]
-                tags.append("discount")
+            if SCORE_VERSION == "v2":
+                # Ramp from 0.05% (half weight) to 0.1% (full weight),
+                # saturating above. Symmetric on direction.
+                basis_score = _ramp_score(
+                    basis_pct, 0.05, 0.10,
+                    w["basis"] * 0.5, w["basis"],
+                )
+                if basis_pct > 0:
+                    short_score += basis_score
+                    if basis_pct > 0.1:
+                        tags.append("premium")
+                elif basis_pct < 0:
+                    long_score += basis_score
+                    if basis_pct < -0.1:
+                        tags.append("discount")
+            else:
+                # v1 legacy: all-or-nothing.
+                if basis_pct > 0.1:
+                    short_score += w["basis"]
+                    tags.append("premium")
+                elif basis_pct < -0.1:
+                    long_score += w["basis"]
+                    tags.append("discount")
 
         # Volume multiplier: strategy-defined, only applied when volume > $10M
         vol_mult = w["volume_mult"] if volume > 10_000_000 else 1.0
@@ -1396,6 +1620,17 @@ def score_ticker(
             direction = "SHORT"
             conviction_base = min(int(short_score * vol_mult), 100)
 
+        # Illiquidity penalty: large price move on thin volume = noisy signal
+        # Amihud proxy: |return%| / (vol_24h / $1M). High ratio = manipulable.
+        if volume > 0:
+            _illiq = abs(change_pct) / max(volume / 1_000_000, 0.01)
+            if _illiq > 20:
+                conviction_base = max(0, conviction_base - 10)
+                tags.append("illiq_extreme")
+            elif _illiq > 8:
+                conviction_base = max(0, conviction_base - 5)
+                tags.append("illiq_high")
+
         result = {
             "symbol": symbol,
             "exchange": ticker.get("exchange", "MEXC"),
@@ -1407,6 +1642,9 @@ def score_ticker(
             "volume_24h": volume,
             "open_interest": open_interest,
             "tags": tags,
+            # New: which Stage 1 scorer ran. Lets analyze.py / the A/B
+            # reconstruction script split v1 cohorts from v2 cohorts.
+            "score_version": SCORE_VERSION,
         }
         result.update(enrich_symbol_with_coinglass(symbol, coinglass_snapshot))
         cg_oi = result.get("coinglass_open_interest_usd")
@@ -1743,36 +1981,20 @@ def enrich_signal(
     price = base["price"]
     direction = base["direction"]
     tags = list(base["tags"])
+    exchange = base.get("exchange", "MEXC")
 
     try:
-        # --- Klines ---
-        exchange = base.get("exchange", "MEXC")
-        if exchange == "HYPERLIQUID":
-            coin = symbol.rsplit("_", 1)[0]
-            hl_1h = fetch_hl_klines(coin, "1h", 120)
-            if not hl_1h:
-                return None
-            kline_data = {
-                "open":  [float(k["o"]) for k in hl_1h],
-                "high":  [float(k["h"]) for k in hl_1h],
-                "low":   [float(k["l"]) for k in hl_1h],
-                "close": [float(k["c"]) for k in hl_1h],
-                "vol":   [float(k["v"]) for k in hl_1h],
-            }
-        else:
-            # No start/end: MEXC returns the latest ~100 candles by default.
-            # 100 × Hour1 = ~4 days, enough for 14-period ATR and RSI with headroom.
-            kline_data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": KLINE_INTERVAL})
-
+        # --- Klines (exchange-agnostic) ---
+        kline_data = fetch_klines(exchange, symbol, "1h", 100)
         if not kline_data or not isinstance(kline_data, dict):
             return None
 
         df = pd.DataFrame({
-            "open":   kline_data.get("open", []),
-            "high":   kline_data.get("high", []),
-            "low":    kline_data.get("low", []),
-            "close":  kline_data.get("close", []),
-            "volume": kline_data.get("vol", []),
+            "open":   kline_data.get("open",   []),
+            "high":   kline_data.get("high",   []),
+            "low":    kline_data.get("low",    []),
+            "close":  kline_data.get("close",  []),
+            "volume": kline_data.get("volume", []),
         }).astype(float)
 
         # Need at least period+2 rows for reliable ATR/RSI (14 + 2 = 16)
@@ -1783,14 +2005,8 @@ def enrich_signal(
 
         # --- Kline depth gate ---
         # Fetch 4h candles just to measure history depth; count only, not used for indicators.
-        if exchange == "HYPERLIQUID":
-            hl_4h = fetch_hl_klines(coin, "4h", 480)
-            n4h = len(hl_4h)
-        else:
-            kline4h_data = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": "Hour4", "limit": 50})
-            n4h = 0
-            if kline4h_data and isinstance(kline4h_data, dict):
-                n4h = len(kline4h_data.get("close", []))
+        kline4h_data = fetch_klines(exchange, symbol, "4h", 50)
+        n4h = len(kline4h_data.get("close", [])) if kline4h_data else 0
 
         if n1h < 50 or n4h < 20:
             print(f"[kline gate] {symbol} skipped — 1h:{n1h} 4h:{n4h}", file=sys.stderr)
@@ -1840,6 +2056,26 @@ def enrich_signal(
 
         atr_pct_val = calc_atr_pct(df, price, period=14)
         vol_regime = volatility_regime(atr_pct_val)
+
+        # Vol-of-vol: if ATR itself is volatile, regime is unstable → lower quality
+        _vol_unstable = False
+        try:
+            _recent_atrs = atr_clean.iloc[-10:].values
+            if len(_recent_atrs) >= 10 and _recent_atrs.mean() > 0:
+                _vol_unstable = (_recent_atrs.std() / _recent_atrs.mean()) > 0.3
+        except Exception:
+            pass
+
+        # Volume spike ratio: current 1h candle vs avg of prior 23 (rolling window)
+        _vol_spike_ratio = None
+        try:
+            _vols = df["volume"].tolist()
+            if len(_vols) >= 24:
+                _avg_prior = sum(_vols[-24:-1]) / 23
+                if _avg_prior > 0:
+                    _vol_spike_ratio = _vols[-1] / _avg_prior
+        except Exception:
+            pass
 
         # Extreme vol firebreak — user-controlled gate, defaults ON.
         # Blocks all extreme-vol signals before any strategy-specific gate logic.
@@ -1921,25 +2157,14 @@ def enrich_signal(
             trend_score = 0
 
         # --- Next funding settlement ---
-        next_funding_minutes = None
-        if exchange != "HYPERLIQUID":
-            # MEXC endpoint returns nextSettleTime as Unix millisecond timestamp.
-            try:
-                fr_data = fetch_mexc(f"/contract/funding_rate/{symbol}")
-                if fr_data and isinstance(fr_data, dict):
-                    next_settle_ms = fr_data.get("nextSettleTime")
-                    if next_settle_ms:
-                        minutes_left = (int(next_settle_ms) / 1000 - time.time()) / 60
-                        next_funding_minutes = max(0, int(round(minutes_left)))
-            except Exception:
-                next_funding_minutes = None
+        try:
+            next_funding_minutes = fetch_next_funding_minutes(exchange, symbol)
+        except Exception:
+            next_funding_minutes = None
 
         # --- Orderbook imbalance ---
         imbalance = 0.5  # neutral default if depth fetch fails
-        if exchange == "HYPERLIQUID":
-            depth_data = fetch_hl_orderbook(coin)
-        else:
-            depth_data = fetch_mexc(f"/contract/depth/{symbol}")
+        depth_data = fetch_depth(exchange, symbol)
         if depth_data and isinstance(depth_data, dict):
             asks = depth_data.get("asks", [])[:10]
             bids = depth_data.get("bids", [])[:10]
@@ -1990,24 +2215,62 @@ def enrich_signal(
         # outperform baseline by +3.9 to +5.6 edge_delta at high confidence.
         # trend_score < -20  → price below ema20 below ema50  (bearish structure)
         # trend_score > +20  → price above ema20 above ema50  (bullish structure)
-        # Extreme vol is excluded — firebreak already gates those; the ×0.85
-        # multiplier below handles any that pass through.
+        #
+        # AUDIT GATE §02 regime_counter_001: the +3.9–5.6 edge_delta came
+        # from ~640 simultaneous cell comparisons with NO Bonferroni or FDR
+        # correction; ~32 spurious findings are expected at α=0.05. The
+        # tag-stratified A/B (May 2026) confirmed conviction is currently
+        # mildly anti-predictive in aggregate — so any unverified boost is
+        # likely amplifying the inversion rather than fighting it. Default
+        # OFF until a walk-forward run confirms the boost survives FDR.
+        # Re-enable with REGIME_COUNTER_ENABLED=true in .env once validated.
+        _regime_counter_enabled = (os.getenv("REGIME_COUNTER_ENABLED") or "false").strip().lower() == "true"
         _bearish_structure = trend_score < -20
         _bullish_structure = trend_score > 20
         if direction == "LONG" and _bearish_structure and vol_regime != "extreme":
-            boost = 8 if vol_regime in ("medium", "high") else 5
-            conviction += boost
-            tags.append("regime_counter_long")
+            if _regime_counter_enabled:
+                boost = 8 if vol_regime in ("medium", "high") else 5
+                conviction += boost
+                tags.append("regime_counter_long")
+            else:
+                tags.append("regime_counter_long_shadow")
         elif direction == "SHORT" and _bullish_structure and vol_regime != "extreme":
-            boost = 8 if vol_regime in ("medium", "high") else 5
-            conviction += boost
-            tags.append("regime_counter_short")
+            if _regime_counter_enabled:
+                boost = 8 if vol_regime in ("medium", "high") else 5
+                conviction += boost
+                tags.append("regime_counter_short")
+            else:
+                tags.append("regime_counter_short_shadow")
 
         # Extreme volatility: high ATR% means the signal is real but the trade
         # is more dangerous — discount conviction so it ranks below calmer setups.
         if vol_regime == "extreme":
             conviction = int(conviction * 0.85)
             tags.append("extreme_vol")
+
+        # Trend extension penalty: overextended trends = late entry, lower quality
+        # Empirical: winners avg |trend_score| 9.3 vs losers 14.1 — higher = worse
+        _abs_ts = abs(trend_score)
+        if _abs_ts > 60:
+            conviction -= 8
+            tags.append("trend_extended")
+        elif _abs_ts > 35:
+            conviction -= 4
+            tags.append("trend_extended_mild")
+
+        # Vol-of-vol penalty: unstable ATR regime = degraded signal quality
+        if _vol_unstable:
+            conviction -= 5
+            tags.append("vol_unstable")
+
+        # Volume spike conviction adjustment
+        if _vol_spike_ratio is not None:
+            if _vol_spike_ratio >= 2.0:
+                conviction += 5
+                tags.append("vol_spike")
+            elif _vol_spike_ratio <= 0.5:
+                conviction -= 5
+                tags.append("vol_low_participation")
 
         conviction = max(0, min(100, conviction))
 
@@ -2034,27 +2297,13 @@ def enrich_signal(
         daily_trend_aligned = None
         try:
             _now = time.time()
-            if exchange == "HYPERLIQUID":
-                _hl_key = f"HL:{symbol}"
-                _cached = _daily_kline_cache.get(_hl_key)
-                if _cached and (_now - _cached[0]) < _DAILY_KLINE_TTL:
-                    daily_klines = _cached[1]
-                else:
-                    hl_daily = fetch_hl_klines(coin, "1d", 720)
-                    # Convert to list-of-entry format that daily_trend_direction accepts:
-                    # [timestamp, open, close, high, low, vol] (index 3=high, 4=low)
-                    daily_klines = [[k["t"], k["o"], k["c"], k["h"], k["l"], k["v"]] for k in hl_daily] if hl_daily else None
-                    _daily_kline_cache[_hl_key] = (_now, daily_klines)
+            _cache_key = f"{exchange}:{symbol}"
+            _cached = _daily_kline_cache.get(_cache_key)
+            if _cached and (_now - _cached[0]) < _DAILY_KLINE_TTL:
+                daily_klines = _cached[1]
             else:
-                _cached = _daily_kline_cache.get(symbol)
-                if _cached and (_now - _cached[0]) < _DAILY_KLINE_TTL:
-                    daily_klines = _cached[1]
-                else:
-                    daily_klines = fetch_mexc(
-                        f"/contract/kline/{symbol}",
-                        params={"interval": "Day1", "limit": 30},
-                    )
-                    _daily_kline_cache[symbol] = (_now, daily_klines)
+                daily_klines = fetch_daily_klines_raw(exchange, symbol, limit=30)
+                _daily_kline_cache[_cache_key] = (_now, daily_klines)
             if daily_klines:
                 dt = daily_trend_direction(daily_klines)
                 daily_trend = dt
@@ -2141,6 +2390,8 @@ def enrich_signal(
             "data_quality": "low" if (n1h < 100 or n4h < 50) else "current",
             # BTC/ETH macro context at signal generation time (from latest snapshot)
             "btc_context": get_latest_market_context(),
+            # Signal quality factors — stored for analyze.py research
+            "vol_spike_ratio": round(_vol_spike_ratio, 3) if _vol_spike_ratio is not None else None,
         }
         cg_context = get_symbol_derivatives_context(symbol)
         if cg_context.get("coinglass_available"):
@@ -2277,7 +2528,8 @@ def enrich_signal(
                 print(f"[agents] {symbol}: {_ae}", file=sys.stderr)
 
         if _agent_output:
-            # Phase 2 live mode: apply delta + real tags
+            # Phase 2 live mode: apply delta + real tags.
+            # Risk Manager hard blocks remain authoritative (deterministic).
             if _agent_output.hard_blocked:
                 sig["tags"] = list(dict.fromkeys(
                     sig["tags"] + ["agent_blocked"] + _agent_output.block_reasons
@@ -2288,7 +2540,11 @@ def enrich_signal(
                     for t in _agent_output.tags
                 ]
                 sig["tags"] = list(dict.fromkeys(sig["tags"] + agent_tags))
-                if _agent_output.shadow_delta:
+                # Only apply the shadow_delta when the LLM pipeline actually
+                # produced parseable analyst output. Otherwise the delta is
+                # the all-neutral fallback (numerically 0) and tagging it as
+                # a real assessment biases the system. Audit §02 fix.
+                if _agent_output.shadow_delta and not _agent_output.llm_unavailable:
                     sig["conviction"] = max(0, min(100, sig["conviction"] + _agent_output.shadow_delta))
 
         sig.update({
@@ -2312,6 +2568,18 @@ def enrich_signal(
             "agent_shadow_disagreement": (
                 _agent_output.shadow_disagreement_score if _agent_output else None
             ),
+            # New: surface LLM availability so downstream consumers (Intelligence
+            # tab, /api/agents/status, factor engine, analyze.py) can filter or
+            # caveat agent-derived rows. None when the whole pipeline didn't run.
+            "agent_llm_unavailable": (
+                _agent_output.llm_unavailable if _agent_output else None
+            ),
+            "agent_llm_ok_count": (
+                _agent_output.llm_ok_count if _agent_output else None
+            ),
+            "agent_llm_analyst_total": (
+                _agent_output.llm_analyst_total if _agent_output else None
+            ),
         })
 
         sig["signal_why"] = why_signal(sig)
@@ -2324,6 +2592,34 @@ def enrich_signal(
         # Sentiment enrichment — no API key needed; per-field failures are
         # swallowed inside fetch_market_sentiment() so this never crashes a scan.
         sig.update(fetch_market_sentiment(symbol, price))
+
+        # L/S ratio contrarian extremes: extreme crowding on one side = warning
+        # for that side (BIS carry paper + practitioner consensus).
+        # Only applies to SENTIMENT_PAIRS — altcoins return None here.
+        _okx_ls = sig.get("okx_ls_long_pct")
+        if _okx_ls is not None:
+            if _okx_ls > 65 and sig["direction"] == "LONG":
+                sig["conviction"] = max(0, sig["conviction"] - 5)
+                sig["tags"] = list(dict.fromkeys(sig["tags"] + ["ls_crowd_long"]))
+            elif _okx_ls < 35 and sig["direction"] == "SHORT":
+                sig["conviction"] = max(0, sig["conviction"] - 5)
+                sig["tags"] = list(dict.fromkeys(sig["tags"] + ["ls_crowd_short"]))
+            sig["conviction"] = max(0, min(100, sig["conviction"]))
+
+        # --- Order flow (MEXC only; data collection for researcher — no conviction impact) ---
+        flow_score     = None
+        flow_confirmed = None
+        if exchange != "HYPERLIQUID":
+            try:
+                _flow = _flow_confirm(symbol, direction, price)
+                flow_score     = _flow.get("score")
+                flow_confirmed = _flow.get("confirmed")
+                if flow_confirmed:
+                    sig["tags"] = list(dict.fromkeys(sig["tags"] + ["flow_confirmed"]))
+            except Exception:
+                pass
+        sig["flow_score"]     = flow_score
+        sig["flow_confirmed"] = flow_confirmed
 
         sig.pop("_scan_rank", None)
         return sig
@@ -2340,14 +2636,15 @@ def run_scan(
     threshold: int = CONVICTION_THRESHOLD,
     strategy_key: str = "balanced",
     tickers: list | None = None,
+    exchange: str = "MEXC",
 ) -> tuple[list[dict], int]:
     """
-    Two-stage scan across all MEXC perpetual tickers.
+    Two-stage scan across tickers from any supported exchange.
 
-    Stage 1: Fetch all 800+ tickers (or use pre-fetched `tickers`), score each
-             with score_ticker() using the active strategy's weights and
-             stage-1 filters. Discard anything with conviction_base < 20, take
-             the top ENRICH_TOP_N.
+    Stage 1: Fetch all tickers (or use pre-fetched `tickers`), normalize to
+             canonical format, score each with score_ticker() using the active
+             strategy's weights and stage-1 filters. Discard conviction_base < 20,
+             take the top ENRICH_TOP_N.
     Stage 2: Enrich the top N concurrently — fetches klines + depth per symbol,
              runs indicators, applies stage-2 strategy filters, builds ladders.
 
@@ -2362,7 +2659,10 @@ def run_scan(
     """
     if tickers is None:
         expire_stale_signals()
-        tickers = fetch_mexc("/contract/ticker")
+        if exchange == "MEXC":
+            tickers = fetch_mexc("/contract/ticker")
+        else:
+            tickers = _fetch_exchange_tickers(exchange)
         if not tickers or not isinstance(tickers, list):
             return [], 0
 
@@ -2387,10 +2687,13 @@ def run_scan(
     sym_overrides = _get_symbol_overrides()
     print(f'[sym_penalty] loaded {len(sym_perf_cache)} records, {len(sym_overrides)} overrides', file=sys.stderr)
 
-    # Stage 1 — strategy weights + stage-1 filters applied inside score_ticker
+    # Stage 1 — normalize to canonical format, then score
     base_signals: list[dict] = []
     for t in tickers:
-        scored = score_ticker(t, strategy=strat, coinglass_snapshot=coinglass_snapshot,
+        canonical = normalize_ticker_for_scoring(t, exchange)
+        if not canonical:
+            continue
+        scored = score_ticker(canonical, strategy=strat, coinglass_snapshot=coinglass_snapshot,
                               sym_perf_cache=sym_perf_cache, sym_overrides=sym_overrides)
         if scored and scored["conviction_base"] >= 20:
             base_signals.append(scored)
@@ -2529,7 +2832,7 @@ def api_hl_scan():
         results: dict = {}
 
         for key in registry:
-            sigs, _ = run_scan(strategy_key=key, tickers=tickers)
+            sigs, _ = run_scan(strategy_key=key, tickers=tickers, exchange="HYPERLIQUID")
             log_signals(sigs)
             results[key] = {
                 "signals":     sigs,
@@ -2548,27 +2851,196 @@ def api_hl_scan():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/bybit/scan", methods=["POST"])
+def api_bybit_scan():
+    """Fetch Bybit tickers once, score and enrich for every enabled strategy.
+    Same shape as /api/scan/all. Bybit is geo-restricted; only works from VPS."""
+    try:
+        t0 = time.time()
+        expire_stale_signals()
+
+        raw_tickers = _fetch_exchange_tickers("BYBIT")
+        if not raw_tickers:
+            return jsonify({"success": False, "error": "Bybit ticker feed unavailable"}), 502
+
+        # normalize_ticker_for_scoring expects raw exchange format; run_scan handles it
+        total_pairs = len(raw_tickers)
+        registry = get_strategy_registry()
+        results: dict = {}
+
+        for key in registry:
+            sigs, _ = run_scan(strategy_key=key, tickers=raw_tickers, exchange="BYBIT")
+            log_signals(sigs)
+            results[key] = {
+                "signals":     sigs,
+                "total_pairs": total_pairs,
+                "strategy":    key,
+            }
+
+        scan_time = round(time.time() - t0, 2)
+        return jsonify({
+            "success":     True,
+            "results":     results,
+            "total_pairs": total_pairs,
+            "scan_time":   scan_time,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Exchange configuration
+# ---------------------------------------------------------------------------
+
+EXCHANGE_CONFIG_PATH = "data/exchange_config.json"
+_DEFAULT_EXCHANGE_CONFIG = {"enabled": ["MEXC", "HYPERLIQUID"]}
+
+
+def _load_exchange_config() -> dict:
+    try:
+        with open(EXCHANGE_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        # Validate enabled list — only keep known exchanges
+        known = set(SUPPORTED_EXCHANGES.keys())
+        cfg["enabled"] = [e for e in cfg.get("enabled", []) if e in known]
+        if not cfg["enabled"]:
+            cfg["enabled"] = list(_DEFAULT_EXCHANGE_CONFIG["enabled"])
+        return cfg
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(_DEFAULT_EXCHANGE_CONFIG)
+
+
+def _save_exchange_config(cfg: dict) -> None:
+    os.makedirs("data", exist_ok=True)
+    with open(EXCHANGE_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+@app.route("/api/exchanges")
+def api_exchanges():
+    """Return SUPPORTED_EXCHANGES registry + current enable/disable config."""
+    cfg = _load_exchange_config()
+    enabled_set = set(cfg["enabled"])
+    exchanges = []
+    for key, meta in SUPPORTED_EXCHANGES.items():
+        exchanges.append({
+            "key":       key,
+            "name":      meta["name"],
+            "enabled":   key in enabled_set,
+            "quote":     meta.get("quote", "USDT"),
+            "geo_free":  meta.get("geo_free", True),
+            "funding_interval_h": meta.get("funding_interval_h", 8),
+        })
+    return jsonify({"success": True, "exchanges": exchanges, "enabled": cfg["enabled"]})
+
+
+@app.route("/api/exchanges/config", methods=["PATCH"])
+def api_exchanges_config():
+    """Toggle an exchange on/off. Body: {"exchange": "BYBIT", "enabled": true}"""
+    try:
+        body = request.get_json(force=True) or {}
+        exch = str(body.get("exchange", "")).upper()
+        if exch not in SUPPORTED_EXCHANGES:
+            return jsonify({"success": False, "error": f"Unknown exchange: {exch}"}), 400
+        enable = bool(body.get("enabled", True))
+        cfg = _load_exchange_config()
+        enabled = list(cfg.get("enabled", []))
+        if enable and exch not in enabled:
+            enabled.append(exch)
+        elif not enable and exch in enabled:
+            enabled.remove(exch)
+            if not enabled:
+                return jsonify({"success": False, "error": "Cannot disable all exchanges"}), 400
+        cfg["enabled"] = enabled
+        _save_exchange_config(cfg)
+        return jsonify({"success": True, "enabled": enabled})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/scan/multi", methods=["POST"])
+def api_scan_multi():
+    """Scan all enabled exchanges simultaneously using parallel threads.
+    Returns {exchange_key: {results, total_pairs, scan_time}} per exchange."""
+    try:
+        t0 = time.time()
+        expire_stale_signals()
+
+        cfg = _load_exchange_config()
+        enabled = cfg.get("enabled", ["MEXC"])
+
+        def _scan_exchange(exch: str) -> tuple[str, dict]:
+            try:
+                if exch == "MEXC":
+                    raw = fetch_mexc("/contract/ticker")
+                elif exch == "HYPERLIQUID":
+                    universe, asset_ctxs = fetch_hl_meta_and_ctxs()
+                    raw = normalize_hl_tickers(universe, asset_ctxs)
+                else:
+                    raw = _fetch_exchange_tickers(exch)
+
+                if not raw:
+                    return exch, {"error": f"{exch} ticker feed unavailable", "results": {}}
+
+                total_pairs = len(raw)
+                registry = get_strategy_registry()
+                results: dict = {}
+                for key in registry:
+                    sigs, _ = run_scan(strategy_key=key, tickers=raw, exchange=exch)
+                    log_signals(sigs)
+                    results[key] = {
+                        "signals":     sigs,
+                        "total_pairs": total_pairs,
+                        "strategy":    key,
+                    }
+                return exch, {"results": results, "total_pairs": total_pairs}
+            except Exception as exc:
+                return exch, {"error": str(exc), "results": {}}
+
+        per_exchange: dict = {}
+        with ThreadPoolExecutor(max_workers=len(enabled)) as pool:
+            for exch, data in pool.map(_scan_exchange, enabled):
+                per_exchange[exch] = data
+
+        scan_time = round(time.time() - t0, 2)
+        return jsonify({
+            "success":      True,
+            "per_exchange": per_exchange,
+            "enabled":      enabled,
+            "scan_time":    scan_time,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/market")
 def api_market():
     try:
         exchange = request.args.get("exchange", "mexc").strip().lower()
         if exchange == "hyperliquid":
             universe, asset_ctxs = fetch_hl_meta_and_ctxs()
-            tickers = normalize_hl_tickers(universe, asset_ctxs)
-            exchange_label = "HYPERLIQUID"
+            raw_tickers = normalize_hl_tickers(universe, asset_ctxs)
+            exchange_key = "HYPERLIQUID"
             unavailable = "Hyperliquid unavailable"
+        elif exchange == "bybit":
+            raw_tickers = _fetch_exchange_tickers("BYBIT")
+            exchange_key = "BYBIT"
+            unavailable = "Bybit unavailable"
         else:
-            tickers = fetch_mexc("/contract/ticker")
-            exchange_label = "MEXC"
+            raw_tickers = fetch_mexc("/contract/ticker")
+            exchange_key = "MEXC"
             unavailable = "MEXC unavailable"
 
-        if not tickers or not isinstance(tickers, list):
+        if not raw_tickers or not isinstance(raw_tickers, list):
             return jsonify({"success": False, "error": unavailable}), 502
 
         coinglass_snapshot = get_coin_market_snapshot()
         pairs = []
-        for t in tickers:
-            scored = score_ticker(t, coinglass_snapshot=coinglass_snapshot)
+        for t in raw_tickers:
+            canonical = normalize_ticker_for_scoring(t, exchange_key)
+            if not canonical:
+                continue
+            scored = score_ticker(canonical, coinglass_snapshot=coinglass_snapshot)
             if scored:
                 pairs.append(scored)
 
@@ -2577,7 +3049,7 @@ def api_market():
             "success": True,
             "pairs": pairs,
             "count": len(pairs),
-            "exchange": exchange_label,
+            "exchange": exchange_key,
             "coinglass_enabled": coinglass_enabled(),
             "coinglass_pairs": len(coinglass_snapshot),
         })
@@ -2596,17 +3068,26 @@ def api_market_summary():
 
         if exchange_param == "hyperliquid":
             universe, asset_ctxs = fetch_hl_meta_and_ctxs()
-            tickers = normalize_hl_tickers(universe, asset_ctxs)
+            raw_tickers = normalize_hl_tickers(universe, asset_ctxs)
             exchange_label = "HYPERLIQUID"
+        elif exchange_param == "bybit":
+            raw_tickers = _fetch_exchange_tickers("BYBIT")
+            exchange_label = "BYBIT"
         else:
-            tickers = fetch_mexc("/contract/ticker")
+            raw_tickers = fetch_mexc("/contract/ticker")
             exchange_label = "MEXC"
 
-        if not tickers or not isinstance(tickers, list):
+        if not raw_tickers or not isinstance(raw_tickers, list):
             return jsonify({"success": False, "error": "no ticker data"}), 502
 
         coinglass_snapshot = get_coin_market_snapshot()
-        scored = [s for t in tickers if (s := score_ticker(t, coinglass_snapshot=coinglass_snapshot))]
+        scored = []
+        for t in raw_tickers:
+            canonical = normalize_ticker_for_scoring(t, exchange_label)
+            if canonical:
+                s = score_ticker(canonical, coinglass_snapshot=coinglass_snapshot)
+                if s:
+                    scored.append(s)
 
         # 7-day avg volume from snapshots for spike detection
         vol_avgs: dict[str, float] = {}
@@ -2695,21 +3176,39 @@ def api_signal(symbol: str):
         strat = registry.get(strategy_key, registry["balanced"])
 
         if exchange == "hyperliquid":
-            universe, asset_ctxs = fetch_hl_meta_and_ctxs()
-            tickers = normalize_hl_tickers(universe, asset_ctxs)
+            raw_tickers = normalize_hl_tickers(*fetch_hl_meta_and_ctxs())
+            exchange_key = "HYPERLIQUID"
             unavailable = "Hyperliquid unavailable"
+        elif exchange == "bybit":
+            raw_tickers = _fetch_exchange_tickers("BYBIT")
+            exchange_key = "BYBIT"
+            unavailable = "Bybit unavailable"
         else:
-            tickers = fetch_mexc("/contract/ticker")
+            raw_tickers = fetch_mexc("/contract/ticker")
+            exchange_key = "MEXC"
             unavailable = "MEXC unavailable"
-        if not tickers:
+        if not raw_tickers:
             return jsonify({"success": False, "error": unavailable}), 502
 
         requested_symbol = symbol.upper()
-        ticker = next(
-            (t for t in tickers if str(t.get("symbol", "")).upper() == requested_symbol), None
-        )
-        if not ticker:
+        # For Bybit, canonical symbols have underscore ("BTC_USDT") but raw tickers
+        # use no separator ("BTCUSDT"). Normalize each raw ticker on the fly to match.
+        def _sym_matches(raw_t: dict) -> bool:
+            raw_sym = str(raw_t.get("symbol", "")).upper()
+            if raw_sym == requested_symbol:
+                return True
+            if exchange_key == "BYBIT":
+                from lib.bybit_client import normalize_bybit_symbol
+                return normalize_bybit_symbol(raw_sym).upper() == requested_symbol
+            return False
+
+        raw_ticker = next((t for t in raw_tickers if _sym_matches(t)), None)
+        if not raw_ticker:
             return jsonify({"success": False, "error": f"Symbol {symbol!r} not found"}), 404
+
+        ticker = normalize_ticker_for_scoring(raw_ticker, exchange_key)
+        if not ticker:
+            return jsonify({"success": False, "error": f"Could not normalize {symbol!r}"}), 404
 
         coinglass_snapshot = get_coin_market_snapshot()
         base = score_ticker(ticker, strategy=strat, coinglass_snapshot=coinglass_snapshot)
@@ -3468,6 +3967,8 @@ def _fetch_klines_for_signal(
             })
             for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+            # HL returns timestamps in milliseconds — normalize to seconds
+            df["timestamp"] = (pd.to_numeric(df["timestamp"], errors="coerce") // 1000).astype("Int64")
             df = df.sort_values("timestamp").tail(limit).reset_index(drop=True)
             print(f"[hl_klines] {symbol} fetched {len(df)} {hl_interval} candles", file=sys.stderr)
             return df
@@ -3502,9 +4003,17 @@ def _fetch_klines_for_signal(
             return pd.DataFrame()
 
 
-def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str | None] | None:
+def evaluate_outcome(
+    sig: dict,
+    interval: str = "Min15",
+    kline_limit: int = 336,
+) -> tuple[str, str, float | None, str | None, str | None] | None:
     """
-    Fetch Min15 klines since the signal was logged and determine if stop or TP was hit.
+    Fetch klines since the signal was logged and determine if stop or TP was hit.
+
+    interval / kline_limit: callers can override. The main signal evaluator uses
+    Min15 / 336 (84 hours). The paper bot uses Min1 / 1440 (24 hours) so that
+    1-minute wicks trigger stops and TPs just as they would in live trading.
 
     Returns (result, note, exit_price, result_at, entry_at) or None if no level
     was hit yet / insufficient data.
@@ -3527,7 +4036,7 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
     tp2       = sig.get("tp2")
     tp3       = sig.get("tp3")
 
-    if not symbol or not direction or not entry1 or not stop_loss or not tp1:
+    if not symbol or not direction or not entry1 or not stop_loss:
         return None
 
     try:
@@ -3538,15 +4047,16 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
     except Exception:
         return None
 
-    # Need at least one full 15-minute candle after the signal
-    if time.time() - start_ts < 900:
+    # Need at least one full candle after the signal
+    candle_seconds = {"Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800}.get(interval, 900)
+    if time.time() - start_ts < candle_seconds:
         return None
 
     klines = _fetch_klines_for_signal(
         sig,
-        interval="Min15",
+        interval=interval,
         start_ts=start_ts,
-        limit=300,   # 300 × 15min = ~75 hours of coverage
+        limit=kline_limit,
     )
     if klines.empty:
         return None
@@ -3576,7 +4086,11 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
         except Exception:
             pass
 
-    # Build candle list — only candles that opened at or after scan_start_ts
+    raw_opens = klines["open"].tolist() if "open" in klines.columns else []
+
+    # Build candle list — only candles that opened at or after scan_start_ts.
+    # `open` is included so the in-candle TP/stop tie-break heuristic below
+    # can use intra-candle direction. Audit §04 fix candle_ordering_001.
     candles: list[dict] = []
     for i, t in enumerate(raw_times):
         try:
@@ -3584,6 +4098,7 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
             if candle_ts >= scan_start_ts:
                 candles.append({
                     "time":  candle_ts,
+                    "open":  float(raw_opens[i]) if i < len(raw_opens) else float(raw_closes[i]),
                     "high":  float(raw_highs[i]),
                     "low":   float(raw_lows[i]),
                     "close": float(raw_closes[i]),
@@ -3604,6 +4119,7 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
 
     for c in candles:
         h, l, ts = c["high"], c["low"], c["time"]
+        o, cl = c.get("open", c["close"]), c["close"]
 
         if not entry_hit:
             if direction == "LONG":
@@ -3618,7 +4134,43 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
                 0.0, 100.0, f"Entry 1 touched at {entry1}"
             )
 
+        # In-candle TP/stop tie-break heuristic (audit §04 candle_ordering_001).
+        # When a single 15m candle touches both a TP level and the stop, the
+        # prior implementation evaluated stop first and broke immediately,
+        # recording LOSS even if the TP was likely hit first. We can't know
+        # the intra-candle tick sequence, but candle open→close direction is
+        # a reasonable proxy:
+        #   LONG  bullish candle (close > open)  → TP probably hit first  → escalate best_tp BEFORE recording stop
+        #   LONG  bearish candle (close <= open) → stop probably hit first → LOSS as before
+        #   SHORT bearish candle (close < open)  → TP probably hit first
+        #   SHORT bullish candle (close >= open) → stop probably hit first → LOSS as before
+        # This converts a subset of LOSS rows into PARTIAL (TP1 then stop).
+        # Not perfect — only tick data is — but better than "stop always wins".
         if direction == "LONG":
+            _both_touched = (l <= stop_loss) and (
+                (tp1 and h >= tp1) or (tp2 and h >= tp2) or (tp3 and h >= tp3)
+            )
+            _bullish_candle = cl > o
+            if _both_touched and _bullish_candle:
+                # TP likely hit first — escalate best_tp BEFORE we process the stop
+                prev_tp = best_tp
+                if tp3 and h >= tp3:
+                    best_tp = max(best_tp, 3)
+                elif tp2 and h >= tp2:
+                    best_tp = max(best_tp, 2)
+                elif tp1 and h >= tp1:
+                    best_tp = max(best_tp, 1)
+                if best_tp > prev_tp:
+                    exit_price = tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
+                    result_at = _iso(ts)
+                    for tier in range(prev_tp + 1, best_tp + 1):
+                        tier_price = tp3 if tier == 3 else tp2 if tier == 2 else tp1
+                        log_position_event(
+                            sig, f"TP{tier}_HIT", result_at, tier_price,
+                            _leveraged_level_pnl(sig, tier_price, 1 / 3),
+                            max(0.0, (3 - tier) / 3 * 100),
+                            f"TP{tier} touched at {tier_price} (in-candle heuristic)",
+                        )
             if l <= stop_loss:
                 stop_hit   = True
                 stop_size = 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)
@@ -3654,6 +4206,32 @@ def evaluate_outcome(sig: dict) -> tuple[str, str, float | None, str | None, str
                 if best_tp == 3:
                     break
         else:  # SHORT
+            # Mirror heuristic for SHORT: bearish candle (close < open) means
+            # the move down dominated, so a TP touch likely happened before
+            # the stop touch in the same candle.
+            _short_both_touched = (h >= stop_loss) and (
+                (tp1 and l <= tp1) or (tp2 and l <= tp2) or (tp3 and l <= tp3)
+            )
+            _bearish_candle = cl < o
+            if _short_both_touched and _bearish_candle:
+                prev_tp = best_tp
+                if tp3 and l <= tp3:
+                    best_tp = max(best_tp, 3)
+                elif tp2 and l <= tp2:
+                    best_tp = max(best_tp, 2)
+                elif tp1 and l <= tp1:
+                    best_tp = max(best_tp, 1)
+                if best_tp > prev_tp:
+                    exit_price = tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
+                    result_at = _iso(ts)
+                    for tier in range(prev_tp + 1, best_tp + 1):
+                        tier_price = tp3 if tier == 3 else tp2 if tier == 2 else tp1
+                        log_position_event(
+                            sig, f"TP{tier}_HIT", result_at, tier_price,
+                            _leveraged_level_pnl(sig, tier_price, 1 / 3),
+                            max(0.0, (3 - tier) / 3 * 100),
+                            f"TP{tier} touched at {tier_price} (in-candle heuristic)",
+                        )
             if h >= stop_loss:
                 stop_hit   = True
                 stop_size = 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)
@@ -5940,6 +6518,44 @@ def api_execution_place():
         return jsonify({"success": False, "error": "Live trading is disabled. Set LIVE_TRADING_ENABLED=true in .env to enable."}), 403
     if not HL_PRIVATE_KEY or not HL_WALLET_ADDRESS:
         return jsonify({"success": False, "error": "HL_PRIVATE_KEY and HL_WALLET_ADDRESS must be set in .env"}), 400
+
+    # AUDIT FIX §07 kill_switch_cooldown_001: after the kill switch fires,
+    # refuse new orders for KILL_SWITCH_COOLDOWN_S seconds. The user (or an
+    # external actor) hitting kill_switch then immediately POSTing /place
+    # would otherwise undo the safety action they just took.
+    _now = time.time()
+    if _KILL_SWITCH_LAST_FIRED_TS and (_now - _KILL_SWITCH_LAST_FIRED_TS) < _KILL_SWITCH_COOLDOWN_S:
+        remaining = int(_KILL_SWITCH_COOLDOWN_S - (_now - _KILL_SWITCH_LAST_FIRED_TS))
+        return jsonify({
+            "success": False,
+            "error": f"Kill switch fired {int(_now - _KILL_SWITCH_LAST_FIRED_TS)}s ago — "
+                     f"new orders refused for another {remaining}s",
+        }), 423  # 423 = Locked
+
+    # AUDIT FIX §07 max_daily_loss_hard_gate: MAX_DAILY_LOSS_USDT was
+    # previously a warning shown in the readiness verdict, not a hard
+    # block on /api/execution/place. The dashboard told the user "you've
+    # hit your daily loss limit" but nothing prevented the next order.
+    # Now: if MAX_DAILY_LOSS_USDT is set and today's realized loss exceeds
+    # it, refuse execution outright.
+    if MAX_DAILY_LOSS_USDT > 0:
+        try:
+            daily = compute_daily_pnl(DB_PATH)
+            today_loss_usdt = float(daily.get("total_pnl_usdt") or 0.0)
+            if today_loss_usdt < 0 and abs(today_loss_usdt) >= MAX_DAILY_LOSS_USDT:
+                return jsonify({
+                    "success": False,
+                    "error": f"daily loss ${abs(today_loss_usdt):.2f} ≥ "
+                             f"MAX_DAILY_LOSS_USDT ${MAX_DAILY_LOSS_USDT:.2f} — refusing execution",
+                }), 403
+        except Exception as e:
+            # Fail closed: if we can't compute today's P&L we can't enforce
+            # the gate, so we refuse rather than skip silently.
+            return jsonify({
+                "success": False,
+                "error": f"daily-P&L lookup failed — refusing execution: {e}",
+            }), 500
+
     try:
         from lib.hl_execution import place_limit_order
         body      = request.get_json(force=True) or {}
@@ -5952,22 +6568,62 @@ def api_execution_place():
         if not coin or size <= 0 or limit_px <= 0:
             return jsonify({"success": False, "error": "coin, size, and limit_px are required"}), 400
 
-        # Signal age gate — never execute on a stale signal
+        # Signal age gate — never execute on a stale signal.
+        # AUDIT FIX §07 sig_age_bypass: the prior `except Exception: pass` here
+        # let any timestamp parse error (e.g. a value with a timezone suffix
+        # triggering TypeError on naive utcnow() subtraction) silently bypass
+        # the 5-minute staleness check. Now we fail closed: every failure
+        # path returns a 400 and refuses execution.
         if signal_id:
+            con = None
             try:
                 con = sqlite3.connect(DB_PATH)
-                row = con.execute("SELECT entry_at, logged_at FROM signals WHERE id=?", (signal_id,)).fetchone()
-                con.close()
-                if row:
-                    ts_str = row[0] or row[1]
-                    if ts_str:
-                        ts = datetime.fromisoformat(ts_str)
-                        age_min = (datetime.utcnow() - ts).total_seconds() / 60
-                        if age_min > 5:
-                            return jsonify({"success": False,
-                                "error": f"Signal is {age_min:.0f}m old — must be < 5 minutes to execute"}), 400
-            except Exception:
-                pass
+                row = con.execute(
+                    "SELECT entry_at, logged_at FROM signals WHERE id=?",
+                    (signal_id,),
+                ).fetchone()
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "error": f"signal lookup failed — refusing execution: {e}",
+                }), 400
+            finally:
+                if con is not None:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+
+            if not row:
+                return jsonify({
+                    "success": False,
+                    "error": "signal_id not found — refusing execution",
+                }), 400
+            ts_str = row[0] or row[1]
+            if not ts_str:
+                return jsonify({
+                    "success": False,
+                    "error": "signal has no entry_at or logged_at timestamp — refusing execution",
+                }), 400
+            try:
+                # Strip any trailing 'Z' (UTC marker) and ensure naive UTC.
+                # CLAUDE.md rule: all timestamps are UTC ISO without Z; we
+                # tolerate Z just in case but never use a TZ-aware dt against
+                # the naive utcnow() that produces the comparison.
+                ts = datetime.fromisoformat(ts_str.replace("Z", ""))
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "error": f"could not parse signal timestamp {ts_str!r}: {e}",
+                }), 400
+            age_min = (datetime.utcnow() - ts).total_seconds() / 60
+            if age_min > 5:
+                return jsonify({
+                    "success": False,
+                    "error": f"Signal is {age_min:.0f}m old — must be < 5 minutes to execute",
+                }), 400
 
         result = place_limit_order(
             coin=coin, is_buy=is_buy, size=size,
@@ -5983,11 +6639,20 @@ def api_execution_kill_switch():
     """
     Emergency kill switch — cancel all open orders and close all positions.
     Available regardless of LIVE_TRADING_ENABLED. Requires keys in .env.
+
+    Audit §07 fix: sets _KILL_SWITCH_LAST_FIRED_TS so /api/execution/place
+    refuses new orders for the next KILL_SWITCH_COOLDOWN_S seconds. Without
+    this, an attacker (or panicking user) hitting kill-switch then immediately
+    /place would undo the safety action.
     """
     if not HL_PRIVATE_KEY or not HL_WALLET_ADDRESS:
         return jsonify({"success": False, "error": "HL_PRIVATE_KEY and HL_WALLET_ADDRESS not configured"}), 400
     try:
         from lib.hl_execution import kill_switch
+        # Set the cooldown BEFORE invoking — if the underlying call partially
+        # succeeds and then raises, we still want the cooldown active.
+        global _KILL_SWITCH_LAST_FIRED_TS
+        _KILL_SWITCH_LAST_FIRED_TS = time.time()
         result = kill_switch(HL_WALLET_ADDRESS.strip(), HL_PRIVATE_KEY.strip())
         return jsonify(result)
     except Exception as e:
@@ -6032,6 +6697,528 @@ def api_ai_settings_patch():
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Paper bot — config, exit checker, scan loop
+# ---------------------------------------------------------------------------
+
+def _load_paper_config() -> dict:
+    try:
+        if os.path.exists(PAPER_CONFIG_PATH):
+            with open(PAPER_CONFIG_PATH, encoding="utf-8") as f:
+                cfg = json.load(f)
+                return {**_PAPER_CONFIG_DEFAULT, **cfg}
+    except Exception:
+        pass
+    return dict(_PAPER_CONFIG_DEFAULT)
+
+
+def _save_paper_config(cfg: dict) -> None:
+    os.makedirs("data", exist_ok=True)
+    with open(PAPER_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _paper_check_exits() -> int:
+    """
+    Check all open paper trades against Min15 klines and close those that
+    have hit a TP or stop level. Returns number of trades closed.
+    Reuses evaluate_outcome() by mapping paper trade columns to the expected dict shape.
+    """
+    closed = 0
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM paper_trades WHERE status='open' ORDER BY opened_at ASC"
+        ).fetchall()
+        con.close()
+
+        for row in rows:
+            pt = dict(row)
+            # Build a signals-compatible dict for evaluate_outcome
+            fake_sig = {
+                "symbol":    pt["symbol"],
+                "direction": pt["direction"],
+                "logged_at": pt["opened_at"],
+                "entry_at":  pt["opened_at"],   # already entered
+                "entry1":    pt["entry_px"],
+                "entry2":    pt["entry_px"],
+                "entry3":    pt["entry_px"],
+                "tp1":       pt["tp1"],
+                "tp2":       pt["tp2"],
+                "tp3":       pt["tp3"],
+                "stop_loss": pt["stop_loss"],
+                "exchange":  "MEXC",
+            }
+            # Min1 klines: catch 1-minute wicks hitting stop/TP, matching live
+            # trading behaviour where stop orders execute on any price touch.
+            # 1440 candles = 24 hours; sufficient since the loop runs every 60s
+            # and the paper bot doesn't hold positions beyond a day by design.
+            outcome = evaluate_outcome(fake_sig, interval="Min1", kline_limit=1440)
+            if outcome is None:
+                continue  # no level hit yet — position stays open
+
+            result, note, exit_px, result_at, _ = outcome
+            # Paper trades only close WIN/LOSS/PARTIAL — never EXPIRED or SKIPPED
+            if result not in {"WIN", "LOSS", "PARTIAL"}:
+                continue
+            leverage = pt.get("leverage") or 1.0
+            if exit_px and pt["entry_px"] and pt["entry_px"] != 0:
+                raw_pnl = (
+                    (exit_px - pt["entry_px"]) / pt["entry_px"] * 100
+                    if pt["direction"] == "LONG"
+                    else (pt["entry_px"] - exit_px) / pt["entry_px"] * 100
+                )
+                pnl_pct = round(raw_pnl * leverage, 2)
+            else:
+                pnl_pct = None
+
+            closed_at = result_at or datetime.utcnow().isoformat()
+            con = sqlite3.connect(DB_PATH)
+            con.execute(
+                """UPDATE paper_trades
+                   SET status='closed', closed_at=?, exit_px=?, result=?, pnl_pct=?, note=?
+                   WHERE id=?""",
+                (closed_at, exit_px, result, pnl_pct, note, pt["id"]),
+            )
+            if pt.get("signal_id"):
+                con.execute(
+                    """UPDATE signals
+                       SET result=?, exit_price=?, result_at=?, pnl_pct=?
+                       WHERE id=? AND result IS NULL""",
+                    (result, exit_px, closed_at, pnl_pct, pt["signal_id"]),
+                )
+            con.commit()
+            con.close()
+            closed += 1
+            print(
+                f"[paper_bot] closed {pt['symbol']} {pt['direction']} → {result} "
+                f"pnl={pnl_pct}% exit={exit_px}",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(f"[paper_bot] _paper_check_exits error: {e}", file=sys.stderr)
+    return closed
+
+
+def _paper_bot_scan(cfg: dict) -> dict:
+    """
+    Run one scan cycle for the paper bot across all enabled strategies.
+    Fetches tickers once, runs each enabled strategy, deduplicates by symbol
+    (highest conviction wins), then checks flow and enters paper positions.
+    Returns a summary dict.
+    """
+    entered = 0
+    rejected = 0
+    skipped = 0
+
+    try:
+        disabled_strategies  = cfg.get("disabled_strategies") or []
+        min_conviction       = int(cfg.get("min_conviction", 55))
+        size_usd             = float(cfg.get("size_usd", 100))
+        flow_required        = cfg.get("flow_required", True)
+        min_flow_score       = float(cfg.get("min_flow_score", 50.0))
+        max_open             = int(cfg.get("max_open_positions", 5))
+        max_atr_pct          = float(cfg.get("max_atr_pct", 4.0))
+        max_trend_score_abs  = int(cfg.get("max_trend_score_abs", 25))
+
+        # Count current open positions
+        con = sqlite3.connect(DB_PATH)
+        open_count = con.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE status='open'"
+        ).fetchone()[0]
+        open_symbols = {
+            r[0] for r in con.execute(
+                "SELECT symbol FROM paper_trades WHERE status='open'"
+            ).fetchall()
+        }
+        con.close()
+
+        if open_count >= max_open:
+            print(f"[paper_bot] at max open positions ({max_open}), skipping scan", file=sys.stderr)
+            return {"entered": 0, "rejected": 0, "skipped": 0, "reason": "max_positions"}
+
+        tickers = fetch_mexc("/contract/ticker")
+        if not tickers:
+            return {"entered": 0, "rejected": 0, "skipped": 0, "reason": "no_tickers"}
+
+        # Run all enabled strategies, dedup by symbol keeping highest conviction
+        registry = get_strategy_registry()
+        best: dict[str, dict] = {}  # symbol → best signal across all strategies
+        for key in registry:
+            if key in disabled_strategies:
+                continue
+            sigs, _ = run_scan(threshold=min_conviction, strategy_key=key, tickers=tickers)
+            for sig in sigs:
+                sym = sig["symbol"]
+                conv = sig.get("conviction", sig.get("conviction_base", 0))
+                if sym not in best or conv > best[sym].get("conviction", best[sym].get("conviction_base", 0)):
+                    sig["_strategy_key"] = key
+                    best[sym] = sig
+
+        # Sort by conviction descending
+        signals = sorted(best.values(), key=lambda s: s.get("conviction", s.get("conviction_base", 0)), reverse=True)
+
+        now = datetime.utcnow().isoformat()
+
+        for sig in signals:
+            if open_count >= max_open:
+                break
+            if sig.get("conviction", sig.get("conviction_base", 0)) < min_conviction:
+                skipped += 1
+                continue
+            if sig["symbol"] in open_symbols:
+                skipped += 1
+                continue
+            # Data-driven gates: atr_pct and trend_score outpredict conviction
+            # (analyze.py: winners 3.2% / 9.3 vs losers 5.5% / 14.1)
+            if sig.get("atr_pct", 0) > max_atr_pct:
+                print(f"[paper_bot] SKIP {sig['symbol']} atr_pct={sig.get('atr_pct'):.2f} > {max_atr_pct}", file=sys.stderr)
+                skipped += 1
+                continue
+            if abs(sig.get("trend_score", 0)) > max_trend_score_abs:
+                print(f"[paper_bot] SKIP {sig['symbol']} trend_score={sig.get('trend_score')} abs>{max_trend_score_abs}", file=sys.stderr)
+                skipped += 1
+                continue
+
+            flow_result = None
+            confirmed   = True
+            flow_score  = 0.0
+            flow_reasons_str = ""
+
+            if flow_required:
+                # Pass min_flow_score through — prior code loaded it from cfg
+                # (line ~5938) into a local then never used it, so the value
+                # in paper_config.json silently had no effect and every
+                # dead-tape altcoin passed the gate at the hardcoded default
+                # of 50. Audit §03 finding paper_flow_dead_001.
+                flow_result   = _flow_confirm(
+                    sig["symbol"],
+                    sig["direction"],
+                    sig.get("price", 0),
+                    min_score=min_flow_score,
+                )
+                confirmed     = flow_result["confirmed"]
+                flow_score    = flow_result["score"]
+                flow_reasons_str = json.dumps(flow_result["reasons"])
+
+            entry_px  = sig.get("price", 0)
+            leverage  = float(sig.get("leverage_cap") or sig.get("leverage") or 1)
+            conviction = sig.get("conviction", sig.get("conviction_base", 0))
+
+            # Ladder levels: signals store as exits[] array, not flat tp1/tp2/tp3 keys
+            exits = sig.get("exits") or []
+            tp1 = exits[0] if len(exits) > 0 else sig.get("tp1")
+            tp2 = exits[1] if len(exits) > 1 else sig.get("tp2")
+            tp3 = exits[2] if len(exits) > 2 else sig.get("tp3")
+
+            status = "open" if confirmed else "flow_rejected"
+
+            # Log confirmed entries to signals table so they appear in History tab
+            signal_id = sig.get("signal_id")
+            if confirmed:
+                sig["strategy_key"]   = sig.get("_strategy_key", "balanced")
+                sig["flow_score"]     = flow_score
+                sig["flow_confirmed"] = True
+                log_signals([sig])
+                try:
+                    _sc  = sqlite3.connect(DB_PATH)
+                    _row = _sc.execute(
+                        "SELECT id FROM signals WHERE symbol=? AND direction=? AND strategy_key=? AND result IS NULL ORDER BY logged_at DESC LIMIT 1",
+                        (sig["symbol"], sig["direction"], sig["strategy_key"]),
+                    ).fetchone()
+                    _sc.close()
+                    if _row:
+                        signal_id = _row[0]
+                except Exception:
+                    pass
+
+            con = sqlite3.connect(DB_PATH)
+            con.execute(
+                """INSERT INTO paper_trades
+                   (opened_at, symbol, strategy_key, direction, entry_px, size_usd,
+                    tp1, tp2, tp3, stop_loss, leverage, conviction,
+                    flow_confirmed, flow_score, flow_reasons, status, signal_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    now,
+                    sig["symbol"],
+                    sig.get("_strategy_key", "balanced"),
+                    sig["direction"],
+                    entry_px,
+                    size_usd,
+                    tp1,
+                    tp2,
+                    tp3,
+                    sig.get("stop_loss"),
+                    leverage,
+                    conviction,
+                    1 if confirmed else 0,
+                    flow_score,
+                    flow_reasons_str,
+                    status,
+                    signal_id,
+                ),
+            )
+            con.commit()
+            con.close()
+
+            if confirmed:
+                entered += 1
+                open_count += 1
+                open_symbols.add(sig["symbol"])
+                print(
+                    f"[paper_bot] ENTER {sig['symbol']} {sig['direction']} "
+                    f"@ {entry_px} flow_score={flow_score:.0f}",
+                    file=sys.stderr,
+                )
+            else:
+                rejected += 1
+                print(
+                    f"[paper_bot] REJECTED {sig['symbol']} {sig['direction']} "
+                    f"flow_score={flow_score:.0f}",
+                    file=sys.stderr,
+                )
+
+    except Exception as e:
+        print(f"[paper_bot] _paper_bot_scan error: {e}", file=sys.stderr)
+
+    return {"entered": entered, "rejected": rejected, "skipped": skipped}
+
+
+def _paper_bot_loop():
+    """Background daemon: exits checked every 60s; new entries on configured interval."""
+    import time as _time
+    _time.sleep(120)  # 2-minute startup delay
+    last_scan = 0.0
+    while True:
+        try:
+            cfg = _load_paper_config()
+            if cfg.get("enabled"):
+                # Always check exits — positions must close the moment a level is hit
+                closed = _paper_check_exits()
+                if closed:
+                    print(f"[paper_bot] closed {closed} position(s)", file=sys.stderr)
+
+                # Only scan for new entries on the configured interval
+                scan_interval = int(cfg.get("scan_interval_minutes", 5)) * 60
+                if _time.time() - last_scan >= scan_interval:
+                    scan_result = _paper_bot_scan(cfg)
+                    last_scan = _time.time()
+                    print(
+                        f"[paper_bot] scan done — entered={scan_result['entered']} "
+                        f"rejected={scan_result['rejected']}",
+                        file=sys.stderr,
+                    )
+        except Exception as e:
+            print(f"[paper_bot] loop error: {e}", file=sys.stderr)
+        _time.sleep(60)  # check exits every 60s; new entries gated by scan_interval
+
+
+# ---------------------------------------------------------------------------
+# Paper bot API routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/paper/trades")
+def api_paper_trades():
+    """Return all paper trades, optionally filtered by status."""
+    try:
+        status = request.args.get("status", "")
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        if status:
+            rows = con.execute(
+                "SELECT * FROM paper_trades WHERE status=? ORDER BY opened_at DESC",
+                (status,),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM paper_trades ORDER BY opened_at DESC LIMIT 200"
+            ).fetchall()
+        con.close()
+        return jsonify({"success": True, "trades": [dict(r) for r in rows]})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/stats")
+def api_paper_stats():
+    """Aggregate stats for paper trading: win rate, P&L, flow-confirmed vs rejected comparison."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+
+        closed = [dict(r) for r in con.execute(
+            "SELECT * FROM paper_trades WHERE status='closed'"
+        ).fetchall()]
+        open_trades = [dict(r) for r in con.execute(
+            "SELECT * FROM paper_trades WHERE status='open'"
+        ).fetchall()]
+        rejected = con.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE status='flow_rejected'"
+        ).fetchone()[0]
+        con.close()
+
+        def _stats(trades):
+            wins  = [t for t in trades if t.get("result") in ("WIN", "TP3")]
+            pnls  = [t["pnl_pct"] for t in trades if t.get("pnl_pct") is not None]
+            return {
+                "count":      len(trades),
+                "win_rate":   round(len(wins) / len(trades) * 100, 1) if trades else 0,
+                "avg_pnl":    round(sum(pnls) / len(pnls), 2) if pnls else 0,
+                "total_pnl":  round(sum(pnls), 2) if pnls else 0,
+            }
+
+        confirmed   = [t for t in closed if t.get("flow_confirmed")]
+        unconfirmed = [t for t in closed if not t.get("flow_confirmed")]
+
+        # Equity curve: cumulative P&L over closed trades sorted by closed_at
+        sorted_closed = sorted(closed, key=lambda t: t.get("closed_at") or "")
+        equity = []
+        running = 0.0
+        for t in sorted_closed:
+            if t.get("pnl_pct") is not None:
+                running += t["pnl_pct"]
+                equity.append({"closed_at": t["closed_at"], "cumulative_pnl": round(running, 2)})
+
+        return jsonify({
+            "success":       True,
+            "open_count":    len(open_trades),
+            "rejected_count": rejected,
+            "all_closed":    _stats(closed),
+            "flow_confirmed":   _stats(confirmed),
+            "flow_unconfirmed": _stats(unconfirmed),
+            "equity_curve":  equity,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _compute_effective_paper_thresholds(cfg: dict) -> dict:
+    """
+    Surface the min_conviction override chain so the UI can show the user
+    why their setting is or isn't actually applied.
+
+    The paper bot calls run_scan() which does:
+        effective_threshold = max(threshold, strat["min_conviction"])
+    where strat["min_conviction"] is the built-in default merged with any
+    active learner override from strategy_overrides.json.
+
+    If the user sets paper_config.min_conviction = 55 but Balanced has a
+    learner override of 65, the paper bot floors to 65 silently. Audit
+    §03 paper_override_silent flagged this as the largest user-facing
+    confusion in the paper subsystem.
+
+    Returns: {strategy_key: {user_floor, strategy_floor, override_floor,
+                             effective_floor, floored_by}}
+    """
+    user_floor = int(cfg.get("min_conviction", 65))
+    try:
+        overrides = _load_strategy_overrides() or {}
+    except Exception:
+        overrides = {}
+    try:
+        registry = get_strategy_registry() or {}
+    except Exception:
+        registry = {}
+
+    out: dict[str, dict] = {}
+    for key, strat in registry.items():
+        base_floor = int(strat.get("min_conviction", 0) or 0)
+        override_floor = base_floor
+        if key in overrides and "min_conviction" in overrides[key]:
+            try:
+                override_floor = int(overrides[key]["min_conviction"])
+            except (TypeError, ValueError):
+                pass
+        effective_floor = max(user_floor, override_floor)
+        if user_floor >= override_floor:
+            floored_by = "user"
+        else:
+            floored_by = "strategy_override" if override_floor > base_floor else "strategy_default"
+        out[key] = {
+            "user_floor":      user_floor,
+            "strategy_floor":  base_floor,
+            "override_floor":  override_floor,
+            "effective_floor": effective_floor,
+            "floored_by":      floored_by,
+        }
+    return out
+
+
+@app.route("/api/paper/config", methods=["GET", "PATCH"])
+def api_paper_config():
+    """GET current paper bot config. PATCH to update fields."""
+    try:
+        if request.method == "GET":
+            cfg = _load_paper_config()
+            return jsonify({
+                "success": True,
+                "config": cfg,
+                # New: surface the silent override chain so the Paper UI can
+                # render "you set 55 but Balanced floors to 65 by learner
+                # override" instead of pretending the user setting won.
+                "effective_thresholds": _compute_effective_paper_thresholds(cfg),
+            })
+
+        body = request.get_json(force=True) or {}
+        cfg  = _load_paper_config()
+        allowed = {
+            "enabled", "size_usd", "disabled_strategies", "min_conviction",
+            "flow_required", "min_flow_score", "scan_interval_minutes", "max_open_positions",
+            "max_atr_pct", "max_trend_score_abs",
+        }
+        for k, v in body.items():
+            if k in allowed:
+                cfg[k] = v
+        _save_paper_config(cfg)
+        return jsonify({
+            "success": True,
+            "config": cfg,
+            "effective_thresholds": _compute_effective_paper_thresholds(cfg),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/flow/<symbol>")
+def api_order_flow(symbol: str):
+    """
+    Live order flow analysis for a single symbol.
+    Returns delta, depth imbalance, walls, and flow confirmation result.
+    Query params: direction (LONG|SHORT), trade_limit (default 500), depth_levels (default 20)
+    """
+    try:
+        direction    = request.args.get("direction", "LONG").upper()
+        trade_limit  = int(request.args.get("trade_limit", 500))
+        depth_levels = int(request.args.get("depth_levels", 20))
+        result = _flow_confirm(
+            symbol.upper(),
+            direction,
+            price=0,
+            trade_limit=trade_limit,
+            depth_levels=depth_levels,
+        )
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/reset", methods=["POST"])
+def api_paper_reset():
+    """Clear all paper trades (maintenance). Requires ?confirm=yes."""
+    if request.args.get("confirm") != "yes":
+        return jsonify({"success": False, "error": "Pass ?confirm=yes to reset paper trades"}), 400
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM paper_trades")
+        con.commit()
+        con.close()
+        return jsonify({"success": True, "message": "All paper trades cleared"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -6048,7 +7235,6 @@ def _outcome_loop():
         _time.sleep(900)  # 15 minutes
 
 _outcome_thread = threading.Thread(target=_outcome_loop, daemon=True)
-_outcome_thread.start()
 
 
 def _snapshot_loop():
@@ -6065,7 +7251,6 @@ def _snapshot_loop():
         _time.sleep(3600)  # every hour
 
 _snapshot_thread = threading.Thread(target=_snapshot_loop, daemon=True)
-_snapshot_thread.start()
 
 
 def _coach_review_loop():
@@ -6151,10 +7336,25 @@ def _coach_review_loop():
         _time.sleep(600)  # 10 minutes between batches
 
 _coach_review_thread = threading.Thread(target=_coach_review_loop, daemon=True)
-_coach_review_thread.start()
+_paper_bot_thread = threading.Thread(target=_paper_bot_loop, daemon=True)
 
 
+# All four background threads (_outcome, _snapshot, _coach_review, _paper_bot)
+# are constructed at module level so they're attribute-accessible, but their
+# .start() calls now live inside the __main__ guard. Previously they fired at
+# import time, which meant any offline script (backtest.py, the reconstruct
+# harness, ad-hoc REPL exploration) would silently spawn four background
+# workers that hit MEXC and the SQLite DB. CLAUDE.md flags this as a hard rule
+# ("Do not import from app.py in a way that triggers Flask server startup");
+# the audit (§05) flagged backtest.py's `from app import score_ticker` as a
+# concrete violation. Moving .start() under __main__ closes that loophole
+# without extracting score_ticker into a separate module.
 if __name__ == "__main__":
+    _outcome_thread.start()
+    _snapshot_thread.start()
+    _coach_review_thread.start()
+    _paper_bot_thread.start()
+
     try:
         # SOCK_DGRAM connect trick: doesn't send packets, just resolves the
         # outbound interface so we get the real LAN IP rather than 127.0.0.1.

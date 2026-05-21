@@ -46,21 +46,28 @@ class MexcAdapter:
         change_24h = float(t.get("riseFallRate") or 0) * 100
 
         next_ft = t.get("nextFundingTime")
+        # MEXC standard contracts settle funding every 8h. The countdown to next
+        # settlement is informational — it is NOT a stress signal. The prior
+        # implementation set funding_interval_h=1 whenever next_funding_minutes
+        # was ≤ 70, which mislabelled the routine 70-minute pre-settlement window
+        # before EVERY 8h settlement as "exchange stress" (~15% of wall-clock).
+        # The news/funding analysts then suppressed valid MEXC signals during
+        # that window. Audit §02 finding mexc_stress_001.
+        #
+        # exchange_stress_notice now only fires on genuinely anomalous funding
+        # magnitudes. STRESS_FUNDING_INTERVAL_H stays as a constant for
+        # documentation/future use if MEXC ever introduces a shortened-interval
+        # stress mode on standard contracts.
         funding_interval_h = self.NORMAL_FUNDING_INTERVAL_H
         next_funding_minutes = None
         if next_ft:
             try:
                 diff_ms = int(next_ft) - int(time.time() * 1000)
                 next_funding_minutes = max(0, int(diff_ms / 60000))
-                if next_funding_minutes <= 70:
-                    funding_interval_h = self.STRESS_FUNDING_INTERVAL_H
             except Exception:
                 pass
 
-        exchange_stress = (
-            funding_interval_h == self.STRESS_FUNDING_INTERVAL_H
-            or abs(funding_rate) > 0.002
-        )
+        exchange_stress = abs(funding_rate) > 0.002
         oi_vol_ratio = (
             open_interest / (volume_24h / last_price)
             if volume_24h and last_price else 0

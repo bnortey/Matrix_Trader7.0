@@ -71,7 +71,7 @@ def rsi(df: pd.DataFrame, period: int = 14, column: str = 'close') -> pd.Series:
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
-    Average True Range.
+    Average True Range — Wilder's smoothing (matches the RSI in this file).
 
     Args:
         df:     OHLCV DataFrame with 'high', 'low', 'close' columns.
@@ -83,12 +83,24 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     Trader use: ATR measures realized volatility in absolute price terms. Used
     to set stop-loss distance (e.g. 1.5× ATR below entry) and tier spacing in
     the laddering system. Higher ATR = wider stops needed.
+
+    Smoothing note (audit fix, §02 indicator_atr_001):
+    The prior implementation used a simple rolling mean over `period` bars,
+    which lets a single spike candle dominate ATR for exactly `period` bars
+    and then drop off a cliff. Wilder's smoothing (the standard ATR formula
+    from "New Concepts in Technical Trading Systems", 1978) uses an EWM with
+    alpha = 1/period, giving recent bars higher weight and decaying old
+    spikes gradually. Matches the EWM smoothing already used by rsi() in
+    this same file. The audit identified trend_score (built on this ATR) as
+    the single best outcome predictor in the system, so jagged ATR was
+    propagating jagged trend_score into scoring.
     """
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
+    # Wilder smoothing == EWM with alpha = 1/period, equivalent to com = period - 1.
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
 
 def atr_pct(df: pd.DataFrame, price: float, period: int = 14) -> float:
