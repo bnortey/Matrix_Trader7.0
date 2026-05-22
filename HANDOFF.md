@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-21
-Last commit: 0a568f4 feat: reconcile deployed Paper Trader and exchange runtime
-app.py: 7,375 lines
-index.html: 8,391 lines
+Last updated: 2026-05-22
+Last commit: 31e3d75 feat: first-person analyst narratives with funding alignment, base rates, and forward calls
+app.py: 7,868 lines
+index.html: 8,478 lines
 
 ---
 
@@ -580,16 +580,26 @@ Execution readiness is tracked live in the Bot Readiness panel in the Strategies
 Review that panel before beginning any execution phase. You decide when to proceed —
 the system surfaces the data, it does not block you.
 
-**COMPLETED THIS SESSION:**
-- ✅ Diagnosed 0-signal bug: nested ThreadPoolExecutor overwhelmed MEXC kline endpoint → sequential strategy execution fix
-- ✅ P9 Trade Readiness Panel shipped: lib/risk_controls.py, /api/account/daily-pnl, checklist in signal detail
-- ✅ Agent Phase 2 unlocked: shadow_delta now applied to conviction, real agent tags (not shadow-prefixed)
-- ✅ History tab: true full-dataset stats via /api/signals/stats (no limit), dual win rate (strict + positive), perf banner streamlined to live-operational stats only
-- ✅ P11 Execution layer shipped (Hyperliquid):
-  - lib/hl_execution.py: place_limit_order, cancel_all_orders, close_all_positions, kill_switch, get_positions, get_open_orders
-  - app.py: GET /api/execution/status, POST /api/execution/place (gated by LIVE_TRADING_ENABLED), POST /api/execution/kill-switch
-  - index.html: KILL SWITCH button, EXECUTE ON HYPERLIQUID button in detail panel, order confirmation modal
-  - eth-account + msgpack installed on VPS and local
+**COMPLETED THIS SESSION (2026-05-22):**
+- ✅ Cipher Research Group: reviewed Codex implementation, identified 6 gaps, fixed 4
+  - `expandAgentBio(key)` modal added — click analyst card to see full bio/voice/exchanges
+  - Date/week navigation controls added to report panel (`navigateReport(dir)`)
+  - `I.reportCache` in-memory cache added — avoids redundant fetches for same date/week
+  - Weekly spotlight section rendered in report panel using `d.spotlight_key`
+- ✅ Two new backend helpers added to app.py:
+  - `_report_explosive_signal_context(symbol, date_str)` — checks if explosive move pair was on today's signal or blocked list
+  - `_report_coiling_base_rates(coiling, date_str)` — queries historical signals DB for win rate of extreme-funding setups
+  - Both wired into `_build_daily_data()` return dict as `explosive_signal_context` and `coiling_base_rates`
+- ✅ Full narrative rewrite — `_build_deterministic_report_narrative()` replaced:
+  - All notes now first-person analyst voice (no "Kenny reads..." framing)
+  - Thomas (trader_open): signal count, best strategy in current regime with win/loss record, funding crowding split, forward call on regime persistence
+  - Nadia (regime_forecast): coiling setups with annualized carry + historical base rates from DB; regime-specific strategy win rates when no coiling
+  - Harper (risk_close): specific gate names from blocked list, disagreement count, forward call on blocked-list watch
+  - Kenny (funding_autopsy): squeeze/flush/aligned-carry/neutral classification, annualized funding cost, signal cross-reference (was it on our list? was it blocked?), forward call on funding normalization window
+  - Niobe (microstructure_autopsy): volume in $M categorized as very-thin / thin / decent / institutional, continuation vs trap read, forward call on volume confirmation
+  - Ghost (cross_venue_autopsy): venue-leader interpretation (MEXC = perp-driven, HL = sophisticated flow), arb gap timing, two-venue confirmation rule
+  - Weekly: paper desk stats with win-rate read (encouraging/concerning/thin), week-ahead regime watch, spotlight with analyst name map
+- ✅ Deployed to VPS, cache cleared, narrative verified live
 
 **To activate P11 live trading:** add to VPS .env:
 ```
@@ -605,6 +615,32 @@ Next in priority order:
 4. **Monitor `regime_counter_long` / `regime_counter_short`** tags over next 20-30 trades
 5. Run `python3 analyze.py` weekly — watch momentum_breakout (anti-correlated, paused) and funding_arb edge
 6. Monitor mt-learner — `journalctl -u mt-learner` weekly
+
+---
+
+## Session Summary — 2026-05-22 (Cipher Research Group gaps + first-person narrative rewrite)
+
+**Cipher gap fixes:** Reviewed Codex's full Intelligence tab implementation against the original spec and plan. Found 6 gaps; fixed 4: analyst bio expand modal (`expandAgentBio(key)` — click any analyst card), date/week navigation controls in the report panel (`navigateReport(dir)`), in-memory report cache (`I.reportCache` keyed by `type:key`), and weekly spotlight render using `d.spotlight_key`.
+
+**New backend intelligence helpers:**
+- `_report_explosive_signal_context(symbol, date_str)` — queries `signals` and `filtered_candidates` to check if the biggest mover was on today's watchlist, blocked, or missed entirely. Added to `_build_daily_data()` return dict as `explosive_signal_context`.
+- `_report_coiling_base_rates(coiling, date_str)` — looks up historical win rate for extreme-funding setups matching each coiling entry's direction and funding threshold, using only signals closed before `date_str`. Added as `coiling_base_rates`.
+
+**Full narrative rewrite (`_build_deterministic_report_narrative()`):** Replaced all 3rd-person template-slot text with first-person analyst voices. Every note now:
+- Speaks as the analyst (no "Kenny reads..." framing)
+- References specific computed data (annualized funding %, gate names, $M volume tier, DB win rates, signal cross-reference)
+- Ends with a concrete forward call
+
+Analyst-specific logic:
+- **Thomas**: regime + best-strategy win record in current regime + funding crowding summary
+- **Nadia**: coiling annualized carry + historical base rates from DB; regime win rates when no coiling
+- **Harper**: gate names from blocked list, disagreement count, forward posture
+- **Kenny**: squeeze / flush / aligned-carry / neutral classification; signal cross-reference; normalization window call
+- **Niobe**: volume in $M labeled very-thin / thin / decent / institutional; continuation vs trap
+- **Ghost**: venue-leader interpretation (MEXC = perp-driven, HL = sophisticated flow); two-venue confirmation rule
+- **Weekly**: paper desk win-rate read; spotlight with named analyst map
+
+Deployed to VPS (31e3d75), cache cleared, narrative verified live via API.
 
 ---
 
