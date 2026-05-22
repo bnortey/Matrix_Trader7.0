@@ -3412,7 +3412,85 @@ def _generate_coach_review(
     if cached:
         return cached
 
-    # Pull Research Firm findings for this strategy
+    direction = sig.get("direction", "")
+
+    # --- Agent consensus at scan time ---
+    agent_context = ""
+    try:
+        regime_at_scan = sig_json_obj.get("agent_regime") or sig_json_obj.get("regime") or ""
+        disagreement = float(sig_json_obj.get("agent_shadow_disagreement") or
+                             sig_json_obj.get("agent_disagreement") or 0)
+        delta = float(sig_json_obj.get("agent_shadow_delta") or
+                      sig_json_obj.get("agent_delta") or 0)
+        bull_thesis = sig_json_obj.get("agent_narrative_bull") or ""
+        bear_thesis = sig_json_obj.get("agent_narrative_bear") or ""
+        struct_bull = sig_json_obj.get("agent_structural_bull") or ""
+        struct_bear = sig_json_obj.get("agent_structural_bear") or ""
+        bits = []
+        if regime_at_scan:
+            bits.append(f"Regime at scan: {regime_at_scan}")
+        if delta:
+            bits.append(f"Analyst conviction delta: {delta:+.1f} pts")
+        if disagreement > 0.3:
+            bits.append(f"Desk disagreement score: {disagreement:.2f} (elevated — desk was split)")
+        elif disagreement > 0:
+            bits.append(f"Desk disagreement score: {disagreement:.2f} (low — desk was aligned)")
+        if bull_thesis:
+            bits.append(f"Bull thesis at scan: {bull_thesis}")
+        if bear_thesis:
+            bits.append(f"Bear thesis at scan: {bear_thesis}")
+        if struct_bull:
+            bits.append(f"Structural bull: {struct_bull}")
+        if struct_bear:
+            bits.append(f"Structural bear: {struct_bear}")
+        if bits:
+            agent_context = "\n\nDesk analyst reads at scan time:\n" + "\n".join(f"- {b}" for b in bits)
+    except Exception:
+        pass
+
+    # --- Funding alignment at signal time ---
+    funding_context = ""
+    try:
+        fr = float(sig.get("funding_rate") or 0)
+        if fr != 0:
+            fr_ann = abs(fr) * 3 * 365 * 100
+            if fr < -0.0003 and direction == "LONG":
+                alignment = f"ALIGNED — funding was {fr:.5f} ({fr_ann:.0f}% annualized), shorts paying longs. Squeeze thesis had structural backing."
+            elif fr > 0.0003 and direction == "SHORT":
+                alignment = f"ALIGNED — funding was {fr:.5f} ({fr_ann:.0f}% annualized), longs paying shorts. Flush thesis had structural backing."
+            elif fr < -0.0003 and direction == "SHORT":
+                alignment = f"MISALIGNED — funding was {fr:.5f} ({fr_ann:.0f}% annualized) negative while shorting. Carry was fighting the trade."
+            elif fr > 0.0003 and direction == "LONG":
+                alignment = f"MISALIGNED — funding was {fr:.5f} ({fr_ann:.0f}% annualized) positive while going long. Carry was fighting the trade."
+            else:
+                alignment = f"NEUTRAL — funding was {fr:.5f} ({fr_ann:.0f}% annualized). No meaningful carry edge in either direction."
+            funding_context = f"\n\nFunding alignment: {alignment}"
+    except Exception:
+        pass
+
+    # --- Daily intelligence report for trade date (fails silently) ---
+    intel_context = ""
+    try:
+        trade_date = (sig.get("logged_at") or "")[:10]
+        if trade_date:
+            report_path = os.path.join("data", "reports", f"daily_{trade_date}.json")
+            if os.path.exists(report_path):
+                with open(report_path, "r", encoding="utf-8") as _rf:
+                    _rep = json.load(_rf)
+                narr = _rep.get("narrative") or {}
+                regime_note = narr.get("regime_forecast", "")[:200]
+                funding_note = narr.get("funding_autopsy", "")[:200]
+                bits = []
+                if regime_note:
+                    bits.append(f"Nadia's regime read that day: {regime_note}")
+                if funding_note:
+                    bits.append(f"Kenny's funding note that day: {funding_note}")
+                if bits:
+                    intel_context = "\n\nCipher desk notes for trade date:\n" + "\n".join(f"- {b}" for b in bits)
+    except Exception:
+        pass
+
+    # --- Research Firm findings for this strategy ---
     research_context = ""
     try:
         briefs_path = "/opt/mt-learner/research/briefs.json"
@@ -3434,30 +3512,41 @@ def _generate_coach_review(
     except Exception:
         pass
 
-    direction = sig.get("direction", "")
     user_msg = (
-        f"Trade review:\n"
+        f"Trade data:\n"
         f"Symbol: {sig.get('symbol')} | Direction: {direction} | Strategy: {sig.get('strategy')}\n"
-        f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Result: {sig.get('result')}\n"
-        f"Stop: {sig.get('stop_loss')} | TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
+        f"Conviction: {sig.get('conviction')} | Result: {sig.get('result')}\n"
+        f"Entry: {entry1} | Exit: {exit_price or 'unknown'} | Stop: {sig.get('stop_loss')}\n"
+        f"TP1: {sig.get('tp1')} | TP2: {sig.get('tp2')} | TP3: {sig.get('tp3')}\n"
         f"Duration: {duration_minutes or 'unknown'} minutes\n"
-        f"Trade journey stats:\n{journey_prompt}\n"
+        f"Trade journey:\n{journey_prompt}\n"
         f"Signal reason: {sig.get('signal_why')}\n"
         f"Tags: {tags_raw}\n"
         f"Result note: {sig.get('result_note')}\n"
-        f"{research_context}\n"
-        f"Write a concise but useful coach review in 2 short paragraphs. "
-        f"First describe the price journey from signal/entry to close using the journey stats. "
-        f"Then explain what the signal got right or wrong and one specific thing to watch next time. "
-        f"If Research Firm findings above are relevant to this trade's outcome, reference them specifically. "
-        f"Do not claim the strategy should change based on a single trade; frame learning as evidence to aggregate."
+        f"{agent_context}"
+        f"{funding_context}"
+        f"{intel_context}"
+        f"{research_context}\n\n"
+        f"Write a coach review in exactly 2 short paragraphs. "
+        f"Paragraph 1: describe the price path using MAE, MFE, capture, stop pressure, and duration in plain language. "
+        f"Paragraph 2: what the signal got right or wrong — reference the funding alignment and agent consensus if present — "
+        f"and give one specific, concrete forward call (not 'monitor more trades', tell the trader exactly what to look for next time). "
+        f"If Cipher desk notes or Research Firm findings are relevant, name them specifically. "
+        f"Do not recommend strategy changes from a single trade — frame it as evidence to aggregate."
     )
     review = call_ai(
-        system="You are a trading coach reviewing a completed trade. "
-               "Be direct, specific, and grounded only in the supplied trade data. "
-               "Explain MAE/MFE/capture in plain trader language. No fluff.",
+        system=(
+            "You are Thomas Chen, head trader at Cipher Research Group, reviewing a completed trade logged by the system. "
+            "You speak in first person, directly, like a mentor who respects the trader's intelligence. "
+            "You are specific about numbers — MAE, MFE, funding rates, annualized carry. "
+            "You do not hedge every sentence. You do not use filler phrases. "
+            "You do not explain what MAE or MFE stand for — the trader already knows. "
+            "Start your response immediately with the first sentence of the review. "
+            "No preamble, no meta-commentary, no 'here is my review' or 'let me analyze this'. "
+            "Output only the two paragraphs of the review and nothing else."
+        ),
         user=user_msg,
-        max_tokens=900,
+        max_tokens=500,
     )
 
     if review:
@@ -3557,6 +3646,31 @@ def api_signal_detail(signal_id: int):
             "journey":          journey,
             "ai_analysis":      ai_analysis,
         })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/signal/detail/<int:signal_id>/regenerate-review", methods=["POST"])
+def api_signal_regenerate_review(signal_id: int):
+    """Clear the cached coach review for a signal so it regenerates on next load."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT signal_json FROM signals WHERE id=?", (signal_id,)).fetchone()
+        if not row:
+            con.close()
+            return jsonify({"success": False, "error": "not found"}), 404
+        try:
+            sj = json.loads(row["signal_json"] or "{}")
+        except Exception:
+            sj = {}
+        sj.pop("coach_review", None)
+        sj.pop("coach_review_at", None)
+        con.execute("UPDATE signals SET signal_json=? WHERE id=?",
+                    (json.dumps(sj, default=str), signal_id))
+        con.commit()
+        con.close()
+        return jsonify({"success": True, "cleared": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
