@@ -5593,7 +5593,7 @@ async function showClosedDetail(id) {
   <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
       <div class="d-lbl" style="margin-bottom:0">Coach Review</div>
-      <button onclick="regenerateCoachReview(${d.id})" style="font-size:10px;padding:2px 8px;background:none;border:1px solid var(--border);border-radius:3px;color:var(--text3);cursor:pointer">Regenerate</button>
+      <button onclick="regenerateCoachReview(${d.id}, this)" style="font-size:10px;padding:2px 8px;background:none;border:1px solid var(--border);border-radius:3px;color:var(--text3);cursor:pointer">Regenerate</button>
     </div>
     ${aiHtml}
   </div>
@@ -5603,16 +5603,14 @@ async function showClosedDetail(id) {
   }
 }
 
-async function regenerateCoachReview(signalId) {
-  const btn = event.target;
+async function regenerateCoachReview(signalId, btn) {
   btn.textContent = 'Clearing…';
   btn.disabled = true;
   try {
     const r = await fetch(`/api/signal/detail/${signalId}/regenerate-review`, { method: 'POST' });
     const d = await r.json();
     if (d.success) {
-      btn.textContent = 'Reloading…';
-      await loadSignalDetail(signalId);
+      await showClosedDetail(signalId);
     } else {
       btn.textContent = 'Error';
       btn.disabled = false;

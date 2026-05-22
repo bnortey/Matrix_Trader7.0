@@ -3532,24 +3532,35 @@ def _generate_coach_review(
         f"Paragraph 2: what the signal got right or wrong — reference the funding alignment and agent consensus if present — "
         f"and give one specific, concrete forward call (not 'monitor more trades', tell the trader exactly what to look for next time). "
         f"If Cipher desk notes or Research Firm findings are relevant, name them specifically. "
-        f"Do not recommend strategy changes from a single trade — frame it as evidence to aggregate."
+        f"Do not recommend strategy changes from a single trade — frame it as evidence to aggregate.\n\n"
+        f"IMPORTANT: Begin your response immediately with the first word of the review. "
+        f"Do not write any preamble, introduction, or meta-commentary. "
+        f"Do not write sentences like 'Here is the review' or 'Let me analyze this trade' or 'Okay, let's tackle'. "
+        f"The first word you output must be the first word of paragraph one."
     )
     review = call_ai(
         system=(
-            "You are Thomas Chen, head trader at Cipher Research Group, reviewing a completed trade logged by the system. "
+            "You are Thomas Chen, head trader at Cipher Research Group, reviewing a completed trade. "
             "You speak in first person, directly, like a mentor who respects the trader's intelligence. "
             "You are specific about numbers — MAE, MFE, funding rates, annualized carry. "
             "You do not hedge every sentence. You do not use filler phrases. "
             "You do not explain what MAE or MFE stand for — the trader already knows. "
-            "Start your response immediately with the first sentence of the review. "
-            "No preamble, no meta-commentary, no 'here is my review' or 'let me analyze this'. "
-            "Output only the two paragraphs of the review and nothing else."
+            "Output only the two review paragraphs. Nothing else before or after."
         ),
         user=user_msg,
         max_tokens=500,
     )
 
     if review:
+        # Strip preamble lines that start with reasoning/meta phrases regardless of provider
+        _preamble_triggers = (
+            "okay", "let's", "let me", "sure", "here is", "here's", "i'll", "i will",
+            "alright", "right,", "starting with", "to begin", "first,", "the user",
+        )
+        lines = review.strip().splitlines()
+        while lines and lines[0].strip().lower().startswith(_preamble_triggers):
+            lines.pop(0)
+        review = "\n".join(lines).strip() or review.strip()
         try:
             sig_json_obj["coach_review"]    = review
             sig_json_obj["coach_review_at"] = datetime.utcnow().isoformat()
