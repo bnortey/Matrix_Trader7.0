@@ -7064,7 +7064,7 @@ function renderReportPanel() {
     ${sectionBlock('Strategy Performance by Regime', reportTable(d.strategy_regime_perf, [{key:'strategy',label:'Strategy'},{key:'regime',label:'Regime'},{key:'win',label:'W'},{key:'loss',label:'L'},{key:'partial',label:'P'}], 'No closed strategy/regime outcomes yet.'))}
     ${sectionBlock('Paper Desk Performance', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;">${reportMetric('Open', (d.paper_desk||{}).open ?? 0)}${reportMetric('Closed', (d.paper_desk||{}).closed ?? 0)}${reportMetric('Wins', (d.paper_desk||{}).wins ?? 0)}${reportMetric('Avg P&L', Number((d.paper_desk||{}).avg_pnl_pct||0).toFixed(2)+'%')}</div>`)}
     ${I.report.type === 'weekly' ? (() => {
-      const spotKey = d.spotlight_analyst_key || 'funding';
+      const spotKey = d.spotlight_key || d.spotlight_analyst_key || 'funding';
       const spotAgent = (I.roster && I.roster.agents && I.roster.agents[spotKey]) || {};
       const spotColors = {narrative:'var(--green)',structural:'var(--blue)',leadership:'var(--amber)'};
       const spotCol = spotColors[spotAgent.division] || 'var(--text2)';
