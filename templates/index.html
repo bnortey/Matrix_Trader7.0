@@ -4108,6 +4108,9 @@ const I = {
   reportType:   'daily',
   report:       null,
   reportLoading:false,
+  reportDate:   null,
+  reportWeek:   null,
+  reportCache:  {},
 };
 
 const STRATEGY_LEARN = {
@@ -6826,7 +6829,7 @@ function agentListByDivision(division) {
 
 function renderAgentCard(key, a) {
   const ex = (a.exchanges || []).map(x => `<span style="border:1px solid var(--border);border-radius:3px;padding:2px 5px;font-size:10px;color:var(--muted);">${esc(x.replace('HYPERLIQUID','HL'))}</span>`).join('');
-  return `<div style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:12px;min-height:150px;">
+  return `<div onclick="expandAgentBio('${key}')" style="border:1px solid var(--border);background:var(--surface);border-radius:6px;padding:12px;min-height:150px;cursor:pointer;">
     <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
       <div>
         <div style="font-size:14px;font-weight:700;color:var(--text);">${esc(a.name)}</div>
@@ -6878,6 +6881,33 @@ function renderFirm() {
   </div>`;
 }
 
+function expandAgentBio(key) {
+  if (!I.roster || !I.roster.agents) return;
+  const a = I.roster.agents[key];
+  if (!a) return;
+  const divColors = {narrative:'var(--green)',structural:'var(--blue)',leadership:'var(--amber)'};
+  const col = divColors[a.division] || 'var(--text2)';
+  const existing = document.getElementById('intel-bio-expanded');
+  if (existing) existing.remove();
+  const bio = document.createElement('div');
+  bio.id = 'intel-bio-expanded';
+  bio.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:999;display:flex;align-items:center;justify-content:center;padding:16px;';
+  bio.onclick = e => { if (e.target === bio) bio.remove(); };
+  bio.innerHTML = `<div style="background:var(--bg2,#0e1016);border:1px solid ${col};border-radius:8px;padding:20px;max-width:480px;width:100%;position:relative;">
+    <button onclick="document.getElementById('intel-bio-expanded').remove()" style="position:absolute;top:10px;right:12px;background:transparent;border:none;color:var(--text2);font-size:18px;cursor:pointer;">✕</button>
+    <div style="color:${col};font-size:9px;letter-spacing:1px;margin-bottom:4px;">${esc(a.division.toUpperCase())} DIVISION</div>
+    <div style="font-size:18px;font-weight:700;color:var(--text);">${esc(a.name)}</div>
+    <div style="font-size:11px;color:${col};margin-bottom:12px;">${esc(a.title)}</div>
+    <div style="font-size:13px;color:var(--text2);line-height:1.5;margin-bottom:12px;">${esc(a.specialty)}</div>
+    <div style="border-left:2px solid ${col};padding:8px 12px;background:rgba(255,255,255,.04);border-radius:0 4px 4px 0;">
+      <div style="color:${col};font-size:9px;letter-spacing:1px;margin-bottom:4px;">VOICE</div>
+      <div style="font-size:12px;color:var(--text);font-style:italic;">"${esc(a.voice)}"</div>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:12px;">${(a.exchanges||[]).map(x=>`<span style="border:1px solid var(--border);border-radius:3px;padding:2px 6px;font-size:10px;color:var(--muted);">${esc(x)}</span>`).join('')}</div>
+  </div>`;
+  document.body.appendChild(bio);
+}
+
 function reportMetric(label, value) {
   return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;">
     <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">${label}</div>
@@ -6899,18 +6929,50 @@ function sectionBlock(title, body) {
   </div>`;
 }
 
+function getISOWeek(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const wk = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${String(wk).padStart(2,'0')}`;
+}
+
+function navigateReport(dir) {
+  if (I.reportType === 'daily') {
+    const base = I.reportDate ? new Date(I.reportDate) : new Date();
+    base.setDate(base.getDate() + dir);
+    I.reportDate = base.toISOString().slice(0,10);
+  } else {
+    const current = I.reportWeek || getISOWeek(new Date());
+    const [yr, wn] = current.split('-W').map(Number);
+    const base = new Date(yr, 0, 1 + (wn - 1) * 7);
+    base.setDate(base.getDate() + dir * 7);
+    I.reportWeek = getISOWeek(base);
+  }
+  I.report = null;
+  loadIntelligenceReport();
+}
+
 async function loadIntelligenceReport(type) {
-  I.reportType = type || I.reportType || 'daily';
+  if (type) I.reportType = type;
+  const date = I.reportDate || new Date().toISOString().slice(0,10);
+  const week = I.reportWeek || getISOWeek(new Date());
+  const cacheKey = I.reportType === 'weekly' ? 'weekly_' + week : 'daily_' + date;
+  if (I.reportCache[cacheKey]) {
+    I.report = I.reportCache[cacheKey];
+    renderIntelligence();
+    return;
+  }
   I.reportLoading = true;
   renderIntelligence();
-  const now = new Date();
   const url = I.reportType === 'weekly'
-    ? '/api/intelligence/reports/weekly'
-    : `/api/intelligence/reports/daily?date=${now.toISOString().slice(0,10)}`;
+    ? `/api/intelligence/reports/weekly?week=${encodeURIComponent(week)}`
+    : `/api/intelligence/reports/daily?date=${date}`;
   try {
     const res = await fetch(url);
     const data = await res.json();
-    I.report = data.success ? data : null;
+    if (data.success) { I.report = data; I.reportCache[cacheKey] = data; }
+    else I.report = null;
   } catch(e) {
     I.report = null;
   } finally {
@@ -6920,21 +6982,23 @@ async function loadIntelligenceReport(type) {
 }
 
 async function regenerateIntelReport() {
-  if (!I.report) return;
+  const date = I.reportDate || new Date().toISOString().slice(0,10);
+  const week = I.reportWeek || getISOWeek(new Date());
+  const key = I.reportType === 'weekly' ? week : date;
+  const cacheKey = I.reportType === 'weekly' ? 'weekly_' + week : 'daily_' + date;
+  delete I.reportCache[cacheKey];
+  I.report = null;
   I.reportLoading = true;
   renderIntelligence();
   try {
-    const key = I.report.type === 'weekly' ? I.report.week : I.report.date;
-    const res = await fetch('/api/intelligence/reports/regenerate', {
+    await fetch('/api/intelligence/reports/regenerate', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({type: I.report.type, key}),
+      body: JSON.stringify({type: I.reportType, key}),
     });
-    const data = await res.json();
-    I.report = data.success ? data : I.report;
   } catch(e) {}
   I.reportLoading = false;
-  renderIntelligence();
+  loadIntelligenceReport();
 }
 
 function renderFundingHeatmap(map) {
@@ -6954,12 +7018,20 @@ function renderFundingHeatmap(map) {
 }
 
 function renderReportPanel() {
-  const btn = t => `<button onclick="I.report=null;loadIntelligenceReport('${t}')" style="background:${I.reportType===t?'var(--blue)':'var(--surface)'};color:${I.reportType===t?'#000':'var(--text2)'};border:1px solid var(--border);border-radius:4px;padding:7px 11px;font-size:12px;font-weight:700;cursor:pointer;">${t === 'daily' ? 'Daily Brief' : 'Weekly Report'}</button>`;
+  const date = I.reportDate || new Date().toISOString().slice(0,10);
+  const week = I.reportWeek || getISOWeek(new Date());
+  const periodLabel = I.reportType === 'weekly' ? week : date;
+  const btn = t => `<button onclick="I.reportDate=null;I.reportWeek=null;I.report=null;loadIntelligenceReport('${t}')" style="background:${I.reportType===t?'var(--blue)':'var(--surface)'};color:${I.reportType===t?'#000':'var(--text2)'};border:1px solid var(--border);border-radius:4px;padding:7px 11px;font-size:12px;font-weight:700;cursor:pointer;">${t === 'daily' ? 'Daily Brief' : 'Weekly Report'}</button>`;
+  const nav = `<div style="display:flex;align-items:center;gap:6px;">
+    <button onclick="navigateReport(-1)" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);border-radius:4px;padding:5px 10px;font-size:13px;cursor:pointer;">←</button>
+    <span style="font-size:12px;color:var(--text2);min-width:90px;text-align:center;">${periodLabel}</span>
+    <button onclick="navigateReport(1)" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);border-radius:4px;padding:5px 10px;font-size:13px;cursor:pointer;">→</button>
+  </div>`;
   if (I.reportLoading) {
-    return `<div style="max-width:1180px;margin:0 auto;">${btn('daily')} ${btn('weekly')}<div style="color:var(--muted);padding:24px 0;">Loading report...</div></div>`;
+    return `<div style="max-width:1180px;margin:0 auto;"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">${btn('daily')}${btn('weekly')}${nav}</div><div style="color:var(--muted);padding:24px 0;">Loading report...</div></div>`;
   }
   if (!I.report) {
-    return `<div style="max-width:1180px;margin:0 auto;">${btn('daily')} ${btn('weekly')}<div style="color:var(--muted);padding:24px 0;">No report loaded.</div></div>`;
+    return `<div style="max-width:1180px;margin:0 auto;"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">${btn('daily')}${btn('weekly')}${nav}</div><div style="color:var(--muted);padding:24px 0;">No report loaded.</div></div>`;
   }
   const d = I.report.data || {};
   const n = I.report.narrative || {};
@@ -6969,7 +7041,7 @@ function renderReportPanel() {
     : 'deterministic desk notes';
   return `<div style="max-width:1180px;margin:0 auto;">
     <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
-      <div style="display:flex;gap:6px;">${btn('daily')}${btn('weekly')}</div>
+      <div style="display:flex;gap:6px;align-items:center;">${btn('daily')}${btn('weekly')}${nav}</div>
       <button onclick="regenerateIntelReport()" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);border-radius:4px;padding:7px 11px;font-size:12px;cursor:pointer;">Regenerate</button>
     </div>
     <div style="font-size:12px;color:var(--muted);margin-bottom:10px;">Generated ${esc(I.report.generated_at || '—')} · Narrative: ${esc(narrativeLabel)}</div>
@@ -6991,7 +7063,19 @@ function renderReportPanel() {
     ${sectionBlock('Agent Disagreement Log', reportTable(d.disagreements, [{key:'symbol',label:'Pair'},{key:'direction',label:'Side'},{key:'conviction',label:'Conviction'},{key:'disagreement_score',label:'Score'}], 'No major disagreements logged.'))}
     ${sectionBlock('Strategy Performance by Regime', reportTable(d.strategy_regime_perf, [{key:'strategy',label:'Strategy'},{key:'regime',label:'Regime'},{key:'win',label:'W'},{key:'loss',label:'L'},{key:'partial',label:'P'}], 'No closed strategy/regime outcomes yet.'))}
     ${sectionBlock('Paper Desk Performance', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;">${reportMetric('Open', (d.paper_desk||{}).open ?? 0)}${reportMetric('Closed', (d.paper_desk||{}).closed ?? 0)}${reportMetric('Wins', (d.paper_desk||{}).wins ?? 0)}${reportMetric('Avg P&L', Number((d.paper_desk||{}).avg_pnl_pct||0).toFixed(2)+'%')}</div>`)}
-    ${I.report.type === 'weekly' ? sectionBlock('Week Ahead', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.week_ahead || 'Week-ahead note unavailable.')}</div>`) : ''}
+    ${I.report.type === 'weekly' ? (() => {
+      const spotKey = d.spotlight_analyst_key || 'funding';
+      const spotAgent = (I.roster && I.roster.agents && I.roster.agents[spotKey]) || {};
+      const spotColors = {narrative:'var(--green)',structural:'var(--blue)',leadership:'var(--amber)'};
+      const spotCol = spotColors[spotAgent.division] || 'var(--text2)';
+      const spotBody = `<div style="border-left:2px solid ${spotCol};padding:8px 12px;background:rgba(255,255,255,.04);border-radius:0 4px 4px 0;margin-bottom:10px;">
+        <div style="color:${spotCol};font-size:9px;letter-spacing:1px;margin-bottom:3px;">${esc(spotAgent.name||spotKey)} · ${esc(spotAgent.title||'')}</div>
+        <div style="font-size:12px;color:var(--text2);margin-bottom:6px;">${esc(spotAgent.specialty||'')}</div>
+        <div style="font-size:13px;color:var(--text);font-style:italic;line-height:1.6;">"${esc(n.spotlight || spotAgent.voice || 'Spotlight narrative unavailable.')}"</div>
+      </div>`;
+      return sectionBlock('Agent Spotlight', spotBody);
+    })() : ''}
+    ${I.report.type === 'weekly' ? sectionBlock('Week Ahead — Thomas Reeves', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.week_ahead || 'Week-ahead note unavailable.')}</div>`) : ''}
     ${sectionBlock('Nadia — Regime Forecast', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.regime_forecast || 'Regime forecast unavailable.')}</div>`)}
     ${sectionBlock('Harper Cross — Closing Note', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.risk_close || 'Risk note unavailable.')}</div>`)}
   </div>`;
