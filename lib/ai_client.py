@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 
 PROVIDERS = [
@@ -80,6 +81,12 @@ def save_ai_settings(settings: dict) -> None:
         json.dump(settings, f)
 
 
+def _strip_thinking_blocks(text: str) -> str:
+    """Remove <think>...</think> blocks produced by reasoning models (Qwen3, DeepSeek-R1)."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return cleaned.strip()
+
+
 def call_ai(
     system: str,
     user: str,
@@ -91,40 +98,46 @@ def call_ai(
     cfg_model    = settings.get("model")
     allowed = set(allowed_providers) if allowed_providers else None
 
+    tried: set[tuple[str, str]] = set()
+
+    def _try(provider_name: str, model: str) -> str | None:
+        key = (provider_name, model)
+        if key in tried:
+            return None
+        tried.add(key)
+        api_key = os.getenv(_KEY_ENV.get(provider_name, ""), "").strip()
+        if not api_key:
+            return None
+        fn = _DISPATCH.get(provider_name)
+        if fn is None:
+            return None
+        try:
+            result = fn(system, user, max_tokens, api_key, model)
+            if result:
+                result = _strip_thinking_blocks(result)
+            return result or None
+        except Exception as e:
+            print(f"ai_client: {provider_name}/{model} failed: {e}", file=sys.stderr)
+            return None
+
     # Try the configured model first
     if cfg_provider and cfg_model and (allowed is None or cfg_provider in allowed):
-        api_key = os.getenv(_KEY_ENV.get(cfg_provider, ""), "").strip()
-        if api_key:
-            fn = _DISPATCH.get(cfg_provider)
-            if fn:
-                try:
-                    return fn(system, user, max_tokens, api_key, cfg_model)
-                except Exception as e:
-                    print(f"ai_client: {cfg_provider}/{cfg_model} failed: {e}", file=sys.stderr)
+        result = _try(cfg_provider, cfg_model)
+        if result:
+            return result
 
-    # Fallback chain — skip the already-tried provider
+    # Fallback chain — try every model for every provider in order
     for provider in PROVIDERS:
-        if provider["name"] == cfg_provider:
+        name = provider["name"]
+        if allowed is not None and name not in allowed:
             continue
-        if allowed is not None and provider["name"] not in allowed:
-            continue
-        api_key = os.getenv(provider["key_env"], "")
-        if not api_key:
-            continue
-        fn = _DISPATCH.get(provider["name"])
-        if fn is None:
-            continue
-        # Use the first model listed for this provider as the fallback default
-        default_model = next(
-            (m["model"] for m in AVAILABLE_MODELS if m["provider"] == provider["name"]),
-            None,
-        )
-        if not default_model:
-            continue
-        try:
-            return fn(system, user, max_tokens, api_key, default_model)
-        except Exception as e:
-            print(f"ai_client: {provider['name']} failed: {e}", file=sys.stderr)
+        for m in AVAILABLE_MODELS:
+            if m["provider"] != name:
+                continue
+            result = _try(name, m["model"])
+            if result:
+                return result
+
     return None
 
 
@@ -168,7 +181,7 @@ def _call_deepseek(system: str, user: str, max_tokens: int, api_key: str, model:
 def _call_groq(system: str, user: str, max_tokens: int, api_key: str, model: str) -> str:
     import groq
     client = groq.Groq(api_key=api_key)
-    response = client.chat.completions.create(
+    kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
         messages=[
@@ -176,6 +189,10 @@ def _call_groq(system: str, user: str, max_tokens: int, api_key: str, model: str
             {"role": "user",   "content": user},
         ],
     )
+    # Qwen3 supports reasoning_effort="none" to suppress <think> blocks
+    if "qwen3" in model.lower():
+        kwargs["reasoning_effort"] = "none"
+    response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
 
 
