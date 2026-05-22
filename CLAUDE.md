@@ -9,21 +9,22 @@
 
 ## What This Is
 
-**Matrix Trader 7.0** is a local web application for high-leverage crypto trading on MEXC perpetual swap markets. A Python Flask backend serves a single-file dark-themed dashboard. It runs on a Mac or VPS and is accessible from iPhone over local WiFi or via the VPS IP.
+**Matrix Trader 7.0** is a local web application for high-leverage crypto trading on MEXC and Hyperliquid perpetual swap markets. A Python Flask backend serves a single-file dark-themed dashboard. It runs on a Mac or VPS and is accessible from iPhone over local WiFi or via the VPS IP.
 
 **The core loop:**
-1. User hits "Scan All Perps" — fetches all 800+ MEXC tickers via public API
+1. User hits "Scan All Perps" — fetches all 800+ MEXC tickers + Hyperliquid in parallel
 2. Sees ranked LONG/SHORT signals with conviction scores, entry/TP/SL ladders
-3. Clicks a signal → AI-generated 4-section trade brief (Claude API)
+3. Clicks a signal → AI-generated trade brief + pre-entry readiness checklist
 4. Tags outcomes (WIN / LOSS / PARTIAL / EXPIRED / SKIPPED) — auto-evaluation runs every 15 min
-5. Reviews strategy analytics, equity curve, and per-trade coach reviews
-6. Executes manually on MEXC
+5. Reviews strategy analytics, equity curve, and per-trade coach reviews (Thomas Chen persona, first-person, MAE/MFE/funding alignment)
+6. Reads daily/weekly Cipher Research Group intelligence reports (12 named analysts, domain-specific first-person notes)
+7. Executes manually on MEXC or Hyperliquid (execution layer built, not yet activated)
 
 **It is not:**
-- An execution bot yet — order placement is a staged future capability (P8–P12), currently disabled.
+- Live trading yet — P11 execution layer is built (Hyperliquid, kill switch, order confirmation) but `LIVE_TRADING_ENABLED=false` is the master gate. Waiting on paper trading validation and `HL_PRIVATE_KEY` in VPS `.env`.
 - A price forecasting engine (no ARIMA, no ML prediction)
 - A SaaS product (local + one VPS for now)
-- A multi-exchange aggregator (MEXC is primary; Binance/Bybit/OKX are context only)
+- Able to use MEXC private endpoints from VPS — MEXC blocks Hetzner IPs. Public market data works; auth endpoints fail gracefully.
 
 ---
 
@@ -37,8 +38,8 @@
 | API key committed in plaintext | All keys in `.env`, never committed |
 | 17 planning files instead of code | Ship before you plan |
 | God class `EnhancedTradingBot` (900+ lines) | `app.py` stays flat — one file |
-| Multi-exchange as primary venues | MEXC is primary. Others are context. |
-| Jumped to automation without validated edge | Paper bot (P10) before micro-live (P12). Bot Readiness panel tracks progress. You decide when the data is sufficient. |
+| Multi-exchange as primary venues | MEXC is primary. Hyperliquid is secondary. Others are context only. |
+| Jumped to automation without validated edge | Paper bot before micro-live. Bot Readiness panel tracks progress. You decide when the data is sufficient. |
 
 ---
 
@@ -46,58 +47,28 @@
 
 See **HANDOFF.md** — that file is updated every session and is authoritative.
 
-As of May 21, 2026 (Paper Trader + Cipher Research Group reconciliation):
-`app.py` is 7,375 lines. `templates/index.html` is 8,391 lines. The app is live on a VPS at
+As of May 22, 2026:
+`app.py` is 7,868 lines. `templates/index.html` is 8,478 lines. The app is live on a VPS at
 `root@62.238.15.113`.
 
-**Signal count (live SQLite at this date): 814 total** — 165 WIN, 366 LOSS,
-233 PARTIAL, 50 EXPIRED-with-NULL-pnl. 764 closed with terminal outcomes.
-The 50 NULL-pnl EXPIRED rows pre-date the outcome evaluator's 75h→84h fix
-(see "Audit fixes applied" section below) and may be recoverable via
-`curl -X POST http://localhost:8080/api/backfill/pnl` on the VPS.
-
-Prior CLAUDE.md / HANDOFF.md sessions cited 800 / 853 / 1,055 / 1,148.
-None of those reconcile to the live DB. The audit (§04) flagged this
-specifically. Use this section as the source of truth until the next
-reconciliation.
+**Signal count (live SQLite as of May 22, 2026): 1,399 total**
+- 307 WIN / 621 LOSS / 318 PARTIAL / 27 open
+- 1,372 closed with terminal outcomes
+- ~45% win+partial rate across closed signals
 
 ### Audit fixes applied 2026-05-15
 
-External meta-analysis report verified 13/14 specific claims as accurate.
-Surgical fixes shipped this session:
+External meta-analysis verified 13/14 claims accurate. Surgical fixes shipped:
 
-1. **Outcome evaluator 75h→84h** — `app.py` `limit=300 → 336` so kline
-   coverage exceeds the 80h EXPIRED threshold. Backfill recovers the 50
-   NULL-pnl EXPIRED rows.
-2. **Paper bot `min_flow_score`** — was loaded but never passed to
-   `_flow_confirm()`. Now plumbed through.
-3. **`/api/paper/config` override surfacing** — response now includes
-   `effective_thresholds[strategy_key]` so the Paper UI can show
-   "you set 55 but Balanced floors to 65 by override".
-4. **`llm_unavailable` flag in agents** — `_analyst_call` tags responses
-   with `_llm_ok`; `run_agent_pipeline` aggregates and sets
-   `AgentOutput.llm_unavailable=True` when <2/8 analysts returned
-   parseable JSON. `enrich_signal` skips shadow_delta in that state and
-   adds `agent_unavailable` tag.
-5. **MEXC false `exchange_stress_notice`** — no longer fires during the
-   routine 70-minute pre-settlement window. Only anomalous funding
-   magnitudes (`|funding| > 0.002`) raise the flag now.
-6. **Hyperliquid `adl_risk`** — threshold raised from 0.001/hr to
-   0.005/hr (~12% annualised). Stops firing on normal trends.
-7. **`SCORE_VERSION` env var** — v1 (default, legacy step) and v2
-   (continuous saturating ramp) live side-by-side in `score_ticker`.
-   Signals tagged with `score_version` for A/B analysis. Run
-   `python3 scripts/reconstruct_conviction.py` to see whether v2
-   widens the winner/loser conviction divergence before flipping
-   `SCORE_VERSION=v2` in `.env`.
-8. **Bybit disabled in SUPPORTED_EXCHANGES** — was listed as supported
-   but no adapter existed, so signals routed through agents with zero
-   enhancement. Re-enable by uncommenting in `lib/exchange_data.py` AND
-   building `lib/adapters/bybit.py`.
-9. **`app.py` import-safe** — background thread `.start()` calls moved
-   inside the `__main__` guard. `backtest.py` and offline scripts can
-   now import `score_ticker` and `STRATEGIES` from `app.py` without
-   spawning four background workers. Closes audit §05 finding.
+1. **Outcome evaluator 75h→84h** — kline coverage now exceeds 80h EXPIRED threshold.
+2. **Paper bot `min_flow_score`** — was loaded but never passed to `_flow_confirm()`. Now plumbed through.
+3. **`/api/paper/config` override surfacing** — response includes `effective_thresholds[strategy_key]`.
+4. **`llm_unavailable` flag in agents** — `_analyst_call` tags `_llm_ok`; pipeline sets `AgentOutput.llm_unavailable=True` when <2/8 analysts return parseable JSON.
+5. **MEXC false `exchange_stress_notice`** — only fires on `|funding| > 0.002`, not routine settlement window.
+6. **Hyperliquid `adl_risk`** — threshold raised from 0.001/hr to 0.005/hr.
+7. **`SCORE_VERSION` env var** — v1 (legacy step) and v2 (continuous saturating ramp) live side-by-side.
+8. **Bybit disabled in SUPPORTED_EXCHANGES** — no adapter exists; re-enable by building `lib/adapters/bybit.py`.
+9. **`app.py` import-safe** — background thread `.start()` calls inside `__main__` guard.
 
 ---
 
@@ -114,7 +85,7 @@ Matrix_Trader_7.0/
 ├── .gitignore             ← covers .env, __pycache__, data/, *.db
 ├── .env                   ← secrets only; never read, never write, never commit
 ├── requirements.txt       ← all deps installed; add packages here if needed
-├── app.py                 ← entire Flask backend — 7,375 lines; keep flat, one file
+├── app.py                 ← entire Flask backend — 7,868 lines; keep flat, one file
 ├── backtest.py            ← standalone script; do NOT import from app.py
 ├── templates/
 │   └── index.html         ← entire frontend: HTML + CSS + JS; one file, no framework
@@ -128,9 +99,13 @@ Matrix_Trader_7.0/
 ├── data/                  ← gitignored; auto-created at runtime; never commit
 │   ├── signals.db         ← SQLite: signals, custom_strategies, position_events, filtered_candidates
 │   ├── risk_gates.json    ← live risk gate config (block/shadow/off per gate)
+│   ├── reports/           ← cached daily/weekly Cipher intelligence reports (daily_YYYY-MM-DD.json)
 │   └── backtest_results.json
 └── lib/                   ← pure utility functions only; no Flask, no API calls
-    ├── agents.py          ← 8-analyst Phase 1 shadow agent layer
+    ├── agents.py          ← 12-analyst Cipher Research Group + 8-analyst signal pipeline
+    │                         AGENT_ROSTER and FIRM_META live here
+    ├── ai_client.py       ← AI provider fallback chain; call_ai() is the only public function
+    │                         Strips <think> blocks; tries all models per provider; Claude→Gemini→DeepSeek→Groq
     ├── exchange_context.py ← canonical exchange-agnostic data contract
     ├── adapters/          ← exchange normalization registry
     │   ├── __init__.py
@@ -138,10 +113,11 @@ Matrix_Trader_7.0/
     │   └── hyperliquid.py
     ├── indicators.py      ← RSI, EMA, VWAP, ATR, volatility_regime, daily_trend_direction
     ├── laddering.py       ← generate_ladders(price, atr, tiers, direction)
-    ├── mexc_stream.py     ← WebSocket client (built; not used by SSE route — SSE uses poll loop)
-    ├── coinglass_client.py ← optional CoinGlass V4 client; fails closed if key is missing
-    ├── hyperliquid_client.py ← Hyperliquid public scan + read-only account client
-    └── ai_client.py       ← AI provider fallback chain; call_ai() is the only public function
+    ├── hl_execution.py    ← Hyperliquid execution: place_limit_order, kill_switch, get_positions
+    ├── risk_controls.py   ← compute_daily_pnl, compute_position_size, get_readiness_verdict
+    ├── mexc_stream.py     ← WebSocket client (built; not used by SSE route)
+    ├── coinglass_client.py ← optional CoinGlass V4 client; fails closed if key missing
+    └── hyperliquid_client.py ← Hyperliquid public scan + read-only account client
 ```
 
 **Touch policy:**
@@ -160,8 +136,11 @@ Matrix_Trader_7.0/
 Backend:    Python 3.11+ / Flask
 Frontend:   Single HTML file — vanilla JS, inline CSS, dark theme, no build step
 Database:   SQLite3 (stdlib) — data/signals.db
-AI:         lib/ai_client.py — fallback chain: Claude → GPT → Gemini → Groq
+AI:         lib/ai_client.py — fallback chain: Claude → Gemini → DeepSeek → Groq
+            Strips <think> blocks globally. Qwen3 on Groq has reasoning_effort="none".
+            Tries all models per provider before moving to next provider.
 Data:       MEXC public contract API (no auth for market data)
+            Hyperliquid public API (parallel scan, same pipeline)
             OKX public API (L/S ratio, OI — geo-unrestricted)
             CoinGlass V4 (optional — requires COINGLASS_API_KEY in .env)
 SSE:        /api/stream/prices — poll loop pushing prices every 3s
@@ -171,7 +150,7 @@ WebSocket:  lib/mexc_stream.py — built but not wired to any route
 **Dependencies (all installed):**
 ```
 flask, requests, pandas, numpy, websocket-client, python-dotenv,
-anthropic, google-generativeai, openai, groq
+anthropic, google-generativeai, openai, groq, eth-account, msgpack
 ```
 
 ---
@@ -180,23 +159,41 @@ anthropic, google-generativeai, openai, groq
 
 ```bash
 # .env — never commit this file
-ANTHROPIC_API_KEY=sk-ant-...     # required — signal reports, coach reviews, strategy analysis
+ANTHROPIC_API_KEY=sk-ant-...     # AI trade briefs, coach reviews, strategy analysis
+GEMINI_API_KEY=                   # fallback AI provider
+GROQ_API_KEY=                     # fallback AI provider (free tier, Qwen3/Llama)
+DEEPSEEK_API_KEY=                 # fallback AI provider (low cost)
 MATRIX_PORT=8080                  # optional — defaults to 8080
-MEXC_API_KEY=                     # optional — only needed for private endpoints (not currently used)
+MEXC_API_KEY=                     # optional — private endpoints blocked from Hetzner VPS
 MEXC_API_SECRET=                  # optional
 COINGLASS_API_KEY=                # optional — enables CoinGlass OI/liquidation enrichment
 HL_WALLET_ADDRESS=                # optional — Hyperliquid read-only account status
+HL_PRIVATE_KEY=                   # required for P11 live execution on Hyperliquid
+LIVE_TRADING_ENABLED=false        # master gate — must be explicitly set to true to place orders
+REPORT_NARRATIVE_MODE=deterministic  # deterministic | free | auto — controls Cipher report AI polish
+SCORE_VERSION=v1                  # v1 (legacy step) | v2 (saturating ramp) — A/B scoring test
 ```
 
 ---
 
-## Agent Shadow Layer
+## Agent Layer — Cipher Research Group
 
-Phase 1 of the Matrix Trader agent system is shadow-first. The 8-analyst pipeline runs from `enrich_signal()` through `lib.agents.run_agent_pipeline()`, but agent conviction deltas are not applied to signal conviction yet. Outputs are stored in `signal_json` under fields such as `agent_exchange`, `agent_regime`, `agent_narrative_bull`, `agent_structural_bull`, `agent_version`, `agent_shadow_delta`, `agent_shadow_narrative_delta`, `agent_shadow_structural_delta`, and `agent_shadow_disagreement`.
+Two distinct agent systems share `lib/agents.py`:
 
-Agent tags are prefixed with `agent_shadow_`. Deterministic Risk Manager hard blocks can still reduce conviction by 30 and add `agent_blocked` because those are math/risk gates, not LLM judgement.
+**Signal pipeline (8 analysts):** Runs from `enrich_signal()` through `run_agent_pipeline()`. Phase 2 is live — `agent_shadow_delta` is now applied to conviction. Tags are no longer shadow-prefixed. `agent_version = v2-phase2-live`. Deterministic Risk Manager hard blocks reduce conviction by 30 and add `agent_blocked`.
 
-Phase 2 must not apply `agent_shadow_delta` until at least 50 closed forward-tested signals have agent data, positive shadow deltas beat baseline, negative shadow deltas underperform baseline, high disagreement correlates with worse outcomes, and scan time stays within 10 seconds of the pre-agent baseline.
+**Intelligence reports (12 analysts — AGENT_ROSTER):** Named personas with domains, voice strings, and exchange focus. Used by `_build_deterministic_report_narrative()` and `_call_report_ai()` to produce daily/weekly reports. Analysts: trader (Thomas Chen), risk_manager (Harper), regime (Nadia Reyes), funding (Kenny Zhao), microstructure (Niobe), cross_venue (Ghost), technical (Ryo Tanaka), sentiment (Zara Cole), tokenomics (Dr. Asha Mehta), narrative_debate, structural_debate.
+
+**Report narrative system:**
+- `_build_deterministic_report_narrative()` — free, always fires, first-person analyst voices
+- `_call_report_ai()` — optional AI polish layer, controlled by `REPORT_NARRATIVE_MODE`
+- Reports cached to `data/reports/daily_YYYY-MM-DD.json` and `weekly_YYYY-Www.json`
+- Coach reviews pull daily report context for the trade date (fails silently if unavailable)
+
+**Phase 2 monitoring criteria (do not revert without data):**
+- Do agent_confirmed signals win more than baseline?
+- Do high-disagreement signals lose more?
+- Is scan time within 10 seconds of pre-agent baseline?
 
 ---
 
@@ -204,7 +201,7 @@ Phase 2 must not apply `agent_shadow_delta` until at least 50 closed forward-tes
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # add ANTHROPIC_API_KEY
+cp .env.example .env   # add ANTHROPIC_API_KEY at minimum
 python3 app.py
 # Local:  http://localhost:8080
 # iPhone: http://<LAN_IP>:8080 (same WiFi)
@@ -227,8 +224,6 @@ Two stages. Stage 1 is fast and free; Stage 2 is expensive and limited to top 30
 
 **Stage 1 — `score_ticker()` — kline-free, runs on all 800+ tickers**
 
-Inputs from `/contract/ticker` response only (no extra API calls):
-
 | Input | Effect |
 |---|---|
 | `riseFallRate` (24h change) | Momentum score — strong tier >5%, weak tier >2% |
@@ -241,7 +236,7 @@ Output: `conviction_base` (0–100), `direction`, `tags[]`, base signal dict.
 
 **Stage 2 — `enrich_signal()` — top 30 signals only, runs in 10 concurrent threads**
 
-Adds: 1h klines (RSI, EMA, ATR, trend score), 4h klines (daily trend), order book depth (imbalance), funding rate, market sentiment (OKX L/S, OKX OI; Binance/Bybit geo-blocked), CoinGlass OI/liquidation context (optional), ladders (3-tier ATR-based entry/TP/SL), signal_why, ai_report.
+Adds: 1h klines (RSI, EMA, ATR, trend score), 4h klines (daily trend), order book depth (imbalance), funding rate, market sentiment (OKX L/S, OKX OI), CoinGlass OI/liquidation context (optional), ladders (3-tier ATR-based entry/TP/SL), signal_why, ai_report, agent pipeline (Phase 2 live).
 
 Gate: pairs with < 50 1h candles or < 20 4h candles are skipped.
 
@@ -251,7 +246,7 @@ Two live gates in `data/risk_gates.json`, each with `block` / `shadow` / `off` m
 - `long_vol_long`: high/extreme-ATR LONG circuit breaker (default: `block`)
 - `short_vol_short`: extreme-ATR SHORT circuit breaker, Balanced only (default: `shadow`)
 
-Blocked signals are dropped. Shadow signals pass through tagged `*_vol_shadow`. Both modes log to `filtered_candidates` table.
+Blocked signals are dropped. Shadow signals pass through tagged `*_vol_shadow`. Both log to `filtered_candidates` table.
 
 **Conviction threshold:** default 55. Signals below this are filtered from results.
 
@@ -268,7 +263,7 @@ Four built-in strategies in `STRATEGIES` dict in `app.py`:
 | `momentum_breakout` | Momentum Breakout | 25x | Requires strong 24h move |
 | `mean_reversion` | Mean Reversion | 15x | RSI extremes only |
 
-Custom strategies persist in `custom_strategies` SQLite table. They clone a built-in base and can override weights, filters, leverage cap, min conviction, and regime.
+Custom strategies persist in `custom_strategies` SQLite table.
 
 **Do not add a new strategy by editing only one place.** Metadata spans:
 - `STRATEGIES` and `_STRATEGY_NAME_TO_KEY` in `app.py`
@@ -281,18 +276,20 @@ Custom strategies persist in `custom_strategies` SQLite table. They clone a buil
 **`signals`** — one row per logged signal
 Key columns: `symbol`, `direction`, `strategy`, `conviction`, `price`, `entry1–3`, `tp1–3`, `stop_loss`, `atr_pct`, `volatility`, `funding_rate`, `rsi_1h`, `trend_score`, `tags`, `signal_why`, `result`, `exit_price`, `entry_at`, `pnl_pct`, `leverage`, `data_quality`, `signal_json`, `evaluation_version`, `strategy_key`
 
+`signal_json` stores: agent outputs, coach_review, coach_review_at, ai_report, ladder data.
+
 **`position_events`** — incremental trade lifecycle ledger
 Event types: `ENTRY_FILLED`, `TP1_HIT`, `TP2_HIT`, `TP3_HIT`, `STOP_HIT`, manual close events.
-Each event stores `realized_pct` and `remaining_size_pct`.
 
 **`custom_strategies`** — user-created strategy clones
 
-**`filtered_candidates`** — signals that were blocked or shadowed by risk gates
-Stores `gate_key`, `gate_mode`, and why the signal was suppressed.
+**`filtered_candidates`** — signals blocked or shadowed by risk gates
+
+**`paper_trades`** — paper bot simulated trade lifecycle
 
 ---
 
-## Dashboard — Five Tabs
+## Dashboard — Six Tabs
 
 | Tab | Section | What It Does |
 |---|---|---|
@@ -300,15 +297,17 @@ Stores `gate_key`, `gate_mode`, and why the signal was suppressed.
 | Market | `#market-section` | All 800+ tickers paginated, sortable, searchable |
 | Tools | `#tools-section` | Risk calculator, compound planner |
 | Strategies | `#strategies-section` | Analytics: equity curves, regime breakdown, symbol performance, Portfolio Lab |
-| History | `#history-section` | Open positions (live P&L via SSE) + closed signals (equity curve, outcome tagging) |
+| History | `#history-section` | Open positions (live P&L via SSE) + closed signals (equity curve, outcome tagging, coach reviews) |
+| Intelligence | `#intelligence-section` | The Firm (analyst roster), Shadow Validation, Edge Lab, daily/weekly Cipher reports |
 
 **Shared detail panel** (`#detail-panel`): slides in from right (desktop) / up from bottom (mobile). Always write innerHTML to `#panel-body`, not the aside.
 
 **State objects** — fully isolated, never cross-reference:
 - `S` — Signals tab state
 - `M` — Market tab state
-- `H` — History tab state (open positions, price cache, closed signals)
+- `H` — History tab state
 - `A` — Strategies tab analytics state
+- `I` — Intelligence tab state (reportDate, reportWeek, reportCache)
 
 ---
 
@@ -316,13 +315,14 @@ Stores `gate_key`, `gate_mode`, and why the signal was suppressed.
 
 | Route | Method | What |
 |---|---|---|
-| `/api/scan` | GET | Scans with one strategy; `?strategy=<key>&threshold=<n>` |
+| `/api/scan` | GET | Scans with one strategy |
 | `/api/scan/all` | POST | Fetches tickers once, runs all enabled strategies |
 | `/api/market` | GET | All scored tickers for market browser |
 | `/api/signal/<symbol>` | GET | Full enrichment of a single symbol on demand |
 | `/api/signal/result` | PATCH | Tag outcome; accepts `exit_price` to compute `pnl_pct` |
 | `/api/signals/history` | GET | Signal history with filters |
-| `/api/signal/detail/<id>` | GET | Full trade detail + Claude coach review (closed signals) |
+| `/api/signal/detail/<id>` | GET | Full trade detail + coach review (closed signals) |
+| `/api/signal/detail/<id>/regenerate-review` | POST | Clear cached coach review; regenerates on next load |
 | `/api/outcomes/check` | POST | Auto-evaluate open positions against klines |
 | `/api/stream/prices` | GET | SSE: price updates every 3s for `?symbols=` |
 | `/api/strategies` | GET | All strategies with performance stats |
@@ -333,10 +333,22 @@ Stores `gate_key`, `gate_mode`, and why the signal was suppressed.
 | `/api/strategies/custom` | POST | Create custom strategy |
 | `/api/strategies/custom/<key>` | PATCH / DELETE | Edit or delete custom strategy |
 | `/api/analysis` | POST | AI strategy review (last 200 tagged outcomes) |
+| `/api/paper/config` | GET / PATCH | Paper bot config |
+| `/api/paper/stats` | GET | Paper bot aggregate stats |
+| `/api/paper/filter-stats` | GET | Live winner/loser ATR% and trend_score averages from signals DB |
+| `/api/paper/trades` | GET | Paper trade history |
+| `/api/intelligence/roster` | GET | Cipher Research Group analyst roster |
+| `/api/intelligence/reports/daily` | GET | Daily intelligence report (cached) |
+| `/api/intelligence/reports/weekly` | GET | Weekly intelligence report (cached) |
+| `/api/intelligence/reports/regenerate` | POST | Force regenerate a cached report |
+| `/api/execution/status` | GET | Hyperliquid execution readiness |
+| `/api/execution/place` | POST | Place limit order (gated by LIVE_TRADING_ENABLED) |
+| `/api/execution/kill-switch` | POST | Cancel all orders + close all positions |
+| `/api/account/daily-pnl` | GET | Today's realized P&L from signals DB |
 | `/api/backfill/pnl` | POST | MAINTENANCE — re-evaluate historical signals |
 | `/api/cleanup/phantom-events` | POST | MAINTENANCE — delete orphan position events |
 
-Background thread `_outcome_loop` runs `api_outcomes_check()` every 15 minutes.
+Background threads: `_outcome_loop` (15 min), `_snapshot_loop`, `_coach_review_loop` (10 min, 5 trades/batch), `_paper_bot_loop`.
 
 ---
 
@@ -350,7 +362,7 @@ Background thread `_outcome_loop` runs `api_outcomes_check()` every 15 minutes.
 6. **Error handling is a feature.** Every API call is wrapped in try/except. App never crashes.
 7. **Signal quality over quantity.** 20 high-conviction signals beats 200 weak ones.
 8. **The tool is for trading, not for looking at.** Aesthetics serve the signal, not the other way around.
-9. **S and M state objects are completely isolated.** Never share state between tabs.
+9. **State objects are completely isolated.** Never share state between tabs.
 10. **No JS frameworks.** Vanilla JS only.
 11. **No glassmorphism, gradients, or drop shadows.** Dark flat UI only.
 12. **Read the actual files before writing a single line.** Do not assume state from memory or prior sessions.
@@ -362,10 +374,10 @@ Background thread `_outcome_loop` runs `api_outcomes_check()` every 15 minutes.
 
 Immutable. Cannot be softened by any future session prompt or task description.
 
-1. Live trading is disabled by default. LIVE_TRADING_ENABLED=false in .env is the master gate.
-2. Paper simulation (P10) must run successfully before assisted live (P11) begins.
+1. Live trading is disabled by default. `LIVE_TRADING_ENABLED=false` in `.env` is the master gate.
+2. Paper simulation must run successfully before assisted live begins.
 3. User confirmation required before every order in assisted mode — no silent placement.
-4. Kill switch must be implemented and tested before P11 ships.
+4. Kill switch must be implemented and tested before live trading activates. It is implemented.
 5. No automatic leverage escalation under any condition.
 6. No averaging down.
 7. No blind retry loops on failed order placement.
@@ -375,8 +387,6 @@ Immutable. Cannot be softened by any future session prompt or task description.
 
 ## What NOT To Do
 
-A condensed version of HANDOFF.md's full list — the most critical items:
-
 - Do not call `enrich_signal()` from `backtest.py` — it makes live API calls
 - Do not import from `app.py` in a way that triggers Flask server startup
 - Do not add new SQLite columns without a migration — wrap in `try/except OperationalError`
@@ -385,19 +395,20 @@ A condensed version of HANDOFF.md's full list — the most critical items:
 - Do not write innerHTML to `$('detail-panel')` — write to `$('panel-body')` only
 - Do not filter direction server-side in `/api/signals/history` — client-side only
 - Do not commit `.env`, `data/`, or `__pycache__/`
-- Do not modify `S` state from market tab code or `M` state from signals tab code
-- Do not call any AI provider directly from routes — always use `call_ai()` from `lib/ai_client.py`
-- Do not import `anthropic` at top of `app.py` — lazy import inside `lib/ai_client.py` handles it
+- Do not modify one tab's state object from another tab's code
+- Do not call any AI provider directly — always use `call_ai()` from `lib/ai_client.py`
+- Do not import `anthropic` at top of `app.py` — lazy import inside `lib/ai_client.py`
 - Do not add new strategies by editing only one place — metadata spans `app.py` and `index.html`
 - Do not write TP/SL events to `position_events` without a prior `ENTRY_FILLED` event
 - Do not place CoinGlass conviction adjustments in `score_ticker()` — they belong in `enrich_signal()`
 - Do not promote `fragility_high`/`fragility_extreme` thresholds to hard gates without 2+ weeks of data
 - Do not run `POST /api/backfill/pnl` from a browser — use `curl -X POST` from the VPS shell
-- Do not let agents read raw exchange dicts directly — normalize through `lib/adapters` into `ExchangeContext` first
+- Do not let agents read raw exchange dicts — normalize through `lib/adapters` into `ExchangeContext` first
 - Do not call LLM providers directly from agents — use `call_ai()` from `lib/ai_client.py` only
 - Do not make MEXC or Hyperliquid API calls inside agents — use data passed from `enrich_signal()`
-- Do not apply `agent_shadow_delta` to conviction in Phase 1
-- Do not add SQLite columns for agent fields — Phase 1 output belongs in `signal_json`
+- Do not add SQLite columns for agent fields — agent output belongs in `signal_json`
+- Do not hardcode AI provider names in routes — always go through `call_ai()`
+- Do not cache coach reviews that contain `<think>` blocks or preamble text — if found, clear via regenerate route
 
 ---
 
