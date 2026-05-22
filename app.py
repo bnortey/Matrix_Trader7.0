@@ -6184,6 +6184,9 @@ def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> d
     This is the baseline narrative layer. Paid/free hosted LLMs can polish it,
     but reports should never go blank because a provider key is missing or a
     free-tier quota is exhausted.
+
+    All notes are written in first-person analyst voice. No 3rd-person framing.
+    Every note ends with a forward call — what to watch or do next.
     """
     narrative = _report_empty_narrative()
     pulse = data.get("market_pulse") or {}
@@ -6193,6 +6196,9 @@ def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> d
     coiling = data.get("whats_coiling") or []
     disagreements = data.get("disagreements") or []
     explosive = data.get("explosive_move") or {}
+    explosive_ctx = data.get("explosive_signal_context") or {}
+    coiling_rates = data.get("coiling_base_rates") or {}
+    strategy_perf = data.get("strategy_regime_perf") or []
     neg_funding, pos_funding = _report_count_funding_extremes(data)
 
     top_gain = top_gainers[0] if top_gainers else None
@@ -6200,84 +6206,312 @@ def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> d
     signals = int(pulse.get("signals") or 0)
     blocked = int(pulse.get("blocked") or 0)
     regime = str(pulse.get("dominant_regime") or "unknown").replace("_", " ")
-    agreement = str(pulse.get("desk_agreement") or "unknown")
 
-    pressure_bits = []
-    if neg_funding:
-        pressure_bits.append(f"{neg_funding} names with extreme negative funding")
-    if pos_funding:
-        pressure_bits.append(f"{pos_funding} names with extreme positive funding")
-    if coiling:
-        pressure_bits.append(f"{len(coiling)} coiling setups")
-    pressure = ", ".join(pressure_bits) if pressure_bits else "no major funding extremes"
+    # --- Thomas: trader_open — signal count, regime, best strategy, funding crowding ---
+    best_strat_note = ""
+    if strategy_perf:
+        regime_key = str(pulse.get("dominant_regime") or "")
+        regime_rows = [r for r in strategy_perf if r.get("regime", "") == regime_key]
+        if not regime_rows:
+            regime_rows = strategy_perf
+        def _win_rate(r: dict) -> float:
+            w = int(r.get("win", 0)) + int(r.get("partial", 0))
+            total = w + int(r.get("loss", 0))
+            return w / total if total >= 3 else 0.0
+        best = max(regime_rows, key=_win_rate, default=None)
+        if best:
+            bw = int(best.get("win", 0)) + int(best.get("partial", 0))
+            btotal = bw + int(best.get("loss", 0))
+            if btotal >= 3:
+                best_strat_note = (
+                    f" {best.get('strategy', 'unknown').replace('_', ' ').title()} "
+                    f"is leading in this regime — {bw}/{btotal} closed trades on the right side."
+                )
 
+    funding_crowd = ""
+    if neg_funding and pos_funding:
+        funding_crowd = f" Funding pressure is split: {neg_funding} names carry negative rate (short squeeze risk), {pos_funding} carry positive (long flush risk)."
+    elif neg_funding:
+        funding_crowd = f" {neg_funding} names are running extreme negative funding — shorts are paying heavily to stay on."
+    elif pos_funding:
+        funding_crowd = f" {pos_funding} names are running extreme positive funding — longs are carrying a crowded bet."
+
+    top_gain_str = _report_fmt_symbol(top_gain)
+    top_loss_str = _report_fmt_symbol(top_loss)
     narrative["trader_open"] = (
-        f"The desk logged {signals} signals with {blocked} blocked candidates. "
-        f"Regime reads {regime}; agreement is {agreement}. "
-        f"Leadership is watching {_report_fmt_symbol(top_gain)} on strength ({_report_fmt_move(top_gain)}) "
-        f"and {_report_fmt_symbol(top_loss)} on weakness ({_report_fmt_move(top_loss)}). "
-        f"The useful read is not direction alone; it is whether the move cleared funding, volume, and risk gates."
+        f"I logged {signals} signals today with {blocked} candidates blocked before they reached the desk. "
+        f"The tape is reading {regime}.{best_strat_note}{funding_crowd} "
+        f"The move that stood out on strength was {top_gain_str} ({_report_fmt_move(top_gain)}); "
+        f"the clearest weakness was {top_loss_str} ({_report_fmt_move(top_loss)}). "
+        f"Watch whether the dominant regime holds through the next session — a regime shift mid-tape changes which filters apply."
     )
 
+    # --- Nadia: regime_forecast — coiling setups + historical base rates ---
     if coiling:
         lead = coiling[0]
+        lead_sym = lead.get("symbol", "")
+        lead_fr = _report_float(lead.get("funding_rate"))
+        lead_fr_ann = abs(lead_fr) * 3 * 365 * 100
+        watch = lead.get("watch", "SHORT SQUEEZE")
+        base_note = ""
+        if lead_sym in coiling_rates:
+            br = coiling_rates[lead_sym]
+            n = br.get("n", 0)
+            wr = br.get("win_rate")
+            if wr is not None and n >= 5:
+                base_note = f" History: {n} prior setups with this funding profile resolved in favor of {br.get('direction', watch)} {wr}% of the time."
+            elif n < 5:
+                base_note = f" We have fewer than 5 historical comps for this setup — treat it as unvalidated edge."
         narrative["regime_forecast"] = (
-            f"Nadia flags a pressure build rather than a clean trend. "
-            f"{_report_fmt_symbol(lead)} is coiling with funding at {_report_float(lead.get('funding_rate')):.5f} "
-            f"while price has moved only {_report_fmt_move(lead)}. "
-            f"That combination can precede forced movement, but leverage should stay reduced until volume confirms."
+            f"I'm reading pressure build, not trend. {lead_sym} has barely moved ({_report_fmt_move(lead)}) "
+            f"but funding is at {lead_fr:.5f} — that's {lead_fr_ann:.0f}% annualized carry. "
+            f"Something has to give: either price breaks in the direction of the carry, or funding normalizes as positions unwind.{base_note} "
+            f"Watch {lead_sym} for a volume surge that resolves the coil. Until then, size down on any signal touching this name."
         )
     else:
+        regime_note = f"The {regime} regime is the dominant read today."
+        if strategy_perf:
+            regime_key = str(pulse.get("dominant_regime") or "")
+            regime_rows = [r for r in strategy_perf if r.get("regime", "") == regime_key]
+            if regime_rows:
+                def _wr(r: dict) -> float:
+                    w = int(r.get("win", 0)) + int(r.get("partial", 0))
+                    t = w + int(r.get("loss", 0))
+                    return w / t if t >= 3 else 0.0
+                best = max(regime_rows, key=_wr, default=None)
+                if best and _wr(best) > 0:
+                    bw = int(best.get("win", 0)) + int(best.get("partial", 0))
+                    bt = bw + int(best.get("loss", 0))
+                    regime_note = (
+                        f"In {regime} regimes, our {best.get('strategy', '').replace('_', ' ').title()} filter "
+                        f"has {bw}/{bt} on the right side of closed trades."
+                    )
+        pressure_summary = ""
+        if neg_funding or pos_funding:
+            pressure_summary = f" Funding extremes are present ({neg_funding} negative, {pos_funding} positive) but no coiling setup meets the threshold today."
         narrative["regime_forecast"] = (
-            f"Nadia sees a {regime} tape with {pressure}. "
-            f"Without a visible coiling list, the better posture is selective: require clean participation, "
-            f"avoid thin books, and let weak signals pass."
+            f"{regime_note}{pressure_summary} "
+            f"No coiling setups on the board means the market isn't telegraphing a squeeze or flush. "
+            f"My posture here is selective: require clean structure, elevated volume, and funded direction before taking any position."
         )
+
+    # --- Harper: risk_close — gate names, blocked counts, forward posture ---
+    blocked_gates: list[str] = []
+    for b in (data.get("blocked") or [])[:20]:
+        gk = b.get("gate_key") or ""
+        if gk and gk not in blocked_gates:
+            blocked_gates.append(gk)
 
     if blocked or disagreements:
+        gate_detail = ""
+        if blocked_gates:
+            gate_detail = f" The active gates were: {', '.join(blocked_gates[:4])}."
+        dis_note = ""
+        if disagreements:
+            dis_note = f" {len(disagreements)} signals came through with material analyst disagreement — those are lower-confidence entries."
         narrative["risk_close"] = (
-            f"Harper's close: {blocked} candidates were blocked and {len(disagreements)} material disagreements "
-            f"showed up in the analyst layer. That is not a mandate to trade less forever; it is a mandate "
-            f"to size smaller until the desk sees alignment across structure, funding, and tape."
+            f"I blocked {blocked} candidates before they reached your list.{gate_detail}{dis_note} "
+            f"This is not a signal to trade less — it's a signal to size correctly. "
+            f"Blocked candidates don't disappear; they reappear when conditions improve. "
+            f"Watch the blocked list for symbols that clear gate criteria on the next scan."
         )
     else:
         narrative["risk_close"] = (
-            "Harper's close: no major internal conflict is showing in today's report, but that is not permission "
-            "to chase. Keep stops mechanical, avoid stale signals, and do not increase leverage just because the dashboard is quiet."
+            f"I blocked nothing today and saw no major disagreement across analysts. "
+            f"That reads as a clean tape — but clean tapes are where discipline matters most. "
+            f"When gates are quiet, the instinct is to increase size. Resist it. "
+            f"Keep stops mechanical and let the signal quality drive position sizing, not the absence of red flags."
         )
 
+    # --- Kenny: funding_autopsy — alignment, annualized carry, signal cross-reference ---
     if explosive:
+        exp_sym = explosive.get("symbol", "")
+        exp_change = _report_float(explosive.get("change_24h_pct"))
+        exp_fr = _report_float(explosive.get("funding_rate"))
+        exp_fr_ann = abs(exp_fr) * 3 * 365 * 100 if exp_fr else 0
+
+        # Classify funding alignment
+        if exp_change > 0 and exp_fr < -0.0003:
+            alignment = "short squeeze"
+            alignment_note = (
+                f"Funding was deeply negative ({exp_fr:.5f}, {exp_fr_ann:.0f}% annualized) while price ripped {exp_change:.1f}%. "
+                f"That's a classic squeeze — shorts got carried out. Late entries from here carry the wrong side of funding."
+            )
+        elif exp_change < 0 and exp_fr > 0.0003:
+            alignment = "long flush"
+            alignment_note = (
+                f"Funding was elevated ({exp_fr:.5f}, {exp_fr_ann:.0f}% annualized) while price dropped {abs(exp_change):.1f}%. "
+                f"That's a long flush — crowded longs unwinding. Catching this knife requires a funding reset first."
+            )
+        elif exp_fr and abs(exp_fr) > 0.0003 and exp_change * (1 if exp_fr > 0 else -1) > 0:
+            alignment = "aligned carry"
+            alignment_note = (
+                f"Funding at {exp_fr:.5f} ({exp_fr_ann:.0f}% annualized) moved in the same direction as price. "
+                f"That's not a squeeze — it's a carry trade. Momentum chasers are paying to be right. "
+                f"Watch for the unwind when funding flips."
+            )
+        else:
+            alignment = "neutral"
+            alignment_note = (
+                f"Funding was neutral ({exp_fr:.5f}) during the {exp_change:.1f}% move on {exp_sym}. "
+                f"This move was driven by something other than carry pressure — likely spot flow or news. "
+                f"No funding edge here in either direction."
+            )
+
+        # Signal cross-reference
+        sig_note = ""
+        if explosive_ctx.get("had_signal"):
+            sig_dir = explosive_ctx.get("signal_direction", "")
+            sig_conv = explosive_ctx.get("signal_conviction", "")
+            sig_result = explosive_ctx.get("signal_result") or "open"
+            sig_note = (
+                f" {exp_sym} was on our list today — {sig_dir} at {sig_conv} conviction, currently {sig_result}. "
+                f"The system caught this name."
+            )
+        elif explosive_ctx.get("was_blocked"):
+            gate = explosive_ctx.get("block_gate", "a risk gate")
+            sig_note = f" {exp_sym} was blocked by {gate} before reaching the signal list — it was on our radar but gated out."
+        else:
+            sig_note = f" {exp_sym} did not appear on today's signal list. Worth reviewing why — if structure was absent at scan time, the move may have been un-scannable."
+
         narrative["funding_autopsy"] = (
-            f"Kenny reads {_report_fmt_symbol(explosive)} as a funding-context move: "
-            f"{_report_fmt_move(explosive)} with funding at {_report_float(explosive.get('funding_rate')):.5f}. "
-            f"If funding is stretched in the direction of the move, late entries are lower quality."
-        )
-        narrative["microstructure_autopsy"] = (
-            f"Niobe cares less about the headline candle and more about whether depth held during {_report_fmt_symbol(explosive)}. "
-            f"A sharp move without durable volume is often a trap; a sharp move with participation can become continuation."
-        )
-        narrative["cross_venue_autopsy"] = (
-            f"Ghost wants venue confirmation before trusting {_report_fmt_symbol(explosive)}. "
-            f"If MEXC, Hyperliquid, and eventually Bybit agree, the move is cleaner. If one venue leads alone, treat it as suspect."
+            f"The big move today was {exp_sym} at {exp_change:+.1f}%. {alignment_note}{sig_note} "
+            f"Forward call: if this is a {alignment}, watch for funding to normalize over the next 8–24 hours. "
+            f"That normalization window is when the next tradeable setup typically appears."
         )
     else:
-        narrative["funding_autopsy"] = "Kenny has no single explosive move to dissect. Funding still matters: crowded carry is a warning, not a trade by itself."
-        narrative["microstructure_autopsy"] = "Niobe has no move autopsy today. The standing rule holds: no depth, no confidence."
-        narrative["cross_venue_autopsy"] = "Ghost has no venue-leader event to call out. Cross-venue agreement remains a future edge layer as Bybit comes online."
+        if neg_funding or pos_funding:
+            narrative["funding_autopsy"] = (
+                f"No single explosive move to dissect today, but funding pressure is real. "
+                f"{neg_funding} names run extreme negative funding (short squeeze risk) and "
+                f"{pos_funding} run extreme positive (long flush risk). "
+                f"Crowded carry without price resolution is a pending event, not a stable condition. "
+                f"Watch for a catalyst that forces the unwind — that's where the next explosive move comes from."
+            )
+        else:
+            narrative["funding_autopsy"] = (
+                f"No explosive move and no extreme funding today. "
+                f"Funding-neutral environments reduce one edge signal but don't eliminate others. "
+                f"Structure and volume still apply. My read: stay selective, let setup quality drive entries."
+            )
 
+    # --- Niobe: microstructure_autopsy — volume classification, continuation vs trap ---
+    if explosive:
+        exp_sym = explosive.get("symbol", "")
+        exp_change = _report_float(explosive.get("change_24h_pct"))
+        exp_vol = _report_float(explosive.get("volume_24h"))
+
+        if exp_vol >= 500_000_000:
+            vol_label = "institutional-grade"
+            vol_read = "participation at this scale is hard to fake — the move had real buyers or sellers behind it"
+        elif exp_vol >= 100_000_000:
+            vol_label = "decent"
+            vol_read = "volume was enough to move the market but not enough to call this a consensus event"
+        elif exp_vol >= 20_000_000:
+            vol_label = "thin"
+            vol_read = "thin volume on a large percentage move is a trap signal — sharp candles with no follow-through are common in this profile"
+        else:
+            vol_label = "very thin"
+            vol_read = "this moved on almost no volume. Treat it as noise until real participation shows up"
+
+        continuation_call = "Watch for volume to expand on the next hourly candle — that's continuation. If volume collapses, the move was a wick, not a trend."
+        if vol_label in ("institutional-grade", "decent") and abs(exp_change) > 5:
+            continuation_call = "High-volume, large-move combination has continuation odds in its favor. Monitor for a retest of the breakout level — that's the entry I'd want, not the breakout itself."
+
+        narrative["microstructure_autopsy"] = (
+            f"I care less about the candle size and more about what was behind it. "
+            f"{exp_sym} moved {exp_change:+.1f}% on {exp_vol / 1e6:.0f}M USD volume — that's {vol_label}: {vol_read}. "
+            f"{continuation_call}"
+        )
+    else:
+        narrative["microstructure_autopsy"] = (
+            f"No single move demanded an autopsy today. "
+            f"The standing rule: volume proportional to move size is continuation. Volume mismatched to move size is trap. "
+            f"If a name appears on the signal list with thin order book depth, drop size by half — the spread will eat the edge."
+        )
+
+    # --- Ghost: cross_venue_autopsy — venue leader, arb gap implications ---
+    if explosive:
+        exp_sym = explosive.get("symbol", "")
+        exp_exchange = explosive.get("exchange") or "MEXC"
+        exp_change = _report_float(explosive.get("change_24h_pct"))
+
+        if exp_exchange == "MEXC":
+            venue_note = (
+                f"MEXC led this move on {exp_sym}. MEXC leads when perp traders are driving — "
+                f"there's no spot market to anchor it, so funding and liquidations do the work. "
+                f"Check Hyperliquid for confirmation: if HL is flat, the move is MEXC-specific and deserves less conviction."
+            )
+        elif exp_exchange in ("Hyperliquid", "HL"):
+            venue_note = (
+                f"Hyperliquid led on {exp_sym} — that's a sophisticated-flow signal. "
+                f"HL tends to attract directional traders with higher conviction. "
+                f"If MEXC is lagging, there's an arb window, but it closes fast. "
+                f"I'd rather trade the HL-led direction on MEXC after MEXC catches up."
+            )
+        else:
+            venue_note = (
+                f"{exp_exchange} led on {exp_sym}. Cross-venue leadership from smaller venues "
+                f"is harder to interpret — check if MEXC and HL are moving in sympathy. "
+                f"If they are, the move is real. If they're flat, it's venue-local noise."
+            )
+
+        narrative["cross_venue_autopsy"] = (
+            f"{exp_sym} moved {exp_change:+.1f}%. {venue_note} "
+            f"As Bybit comes back online in this stack, three-venue agreement will become the gold standard. "
+            f"Until then: two-venue confirmation is strong enough to trade; single-venue requires tighter stops."
+        )
+    else:
+        narrative["cross_venue_autopsy"] = (
+            f"No venue-leader event to call out today. "
+            f"Cross-venue arb opportunities are quiet when the tape is range-bound. "
+            f"The edge I'm building toward: when MEXC and Hyperliquid diverge by more than 0.5% on the same pair, "
+            f"that gap telegraphs the next directional move. Watch for that pattern on any name running extreme funding."
+        )
+
+    # --- Weekly additions ---
     if weekly:
         wins = int(paper.get("wins") or 0)
         closed = int(paper.get("closed") or 0)
         avg_pnl = _report_float(paper.get("avg_pnl_pct"))
+        total_pnl = _report_float(paper.get("total_pnl_pct"))
+
+        perf_note = ""
+        if closed >= 5:
+            win_rate = round(wins / closed * 100) if closed else 0
+            if win_rate >= 60 and avg_pnl > 0:
+                perf_note = f" The paper numbers are encouraging — {win_rate}% win rate and {avg_pnl:.2f}% average P&L. If these hold another two weeks, the filters are earning promotion to live."
+            elif win_rate < 40 or avg_pnl < 0:
+                perf_note = f" The paper numbers are telling me something is wrong — {win_rate}% win rate and {avg_pnl:.2f}% average P&L. Before going live, I need to understand whether this is a filter problem or a regime problem."
+            else:
+                perf_note = f" Paper is running at {win_rate}% and {avg_pnl:.2f}% average — acceptable but not yet compelling. Give it more reps before reading too much into it."
+        elif closed > 0:
+            perf_note = f" Only {closed} paper trades closed this week — too thin for statistical reads. Keep running."
+        else:
+            perf_note = " No paper trades closed this week. Check that the paper bot is scanning and that minimum conviction thresholds are reachable."
+
         narrative["week_ahead"] = (
-            f"Thomas's week-ahead view: keep studying whether the Paper Desk is proving the filters. "
-            f"It closed {closed} trades with {wins} wins and {avg_pnl:.2f}% average P&L. "
-            f"Next week, prioritize regimes where paper results, funding behavior, and analyst agreement point the same way."
+            f"I closed {closed} paper trades this week with {wins} winners, {avg_pnl:.2f}% average, and {total_pnl:.2f}% total P&L.{perf_note} "
+            f"Next week, I'm watching whether the dominant regime persists or rotates — regime changes are where backtested win rates stop applying. "
+            f"If funding extremes are still building, expect at least one squeeze or flush in the first half of the week."
         )
+
         spotlight_key = data.get("spotlight_key") or "funding"
+        spotlight_name_map = {
+            "funding": "Kenny Zhao",
+            "microstructure": "Niobe",
+            "cross_venue": "Ghost",
+            "regime": "Nadia Reyes",
+            "technical": "Ryo Tanaka",
+            "sentiment": "Zara Cole",
+            "tokenomics": "Dr. Asha Mehta",
+        }
+        spotlight_name = spotlight_name_map.get(spotlight_key, spotlight_key.replace("_", " ").title())
         narrative["spotlight"] = (
-            f"This week's spotlight is {spotlight_key.replace('_', ' ')}. "
-            f"The desk should use that analyst's domain to explain not just what moved, but what condition appeared before the move."
+            f"This week's spotlight is {spotlight_name}. "
+            f"Pull up the signals where {spotlight_name}'s domain was the deciding factor — "
+            f"did those calls add edge or cost us? That's the question that earns the analyst a bigger role next week. "
+            f"Spotlights rotate to prevent anchoring on a single voice."
         )
 
     return narrative
@@ -6360,6 +6594,69 @@ def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool, str]:
     except Exception as e:
         print(f"[report_ai] {e}", file=sys.stderr)
     return narrative, False, "deterministic"
+
+
+def _report_explosive_signal_context(symbol: str, date_str: str) -> dict:
+    """Check if the explosive move pair appeared in today's signals or blocked list."""
+    ctx: dict = {"had_signal": False, "was_blocked": False}
+    if not symbol:
+        return ctx
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT direction, conviction, result, strategy_key FROM signals "
+            "WHERE symbol=? AND date(logged_at)=? ORDER BY conviction DESC LIMIT 1",
+            (symbol, date_str),
+        ).fetchone()
+        if row:
+            ctx.update({"had_signal": True, "signal_direction": row[0],
+                         "signal_conviction": row[1], "signal_result": row[2],
+                         "signal_strategy": row[3]})
+        blk = con.execute(
+            "SELECT gate_key FROM filtered_candidates WHERE symbol=? AND date(logged_at)=? LIMIT 1",
+            (symbol, date_str),
+        ).fetchone()
+        if blk:
+            ctx.update({"was_blocked": True, "block_gate": blk[0]})
+        con.close()
+    except Exception as e:
+        print(f"[explosive_ctx] {e}", file=sys.stderr)
+    return ctx
+
+
+def _report_coiling_base_rates(coiling: list, date_str: str) -> dict:
+    """Historical win rate for extreme-funding setups in the signals DB."""
+    result: dict = {}
+    if not coiling:
+        return result
+    try:
+        con = sqlite3.connect(DB_PATH)
+        for entry in coiling[:4]:
+            fr = _report_float(entry.get("funding_rate"))
+            sym = entry.get("symbol", "")
+            if fr == 0 or not sym:
+                continue
+            direction = "LONG" if fr < 0 else "SHORT"
+            threshold = max(abs(fr) * 0.5, 0.0003)
+            sign = -1 if fr < 0 else 1
+            rows = con.execute(
+                "SELECT result FROM signals WHERE direction=? "
+                "AND funding_rate IS NOT NULL AND ABS(funding_rate)>=? "
+                "AND (CASE WHEN funding_rate<0 THEN -1 ELSE 1 END)=? "
+                "AND result IN ('WIN','LOSS','PARTIAL') AND date(logged_at)<date(?) LIMIT 100",
+                (direction, threshold, sign, date_str),
+            ).fetchall()
+            n = len(rows)
+            wins = sum(1 for r in rows if r[0] in ("WIN", "PARTIAL"))
+            result[sym] = {
+                "n": n,
+                "win_rate": round(wins / n * 100) if n >= 5 else None,
+                "direction": direction,
+            }
+        con.close()
+    except Exception as e:
+        print(f"[coiling_base_rates] {e}", file=sys.stderr)
+    return result
 
 
 def _build_daily_data(date_str: str, ticker_snapshot: list[dict] | None = None) -> dict:
@@ -6463,6 +6760,9 @@ def _build_daily_data(date_str: str, ticker_snapshot: list[dict] | None = None) 
     }
 
     dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
+    explosive_sym = (explosive_move or {}).get("symbol", "")
+    explosive_signal_context = _report_explosive_signal_context(explosive_sym, date_str)
+    coiling_base_rates = _report_coiling_base_rates(coiling, date_str)
     return {
         "date": date_str,
         "market_pulse": {
@@ -6480,7 +6780,9 @@ def _build_daily_data(date_str: str, ticker_snapshot: list[dict] | None = None) 
         "top_gainers": top_gainers,
         "top_losers": top_losers,
         "explosive_move": explosive_move,
+        "explosive_signal_context": explosive_signal_context,
         "whats_coiling": coiling,
+        "coiling_base_rates": coiling_base_rates,
         "liquidation_clusters": [],
         "disagreements": disagreements[:10],
         "strategy_regime_perf": [
