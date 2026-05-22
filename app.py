@@ -7648,6 +7648,43 @@ def api_paper_trades():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/paper/filter-stats")
+def api_paper_filter_stats():
+    """
+    Live winner/loser averages for ATR% and trend_score from closed signals.
+    Used to annotate the paper trader config panel with real DB-derived hints.
+    Requires at least 10 winners and 10 losers to return meaningful data.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            "SELECT atr_pct, trend_score, result FROM signals "
+            "WHERE result IN ('WIN','LOSS','PARTIAL') "
+            "AND atr_pct IS NOT NULL AND trend_score IS NOT NULL"
+        ).fetchall()
+        con.close()
+
+        winners = [(r[0], abs(r[1])) for r in rows if r[2] in ("WIN", "PARTIAL")]
+        losers  = [(r[0], abs(r[1])) for r in rows if r[2] == "LOSS"]
+
+        def _avg(vals):
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        w_atr   = _avg([r[0] for r in winners])
+        l_atr   = _avg([r[0] for r in losers])
+        w_trend = _avg([r[1] for r in winners])
+        l_trend = _avg([r[1] for r in losers])
+
+        return jsonify({
+            "success": True,
+            "sample": {"winners": len(winners), "losers": len(losers)},
+            "atr_pct":     {"winners_avg": w_atr,   "losers_avg": l_atr},
+            "trend_score": {"winners_avg": w_trend, "losers_avg": l_trend},
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/paper/stats")
 def api_paper_stats():
     """Aggregate stats for paper trading: win rate, P&L, flow-confirmed vs rejected comparison."""

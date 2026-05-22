@@ -7678,16 +7678,18 @@ async function loadPaperTrading() {
   if (!el) return;
   el.innerHTML = '<div style="color:var(--muted);padding:2rem;">Loading...</div>';
   try {
-    const [cfgR, statsR, tradesR, stratR] = await Promise.all([
+    const [cfgR, statsR, tradesR, stratR, filterStatsR] = await Promise.all([
       fetch('/api/paper/config'),
       fetch('/api/paper/stats'),
       fetch('/api/paper/trades'),
       fetch('/api/strategies'),
+      fetch('/api/paper/filter-stats'),
     ]);
-    const cfg    = await cfgR.json();
-    const stats  = await statsR.json();
-    const trades = await tradesR.json();
-    const stratD = await stratR.json();
+    const cfg         = await cfgR.json();
+    const stats       = await statsR.json();
+    const trades      = await tradesR.json();
+    const stratD      = await stratR.json();
+    const filterStats = await filterStatsR.json();
     if (!cfg.success) { el.innerHTML = '<div style="color:var(--red);padding:2rem;">Config unavailable</div>'; return; }
 
     // All enabled strategies from the API (built-ins + custom)
@@ -7767,12 +7769,27 @@ async function loadPaperTrading() {
           </select>`)}
           ${paperConfigField('Min Flow Score', `<input id="pc-flowscore" type="number" value="${c.min_flow_score}" min="0" max="100" step="5"
             style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">`)}
-          ${paperConfigField('Max ATR% (volatility gate)', `<input id="pc-maxatr" type="number" value="${c.max_atr_pct ?? 4.0}" min="1" max="20" step="0.5"
-            style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">
-            <div style="font-size:10px;color:#555;margin-top:2px">Winners avg 3.2% vs losers 5.5%</div>`)}
-          ${paperConfigField('Max |Trend Score| (structure gate)', `<input id="pc-maxtrend" type="number" value="${c.max_trend_score_abs ?? 25}" min="5" max="100" step="5"
-            style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">
-            <div style="font-size:10px;color:#555;margin-top:2px">Winners avg 9.3 vs losers 14.1</div>`)}
+          ${(()=>{
+            const fs = filterStats && filterStats.success ? filterStats : null;
+            const atrW = fs?.atr_pct?.winners_avg;
+            const atrL = fs?.atr_pct?.losers_avg;
+            const tW   = fs?.trend_score?.winners_avg;
+            const tL   = fs?.trend_score?.losers_avg;
+            const nW   = fs?.sample?.winners ?? 0;
+            const nL   = fs?.sample?.losers ?? 0;
+            const atrHint = (atrW != null && atrL != null)
+              ? `Live: winners avg ${atrW}% vs losers ${atrL}% (${nW}W / ${nL}L)`
+              : 'Insufficient data yet';
+            const trendHint = (tW != null && tL != null)
+              ? `Live: winners avg ${tW} vs losers ${tL} (${nW}W / ${nL}L)`
+              : 'Insufficient data yet';
+            return paperConfigField('Max ATR% (volatility gate)', `<input id="pc-maxatr" type="number" value="${c.max_atr_pct ?? 4.0}" min="1" max="20" step="0.5"
+              style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">
+              <div style="font-size:10px;color:#555;margin-top:2px">${atrHint}</div>`)
+              + paperConfigField('Max |Trend Score| (structure gate)', `<input id="pc-maxtrend" type="number" value="${c.max_trend_score_abs ?? 25}" min="5" max="100" step="5"
+              style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">
+              <div style="font-size:10px;color:#555;margin-top:2px">${trendHint}</div>`);
+          })()}
         </div>
         <button onclick="savePaperConfig()"
           style="margin-top:10px;padding:5px 16px;border-radius:4px;border:1px solid #448aff;background:transparent;color:#448aff;font-size:12px;font-weight:700;cursor:pointer;">
