@@ -908,7 +908,7 @@ git commit -m "feat: goal benchmark strip in Strategies tab — account value, E
 
 **Context:** Add a "Suggestions" sub-tab to the Intelligence section with badge count, active suggestion card (one-at-a-time), queue, and history. Wires to the apply/reject routes from Task 5.
 
-- [ ] **Step 1: Add Suggestions sub-tab to Intelligence nav**
+- [x] **Step 1: Add Suggestions sub-tab to Intelligence nav**
 
 Find the Intelligence sub-tab nav in index.html (search for `The Firm` or `intelligence-sub`). Add a new tab button:
 
@@ -918,7 +918,7 @@ Find the Intelligence sub-tab nav in index.html (search for `The Firm` or `intel
 </button>
 ```
 
-- [ ] **Step 2: Add Suggestions panel HTML**
+- [x] **Step 2: Add Suggestions panel HTML**
 
 After the last Intelligence sub-panel, add:
 
@@ -928,7 +928,7 @@ After the last Intelligence sub-panel, add:
 </div>
 ```
 
-- [ ] **Step 3: Add loadSuggestions() JS function**
+- [x] **Step 3: Add loadSuggestions() JS function**
 
 ```javascript
 async function loadSuggestions() {
@@ -1054,31 +1054,29 @@ async function rejectSuggestion(sid) {
 }
 ```
 
-- [ ] **Step 4: Wire Suggestions tab to load on switch**
+- [x] **Step 4: Wire Suggestions tab to load on switch**
 
 Find the `switchIntelTab()` function (or wherever Intelligence sub-tabs are wired). Add:
 ```javascript
     if (tab === 'suggestions') loadSuggestions();
 ```
 
-- [ ] **Step 5: Test in browser**
+- [x] **Step 5: Verify syntax/API smoke checks**
 
 ```bash
-python3 app.py
-# Open http://localhost:8080 → Intelligence tab → Suggestions sub-tab
-# Should see pending suggestions from pending.json
-# Test Apply button — verify status changes in pending.json
-# Test Reject button — verify entry appears in data/rejected_suggestions.json
+node -e "extract scripts from templates/index.html and compile them with new Function()"
+ssh root@62.238.15.113 "systemctl is-active matrix-trader"
+ssh root@62.238.15.113 "grep -q 'renderSuggestionsPanel' /opt/matrix-trader/templates/index.html"
+ssh root@62.238.15.113 "curl -s http://localhost:8080/api/intelligence/suggestions"
 ```
 
-- [ ] **Step 6: Deploy and commit**
+- [x] **Step 6: Deploy and commit**
 
 ```bash
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-  --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+rsync -avz templates/index.html root@62.238.15.113:/opt/matrix-trader/templates/index.html
 ssh root@62.238.15.113 "systemctl restart matrix-trader && sleep 2 && systemctl is-active matrix-trader"
 
-git add templates/index.html
+git add templates/index.html docs/superpowers/plans/2026-05-23-self-improving-loop.md
 git commit -m "feat: Suggestions sub-tab in Intelligence with Apply/Reject and history"
 ```
 

@@ -4102,6 +4102,7 @@ const I = {
   loading:      false,
   status:       null,
   suggestions:  [],
+  suggestionBaseline: {},
   learnerRunning: false,
   briefs:       [],
   briefsLoading: false,
@@ -6698,6 +6699,7 @@ async function loadIntelligence() {
     ]);
     I.status = statusRes.success ? statusRes : null;
     I.suggestions = suggestionsRes.suggestions || [];
+    I.suggestionBaseline = suggestionsRes.baseline || {};
     I.learnerRunning = suggestionsRes.learner_running || false;
     if (rosterRes && rosterRes.success) I.roster = rosterRes;
     renderIntelligence();
@@ -6735,6 +6737,10 @@ function renderIntelligence() {
   if (I.activeSubTab === 'reports') {
     container.innerHTML = subTabs + renderReportPanel();
     if (!I.report && !I.reportLoading) loadIntelligenceReport(I.reportType);
+    return;
+  }
+  if (I.activeSubTab === 'suggestions') {
+    container.innerHTML = subTabs + renderSuggestionsPanel();
     return;
   }
 
@@ -6930,11 +6936,166 @@ journalctl -u mt-learner -f</pre>`;
   renderResearchFirm();
 }
 
+async function loadSuggestions(rerender = true) {
+  try {
+    const res = await fetch('/api/intelligence/suggestions');
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'suggestions unavailable');
+    I.suggestions = data.suggestions || [];
+    I.suggestionBaseline = data.baseline || {};
+    I.learnerRunning = !!data.learner_running;
+    if (rerender) renderIntelligence();
+  } catch (e) {
+    showOverrideMsg('Suggestions unavailable: ' + (e.message || e), true);
+  }
+}
+
+function suggestionMetric(label, value, color) {
+  return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px;min-width:0;">
+    <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}</div>
+    <div style="font-size:14px;font-weight:700;color:${color || 'var(--text2)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${value ?? '—'}</div>
+  </div>`;
+}
+
+function fmtSuggestionEv(v) {
+  if (v == null || Number.isNaN(Number(v))) return '—';
+  const n = Number(v);
+  return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+}
+
+function fmtSuggestionRate(v) {
+  if (v == null || Number.isNaN(Number(v))) return '—';
+  return (Number(v) * 100).toFixed(1) + '%';
+}
+
+function suggestionStatusBadge(status) {
+  const map = {
+    pending_review: ['Pending Review', '#f59e0b', '#1a1400'],
+    pending: ['Pending Review', '#f59e0b', '#1a1400'],
+    evaluating: ['Evaluating', '#60a5fa', '#08111f'],
+    rejected: ['Rejected', '#ef4444', '#190909'],
+    evaluated: ['Evaluated', '#22c55e', '#07180f'],
+    applied: ['Applied', '#22c55e', '#07180f'],
+    dismissed: ['Dismissed', '#667085', '#111'],
+  };
+  const [label, color, bg] = map[status] || [status || 'Unknown', '#667085', '#111'];
+  return `<span style="background:${bg};border:1px solid ${color};color:${color};padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;">${esc(label)}</span>`;
+}
+
+function renderSuggestionCard(sug, active = false) {
+  const baseline = sug.baseline || I.suggestionBaseline || {};
+  const isEvaluating = sug.status === 'evaluating';
+  const canAct = ['pending_review', 'pending'].includes(sug.status);
+  const border = active ? (isEvaluating ? '#1e3a5f' : '#5b4214') : '#202936';
+  const expected = sug.expected_win_rate_delta || sug.expected_trade_count_delta || '—';
+  const sample = sug.sample_size || '?';
+  const confidenceColor = {high:'var(--green)', medium:'var(--amber)', low:'var(--text3)'}[sug.confidence] || 'var(--text3)';
+  return `<div style="background:#10151c;border:1px solid ${border};border-radius:7px;padding:14px;margin-bottom:12px;${active ? '' : 'opacity:.72;'}">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:9px;">
+      <div style="min-width:0;">
+        <div style="font-size:13px;font-weight:700;color:var(--text);line-height:1.35;">${esc(sug.evidence_summary || sug.id || 'Learner suggestion')}</div>
+        <div style="font-size:10px;color:#667085;margin-top:4px;">${esc(sug.strategy || 'system')} · ${esc(sug.type || 'suggestion')} · confidence <span style="color:${confidenceColor};">${esc(sug.confidence || 'unknown')}</span> · sample ${sample}</div>
+      </div>
+      ${suggestionStatusBadge(sug.status)}
+    </div>
+    <div style="font-size:12px;color:var(--text2);line-height:1.5;background:#0b0f15;border-left:3px solid #263244;border-radius:4px;padding:9px;margin-bottom:10px;">${esc(sug.reasoning || '')}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin-bottom:11px;">
+      ${suggestionMetric('Baseline EV', fmtSuggestionEv(baseline.ev_per_trade_pct), Number(baseline.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)')}
+      ${suggestionMetric('Win + Partial', fmtSuggestionRate(baseline.win_partial_rate), 'var(--text2)')}
+      ${suggestionMetric('Sample', baseline.ev_sample_n ?? sample, 'var(--text2)')}
+      ${suggestionMetric('Expected', esc(expected), 'var(--amber)')}
+    </div>
+    ${isEvaluating ? `<div style="font-size:11px;color:#60a5fa;background:#07111e;border:1px solid #14365f;border-radius:5px;padding:8px;">Monitoring outcomes against the captured baseline. The queue stays locked until this resolves.</div>` : ''}
+    ${canAct ? `<div style="display:flex;gap:8px;">
+      <button onclick="applySuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#166534;color:#86efac;border:1px solid #15803d;padding:8px;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;">Apply</button>
+      <button onclick="rejectSuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#1b0808;color:#fca5a5;border:1px solid #7f1d1d;padding:8px;border-radius:5px;font-size:12px;cursor:pointer;">Reject</button>
+    </div>` : ''}
+    ${sug.reject_reason ? `<div style="font-size:10px;color:#9ca3af;margin-top:8px;">Reason: ${esc(sug.reject_reason)}</div>` : ''}
+  </div>`;
+}
+
+function renderSuggestionsPanel() {
+  const suggestions = I.suggestions || [];
+  const pending = suggestions.filter(s => ['pending_review', 'pending'].includes(s.status));
+  const evaluating = suggestions.filter(s => s.status === 'evaluating');
+  const history = suggestions.filter(s => ['rejected', 'evaluated', 'applied', 'dismissed'].includes(s.status));
+  const active = evaluating[0] || pending[0];
+  const queue = pending.filter(s => !active || s.id !== active.id);
+  const baseline = I.suggestionBaseline || {};
+
+  const learnerNote = I.learnerRunning
+    ? `<span style="color:var(--green);">mt-learner online</span>`
+    : `<span style="color:var(--amber);">mt-learner heartbeat not fresh</span>`;
+
+  return `<div style="max-width:980px;margin:0 auto;">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
+      <div>
+        <h3 style="font-size:16px;margin:0 0 4px;">Learner Suggestions</h3>
+        <div style="font-size:12px;color:var(--muted);">One change at a time. Apply captures a baseline, Reject teaches the learner not to repeat the same idea.</div>
+      </div>
+      <button onclick="loadSuggestions(true)" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Refresh</button>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px;">
+      ${suggestionMetric('Learner', learnerNote, 'var(--text2)')}
+      ${suggestionMetric('Current EV', fmtSuggestionEv(baseline.ev_per_trade_pct), Number(baseline.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)')}
+      ${suggestionMetric('Win + Partial', fmtSuggestionRate(baseline.win_partial_rate), 'var(--text2)')}
+      ${suggestionMetric('Pending', pending.length + evaluating.length, pending.length + evaluating.length ? 'var(--amber)' : 'var(--green)')}
+    </div>
+
+    <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;margin:0 0 8px;">Active Review</div>
+    ${active ? renderSuggestionCard(active, true) : `<div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:14px;color:var(--muted);font-size:12px;margin-bottom:14px;">No active suggestions. The learner will surface new candidates after its next analysis pass.</div>`}
+
+    ${queue.length ? `<div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;margin:14px 0 8px;">Queue - Locked</div>
+      ${queue.map(s => renderSuggestionCard(s, false)).join('')}` : ''}
+
+    ${history.length ? `<div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;margin:16px 0 8px;">History</div>
+      ${history.slice(0, 12).map(s => renderSuggestionCard(s, false)).join('')}` : ''}
+  </div>`;
+}
+
+async function applySuggestion(sid) {
+  sid = decodeURIComponent(sid || '');
+  if (!confirm('Apply this learner suggestion? The change will update strategy configuration immediately.')) return;
+  try {
+    const res = await fetch(`/api/intelligence/suggestions/${encodeURIComponent(sid)}/apply`, {method:'POST'});
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'apply failed');
+    showOverrideMsg('Suggestion applied. Evaluation started.');
+    await loadSuggestions(true);
+    loadStrategyOverrides();
+    if (typeof loadGoalBenchmark === 'function') loadGoalBenchmark();
+  } catch (e) {
+    alert('Apply failed: ' + (e.message || e));
+  }
+}
+
+async function rejectSuggestion(sid) {
+  sid = decodeURIComponent(sid || '');
+  const reason = prompt('Reason for rejection (optional):') ?? '';
+  try {
+    const res = await fetch(`/api/intelligence/suggestions/${encodeURIComponent(sid)}/reject`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({reason}),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'reject failed');
+    showOverrideMsg('Suggestion rejected.');
+    await loadSuggestions(true);
+    if (typeof loadGoalBenchmark === 'function') loadGoalBenchmark();
+  } catch (e) {
+    alert('Reject failed: ' + (e.message || e));
+  }
+}
+
 function renderIntelSubTabs() {
+  const sugCount = (I.suggestions || []).filter(s => ['pending_review', 'pending', 'evaluating'].includes(s.status)).length;
   const tabs = [
     ['overview', 'Overview'],
     ['firm', 'The Firm'],
     ['reports', 'Reports'],
+    ['suggestions', `Suggestions${sugCount ? ` <span id="suggestions-badge" style="background:#ef4444;color:#fff;border-radius:8px;padding:1px 5px;font-size:9px;margin-left:4px;">${sugCount}</span>` : ''}`],
   ];
   const firm = I.roster && I.roster.firm ? I.roster.firm : {name:'Cipher Research Group', tagline:'We read the market structure. Not its noise.'};
   return `<div style="max-width:1180px;margin:0 auto 14px;">
@@ -6954,6 +7115,7 @@ function switchIntelTab(tab) {
   I.activeSubTab = tab;
   localStorage.setItem('mt7_intel_subtab', tab);
   renderIntelligence();
+  if (tab === 'suggestions') loadSuggestions(true);
 }
 
 function agentListByDivision(division) {
