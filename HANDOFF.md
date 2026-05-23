@@ -6,16 +6,16 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-05-22
-Last commit: 31e3d75 feat: first-person analyst narratives with funding alignment, base rates, and forward calls
-app.py: 7,868 lines
-index.html: 8,478 lines
+Last updated: 2026-05-23
+Last commit: c37717d fix: update MEXC private contract auth client
+app.py: 8,503 lines
+index.html: 8,796 lines
 
 ---
 
 ## What This Project Is
 
-Matrix Trader 7.0 is a local web application for high-leverage crypto trading on MEXC perpetual swap markets. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders derived from ATR, views a 4-section AI trade brief, and executes trades manually. Signal history is auto-logged to SQLite on every scan. It is not yet an execution bot — order placement is a staged future capability (P8–P12), currently disabled. It is not a price forecasting engine, and not a SaaS product.
+Matrix Trader 7.0 is a local and VPS-hosted web application for high-leverage crypto trading on MEXC perpetual swap markets, with Hyperliquid integrated as an explicit secondary venue. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders derived from ATR, views AI/Cipher intelligence, tracks paper/live-readiness data, and currently executes trades manually unless an assisted execution path is deliberately enabled. Signal history is auto-logged to SQLite on every scan. It is not a blind execution bot, not a price forecasting engine, and not a SaaS product.
 
 ---
 
@@ -77,7 +77,7 @@ Matrix_Trader_7.0/
 ├── STRATEGIES.md          ← user-facing strategy guide: scoring, paper trading, analytics, bot-readiness
 ├── SERVER_GUIDE.md        ← VPS access, deploy, and service management cheat sheet
 ├── .gitignore             ← covers .env, __pycache__, data/, *.db
-├── .env                   ← secrets/config only: ANTHROPIC_API_KEY, MATRIX_PORT, optional COINGLASS_API_KEY, HL_WALLET_ADDRESS
+├── .env                   ← secrets/config only: ANTHROPIC_API_KEY, MATRIX_PORT, MEXC keys, optional COINGLASS_API_KEY, HL_WALLET_ADDRESS
 ├── requirements.txt       ← all deps installed; add packages here if needed
 ├── app.py                 ← entire Flask backend; keep flat, one file
 ├── backtest.py            ← standalone script; do NOT import from app.py
@@ -117,6 +117,8 @@ Matrix_Trader_7.0/
     suggestions/pending.json ← Read by MT7 /api/intelligence/suggestions route
     logs/                 ← learner.log (5MB rotating), last_heartbeat.txt
     .env                  ← DB_PATH=/opt/matrix-trader/data/signals.db
+
+/opt/matrix-trader/scripts/run_edge_lab_lite.sh ← Weekly bounded Edge Lab refresh runner on production VPS
 ```
 
 Note: External learner is a separate VPS service. It reads signals.db read-only and writes only to /opt/mt-learner/. Managed by mt-learner.service (systemd). MT7 reads learner output via pending.json — no direct import or HTTP dependency.
@@ -157,13 +159,31 @@ SQLite3 is stdlib — no pip install needed. Used for `data/signals.db`.
 ```
 ANTHROPIC_API_KEY=        # AI trade briefs / coach reviews
 MATRIX_PORT=8080          # optional app port
-MEXC_API_KEY=             # optional MEXC private account status
-MEXC_API_SECRET=          # optional MEXC private account status
+MEXC_API_KEY=             # MEXC subaccount access key; server-side only
+MEXC_API_SECRET=          # MEXC subaccount secret key; server-side only
 COINGLASS_API_KEY=        # optional derivatives context
 HL_WALLET_ADDRESS=        # optional Hyperliquid read-only account status, 0x... wallet
 ```
 
 Hyperliquid scans do not need API keys or a wallet address. `HL_WALLET_ADDRESS` is only for `/api/hl/account`.
+
+Production MEXC private access is configured on the Vultr Singapore VPS. The subaccount API key is whitelisted to `207.148.66.39`; never copy `.env` from the server into git or paste its values into logs.
+
+---
+
+## Production VPS
+
+Current production host is Vultr Singapore at `207.148.66.39`.
+
+| Item | Value |
+|---|---|
+| App URL | `http://207.148.66.39:8080` |
+| SSH | `root@207.148.66.39`, key auth only |
+| App dir | `/opt/matrix-trader` |
+| Learner dir | `/opt/mt-learner` |
+| Active services | `matrix-trader`, `mt-learner`, `edge-lab-lite.timer` |
+
+Old Hetzner host `62.238.15.113` is legacy only. Do not deploy there unless explicitly doing recovery.
 
 ---
 
@@ -185,6 +205,15 @@ Intervals: Min1, Min5, Min15, Min30, Min60, Hour4, Hour8, Day1
 ```
 
 Response wrapper: `{ "success": true, "data": [...] }`
+
+Private contract account endpoints require the server-side MEXC subaccount key pair in `.env` and the linked IP `207.148.66.39` on MEXC. `lib/mexc_private.py` is the only code path that should call private MEXC endpoints. Current working read-only endpoints:
+
+```
+GET /private/account/assets
+GET /private/position/open_positions
+```
+
+The client signs MEXC private contract requests using the official access-key + timestamp + parameter-string target. Do not reintroduce the older spot-style signing path.
 
 Sentiment APIs (no key needed):
 - OKX L/S: `https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=BTC&period=1H`
@@ -566,7 +595,7 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P7b | Strategy lifecycle controls: built-in pause/resume, direction lock filter, volatility allowlist filter for custom strategies | ✅ Done |
 | Research Firm | researcher.py + 2 new learner jobs + `/api/intelligence/research` + Intelligence tab 4th section | ✅ Done |
 | P4 | README updated and published to GitHub | ✅ Done (beta testers TBD) |
-| P8 | MEXC read-only account integration + Bot Readiness tracker panel in Strategies tab | ✅ Done (MEXC private API blocked by Akamai/CDN from Hetzner VPS — routes fail-closed gracefully; works from local Mac) |
+| P8 | MEXC read-only account integration + Bot Readiness tracker panel in Strategies tab | ✅ Done (MEXC private API connected on Vultr Singapore; subaccount currently unfunded) |
 | P9 | Execution readiness layer — pre-flight validation, position sizing, risk budget checks, max loss gate. New lib/execution_engine.py and lib/risk_controls.py. | ⏳ Pending |
 | P10 | Paper bot mode — simulated order lifecycle with fill simulation, fee/funding modeling. Distinct from current candle-based paper tracking. | ⏳ Pending |
 | P11 | Assisted live trading — user-approved order placement, tiny size, full execution logging, kill switch mandatory, one strategy only. | ⏳ Pending |
@@ -579,6 +608,26 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 Execution readiness is tracked live in the Bot Readiness panel in the Strategies tab.
 Review that panel before beginning any execution phase. You decide when to proceed —
 the system surfaces the data, it does not block you.
+
+**COMPLETED THIS SESSION (2026-05-23 — Ops / Vultr / MEXC):**
+- ✅ Migrated production operations to Vultr Singapore at `207.148.66.39`
+  - SSH is key-auth only; password login disabled after the root password was exposed in chat
+  - Old Hetzner IP `62.238.15.113` is legacy only
+- ✅ MEXC subaccount IP whitelist set to `207.148.66.39`
+  - Public MEXC market data works from Vultr
+  - Private read-only account endpoints now work from Vultr
+  - `/api/account/status`, `/api/account/balance`, and `/api/account/positions` return `connected: true`
+  - Current account is connected but unfunded: USDT equity/balance `0.0`, open positions `0`
+- ✅ `lib/mexc_private.py` fixed and deployed
+  - Uses `/private/account/assets` and `/private/position/open_positions`
+  - Uses the working MEXC contract private signing target
+  - Commit: `c37717d fix: update MEXC private contract auth client`
+- ✅ Edge Lab Lite weekly timer installed on Vultr
+  - `edge-lab-lite.timer` runs Sundays at `03:15 UTC` with a 20-minute randomized delay
+  - Runner: `/opt/matrix-trader/scripts/run_edge_lab_lite.sh`
+  - Log: `/opt/matrix-trader/logs/edge_lab_lite.log`
+  - Outputs: `data/edge_lab.db` and `data/factor_report.json`
+  - Initial smoke run succeeded and regenerated the factor report
 
 **COMPLETED THIS SESSION (2026-05-22):**
 - ✅ Cipher Research Group: reviewed Codex implementation, identified 6 gaps, fixed 4
@@ -919,7 +968,7 @@ Deployed to VPS (31e3d75), cache cleared, narrative verified live via API.
 
 **Learner findings actioned.** Applied two threshold changes based on 853-signal dataset: `balanced` min conviction raised 55→65 (net expectancy improves), `funding_arb` raised 60→76 (only strategy with positive net expectancy at +4.76; optimal at 76 per 46-trade medium-confidence finding). `momentum_breakout` confirmed still disabled (anti-correlated direction calls, -13.8 net expectancy at best threshold). Committed `0014cc3`.
 
-**MEXC private API blocked.** Akamai CDN returns 403 for all requests from Hetzner VPS IP. Not a signing or permission issue — CDN-level block. Routes fail-closed gracefully (`connected: false`). Works from local Mac. P8 marked done; VPS account panel stays grayed out unless VPS provider changes.
+**Legacy MEXC private API blocker resolved by migration.** Hetzner returned CDN-level 403s for MEXC private endpoints, but production has moved to Vultr Singapore (`207.148.66.39`) and MEXC private read-only endpoints now connect successfully with the whitelisted subaccount key. Treat the Hetzner/Akamai issue as historical context only.
 
 **Key learner findings (853 signals, 800 with P&L):** Top predictors: trend_score (winners avg 9.3 vs losers 14.1 — lower is better, counterintuitive), atr_pct (winners 3.2% vs losers 5.5%), conviction (barely separates — 0.56 point divergence). RSI and funding_rate show no predictive divergence. Conviction score is not strongly predictive of outcomes — important signal for P9 design.
 
@@ -1110,14 +1159,20 @@ Port configurable via `MATRIX_PORT` env var.
 
 ## VPS Deploy / Restart
 
-The live VPS app runs from `/opt/matrix-trader/` on `root@62.238.15.113`. After local edits, sync code and restart:
+The live VPS app runs from `/opt/matrix-trader/` on `root@207.148.66.39` (Vultr Singapore). After local edits, sync code and restart. Prefer targeted rsyncs when only a few files changed, because the local worktree often contains scratch/research files.
 
 ```bash
 cd /Users/bnortey/Documents/coding_projects/Matrix_Trader_7.0
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
-ssh root@62.238.15.113
-systemctl restart matrix-trader
-systemctl status matrix-trader --no-pager
+rsync -avz app.py root@207.148.66.39:/opt/matrix-trader/app.py
+rsync -avz templates/index.html root@207.148.66.39:/opt/matrix-trader/templates/index.html
+rsync -avz lib/mexc_private.py root@207.148.66.39:/opt/matrix-trader/lib/mexc_private.py
+ssh root@207.148.66.39 "systemctl restart matrix-trader && sleep 2 && systemctl is-active matrix-trader"
+```
+
+If a full sync is genuinely needed:
+
+```bash
+rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' --exclude='.git' --exclude='*.pyc' --exclude='.superpowers/' ./ root@207.148.66.39:/opt/matrix-trader/
 ```
 
 mt-learner is a separate service (files live at /opt/mt-learner/ — not in this repo):
@@ -1142,6 +1197,8 @@ Post-deploy smoke checks:
 ```bash
 curl -s http://localhost:8080/ | grep "loadStrategies"
 curl -s http://localhost:8080/api/strategies
+curl -s http://localhost:8080/api/account/status
+curl -s http://localhost:8080/api/paper/stats
 ```
 
 ---
