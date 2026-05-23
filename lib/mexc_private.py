@@ -9,18 +9,31 @@ import hashlib
 import hmac
 import sys
 import time
+from urllib.parse import quote
 
 import requests
 
 _BASE = "https://contract.mexc.com/api/v1"
-_DEFAULT_RECV_WINDOW = "5000"
 
 
-def _sign(api_key: str, api_secret: str, query_string: str = "") -> dict:
+def _query_string(params: dict | None = None) -> str:
+    if not params:
+        return ""
+    parts = []
+    for key in sorted(params):
+        value = params[key]
+        if value is None:
+            continue
+        parts.append(f"{key}={quote(str(value), safe='')}")
+    return "&".join(parts)
+
+
+def _sign(api_key: str, api_secret: str, params: dict | None = None) -> dict:
     timestamp = str(int(time.time() * 1000))
-    params_str = timestamp + api_key + _DEFAULT_RECV_WINDOW + query_string
+    params_str = _query_string(params)
+    signature_target = api_key + timestamp + params_str
     signature = hmac.new(
-        api_secret.encode(), params_str.encode(), hashlib.sha256
+        api_secret.encode(), signature_target.encode(), hashlib.sha256
     ).hexdigest()
     return {
         "ApiKey": api_key,
@@ -38,7 +51,7 @@ def get_account_assets(api_key: str, api_secret: str) -> dict:
     try:
         headers = _sign(api_key, api_secret)
         resp = requests.get(
-            f"{_BASE}/contract/account/assets",
+            f"{_BASE}/private/account/assets",
             headers=headers,
             timeout=10,
         )
@@ -75,7 +88,7 @@ def get_open_positions(api_key: str, api_secret: str) -> list:
     try:
         headers = _sign(api_key, api_secret)
         resp = requests.get(
-            f"{_BASE}/contract/position/open_positions",
+            f"{_BASE}/private/position/open_positions",
             headers=headers,
             timeout=10,
         )
