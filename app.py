@@ -429,10 +429,17 @@ def init_db() -> None:
             result         TEXT,
             pnl_pct        REAL,
             signal_id      INTEGER,
-            note           TEXT
+            note           TEXT,
+            atr_pct        REAL,
+            trend_score    REAL
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades (status, opened_at)")
+    for _col, _type in [("atr_pct", "REAL"), ("trend_score", "REAL")]:
+        try:
+            con.execute(f"ALTER TABLE paper_trades ADD COLUMN {_col} {_type}")
+        except sqlite3.OperationalError:
+            pass
     con.commit()
     con.close()
 
@@ -6696,11 +6703,20 @@ def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool, str]:
                 ("week_ahead", AGENT_ROSTER["trader"]),
                 ("spotlight", AGENT_ROSTER.get(data.get("spotlight_key", "funding"), AGENT_ROSTER["funding"])),
             ])
+        analyst_guide = "\n".join(
+            f"- {k}: {v['name']}, {v.get('domain', v.get('role', 'analyst'))}"
+            for k, v in requested
+        )
+        output_template = json.dumps({k: "" for k, _ in requested}, indent=2)
         user = (
-            "Use this data:\n"
+            "Market data:\n"
             f"{json.dumps(compact, default=str)}\n\n"
-            "Return this JSON object with one 35-80 word string per key:\n"
-            f"{json.dumps({k: v['voice'] for k, v in requested}, indent=2)}"
+            "Write one 35-80 word first-person note for each analyst using the data above. "
+            "Reference specific numbers, symbols, or rates from the data. End each note with a forward call.\n\n"
+            "Analyst voices:\n"
+            f"{analyst_guide}\n\n"
+            "Return only this JSON with your notes as the values (no extra text):\n"
+            f"{output_template}"
         )
         raw = call_ai(
             system=system,
@@ -7556,8 +7572,9 @@ def _paper_bot_scan(cfg: dict) -> dict:
                 """INSERT INTO paper_trades
                    (opened_at, symbol, strategy_key, direction, entry_px, size_usd,
                     tp1, tp2, tp3, stop_loss, leverage, conviction,
-                    flow_confirmed, flow_score, flow_reasons, status, signal_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    flow_confirmed, flow_score, flow_reasons, status, signal_id,
+                    atr_pct, trend_score)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     now,
                     sig["symbol"],
@@ -7576,6 +7593,8 @@ def _paper_bot_scan(cfg: dict) -> dict:
                     flow_reasons_str,
                     status,
                     signal_id,
+                    sig.get("atr_pct"),
+                    sig.get("trend_score"),
                 ),
             )
             con.commit()
