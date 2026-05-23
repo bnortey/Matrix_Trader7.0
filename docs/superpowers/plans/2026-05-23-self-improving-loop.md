@@ -565,7 +565,7 @@ git commit -m "feat: /api/goals route with goal definition file and computed act
 
 **Context:** MT7 needs to read `pending.json`, apply suggestions by PATCHing existing config routes, and write rejections to `data/rejected_suggestions.json`. One active suggestion at a time is enforced server-side.
 
-- [ ] **Step 1: Add PENDING_PATH and REJECTED_PATH constants**
+- [x] **Step 1: Add PENDING_PATH and REJECTED_PATH constants**
 
 After `GOALS_PATH = ...`, add:
 ```python
@@ -573,7 +573,7 @@ LEARNER_PENDING_PATH  = "/opt/mt-learner/suggestions/pending.json"
 LEARNER_REJECTED_PATH = os.path.join(DATA_DIR, "rejected_suggestions.json")
 ```
 
-- [ ] **Step 2: Add helpers to load pending and write rejected**
+- [x] **Step 2: Add helpers to load pending and write rejected**
 
 ```python
 def _load_suggestions() -> list[dict]:
@@ -619,7 +619,7 @@ def _update_suggestion_status(sid: str, status: str, extra: dict | None = None) 
     return False
 ```
 
-- [ ] **Step 3: Add /api/intelligence/suggestions GET route**
+- [x] **Step 3: Add /api/intelligence/suggestions GET route**
 
 ```python
 @app.route("/api/intelligence/suggestions")
@@ -642,7 +642,7 @@ def api_intelligence_suggestions():
         return jsonify({"success": False, "error": str(e)}), 500
 ```
 
-- [ ] **Step 4: Add /api/intelligence/suggestions/<sid>/apply POST route**
+- [x] **Step 4: Add /api/intelligence/suggestions/<sid>/apply POST route**
 
 ```python
 @app.route("/api/intelligence/suggestions/<sid>/apply", methods=["POST"])
@@ -688,7 +688,7 @@ def api_suggestion_apply(sid):
         return jsonify({"success": False, "error": str(e)}), 500
 ```
 
-- [ ] **Step 5: Add /api/intelligence/suggestions/<sid>/reject POST route**
+- [x] **Step 5: Add /api/intelligence/suggestions/<sid>/reject POST route**
 
 ```python
 @app.route("/api/intelligence/suggestions/<sid>/reject", methods=["POST"])
@@ -716,7 +716,7 @@ def api_suggestion_reject(sid):
         return jsonify({"success": False, "error": str(e)}), 500
 ```
 
-- [ ] **Step 6: Add _load_paper_config() and _save_paper_config() if they don't exist**
+- [x] **Step 6: Add _load_paper_config() and _save_paper_config() if they don't exist**
 
 Search app.py for where paper config is loaded (around the `api_paper_config` route). Extract or confirm helpers exist:
 
@@ -742,7 +742,7 @@ def _save_paper_config(cfg: dict) -> None:
 
 If the `api_paper_config` route already loads/saves inline, refactor it to use these helpers.
 
-- [ ] **Step 7: Test apply endpoint**
+- [x] **Step 7: Test apply endpoint**
 
 ```bash
 curl -s http://localhost:8080/api/intelligence/suggestions | python3 -m json.tool | head -20
@@ -751,11 +751,10 @@ curl -s -X POST http://localhost:8080/api/intelligence/suggestions/thresh_balanc
 ```
 Expected: `{"success": true, "applied": "...", "baseline": {...}}`
 
-- [ ] **Step 8: Deploy and commit**
+- [x] **Step 8: Deploy and commit**
 
 ```bash
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-  --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+rsync -avz app.py root@62.238.15.113:/opt/matrix-trader/app.py
 ssh root@62.238.15.113 "systemctl restart matrix-trader && sleep 2 && systemctl is-active matrix-trader"
 
 git add app.py

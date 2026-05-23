@@ -144,6 +144,12 @@ STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
 AI_SETTINGS_PATH   = "data/ai_settings.json"
 PAPER_CONFIG_PATH  = "data/paper_config.json"
 GOALS_PATH         = "data/trading_goals.json"
+LEARNER_PENDING_PATH = os.getenv("LEARNER_PENDING_PATH") or "/opt/mt-learner/suggestions/pending.json"
+LEARNER_REJECTED_PATH = (
+    os.getenv("LEARNER_REJECTED_PATH")
+    or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "rejected_suggestions.json"))
+)
+LEARNER_HEARTBEAT_PATH = os.getenv("LEARNER_HEARTBEAT_PATH") or "/opt/mt-learner/logs/last_heartbeat.txt"
 REPORT_NARRATIVE_MODE = (os.getenv("REPORT_NARRATIVE_MODE") or "free").strip().lower()
 REPORT_FREE_AI_PROVIDERS = {"gemini", "groq", "ollama"}
 
@@ -236,6 +242,86 @@ def _save_goals(goals: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(goals, f, indent=2)
     os.replace(tmp, GOALS_PATH)
+
+
+def _load_suggestions_data() -> dict:
+    try:
+        with open(LEARNER_PENDING_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("suggestions", [])
+            return data
+    except Exception:
+        pass
+    return {"suggestions": []}
+
+
+def _load_suggestions() -> list[dict]:
+    return _load_suggestions_data().get("suggestions", [])
+
+
+def _write_suggestions_data(data: dict) -> None:
+    os.makedirs(os.path.dirname(LEARNER_PENDING_PATH) or ".", exist_ok=True)
+    tmp = LEARNER_PENDING_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, LEARNER_PENDING_PATH)
+
+
+def _write_rejected(entry: dict) -> None:
+    try:
+        existing = []
+        if os.path.exists(LEARNER_REJECTED_PATH):
+            with open(LEARNER_REJECTED_PATH, encoding="utf-8") as f:
+                existing = json.load(f)
+        if not isinstance(existing, list):
+            existing = []
+        existing.append(entry)
+        os.makedirs(os.path.dirname(LEARNER_REJECTED_PATH) or ".", exist_ok=True)
+        tmp = LEARNER_REJECTED_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, LEARNER_REJECTED_PATH)
+    except Exception as e:
+        print(f"[suggestions] write_rejected error: {e}", file=sys.stderr)
+
+
+def _update_suggestion_status(sid: str, status: str, extra: dict | None = None) -> bool:
+    try:
+        data = _load_suggestions_data()
+        for suggestion in data.get("suggestions", []):
+            if suggestion.get("id") == sid:
+                suggestion["status"] = status
+                if extra:
+                    suggestion.update(extra)
+                _write_suggestions_data(data)
+                return True
+    except Exception as e:
+        print(f"[suggestions] update_status error: {e}", file=sys.stderr)
+    return False
+
+
+def _learner_running() -> bool:
+    if not os.path.exists(LEARNER_HEARTBEAT_PATH):
+        return False
+    try:
+        mtime = os.path.getmtime(LEARNER_HEARTBEAT_PATH)
+        return (datetime.utcnow().timestamp() - mtime) < 600
+    except Exception:
+        return False
+
+
+def _suggestion_baseline_snapshot() -> dict:
+    goals = _load_goals()
+    actuals = _compute_goal_actuals(goals)
+    return {
+        "ev_per_trade_pct":  actuals.get("ev_per_trade_pct"),
+        "paper_ev_per_trade_pct": actuals.get("paper_ev_per_trade_pct"),
+        "win_partial_rate":  actuals.get("win_partial_rate"),
+        "ev_sample_n":       actuals.get("ev_sample_n"),
+        "current_value_usd": actuals.get("current_value_usd"),
+        "snapshot_at":       datetime.utcnow().isoformat(),
+    }
 
 
 def _compute_goal_actuals(goals: dict) -> dict:
@@ -884,9 +970,9 @@ def _save_strategy_override(strategy_key: str, field: str, value) -> None:
     """
     Persist a single field override for a built-in strategy.
     Preserves all existing overrides. Atomic write.
-    Only permitted fields: ["min_conviction"]
+    Only permitted fields: ["min_conviction", "allowed_volatility"]
     """
-    PERMITTED = {"min_conviction"}
+    PERMITTED = {"min_conviction", "allowed_volatility"}
     if field not in PERMITTED:
         return
     os.makedirs("data", exist_ok=True)
@@ -2862,6 +2948,8 @@ def run_scan(
         for field, value in overrides[strategy_key].items():
             if field == "min_conviction":
                 strat["min_conviction"] = int(value)
+            elif field == "allowed_volatility":
+                strat["allowed_volatility"] = list(value) if isinstance(value, list) else None
 
     effective_threshold = max(threshold, strat["min_conviction"])
     coinglass_snapshot = get_coin_market_snapshot()
@@ -6212,101 +6300,204 @@ def api_intelligence_status():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/intelligence/suggestions')
-def api_intelligence_suggestions():
-    """Read pending.json from the external learner service."""
-    pending_path = '/opt/mt-learner/suggestions/pending.json'
-    heartbeat_path = '/opt/mt-learner/logs/last_heartbeat.txt'
-    learner_running = False
-
-    if os.path.exists(heartbeat_path):
-        try:
-            mtime = os.path.getmtime(heartbeat_path)
-            learner_running = (datetime.utcnow().timestamp() - mtime) < 600
-        except Exception:
-            pass
-
-    if not os.path.exists(pending_path):
-        return jsonify({'success': True, 'suggestions': [], 'learner_running': learner_running})
+def _apply_suggestion_config(suggestion: dict) -> tuple[bool, str | None]:
+    stype = suggestion.get("type")
+    payload = suggestion.get("api_payload") or {}
+    strategy_key = suggestion.get("strategy")
 
     try:
-        with open(pending_path, 'r') as f:
-            data = json.load(f)
-        suggestions = data.get('suggestions', [])
-        return jsonify({'success': True, 'suggestions': suggestions, 'learner_running': learner_running})
+        if stype == "new_strategy":
+            with app.test_client() as c:
+                r = c.post(
+                    "/api/strategies/custom",
+                    data=json.dumps(payload),
+                    content_type="application/json",
+                )
+            if r.status_code not in (200, 201):
+                return False, "failed to create strategy"
+            return True, None
+
+        if stype == "threshold":
+            if not strategy_key:
+                return False, "strategy missing"
+            min_conviction = payload.get("min_conviction")
+            if min_conviction is None:
+                return False, "min_conviction missing from payload"
+            if strategy_key in STRATEGIES:
+                _save_strategy_override(strategy_key, "min_conviction", int(min_conviction))
+            else:
+                with app.test_client() as c:
+                    r = c.patch(
+                        f"/api/strategies/custom/{strategy_key}",
+                        data=json.dumps({"min_conviction": int(min_conviction)}),
+                        content_type="application/json",
+                    )
+                if r.status_code not in (200, 201):
+                    return False, "failed to update custom strategy threshold"
+            return True, None
+
+        if stype == "regime_suppress":
+            if not strategy_key:
+                return False, "strategy missing"
+            allowed = payload.get("allowed_volatility")
+            valid = {"low", "medium", "high", "extreme"}
+            if not isinstance(allowed, list) or not allowed or any(v not in valid for v in allowed):
+                return False, "allowed_volatility payload is invalid"
+            if strategy_key in STRATEGIES:
+                _save_strategy_override(strategy_key, "allowed_volatility", allowed)
+            else:
+                with app.test_client() as c:
+                    r = c.patch(
+                        f"/api/strategies/custom/{strategy_key}",
+                        data=json.dumps({"allowed_volatility": allowed}),
+                        content_type="application/json",
+                    )
+                if r.status_code not in (200, 201):
+                    return False, "failed to update custom strategy volatility filter"
+            return True, None
+
+        if payload:
+            cfg = _load_paper_config()
+            cfg.update(payload)
+            _save_paper_config(cfg)
+            return True, None
+
+        return False, f"unsupported suggestion type: {stype}"
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e), 'suggestions': [], 'learner_running': learner_running})
+        return False, str(e)
+
+
+@app.route('/api/intelligence/suggestions')
+def api_intelligence_suggestions():
+    """Read learner suggestions and annotate with current performance baseline."""
+    try:
+        suggestions = _load_suggestions()
+        return jsonify({
+            'success': True,
+            'suggestions': suggestions,
+            'baseline': _suggestion_baseline_snapshot(),
+            'learner_running': _learner_running(),
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'suggestions': [],
+            'learner_running': _learner_running(),
+        }), 500
 
 
 @app.route('/api/intelligence/suggestions/<suggestion_id>', methods=['PATCH'])
 def api_intelligence_suggestion_action(suggestion_id):
-    """Apply or dismiss a learner suggestion."""
-    pending_path = '/opt/mt-learner/suggestions/pending.json'
+    """Backward-compatible apply/dismiss endpoint for older frontend code."""
     data = request.get_json() or {}
     action = data.get('action')
     if action not in ('apply', 'dismiss'):
         return jsonify({'success': False, 'error': 'action must be apply or dismiss'}), 400
 
-    if not os.path.exists(pending_path):
-        return jsonify({'success': False, 'error': 'pending.json not found'}), 404
-
-    try:
-        with open(pending_path, 'r') as f:
-            pending = json.load(f)
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'failed to read pending.json: {e}'}), 500
-
-    suggestions = pending.get('suggestions', [])
+    suggestions = _load_suggestions()
     suggestion = next((s for s in suggestions if s.get('id') == suggestion_id), None)
     if not suggestion:
         return jsonify({'success': False, 'error': 'suggestion not found'}), 404
 
     if action == 'dismiss':
-        suggestion['status'] = 'dismissed'
-    elif action == 'apply':
-        stype = suggestion.get('type')
-        payload = suggestion.get('api_payload', {})
-        strategy_key = suggestion.get('strategy')
-        try:
-            if stype == 'new_strategy':
-                with app.test_client() as c:
-                    r = c.post('/api/strategies/custom',
-                               data=json.dumps(payload),
-                               content_type='application/json')
-                    if r.status_code not in (200, 201):
-                        return jsonify({'success': False, 'error': 'failed to create strategy'}), 500
-            elif stype in ('threshold', 'regime_suppress') and strategy_key:
-                registry = get_strategy_registry()
-                if strategy_key in registry and strategy_key not in _get_custom_strategy_keys():
-                    # Built-in strategy — apply via strategy_overrides.json
-                    min_conviction = payload.get("min_conviction")
-                    if min_conviction is not None:
-                        _save_strategy_override(strategy_key, "min_conviction", int(min_conviction))
-                    else:
-                        return jsonify({'success': False,
-                                        'error': 'min_conviction missing from payload'}), 400
-                else:
-                    # Custom strategy — use existing PATCH route
-                    with app.test_client() as c:
-                        r = c.patch(f'/api/strategies/custom/{strategy_key}',
-                                    data=json.dumps(payload),
-                                    content_type='application/json')
-                        if r.status_code not in (200, 201):
-                            return jsonify({'success': False,
-                                            'error': 'failed to update strategy'}), 500
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)}), 500
-        suggestion['status'] = 'applied'
+        reason = data.get("reason", "dismissed via legacy PATCH")
+        _write_rejected({
+            "id": suggestion_id,
+            "strategy": suggestion.get("strategy"),
+            "type": suggestion.get("type"),
+            "suggested_value": suggestion.get("suggested_value") or suggestion.get("regime"),
+            "reason": reason,
+            "rejected_at": datetime.utcnow().isoformat(),
+        })
+        if not _update_suggestion_status(suggestion_id, "rejected", {
+            "rejected_at": datetime.utcnow().isoformat(),
+            "reject_reason": reason,
+        }):
+            return jsonify({'success': False, 'error': 'failed to update suggestion'}), 500
+        return jsonify({'success': True, 'applied': False, 'suggestion_id': suggestion_id})
 
-    tmp_path = pending_path + '.tmp'
+    ok, err = _apply_suggestion_config(suggestion)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    applied_at = datetime.utcnow().isoformat()
+    baseline = _suggestion_baseline_snapshot()
+    baseline["applied_at"] = applied_at
+    if not _update_suggestion_status(suggestion_id, "evaluating", {
+        "baseline": baseline,
+        "applied_at": applied_at,
+    }):
+        return jsonify({'success': False, 'error': 'failed to update suggestion'}), 500
+
+    return jsonify({'success': True, 'applied': True, 'suggestion_id': suggestion_id, 'baseline': baseline})
+
+
+@app.route("/api/intelligence/suggestions/<suggestion_id>/apply", methods=["POST"])
+def api_suggestion_apply(suggestion_id):
     try:
-        with open(tmp_path, 'w') as f:
-            json.dump(pending, f, indent=2)
-        os.replace(tmp_path, pending_path)
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'failed to write pending.json: {e}'}), 500
+        suggestions = _load_suggestions()
+        evaluating = [s for s in suggestions if s.get("status") == "evaluating" and s.get("id") != suggestion_id]
+        if evaluating:
+            return jsonify({
+                "success": False,
+                "error": f"Cannot apply — '{evaluating[0].get('id')}' is still evaluating",
+            }), 409
 
-    return jsonify({'success': True, 'applied': action == 'apply', 'suggestion_id': suggestion_id})
+        suggestion = next((s for s in suggestions if s.get("id") == suggestion_id), None)
+        if not suggestion:
+            return jsonify({"success": False, "error": "Suggestion not found"}), 404
+        if suggestion.get("status") not in {"pending_review", "pending"}:
+            return jsonify({
+                "success": False,
+                "error": f"Status is {suggestion.get('status')}, not pending_review",
+            }), 409
+
+        ok, err = _apply_suggestion_config(suggestion)
+        if not ok:
+            return jsonify({"success": False, "error": err}), 400
+
+        applied_at = datetime.utcnow().isoformat()
+        baseline = _suggestion_baseline_snapshot()
+        baseline["applied_at"] = applied_at
+        if not _update_suggestion_status(suggestion_id, "evaluating", {
+            "baseline": baseline,
+            "applied_at": applied_at,
+        }):
+            return jsonify({"success": False, "error": "Failed to update suggestion"}), 500
+        return jsonify({"success": True, "applied": suggestion_id, "baseline": baseline})
+    except Exception as e:
+        print(f"[api/suggestion/apply] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/intelligence/suggestions/<suggestion_id>/reject", methods=["POST"])
+def api_suggestion_reject(suggestion_id):
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = body.get("reason", "")
+        suggestions = _load_suggestions()
+        suggestion = next((s for s in suggestions if s.get("id") == suggestion_id), None)
+        if not suggestion:
+            return jsonify({"success": False, "error": "Suggestion not found"}), 404
+
+        rejected_at = datetime.utcnow().isoformat()
+        _write_rejected({
+            "id": suggestion_id,
+            "strategy": suggestion.get("strategy"),
+            "type": suggestion.get("type"),
+            "suggested_value": suggestion.get("suggested_value") or suggestion.get("regime"),
+            "reason": reason,
+            "rejected_at": rejected_at,
+        })
+        if not _update_suggestion_status(suggestion_id, "rejected", {
+            "rejected_at": rejected_at,
+            "reject_reason": reason,
+        }):
+            return jsonify({"success": False, "error": "Failed to update suggestion"}), 500
+        return jsonify({"success": True, "rejected": suggestion_id})
+    except Exception as e:
+        print(f"[api/suggestion/reject] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/intelligence/research')
