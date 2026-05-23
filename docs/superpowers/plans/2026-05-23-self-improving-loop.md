@@ -374,7 +374,7 @@ git commit -m "feat: dynamic position sizing — risk% of account balance with A
 
 **Context:** `data/trading_goals.json` is the single source of truth for account parameters and performance targets. `/api/goals` computes actuals from the DB and returns them alongside targets. `/api/paper/account` returns just the financial snapshot.
 
-- [ ] **Step 1: Add _load_goals() and _save_goals() helpers**
+- [x] **Step 1: Add _load_goals() and _save_goals() helpers**
 
 Add after `compute_paper_position_size()`:
 
@@ -418,7 +418,7 @@ def _save_goals(goals: dict) -> None:
     os.replace(tmp, GOALS_PATH)
 ```
 
-- [ ] **Step 2: Add _compute_goal_actuals() helper**
+- [x] **Step 2: Add _compute_goal_actuals() helper**
 
 ```python
 def _compute_goal_actuals(goals: dict) -> dict:
@@ -505,7 +505,7 @@ def _compute_goal_actuals(goals: dict) -> dict:
         return {}
 ```
 
-- [ ] **Step 3: Add /api/goals GET and PATCH routes**
+- [x] **Step 3: Add /api/goals GET and PATCH routes**
 
 Add near the paper bot routes section:
 
@@ -535,7 +535,7 @@ def api_goals():
         return jsonify({"success": False, "error": str(e)}), 500
 ```
 
-- [ ] **Step 4: Verify route returns valid JSON**
+- [x] **Step 4: Verify route returns valid JSON**
 
 ```bash
 python3 app.py &
@@ -545,11 +545,10 @@ kill %1
 ```
 Expected: JSON with `goals` and `actuals` keys, no errors.
 
-- [ ] **Step 5: Deploy and commit**
+- [x] **Step 5: Deploy and commit**
 
 ```bash
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-  --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+rsync -avz app.py root@62.238.15.113:/opt/matrix-trader/app.py
 ssh root@62.238.15.113 "systemctl restart matrix-trader && sleep 2 && \
   curl -s http://localhost:8080/api/goals | python3 -c 'import json,sys; d=json.load(sys.stdin); print(\"ok:\", d.get(\"success\"))'"
 

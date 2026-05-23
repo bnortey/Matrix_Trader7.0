@@ -143,6 +143,7 @@ RISK_GATES_PATH = "data/risk_gates.json"
 STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
 AI_SETTINGS_PATH   = "data/ai_settings.json"
 PAPER_CONFIG_PATH  = "data/paper_config.json"
+GOALS_PATH         = "data/trading_goals.json"
 REPORT_NARRATIVE_MODE = (os.getenv("REPORT_NARRATIVE_MODE") or "free").strip().lower()
 REPORT_FREE_AI_PROVIDERS = {"gemini", "groq", "ollama"}
 
@@ -191,6 +192,144 @@ def compute_paper_position_size(
 
     cap = account_balance * 0.25
     return round(min(size * modifier, cap), 2)
+
+
+DEFAULT_GOALS: dict = {
+    "account_balance_usd":      200.0,
+    "risk_pct_per_trade":       5.0,
+    "max_positions":            4,
+    "target_monthly_return_pct": 20.0,
+    "target_ev_per_trade_pct":  5.0,
+    "min_win_partial_rate":     0.50,
+    "max_drawdown_pct":         40.0,
+    "consecutive_loss_alert":   5,
+    "scale_up_trigger": {
+        "ev_threshold_pct": 8.0,
+        "min_trades":       50,
+        "new_risk_pct":     8.0,
+    },
+    "evaluation_window_trades": 20,
+    "evaluation_window_days":   14,
+}
+
+
+def _load_goals() -> dict:
+    try:
+        with open(GOALS_PATH, encoding="utf-8") as f:
+            stored = json.load(f)
+        merged = copy.deepcopy(DEFAULT_GOALS)
+        if isinstance(stored, dict):
+            merged.update(stored)
+            if isinstance(stored.get("scale_up_trigger"), dict):
+                merged["scale_up_trigger"] = {
+                    **DEFAULT_GOALS["scale_up_trigger"],
+                    **stored["scale_up_trigger"],
+                }
+        return merged
+    except Exception:
+        return copy.deepcopy(DEFAULT_GOALS)
+
+
+def _save_goals(goals: dict) -> None:
+    os.makedirs("data", exist_ok=True)
+    tmp = GOALS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(goals, f, indent=2)
+    os.replace(tmp, GOALS_PATH)
+
+
+def _compute_goal_actuals(goals: dict) -> dict:
+    """Compute paper account and live-signal goal metrics from signals.db."""
+    account_balance = float(goals.get("account_balance_usd", 200.0) or 200.0)
+    now = datetime.utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    thirty_days_ago = (now - timedelta(days=30)).isoformat()
+
+    try:
+        con = sqlite3.connect(DB_PATH)
+
+        rows = con.execute(
+            "SELECT size_usd, pnl_pct FROM paper_trades WHERE status='closed' AND pnl_pct IS NOT NULL"
+        ).fetchall()
+        total_pnl_usd = sum((r[0] or 0) * (r[1] or 0) / 100 for r in rows)
+        current_value = round(account_balance + total_pnl_usd, 2)
+        drawdown_pct = round((total_pnl_usd / account_balance) * 100, 2) if account_balance else 0
+
+        month_rows = con.execute(
+            "SELECT size_usd, pnl_pct FROM paper_trades "
+            "WHERE status='closed' AND closed_at >= ? AND pnl_pct IS NOT NULL",
+            (month_start,),
+        ).fetchall()
+        month_pnl_usd = sum((r[0] or 0) * (r[1] or 0) / 100 for r in month_rows)
+        monthly_return_pct = round((month_pnl_usd / account_balance) * 100, 2) if account_balance else 0
+
+        ev_rows = con.execute(
+            "SELECT pnl_pct FROM signals WHERE COALESCE(source, 'live')='live' "
+            "AND result IN ('WIN','LOSS','PARTIAL') "
+            "AND pnl_pct IS NOT NULL AND logged_at >= ?",
+            (thirty_days_ago,),
+        ).fetchall()
+        ev_values = [r[0] for r in ev_rows]
+        ev_per_trade = round(sum(ev_values) / len(ev_values), 2) if ev_values else None
+        ev_sample_n = len(ev_values)
+
+        paper_ev_rows = con.execute(
+            "SELECT pnl_pct FROM signals WHERE source='paper' "
+            "AND result IN ('WIN','LOSS','PARTIAL') "
+            "AND pnl_pct IS NOT NULL AND logged_at >= ?",
+            (thirty_days_ago,),
+        ).fetchall()
+        paper_ev_values = [r[0] for r in paper_ev_rows]
+        paper_ev_per_trade = round(sum(paper_ev_values) / len(paper_ev_values), 2) if paper_ev_values else None
+
+        wr_rows = con.execute(
+            "SELECT result FROM signals WHERE COALESCE(source, 'live')='live' "
+            "AND result IN ('WIN','LOSS','PARTIAL') AND logged_at >= ?",
+            (thirty_days_ago,),
+        ).fetchall()
+        wr_results = [r[0] for r in wr_rows]
+        win_partial = sum(1 for r in wr_results if r in ("WIN", "PARTIAL"))
+        win_partial_rate = round(win_partial / len(wr_results), 4) if wr_results else None
+
+        streak_rows = con.execute(
+            "SELECT result FROM signals WHERE COALESCE(source, 'live')='live' "
+            "AND result IN ('WIN','LOSS','PARTIAL') "
+            "ORDER BY logged_at DESC LIMIT 20"
+        ).fetchall()
+        streak = 0
+        for r in streak_rows:
+            if r[0] == "LOSS":
+                streak += 1
+            else:
+                break
+
+        scale_trigger = goals.get("scale_up_trigger", {})
+        scale_ready = (
+            ev_per_trade is not None
+            and ev_per_trade >= float(scale_trigger.get("ev_threshold_pct", 8.0))
+            and ev_sample_n >= int(scale_trigger.get("min_trades", 50))
+        )
+
+        con.close()
+        return {
+            "current_value_usd":    current_value,
+            "total_pnl_usd":        round(total_pnl_usd, 2),
+            "monthly_return_pct":   monthly_return_pct,
+            "month_pnl_usd":        round(month_pnl_usd, 2),
+            "ev_per_trade_pct":     ev_per_trade,
+            "ev_sample_n":          ev_sample_n,
+            "paper_ev_per_trade_pct": paper_ev_per_trade,
+            "paper_ev_sample_n":    len(paper_ev_values),
+            "win_partial_rate":     win_partial_rate,
+            "win_partial_sample_n": len(wr_results),
+            "drawdown_pct":         drawdown_pct,
+            "consecutive_losses":   streak,
+            "scale_up_ready":       scale_ready,
+            "kill_switch_breached": drawdown_pct <= -abs(float(goals.get("max_drawdown_pct", 40.0))),
+        }
+    except Exception as e:
+        print(f"[goals] compute error: {e}", file=sys.stderr)
+        return {}
 
 # Daily kline cache: symbol → (fetched_at_ts, data)
 _daily_kline_cache: dict = {}
@@ -7815,6 +7954,88 @@ def api_paper_stats():
             "equity_curve":  equity,
         })
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/account")
+def api_paper_account():
+    """Return the current paper account scoreboard derived from goals + trades."""
+    try:
+        goals = _load_goals()
+        actuals = _compute_goal_actuals(goals)
+        return jsonify({
+            "success": True,
+            "account": {
+                "starting_balance_usd": goals.get("account_balance_usd"),
+                "current_value_usd":    actuals.get("current_value_usd"),
+                "total_pnl_usd":        actuals.get("total_pnl_usd"),
+                "monthly_return_pct":   actuals.get("monthly_return_pct"),
+                "month_pnl_usd":        actuals.get("month_pnl_usd"),
+                "drawdown_pct":         actuals.get("drawdown_pct"),
+                "kill_switch_breached": actuals.get("kill_switch_breached"),
+            },
+            "actuals": actuals,
+        })
+    except Exception as e:
+        print(f"[api/paper/account] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/goals", methods=["GET", "PATCH"])
+def api_goals():
+    """GET/PATCH trading goals and return computed performance actuals."""
+    try:
+        if request.method == "PATCH":
+            body = request.get_json(force=True) or {}
+            goals = _load_goals()
+            allowed = {
+                "account_balance_usd",
+                "risk_pct_per_trade",
+                "max_positions",
+                "target_monthly_return_pct",
+                "target_ev_per_trade_pct",
+                "min_win_partial_rate",
+                "max_drawdown_pct",
+                "consecutive_loss_alert",
+                "evaluation_window_trades",
+                "evaluation_window_days",
+                "scale_up_trigger",
+            }
+            for k, v in body.items():
+                if k == "scale_up_trigger" and isinstance(v, dict):
+                    goals["scale_up_trigger"] = {
+                        **DEFAULT_GOALS["scale_up_trigger"],
+                        **goals.get("scale_up_trigger", {}),
+                        **v,
+                    }
+                elif k in allowed:
+                    goals[k] = v
+            _save_goals(goals)
+
+            # Keep paper bot risk controls aligned with the goal definition.
+            paper_cfg = _load_paper_config()
+            if "account_balance_usd" in body:
+                paper_cfg["account_balance_usd"] = goals["account_balance_usd"]
+            if "risk_pct_per_trade" in body:
+                paper_cfg["risk_pct_per_trade"] = goals["risk_pct_per_trade"]
+            if "max_positions" in body:
+                paper_cfg["max_open_positions"] = goals["max_positions"]
+            _save_paper_config(paper_cfg)
+
+            return jsonify({
+                "success": True,
+                "goals": goals,
+                "actuals": _compute_goal_actuals(goals),
+            })
+
+        goals = _load_goals()
+        return jsonify({
+            "success": True,
+            "goals": goals,
+            "actuals": _compute_goal_actuals(goals),
+        })
+    except Exception as e:
+        print(f"[api/goals] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
