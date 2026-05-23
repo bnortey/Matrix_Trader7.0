@@ -1380,6 +1380,8 @@
           <button class="sa-refresh" onclick="loadStrategyAnalytics(true)">Refresh</button>
         </div>
 
+        <div id="goal-benchmark"></div>
+
         <!-- Strategy manager — shown from the Strategies comparison table -->
         <div id="strategy-explainer"></div>
 
@@ -1778,7 +1780,7 @@ function switchTab(tab) {
   if (tab === 'signals') applySignalExchangeState();
   if (tab === 'history') loadHistory();
   if (tab === 'market') applyMarketExchangeState();
-  if (tab === 'strategies') loadStrategyAnalytics();
+  if (tab === 'strategies') { loadStrategyAnalytics(); loadGoalBenchmark(); }
   if (tab === 'intelligence') loadIntelligence();
   if (tab === 'tools') loadAIModels();
   if (tab === 'paper') loadPaperTrading();
@@ -4143,6 +4145,117 @@ const STRATEGY_LEARN = {
     read: 'Trust it when RSI is extreme but momentum is weakening. Be skeptical when the daily trend is aggressively aligned against the trade.'
   }
 };
+
+function gbFmtMoney(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '$0';
+  return '$' + n.toFixed(0);
+}
+
+function gbSigned(v, digits = 1) {
+  if (v == null || Number.isNaN(Number(v))) return 'No data';
+  const n = Number(v);
+  return (n >= 0 ? '+' : '') + n.toFixed(digits) + '%';
+}
+
+function gbProgress(value, target) {
+  const v = Math.max(0, Number(value) || 0);
+  const t = Math.max(0.001, Number(target) || 1);
+  return Math.max(0, Math.min(100, (v / t) * 100));
+}
+
+function gbTile(label, value, sub, color, progress, target) {
+  return `<div style="background:#10151c;border:1px solid #202936;border-radius:6px;padding:10px;min-width:0;">
+    <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}</div>
+    <div style="font-size:19px;line-height:1.1;font-weight:700;color:${color};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${value}</div>
+    <div style="font-size:10px;color:#94a3b8;margin-top:4px;min-height:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${sub || ''}</div>
+    ${progress == null ? '' : `<div style="margin-top:8px;height:3px;background:#1f2937;border-radius:2px;overflow:hidden;">
+      <div style="width:${Math.max(0, Math.min(100, progress))}%;height:100%;background:${color};"></div>
+    </div>`}
+    <div style="font-size:9px;color:#5b6472;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${target || ''}</div>
+  </div>`;
+}
+
+async function loadGoalBenchmark() {
+  const el = $('goal-benchmark');
+  if (!el) return;
+  try {
+    const [goalsResp, suggestionsResp] = await Promise.allSettled([
+      fetch('/api/goals'),
+      fetch('/api/intelligence/suggestions'),
+    ]);
+
+    if (goalsResp.status !== 'fulfilled') throw new Error('Goals unavailable');
+    const data = await goalsResp.value.json();
+    if (!data.success) throw new Error(data.error || 'Goals unavailable');
+
+    const g = data.goals || {};
+    const a = data.actuals || {};
+    const starting = Number(g.account_balance_usd || 200);
+    const current = Number(a.current_value_usd ?? starting);
+    const delta = current - starting;
+    const accountPct = starting > 0 ? (delta / starting) * 100 : 0;
+    const accountColor = delta >= 0 ? 'var(--green)' : 'var(--red)';
+
+    const monthly = Number(a.monthly_return_pct ?? 0);
+    const monthlyTarget = Number(g.target_monthly_return_pct || 20);
+    const monthlyColor = monthly >= monthlyTarget ? 'var(--green)' : monthly >= 0 ? 'var(--amber)' : 'var(--red)';
+
+    const ev = a.ev_per_trade_pct;
+    const evTarget = Number(g.target_ev_per_trade_pct || 5);
+    const evColor = ev == null ? 'var(--text3)' : ev >= evTarget ? 'var(--green)' : ev >= 0 ? 'var(--amber)' : 'var(--red)';
+    const evSub = ev == null ? 'Live signal sample pending' : `n=${a.ev_sample_n || 0}${(a.ev_sample_n || 0) < 20 ? ' thin sample' : ''}`;
+
+    const wr = a.win_partial_rate;
+    const wrFloor = Number(g.min_win_partial_rate || 0.5);
+    const wrColor = wr == null ? 'var(--text3)' : wr >= wrFloor ? 'var(--green)' : 'var(--amber)';
+    const wrPct = wr == null ? 'No data' : (wr * 100).toFixed(1) + '%';
+
+    const dd = Number(a.drawdown_pct || 0);
+    const ddLimit = Number(g.max_drawdown_pct || 40);
+    const ddColor = dd <= -ddLimit * 0.75 ? 'var(--red)' : dd <= -ddLimit * 0.4 ? 'var(--amber)' : 'var(--green)';
+
+    let pendingCount = 0;
+    if (suggestionsResp.status === 'fulfilled') {
+      try {
+        const sd = await suggestionsResp.value.json();
+        pendingCount = (sd.suggestions || []).filter(s => s.status === 'pending_review' || s.status === 'evaluating').length;
+      } catch (_) {}
+    }
+
+    let alertHtml = '';
+    if (pendingCount > 0) {
+      alertHtml += `<div style="margin-top:8px;padding:8px 10px;background:#171303;border:1px solid #5b4214;border-radius:5px;font-size:11px;color:#f6c453;display:flex;gap:10px;align-items:center;justify-content:space-between;">
+        <span>mt-learner has ${pendingCount} suggestion${pendingCount === 1 ? '' : 's'} pending review.</span>
+        <button onclick="switchTab('intelligence')" style="background:transparent;border:0;color:#8ab4ff;font-size:11px;cursor:pointer;padding:0;">Open Intelligence</button>
+      </div>`;
+    }
+    if (a.kill_switch_breached) {
+      alertHtml += `<div style="margin-top:8px;padding:8px 10px;background:#1b0808;border:1px solid #5f1b1b;border-radius:5px;font-size:11px;color:#fca5a5;">Kill zone breached. Drawdown is beyond -${ddLimit.toFixed(0)}%.</div>`;
+    }
+    if (a.scale_up_ready) {
+      const trigger = g.scale_up_trigger || {};
+      alertHtml += `<div style="margin-top:8px;padding:8px 10px;background:#07180f;border:1px solid #14532d;border-radius:5px;font-size:11px;color:#86efac;">Scale-up trigger reached: EV is above ${trigger.ev_threshold_pct || 8}% across ${a.ev_sample_n || 0} trades.</div>`;
+    }
+
+    el.innerHTML = `<div style="margin:12px 0 14px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:10px;">
+        <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;">Performance Goals - ${gbFmtMoney(starting)} Account</div>
+        <div style="font-size:10px;color:#667085;">Risk ${Number(g.risk_pct_per_trade || 5).toFixed(1)}% / trade</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:8px;">
+        ${gbTile('Account Value', gbFmtMoney(current), `${delta >= 0 ? '+' : ''}${gbFmtMoney(delta).replace('$','')} (${accountPct.toFixed(1)}%)`, accountColor, gbProgress(Math.max(0, accountPct), monthlyTarget), `Monthly target ${monthlyTarget.toFixed(0)}%`)}
+        ${gbTile('Monthly Return', gbSigned(monthly), `Goal ${monthlyTarget.toFixed(0)}%`, monthlyColor, gbProgress(Math.max(0, monthly), monthlyTarget), `${gbFmtMoney(a.month_pnl_usd || 0)} this month`)}
+        ${gbTile('EV / Trade', gbSigned(ev), evSub, evColor, ev == null ? 0 : gbProgress(Math.abs(ev), evTarget), `Target +${evTarget.toFixed(1)}%`)}
+        ${gbTile('Win + Partial', wrPct, wr == null ? '' : `${a.win_partial_sample_n || 0} closed`, wrColor, wr == null ? 0 : wr * 100, `Floor ${(wrFloor * 100).toFixed(0)}%`)}
+        ${gbTile('Drawdown', gbSigned(dd), `Kill zone -${ddLimit.toFixed(0)}%`, ddColor, gbProgress(Math.abs(dd), ddLimit), `Limit ${gbFmtMoney(starting * ddLimit / 100)}`)}
+      </div>
+      ${alertHtml}
+    </div>`;
+  } catch (e) {
+    el.innerHTML = `<div style="margin:12px 0 14px;padding:10px;background:#111;border:1px solid #262626;border-radius:6px;color:#777;font-size:12px;">Goals unavailable: ${esc(e.message || e)}</div>`;
+  }
+}
 
 function analyticsLearnFor(strat) {
   const base = strat.base_key || strat.key || 'balanced';

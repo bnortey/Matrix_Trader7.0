@@ -770,7 +770,7 @@ git commit -m "feat: /api/intelligence/suggestions apply/reject routes with one-
 
 **Context:** Add a five-tile benchmark strip at the very top of the Strategies tab content. Loads from `/api/goals`. Shows account value, monthly return, EV/trade, win+partial rate, and drawdown gauge. Includes an alert strip for learner suggestions and scale-up trigger.
 
-- [ ] **Step 1: Add loadGoalBenchmark() JS function**
+- [x] **Step 1: Add loadGoalBenchmark() JS function**
 
 Find the Strategies tab JS section (search for `loadStrategies` or `function.*strateg`). Add before it:
 
@@ -864,7 +864,7 @@ function editGoals() {
 }
 ```
 
-- [ ] **Step 2: Add benchmark HTML container to Strategies section**
+- [x] **Step 2: Add benchmark HTML container to Strategies section**
 
 Find `<div id="strategies-section"` in index.html. Inside it, at the very top before any existing content, add:
 
@@ -872,7 +872,7 @@ Find `<div id="strategies-section"` in index.html. Inside it, at the very top be
 <div id="goal-benchmark"></div>
 ```
 
-- [ ] **Step 3: Wire loadGoalBenchmark() to tab switch**
+- [x] **Step 3: Wire loadGoalBenchmark() to tab switch**
 
 Find the `switchTab` function in index.html. In the block that handles `tab === 'strategies'` (or wherever `loadStrategies()` is called), add:
 
@@ -880,7 +880,7 @@ Find the `switchTab` function in index.html. In the block that handles `tab === 
     if (tab === 'strategies') { loadStrategies(); loadGoalBenchmark(); }
 ```
 
-- [ ] **Step 4: Test in browser**
+- [x] **Step 4: Test in browser**
 
 ```bash
 python3 app.py
@@ -889,11 +889,10 @@ python3 app.py
 # If /api/goals returns actuals with no signals, EV should show "No data"
 ```
 
-- [ ] **Step 5: Deploy and commit**
+- [x] **Step 5: Deploy and commit**
 
 ```bash
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-  --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+rsync -avz templates/index.html root@62.238.15.113:/opt/matrix-trader/templates/index.html
 ssh root@62.238.15.113 "systemctl restart matrix-trader && sleep 2 && systemctl is-active matrix-trader"
 
 git add templates/index.html
