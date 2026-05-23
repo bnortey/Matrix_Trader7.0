@@ -231,7 +231,8 @@ def init_db() -> None:
             signal_why   TEXT,
             result       TEXT DEFAULT NULL,
             result_note  TEXT DEFAULT NULL,
-            result_at    TEXT DEFAULT NULL
+            result_at    TEXT DEFAULT NULL,
+            source       TEXT DEFAULT 'live'
         )
     """)
     con.commit()
@@ -282,6 +283,11 @@ def init_db() -> None:
         pass
     try:
         con.execute("ALTER TABLE signals ADD COLUMN flow_confirmed INTEGER DEFAULT NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        con.execute("ALTER TABLE signals ADD COLUMN source TEXT DEFAULT 'live'")
         con.commit()
     except sqlite3.OperationalError:
         pass
@@ -547,7 +553,7 @@ def get_latest_market_context() -> dict | None:
         return None
 
 
-def log_signals(signals: list[dict]) -> None:
+def log_signals(signals: list[dict], source: str = "live") -> None:
     """
     Append enriched signals to the history DB after every scan.
     Failures are swallowed — logging must never crash the scan.
@@ -575,8 +581,8 @@ def log_signals(signals: list[dict]) -> None:
                  price, entry1, entry2, entry3, tp1, tp2, tp3, stop_loss,
                  atr_pct, volatility, funding_rate, rsi_1h, trend_score,
                  tags, signal_why, signal_json, data_quality, leverage,
-                 flow_score, flow_confirmed)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 flow_score, flow_confirmed, source)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 datetime.utcnow().isoformat(),
                 sig["symbol"],
@@ -601,6 +607,7 @@ def log_signals(signals: list[dict]) -> None:
                 leverage_val,
                 sig.get("flow_score"),
                 1 if sig.get("flow_confirmed") else (0 if sig.get("flow_confirmed") is False else None),
+                source,
             ))
         con.commit()
         con.close()
@@ -7554,7 +7561,7 @@ def _paper_bot_scan(cfg: dict) -> dict:
                 sig["strategy_key"]   = sig.get("_strategy_key", "balanced")
                 sig["flow_score"]     = flow_score
                 sig["flow_confirmed"] = True
-                log_signals([sig])
+                log_signals([sig], source="paper")
                 try:
                     _sc  = sqlite3.connect(DB_PATH)
                     _row = _sc.execute(

@@ -14,8 +14,7 @@
 
 ```bash
 # From project root on Mac:
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-  --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+rsync -avz app.py root@62.238.15.113:/opt/matrix-trader/app.py
 ssh root@62.238.15.113 "systemctl restart matrix-trader && sleep 2 && systemctl is-active matrix-trader"
 
 # For mt-learner code changes only. Do not overwrite runtime learner state.
@@ -146,14 +145,14 @@ git commit -m "fix: learner writes pending_review status, respects rejection log
 
 **Context:** Paper bot calls `log_signals()` so paper outcomes land in the `signals` table alongside manually-tagged live signals. Adding a `source` column lets the analyzer separate the two EV tracks.
 
-- [ ] **Step 1: Add source column to signals CREATE TABLE**
+- [x] **Step 1: Add source column to signals CREATE TABLE**
 
 In `app.py`, find the signals table schema (around line 200). Add after the last column before the closing `)`):
 ```sql
             source       TEXT DEFAULT 'live'
 ```
 
-- [ ] **Step 2: Add migration for existing DB**
+- [x] **Step 2: Add migration for existing DB**
 
 Find the migration block (around line 237 where other ALTER TABLE statements live). Add:
 ```python
@@ -163,7 +162,7 @@ Find the migration block (around line 237 where other ALTER TABLE statements liv
         pass
 ```
 
-- [ ] **Step 3: Add source parameter to log_signals()**
+- [x] **Step 3: Add source parameter to log_signals()**
 
 Change the function signature at line 550:
 ```python
@@ -184,14 +183,14 @@ Values tuple (after `sig.get("flow_confirmed")`):
                 source,
 ```
 
-- [ ] **Step 4: Paper bot passes source="paper"**
+- [x] **Step 4: Paper bot passes source="paper"**
 
 In `_paper_bot_scan()`, find the `log_signals([sig])` call (around line 7541). Change to:
 ```python
                 log_signals([sig], source="paper")
 ```
 
-- [ ] **Step 5: Verify migration runs cleanly**
+- [x] **Step 5: Verify migration runs cleanly**
 
 ```bash
 python3 -c "
@@ -205,7 +204,7 @@ con.close()
 ```
 Expected: `source column present, PASS`
 
-- [ ] **Step 6: Deploy and commit**
+- [x] **Step 6: Deploy and commit**
 
 ```bash
 rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
