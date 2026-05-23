@@ -148,19 +148,49 @@ REPORT_FREE_AI_PROVIDERS = {"gemini", "groq", "ollama"}
 
 _PAPER_CONFIG_DEFAULT = {
     "enabled":               False,
-    "size_usd":              100,
+    "account_balance_usd":   200.0,
+    "risk_pct_per_trade":    5.0,
     "disabled_strategies":   [],       # list of strategy keys to skip; empty = run all
     "min_conviction":        55,
     "flow_required":         True,
     "min_flow_score":        50.0,
-    "scan_interval_minutes": 5,
-    "max_open_positions":    5,
-    # Data-driven gates from analyze.py: winners avg atr_pct=3.2% vs losers 5.5%;
-    # winners avg trend_score=9.3 vs losers 14.1. These outpredict conviction score
-    # (0.56-point separation) by a wide margin.
-    "max_atr_pct":           4.0,
-    "max_trend_score_abs":   25,
+    "scan_interval_minutes": 2,
+    "max_open_positions":    4,
+    "max_atr_pct":           3.43,
+    "max_trend_score_abs":   41,
 }
+
+
+def compute_paper_position_size(
+    account_balance: float,
+    risk_pct: float,
+    entry_px: float,
+    stop_loss: float | None,
+    atr_pct: float | None,
+    conviction: int,
+) -> float:
+    """Return derived paper trade notional from account risk and stop distance."""
+    risk_amount = account_balance * risk_pct / 100
+
+    if stop_loss and entry_px and entry_px > 0:
+        stop_pct = abs(entry_px - stop_loss) / entry_px
+    elif atr_pct and atr_pct > 0:
+        stop_pct = atr_pct / 100
+    else:
+        stop_pct = 0.02
+
+    stop_pct = max(stop_pct, 0.005)
+    size = risk_amount / stop_pct
+
+    if conviction >= 80:
+        modifier = 1.0
+    elif conviction >= 65:
+        modifier = 0.8
+    else:
+        modifier = 0.6
+
+    cap = account_balance * 0.25
+    return round(min(size * modifier, cap), 2)
 
 # Daily kline cache: symbol → (fetched_at_ts, data)
 _daily_kline_cache: dict = {}
@@ -7347,7 +7377,9 @@ def _load_paper_config() -> dict:
         if os.path.exists(PAPER_CONFIG_PATH):
             with open(PAPER_CONFIG_PATH, encoding="utf-8") as f:
                 cfg = json.load(f)
-                return {**_PAPER_CONFIG_DEFAULT, **cfg}
+                merged = {**_PAPER_CONFIG_DEFAULT, **cfg}
+                merged.pop("size_usd", None)
+                return merged
     except Exception:
         pass
     return dict(_PAPER_CONFIG_DEFAULT)
@@ -7355,6 +7387,8 @@ def _load_paper_config() -> dict:
 
 def _save_paper_config(cfg: dict) -> None:
     os.makedirs("data", exist_ok=True)
+    cfg = dict(cfg)
+    cfg.pop("size_usd", None)
     with open(PAPER_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
@@ -7456,7 +7490,8 @@ def _paper_bot_scan(cfg: dict) -> dict:
     try:
         disabled_strategies  = cfg.get("disabled_strategies") or []
         min_conviction       = int(cfg.get("min_conviction", 55))
-        size_usd             = float(cfg.get("size_usd", 100))
+        account_balance      = float(cfg.get("account_balance_usd", 200.0))
+        risk_pct             = float(cfg.get("risk_pct_per_trade", 5.0))
         flow_required        = cfg.get("flow_required", True)
         min_flow_score       = float(cfg.get("min_flow_score", 50.0))
         max_open             = int(cfg.get("max_open_positions", 5))
@@ -7546,6 +7581,14 @@ def _paper_bot_scan(cfg: dict) -> dict:
             entry_px  = sig.get("price", 0)
             leverage  = float(sig.get("leverage_cap") or sig.get("leverage") or 1)
             conviction = sig.get("conviction", sig.get("conviction_base", 0))
+            size_usd = compute_paper_position_size(
+                account_balance=account_balance,
+                risk_pct=risk_pct,
+                entry_px=entry_px,
+                stop_loss=sig.get("stop_loss"),
+                atr_pct=sig.get("atr_pct"),
+                conviction=conviction,
+            )
 
             # Ladder levels: signals store as exits[] array, not flat tp1/tp2/tp3 keys
             exits = sig.get("exits") or []
@@ -7845,7 +7888,8 @@ def api_paper_config():
         body = request.get_json(force=True) or {}
         cfg  = _load_paper_config()
         allowed = {
-            "enabled", "size_usd", "disabled_strategies", "min_conviction",
+            "enabled", "account_balance_usd", "risk_pct_per_trade",
+            "disabled_strategies", "min_conviction",
             "flow_required", "min_flow_score", "scan_interval_minutes", "max_open_positions",
             "max_atr_pct", "max_trend_score_abs",
         }

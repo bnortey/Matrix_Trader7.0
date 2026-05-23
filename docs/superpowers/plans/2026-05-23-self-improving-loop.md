@@ -207,8 +207,7 @@ Expected: `source column present, PASS`
 - [x] **Step 6: Deploy and commit**
 
 ```bash
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-  --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+rsync -avz app.py root@62.238.15.113:/opt/matrix-trader/app.py
 ssh root@62.238.15.113 "systemctl restart matrix-trader && sleep 2 && systemctl is-active matrix-trader"
 
 git add app.py
@@ -224,7 +223,7 @@ git commit -m "feat: add source column to signals table, paper bot tags entries 
 
 **Context:** Paper bot uses flat `size_usd=100`. Replace with `risk_pct_per_trade % of account_balance_usd`, ATR-stop-based sizing, conviction modifier, and a 25%-of-account hard cap.
 
-- [ ] **Step 1: Add compute_paper_position_size() near risk_controls imports**
+- [x] **Step 1: Add compute_paper_position_size() near risk_controls imports**
 
 Find the area around line 155 (after `DEFAULT_PAPER_CONFIG`). Add this function:
 
@@ -269,7 +268,7 @@ def compute_paper_position_size(
     return round(min(size, cap), 2)
 ```
 
-- [ ] **Step 2: Update DEFAULT_PAPER_CONFIG**
+- [x] **Step 2: Update DEFAULT_PAPER_CONFIG**
 
 Around line 148, change:
 ```python
@@ -288,7 +287,7 @@ DEFAULT_PAPER_CONFIG: dict = {
 }
 ```
 
-- [ ] **Step 3: Update _paper_bot_scan() to use dynamic sizing**
+- [x] **Step 3: Update _paper_bot_scan() to use dynamic sizing**
 
 In `_paper_bot_scan()`, remove:
 ```python
@@ -316,7 +315,7 @@ Then replace the `entry_px` / `size_usd` block (where the INSERT happens) — co
             )
 ```
 
-- [ ] **Step 4: Update paper config PATCH to accept new fields**
+- [x] **Step 4: Update paper config PATCH to accept new fields**
 
 Find `PAPER_CONFIG_ALLOWED_KEYS` or the allowed field list in `/api/paper/config` PATCH handler. Replace with:
 ```python
@@ -328,7 +327,7 @@ Find `PAPER_CONFIG_ALLOWED_KEYS` or the allowed field list in `/api/paper/config
         }
 ```
 
-- [ ] **Step 5: Test sizing formula locally**
+- [x] **Step 5: Test sizing formula locally**
 
 ```bash
 python3 -c "
@@ -356,14 +355,13 @@ print('PASS')
 ```
 Expected: `PASS`
 
-- [ ] **Step 6: Deploy and commit**
+- [x] **Step 6: Deploy and commit**
 
 ```bash
-rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-  --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
+rsync -avz app.py templates/index.html root@62.238.15.113:/opt/matrix-trader/ --relative
 ssh root@62.238.15.113 "systemctl restart matrix-trader && sleep 2 && systemctl is-active matrix-trader"
 
-git add app.py
+git add app.py templates/index.html
 git commit -m "feat: dynamic position sizing — risk% of account balance with ATR-stop and conviction modifier"
 ```
 

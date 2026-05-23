@@ -7753,7 +7753,9 @@ async function loadPaperTrading() {
           <div style="display:flex;flex-wrap:wrap;gap:10px 20px;">${stratToggles}</div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;">
-          ${paperConfigField('Position Size $', `<input id="pc-size" type="number" value="${c.size_usd}" min="10" step="10"
+          ${paperConfigField('Account Balance $', `<input id="pc-account-balance" type="number" value="${c.account_balance_usd ?? 200}" min="50" step="10"
+            style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">`)}
+          ${paperConfigField('Risk / Trade %', `<input id="pc-risk-pct" type="number" value="${c.risk_pct_per_trade ?? 5}" min="1" max="12" step="0.5"
             style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">`)}
           ${paperConfigField('Min Conviction', `<input id="pc-conv" type="number" value="${c.min_conviction}" min="50" max="100" step="1"
             style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">`)}
@@ -8164,7 +8166,8 @@ async function savePaperConfig() {
     ).filter(el => !el.checked).map(el => el.id.replace('pc-strat-', ''));
     const body = {
       disabled_strategies,
-      size_usd:              parseFloat(document.getElementById('pc-size')?.value),
+      account_balance_usd:   parseFloat(document.getElementById('pc-account-balance')?.value),
+      risk_pct_per_trade:    parseFloat(document.getElementById('pc-risk-pct')?.value),
       min_conviction:        parseInt(document.getElementById('pc-conv')?.value),
       max_open_positions:    parseInt(document.getElementById('pc-maxpos')?.value),
       scan_interval_minutes: parseInt(document.getElementById('pc-interval')?.value),
