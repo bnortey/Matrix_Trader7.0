@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Matrix Trader Hermes consultancy memo weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=mt7-hermes-weekly.service
+
+[Install]
+WantedBy=timers.target

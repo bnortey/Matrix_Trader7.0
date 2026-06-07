@@ -1,0 +1,10 @@
+[Unit]
+Description=Matrix Trader Hermes weekly consultancy memo
+Wants=network-online.target
+After=network-online.target matrix-trader.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/matrix-trader
+ExecStart=/opt/matrix-trader/scripts/run_hermes_weekly_from_vultr.sh
+
