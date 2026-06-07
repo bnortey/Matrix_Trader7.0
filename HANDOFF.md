@@ -7,7 +7,7 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-06-07
-Last commit: 387584d chore: document Edge Lab Lite production runner
+Last commit: 9bda491 chore: schedule daily Edge Lab refresh
 app.py: 12,273 lines
 index.html: 13,111 lines
 
@@ -521,11 +521,10 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 
 **Next in priority order:**
 
-1. **Evaluate paper bot gate before P12**: production has 100+ closed paper trades, but edge is not strong enough yet. Review strategy/regime concentration, outliers, drawdown, W+P, EV after costs, and whether performance survives without the biggest winner.
-2. **Monitor focus-short cohort**: production paper config now runs `balanced_focus_short` and `funding_arb_focus_short` only, with `current_cohort_started_at="2026-06-07T14:50:00"`.
-3. **Tighten strategy filters from evidence**: use paper stats, learner suggestions, and Edge Lab output to identify which strategy/regime combinations should remain enabled.
-4. **Use Edge Lab output as research priors**: weekly Lite timer is running; review `data/factor_report.json` top states before changing strategy filters.
-5. **If paper proves edge** (50+ trades, 50%+ W+P, EV > 0 after fees): prepare P12 micro-live design. Do not activate yet.
+1. **Monitor focus-short cohort**: Active strategies are `balanced_focus_short` and `funding_arb_focus_short` only. `mean_reversion` disabled June 7 after post-tightening sample showed avg net ~-20%. Cohort target is 20+ clean trades with 50%+ W+P and positive EV. `current_cohort_started_at="2026-06-07T14:50:00"`.
+2. **Apply choppy regime suggestion when guard clears**: `regime_funding_arb_choppy_20260529_001` is `pending_review`. The one-at-a-time evaluating guard must clear before it can be applied. Once learner queue is unlocked, apply via: `curl -X PATCH http://localhost:8080/api/intelligence/suggestions/regime_funding_arb_choppy_20260529_001 -H "Content-Type: application/json" -d '{"action":"apply"}'` from the VPS.
+3. **Use Edge Lab attribution panel**: `/api/paper/cohort-edge` + Paper tab panel now attributes cohort trades to Edge Lab factor states. Use this to validate whether winning trades align with strong Edge Lab states.
+4. **If focus-short cohort proves edge** (50+ clean trades, 50%+ W+P, EV > 0 after fees): prepare P12 micro-live design. Do not activate yet.
 
 **Do NOT do yet:**
 - Add `HL_PRIVATE_KEY` to VPS — paper bot has not proven edge
@@ -610,6 +609,16 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 ---
 
 ## Session Notes
+
+### 2026-06-07 — Session summary (project review, mean_reversion disable, GitHub push)
+
+- Reviewed full project state. Paper bot config confirmed correct on VPS: `disabled_strategies` properly blocks `balanced`, `custom_balanced_no_extreme_vol`, `funding_arb`, `momentum_breakout`. "Leaking" trades observed in post-tightening data were pre-June-1 trades already open when the disable took effect — not a bug.
+- Post-tightening cohort as of this session: 29 closed, W+P 55.2%, avg net +1.07%, PF 1.09. `funding_arb_focus_short` is the only strong performer (50% W+P, avg net +10.56% over 28 trades). `mean_reversion` dragging at avg net -20% over 7 trades.
+- Disabled `mean_reversion` via Paper tab Configuration UI. Active paper strategies are now `balanced_focus_short` and `funding_arb_focus_short` only.
+- Learner status: `learner_running` was showing false due to heartbeat file age (10-minute window check). Heartbeat fix deployed by Codex. Suggestions queue: `thresh_balanced_20260523_001=applied`, both regime suggestions parked by Codex session earlier today.
+- Set up GitHub SSH auth for the first time: generated `ed25519` key on Mac, added to GitHub. Switched remote from HTTPS to SSH (`git remote set-url origin git@github.com:bnortey/Matrix_Trader7.0.git`).
+- Pushed all 7 local commits to GitHub for the first time. Repo is now backed up remotely.
+- Updated HANDOFF.md to reflect current state.
 
 ### 2026-06-07 — Session summary (learner heartbeat + focus-short paper cohort)
 
