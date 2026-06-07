@@ -9802,18 +9802,93 @@ function renderEdgeLabPanel() {
   const dc = v => Number(v) > 0 ? 'color:var(--green)' : Number(v) < 0 ? 'color:var(--red)' : '';
   const thL = 'padding:5px 8px;font-size:11px;color:var(--text2);font-weight:400;text-align:left;border-bottom:1px solid var(--border);';
   const thR = 'padding:5px 8px;font-size:11px;color:var(--text2);font-weight:400;text-align:right;border-bottom:1px solid var(--border);';
+  const groupInfo = {
+    volatility_regime: {
+      label: 'Volatility Regime',
+      plain: 'How wide the recent candle ranges are compared with normal.',
+      use: 'Helps MT7 avoid treating a quiet grind and a violent expansion as the same setup.',
+    },
+    trend_state: {
+      label: 'Trend State',
+      plain: 'Whether the recent structure is bullish, bearish, or neutral.',
+      use: 'Shows whether longs or shorts worked better with or against the current trend.',
+    },
+    compression_state: {
+      label: 'Compression State',
+      plain: 'Whether price is compressed, normal, or expanded.',
+      use: 'Compressed states often matter because breakouts and fakeouts behave differently there.',
+    },
+    regime_x_trend: {
+      label: 'Regime x Trend',
+      plain: 'A combined state, such as low volatility plus bearish trend.',
+      use: 'Usually more useful than one factor alone because it describes the market backdrop.',
+    },
+    rsi_decile: {
+      label: 'RSI Decile',
+      plain: 'RSI bucket from 1 to 10. 1 is most oversold, 10 is most overbought.',
+      use: 'Explains rows like 1, 2, 7, and 8. Low numbers often test long mean-reversion; high numbers often test short mean-reversion.',
+    },
+    volume_decile: {
+      label: 'Volume Decile',
+      plain: 'Volume bucket from 1 to 10. 1 is quietest, 10 is busiest.',
+      use: 'Separates thin conditions from crowded, high-participation moves.',
+    },
+    atr_decile: {
+      label: 'ATR Decile',
+      plain: 'ATR bucket from 1 to 10. 1 is lowest range, 10 is highest range.',
+      use: 'Measures tradable range pressure; high values usually demand wider stops or smaller size.',
+    },
+    tag_presence: {
+      label: 'Tag Presence',
+      plain: 'Whether an interpretable feature tag was present, such as low_vol or bearish_trend.',
+      use: 'Duplicates some factor groups in trader language so the same edge is easier to recognize.',
+    },
+  };
+  const templateInfo = {
+    TP0_5_SL0_5: 'Take profit +0.5%, stop -0.5%',
+    TP1_0_SL0_5: 'Take profit +1.0%, stop -0.5%',
+    TP1_5_SL0_75: 'Take profit +1.5%, stop -0.75%',
+    TP2_0_SL1_0: 'Take profit +2.0%, stop -1.0%',
+  };
+  const groupLabel = g => (groupInfo[g] && groupInfo[g].label) || String(g || '').replace(/_/g, ' ');
+  const stateMeaning = (group, key) => {
+    const k = String(key ?? '');
+    if (group === 'rsi_decile') return `RSI decile ${k}: ${Number(k) <= 2 ? 'oversold bucket' : Number(k) >= 8 ? 'overbought bucket' : 'middle momentum bucket'}`;
+    if (group === 'atr_decile') return `ATR decile ${k}: ${Number(k) <= 2 ? 'low range' : Number(k) >= 8 ? 'high range' : 'middle range'}`;
+    if (group === 'volume_decile') return `Volume decile ${k}: ${Number(k) <= 2 ? 'quiet volume' : Number(k) >= 8 ? 'heavy volume' : 'normal volume'}`;
+    if (group === 'regime_x_trend') return k.replace(/_/g, ' volatility + ') + ' trend backdrop';
+    if (group === 'tag_presence') return `Feature tag present: ${k.replace(/_/g, ' ')}`;
+    return k.replace(/_/g, ' ');
+  };
+  const collectGroupRows = value => {
+    if (Array.isArray(value)) return value;
+    if (!value || typeof value !== 'object') return [];
+    return Object.values(value).flatMap(v => collectGroupRows(v));
+  };
+  const uniqueStatesForGroup = value => {
+    const set = new Set(collectGroupRows(value).map(r => r && r.group_key).filter(v => v !== undefined && v !== null).map(String));
+    return [...set];
+  };
 
-  const stateRows = (rows, side) => rows.map(r => `<tr>
-    <td style="padding:5px 8px;font-family:var(--mono);font-size:12px;">${esc(r.group_key)}</td>
-    <td style="padding:5px 8px;font-size:12px;color:var(--text2);">${esc(r.source_group || '')}</td>
-    <td style="padding:5px 8px;font-size:12px;text-align:right;">${fmtN(r.n)}</td>
-    <td style="padding:5px 8px;font-size:12px;text-align:right;">${Number(r.tp_rate).toFixed(1)}%</td>
-    <td style="padding:5px 8px;font-size:12px;text-align:right;${dc(r.edge_delta)}">${fmtPct(r.edge_delta)}</td>
-    <td style="padding:5px 8px;font-size:12px;text-align:right;color:var(--green);">${fmtPct(r.avg_mfe_pct)}</td>
-    <td style="padding:5px 8px;font-size:12px;text-align:right;color:var(--red);">${fmtPct(r.avg_mae_pct)}</td>
-    <td style="padding:5px 8px;font-size:11px;color:var(--text3);">${esc(r.template || '')}</td>
-    <td style="padding:5px 8px;font-size:11px;color:var(--text3);">${esc(r.sample_quality || '')}</td>
-  </tr>`).join('');
+  const stateRows = (rows, side) => rows.map(r => {
+    const group = r.source_group || '';
+    const templateTitle = templateInfo[r.template] || '';
+    const edgeTitle = `TP rate ${Number(r.tp_rate).toFixed(1)}% vs baseline ${Number(r.baseline_rate || 0).toFixed(1)}%. Positive Edge Delta means this state beat the baseline for ${side.toUpperCase()} paths.`;
+    return `<tr title="${esc(stateMeaning(group, r.group_key))}">
+      <td style="padding:6px 8px;font-family:var(--mono);font-size:12px;color:var(--text);">
+        ${esc(r.group_key)}
+        <div style="font-family:var(--font);font-size:10px;color:var(--text3);margin-top:2px;max-width:220px;white-space:normal;">${esc(stateMeaning(group, r.group_key))}</div>
+      </td>
+      <td style="padding:6px 8px;font-size:12px;color:var(--text2);" title="${esc((groupInfo[group] || {}).plain || '')}">${esc(groupLabel(group))}</td>
+      <td style="padding:6px 8px;font-size:12px;text-align:right;" title="Sample size: number of historical candles in this state.">${fmtN(r.n)}</td>
+      <td style="padding:6px 8px;font-size:12px;text-align:right;" title="How often this template hit take-profit before stop-loss.">${Number(r.tp_rate).toFixed(1)}%</td>
+      <td style="padding:6px 8px;font-size:12px;text-align:right;${dc(r.edge_delta)}" title="${esc(edgeTitle)}">${fmtPct(r.edge_delta)}</td>
+      <td style="padding:6px 8px;font-size:12px;text-align:right;color:var(--green);" title="Average maximum favorable move before the path resolved.">${fmtPct(r.avg_mfe_pct)}</td>
+      <td style="padding:6px 8px;font-size:12px;text-align:right;color:var(--red);" title="Average maximum adverse move before the path resolved.">${fmtPct(r.avg_mae_pct)}</td>
+      <td style="padding:6px 8px;font-size:11px;color:var(--text3);" title="${esc(templateTitle)}">${esc(r.template || '')}</td>
+      <td style="padding:6px 8px;font-size:11px;color:var(--text3);" title="Confidence is based on sample size and statistical interval width.">${esc(String(r.sample_quality || '').replace(/_/g, ' '))}</td>
+    </tr>`;
+  }).join('');
 
   const thead = `<thead><tr>
     <th style="${thL}">State</th><th style="${thL}">Factor Group</th>
@@ -9825,10 +9900,16 @@ function renderEdgeLabPanel() {
   const groupKeys = Object.keys(groups);
   const groupSummary = groupKeys.length ? groupKeys.map(g => {
     const gd = groups[g];
-    const rows = Array.isArray(gd) ? gd : (gd.long || gd.short || []);
+    const states = uniqueStatesForGroup(gd);
+    const rows = collectGroupRows(gd);
+    const best = rows.filter(r => r && r.edge_delta !== undefined).sort((a, b) => Number(b.edge_delta || 0) - Number(a.edge_delta || 0))[0];
+    const info = groupInfo[g] || {label: g, plain: '', use: ''};
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:10px;">
-      <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;">${esc(g)}</div>
-      <div style="font-size:12px;color:var(--text2);">${rows.length} factor states</div>
+      <div style="font-size:11px;color:var(--text);text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px;">${esc(info.label)}</div>
+      <div style="font-size:11px;color:var(--text2);line-height:1.45;margin-bottom:7px;">${esc(info.plain)}</div>
+      <div style="font-size:11px;color:var(--text3);line-height:1.45;margin-bottom:7px;">${esc(info.use)}</div>
+      <div style="font-size:11px;color:var(--text2);">${states.length} states · ${fmtN(rows.length)} template rows</div>
+      ${best ? `<div style="font-size:10px;color:var(--green);margin-top:5px;">Best: ${esc(best.group_key)} ${fmtPct(best.edge_delta)}</div>` : ''}
     </div>`;
   }).join('') : '';
 
@@ -9855,18 +9936,46 @@ function renderEdgeLabPanel() {
       <div style="font-size:11px;color:var(--text3);margin-top:10px;">Edge Δ = TP rate minus baseline for that side. Higher is better. MFE/MAE are avg candle moves during the trade window.</div>
     </div>
 
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 16px;margin-bottom:14px;">
+      <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:8px;">How To Read Edge Lab</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">
+        <div style="font-size:11px;color:var(--text2);line-height:1.5;">
+          <div style="color:var(--text);font-weight:700;margin-bottom:3px;">What this is</div>
+          Edge Lab replays historical MEXC 15m candles and asks: when the market was in this state, did a simple long or short TP/SL path work better than baseline?
+        </div>
+        <div style="font-size:11px;color:var(--text2);line-height:1.5;">
+          <div style="color:var(--text);font-weight:700;margin-bottom:3px;">What a factor group means</div>
+          A factor group is one lens on market condition: RSI bucket, volatility bucket, trend state, compression, volume, or combinations such as regime x trend.
+        </div>
+        <div style="font-size:11px;color:var(--text2);line-height:1.5;">
+          <div style="color:var(--text);font-weight:700;margin-bottom:3px;">What numbers like 1, 2, 7, 8 mean</div>
+          Deciles rank candles from 1 to 10. For RSI, 1 is most oversold and 10 is most overbought. For ATR or volume, 1 is lowest and 10 is highest.
+        </div>
+        <div style="font-size:11px;color:var(--text2);line-height:1.5;">
+          <div style="color:var(--text);font-weight:700;margin-bottom:3px;">How MT7 uses it</div>
+          This is research context, not an automatic trade command. Use it to validate paper trades, explain cohort performance, and spot strategy/regime filters worth testing.
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--border);margin-top:10px;padding-top:9px;font-size:11px;color:var(--text3);line-height:1.5;">
+        Practical read: favor states with high sample size, positive Edge Δ, and MAE that your stop can survive. A green Edge Δ does not guarantee profit after fees, slippage, leverage, or current order-flow conditions.
+      </div>
+    </div>
+
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:14px;">
-      <div style="font-size:13px;font-weight:600;color:var(--green);margin-bottom:10px;">Top Long States</div>
+      <div style="font-size:13px;font-weight:600;color:var(--green);margin-bottom:4px;">Top Long States</div>
+      <div style="font-size:11px;color:var(--text3);line-height:1.45;margin-bottom:10px;">Historical states where long templates beat their baseline most. Use these as long-side research priors, not standalone entries.</div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">${thead}<tbody>${stateRows(topLong,'long')}</tbody></table></div>
     </div>
 
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:14px;">
-      <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:10px;">Top Short States</div>
+      <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:4px;">Top Short States</div>
+      <div style="font-size:11px;color:var(--text3);line-height:1.45;margin-bottom:10px;">Historical states where short templates beat their baseline most. These help explain when short-biased strategies have a real backdrop.</div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">${thead}<tbody>${stateRows(topShort,'short')}</tbody></table></div>
     </div>
 
     ${groupKeys.length ? `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:14px;">
-      <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:10px;">Factor Groups</div>
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px;">Factor Groups</div>
+      <div style="font-size:11px;color:var(--text3);line-height:1.45;margin-bottom:10px;">Each group is a different way to bucket the same historical candles. Stronger strategy ideas usually show up across more than one group.</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;">${groupSummary}</div>
     </div>` : ''}
   </div>`;
