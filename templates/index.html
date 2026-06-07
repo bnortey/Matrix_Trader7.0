@@ -11522,6 +11522,41 @@ function renderPaperCohortStrip(cohort) {
   </div>`;
 }
 
+function edgeStateMeaning(group, key) {
+  const k = String(key ?? '');
+  if (group === 'rsi_decile') return `RSI decile ${k}: ${Number(k) <= 2 ? 'oversold' : Number(k) >= 8 ? 'overbought' : 'middle momentum'} bucket`;
+  if (group === 'atr_decile') return `ATR decile ${k}: ${Number(k) <= 2 ? 'low range' : Number(k) >= 8 ? 'high range' : 'normal range'} bucket`;
+  if (group === 'volume_decile') return `Volume decile ${k}: ${Number(k) <= 2 ? 'quiet' : Number(k) >= 8 ? 'heavy' : 'normal'} participation`;
+  if (group === 'regime_x_trend') return `${k.replace(/_/g, ' volatility + ')} trend backdrop`;
+  if (group === 'volatility_regime') return `${k.replace(/_/g, ' ')} volatility regime`;
+  if (group === 'trend_state') return `${k.replace(/_/g, ' ')} trend state`;
+  if (group === 'compression_state') return `${k.replace(/_/g, ' ')} price structure`;
+  if (group === 'tag_presence') return `${k.replace(/_/g, ' ')} feature tag was present`;
+  return k.replace(/_/g, ' ');
+}
+
+function edgeGroupLabel(group) {
+  return ({
+    volatility_regime: 'Volatility',
+    trend_state: 'Trend',
+    compression_state: 'Compression',
+    regime_x_trend: 'Regime x Trend',
+    rsi_decile: 'RSI',
+    volume_decile: 'Volume',
+    atr_decile: 'ATR',
+    tag_presence: 'Tag',
+  })[group] || String(group || '').replace(/_/g, ' ');
+}
+
+function edgeAlignmentText(label, bestEdge) {
+  const edge = bestEdge == null ? '' : ` Best historical edge: ${fmtPct(bestEdge)}.`;
+  if (label === 'favorable') return `Matched a strong favorable Edge Lab state.${edge}`;
+  if (label === 'mild') return `Matched a mildly favorable Edge Lab state.${edge}`;
+  if (label === 'neutral') return `Matched Edge Lab state was close to baseline.${edge}`;
+  if (label === 'unfavorable') return `Matched state has historically underperformed baseline.${edge}`;
+  return 'No nearby same-symbol Edge Lab candle was available for this entry.';
+}
+
 function renderPaperCohortEdge(data) {
   if (!data) return '';
   if (!data.success) {
@@ -11537,6 +11572,16 @@ function renderPaperCohortEdge(data) {
   const factors = s.top_positive_factors || [];
   const coverage = Number(s.coverage_pct || 0);
   const maxIso = edge.max_timestamp_iso ? new Date(edge.max_timestamp_iso + 'Z').toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '—';
+  const totalTrades = Number(s.total_trades || 0);
+  const matchedTrades = Number(s.matched_trades || 0);
+  const closedTrades = Number(s.closed_trades || 0);
+  const favorableClosed = Number((align.favorable || {}).count || 0);
+  const mildClosed = Number((align.mild || {}).count || 0);
+  const alignedClosed = favorableClosed + mildClosed;
+  const verdictColor = !closedTrades ? '#9ca3af' : alignedClosed / closedTrades >= 0.7 ? '#22c55e' : alignedClosed / closedTrades >= 0.4 ? '#f59e0b' : '#ef4444';
+  const verdictText = !closedTrades
+    ? 'No closed cohort trades yet. Keep collecting sample before changing filters.'
+    : `${alignedClosed}/${closedTrades} closed trades matched favorable or mild Edge Lab states. Use this as context, not a standalone green light.`;
   const metric = (label, value, color='var(--text2)', title='') => `
     <div title="${esc(title)}" style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:7px 9px;">
       <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px;">${label}</div>
@@ -11555,14 +11600,26 @@ function renderPaperCohortEdge(data) {
       <span style="font-family:var(--mono);color:${avg >= 0 ? '#22c55e' : '#ef4444'}">${Number(v.count || 0)} · ${fmtPct(avg)} · W+P ${Number(v.win_partial_rate || 0).toFixed(1)}%</span>
     </div>`;
   }).join('');
-  const factorRows = factors.slice(0, 4).map(f => `<span title="Closed ${f.closed || f.count || 0}, avg ${fmtPct(f.avg_pnl || 0)}" style="border:1px solid #263244;border-radius:4px;padding:3px 6px;color:#9ca3af;font-size:10px;">${esc(String(f.factor || '').replace(/_/g, ' '))}</span>`).join('');
+  const factorRows = factors.slice(0, 4).map(f => {
+    const [group, key] = String(f.factor || '').split(':');
+    const label = key ? `${edgeGroupLabel(group)}: ${edgeStateMeaning(group, key)}` : String(f.factor || '').replace(/_/g, ' ');
+    return `<span title="Closed ${f.closed || f.count || 0}, avg ${fmtPct(f.avg_pnl || 0)}" style="border:1px solid #263244;border-radius:4px;padding:3px 6px;color:#9ca3af;font-size:10px;">${esc(label)}</span>`;
+  }).join('');
   const recent = trades.filter(t => t.status === 'closed').slice(0, 4).map(t => {
-    const a = (t.edge_lab && t.edge_lab.alignment) || {};
+    const el = t.edge_lab || {};
+    const a = (el && el.alignment) || {};
+    const matches = el.top_matches || [];
+    const top = matches[0] || {};
     const color = a.label === 'favorable' ? '#22c55e' : a.label === 'mild' ? '#60a5fa' : a.label === 'unfavorable' ? '#ef4444' : '#9ca3af';
-    return `<div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;border-top:1px solid #18202b;padding-top:5px;margin-top:5px;font-size:11px;">
-      <span style="color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc((t.symbol || '').replace('_USDT',''))} · ${esc(t.strategy_key || '')}</span>
-      <span style="color:${color};font-family:var(--mono);">${esc(a.label || 'unmatched')} ${a.best_edge_delta != null ? `${Number(a.best_edge_delta).toFixed(1)}` : ''}</span>
-      <span style="color:${Number(t.pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444'};font-family:var(--mono);">${t.pnl_pct == null ? 'open' : fmtPct(t.pnl_pct)}</span>
+    const state = top.group ? `${edgeGroupLabel(top.group)} · ${edgeStateMeaning(top.group, top.group_key)}` : edgeAlignmentText(a.label, a.best_edge_delta);
+    const path = top.template ? `${top.template} ${String(top.side || '').toUpperCase()} · TP ${Number(top.tp_rate || 0).toFixed(1)}% vs base ${Number(top.baseline_rate || 0).toFixed(1)}%` : '';
+    return `<div style="border-top:1px solid #18202b;padding-top:7px;margin-top:7px;font-size:11px;">
+      <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;">
+        <span style="color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc((t.symbol || '').replace('_USDT',''))} · ${esc(t.strategy_key || '')}</span>
+        <span title="${esc(edgeAlignmentText(a.label, a.best_edge_delta))}" style="color:${color};font-family:var(--mono);">${esc(a.label || 'unmatched')} ${a.best_edge_delta != null ? `${fmtPct(a.best_edge_delta)}` : ''}</span>
+        <span style="color:${Number(t.pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444'};font-family:var(--mono);">${t.pnl_pct == null ? 'open' : fmtPct(t.pnl_pct)}</span>
+      </div>
+      <div style="color:#7b8494;line-height:1.45;margin-top:4px;">${esc(state)}${path ? ` · ${esc(path)}` : ''}</div>
     </div>`;
   }).join('');
   const coverageColor = coverage >= 80 ? '#22c55e' : coverage >= 40 ? '#f59e0b' : '#ef4444';
@@ -11574,8 +11631,13 @@ function renderPaperCohortEdge(data) {
       </div>
       <div style="font-size:11px;color:${coverageColor};font-family:var(--mono);font-weight:800;">${coverage.toFixed(1)}% coverage</div>
     </div>
+    <div style="border:1px solid #1e2530;background:#0b0f15;border-radius:5px;padding:8px 9px;margin-bottom:8px;">
+      <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.07em;font-weight:800;margin-bottom:3px;">Cohort Verdict</div>
+      <div style="font-size:12px;color:${verdictColor};line-height:1.45;">${esc(verdictText)}</div>
+      <div style="font-size:11px;color:#667085;line-height:1.45;margin-top:4px;">Edge Lab compares each paper entry to the closest same-symbol 15m historical state. It helps explain whether winners and losers are happening in historically favorable conditions.</div>
+    </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:7px;margin-bottom:8px;">
-      ${metric('Matched', `${s.matched_trades || 0}/${s.total_trades || 0}`, coverageColor, 'Paper trades with a same-symbol Edge Lab candle near entry')}
+      ${metric('Matched', `${matchedTrades}/${totalTrades}`, coverageColor, 'Paper trades with a same-symbol Edge Lab candle near entry')}
       ${bucket('favorable', 'Favorable')}
       ${bucket('mild', 'Mild')}
       ${bucket('unfavorable', 'Unfavorable')}
