@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Matrix Trader Edge Lab Daily incremental refresh
+
+[Timer]
+OnCalendar=Mon..Sat 03:45:00 UTC
+RandomizedDelaySec=20m
+Persistent=true
+Unit=edge-lab-daily.service
+
+[Install]
+WantedBy=timers.target

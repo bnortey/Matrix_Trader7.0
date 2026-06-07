@@ -1,0 +1,20 @@
+[Unit]
+Description=Matrix Trader Edge Lab Daily incremental refresh
+After=network-online.target matrix-trader.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/matrix-trader
+Environment="EDGE_LAB_RUN_NAME=Edge Lab Daily"
+Environment=EDGE_LAB_LOG_FILE=/opt/matrix-trader/logs/edge_lab_daily.log
+Environment=EDGE_LAB_TOP_N=120
+Environment=EDGE_LAB_MAX_RUNTIME_MINUTES=35
+Environment=EDGE_LAB_BATCH_SIZE=40
+Environment=EDGE_LAB_MATERIALIZE_BATCH_SIZE=20000
+Environment=EDGE_LAB_FACTOR_TOP_N=10
+ExecStart=/opt/matrix-trader/scripts/run_edge_lab_daily.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

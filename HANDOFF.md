@@ -511,7 +511,7 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | Strategy Context card | Pair workspace sidebar: recent 20/10 perf, symbol fit, direction fit, cold streak warnings | ✅ Done |
 | Hermes on-demand run | `POST /api/intelligence/hermes/run` + Run Now button with async status polling | ✅ Done |
 | Market fullscreen chart | `.panel-fullscreen .chart-panel` expands to 58vh; chart reloads on toggle | ✅ Done |
-| Edge Lab pipeline | `edge_lab/` package + weekly Lite timer — candle fetch, path labeling, materializer, factor analysis → `edge_lab.db` + `factor_report.json` | ✅ Deployed/running |
+| Edge Lab pipeline | `edge_lab/` package + weekly Lite timer + daily incremental refresh — candle fetch, path labeling, materializer, factor analysis → `edge_lab.db` + `factor_report.json` | ✅ Deployed/running |
 | Edge Lab cohort attribution | `/api/paper/cohort-edge` + Paper tab panel attribute current paper cohort trades to Edge Lab factor states | ✅ Done/deployed |
 | P12 | Micro-live automation — one proven strategy, automated, exposure caps | ⏳ Pending — gated on paper bot proving edge (50%+ W+P, positive EV after fees, 50+ trades) |
 
@@ -628,6 +628,9 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 - Added the production Edge Lab Lite runner and systemd units to the repo: `scripts/run_edge_lab_lite.sh`, `scripts/systemd/edge-lab-lite.service`, `scripts/systemd/edge-lab-lite.timer`. Checksum dry-run against production shows content matches; only timestamp/group metadata differs.
 - Added `/api/paper/cohort-edge` plus a compact Paper tab "Edge Lab Cohort Attribution" panel. It matches current cohort paper trades to same-symbol `Min15` Edge Lab candle states within a configurable 30-minute window, reports coverage, favorable/mild/unfavorable alignment buckets, strategy breakdowns, top positive factors, and recent closed trade attribution. This is research-only and does not mutate paper config or signal scoring.
 - Deployed `app.py` and `templates/index.html` to production `207.148.66.39`; `matrix-trader` restarted and is active. Production endpoint verification returned `success=true` for the Focus-short only cohort with `0` current cohort trades, `0%` coverage, Edge Lab report metadata present, and latest Edge candle `2026-06-06T03:30:00`. That empty attribution is expected until the focus-short cohort produces trades and the weekly Edge Lab dataset catches up.
+- Added a daily incremental Edge Lab refresh alongside the weekly Lite run: `scripts/run_edge_lab_daily.sh`, `scripts/systemd/edge-lab-daily.service`, and `scripts/systemd/edge-lab-daily.timer`. Daily timer runs Mon-Sat around `03:45 UTC` with jitter; weekly Lite remains Sunday. Both share the same lock so jobs cannot overlap.
+- Manual production run of `edge-lab-daily.service` completed successfully on `2026-06-07T15:25:07Z`: processed `120` eligible top-volume symbols, fetched `81,509` recent candles, inserted/materialized `5,279` new rows, rebuilt `factor_report.json`, and advanced `/api/paper/cohort-edge` max Edge candle from `2026-06-06T03:30:00` to `2026-06-06T15:15:00`. Runtime was about `9m42s`; factor analysis is still the long pole (`~364s`).
+- Cleaned Edge Lab incremental fetch logging so short lookback runs no longer produce false "partial history" warnings against the 90-day backfill expectation.
 
 ### 2026-05-24 — Session summary (paper realism, regime cleanup, net-EV learner)
 

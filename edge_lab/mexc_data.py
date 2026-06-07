@@ -20,6 +20,16 @@ DEFAULT_TIMEOUT = 8
 DEFAULT_RETRIES = 2
 KLINE_LIMIT = 2000
 MAX_CHUNK_ATTEMPTS = 20
+INTERVAL_SECONDS = {
+    "Min1": 60,
+    "Min5": 5 * 60,
+    "Min15": 15 * 60,
+    "Min30": 30 * 60,
+    "Min60": 60 * 60,
+    "Hour4": 4 * 60 * 60,
+    "Hour8": 8 * 60 * 60,
+    "Day1": 24 * 60 * 60,
+}
 
 
 def _request_json(path: str, params: dict | None = None, retries: int = DEFAULT_RETRIES) -> tuple[Any, str | None]:
@@ -134,13 +144,15 @@ def fetch_klines(
     else:
         out = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
+    interval_seconds = INTERVAL_SECONDS.get(interval, 15 * 60)
+    requested_candles = max(1, int((end - start) / interval_seconds))
     meta = {
         "symbol": symbol,
         "interval": interval,
         "requested_start": start,
         "requested_end": end,
         "candles": int(len(out)),
-        "partial_history": len(out) < int(days * 24 * 4 * 0.8),
+        "partial_history": len(out) < int(requested_candles * 0.8),
         "errors": errors,
     }
     if meta["partial_history"]:
