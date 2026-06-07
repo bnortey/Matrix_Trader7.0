@@ -7,9 +7,9 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-06-07
-Last commit: 70dfed4 docs: update Vultr production handoff
-app.py: 9,388 lines
-index.html: 9,214 lines
+Last commit: 387584d chore: document Edge Lab Lite production runner
+app.py: 12,273 lines
+index.html: 13,111 lines
 
 ---
 
@@ -512,6 +512,7 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | Hermes on-demand run | `POST /api/intelligence/hermes/run` + Run Now button with async status polling | ✅ Done |
 | Market fullscreen chart | `.panel-fullscreen .chart-panel` expands to 58vh; chart reloads on toggle | ✅ Done |
 | Edge Lab pipeline | `edge_lab/` package + weekly Lite timer — candle fetch, path labeling, materializer, factor analysis → `edge_lab.db` + `factor_report.json` | ✅ Deployed/running |
+| Edge Lab cohort attribution | `/api/paper/cohort-edge` + Paper tab panel attribute current paper cohort trades to Edge Lab factor states | ✅ Done/deployed |
 | P12 | Micro-live automation — one proven strategy, automated, exposure caps | ⏳ Pending — gated on paper bot proving edge (50%+ W+P, positive EV after fees, 50+ trades) |
 
 ---
@@ -625,6 +626,8 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 - Verified Edge Lab Lite on production: `edge-lab-lite.timer` is active, last run was `2026-06-07 03:25:28 UTC`, next run is `2026-06-14 03:19:38 UTC`. The run completed at `2026-06-07T03:41:38Z`.
 - Production Edge Lab outputs: `data/edge_lab.db` is present (`9.2G`), `data/factor_report.json` is present (`236K`), and `/api/intelligence/factor-report` returns success with `2,157,163` candles across templates `TP0_5_SL0_5`, `TP1_0_SL0_5`, `TP1_5_SL0_75`, `TP2_0_SL1_0`.
 - Added the production Edge Lab Lite runner and systemd units to the repo: `scripts/run_edge_lab_lite.sh`, `scripts/systemd/edge-lab-lite.service`, `scripts/systemd/edge-lab-lite.timer`. Checksum dry-run against production shows content matches; only timestamp/group metadata differs.
+- Added `/api/paper/cohort-edge` plus a compact Paper tab "Edge Lab Cohort Attribution" panel. It matches current cohort paper trades to same-symbol `Min15` Edge Lab candle states within a configurable 30-minute window, reports coverage, favorable/mild/unfavorable alignment buckets, strategy breakdowns, top positive factors, and recent closed trade attribution. This is research-only and does not mutate paper config or signal scoring.
+- Deployed `app.py` and `templates/index.html` to production `207.148.66.39`; `matrix-trader` restarted and is active. Production endpoint verification returned `success=true` for the Focus-short only cohort with `0` current cohort trades, `0%` coverage, Edge Lab report metadata present, and latest Edge candle `2026-06-06T03:30:00`. That empty attribution is expected until the focus-short cohort produces trades and the weekly Edge Lab dataset catches up.
 
 ### 2026-05-24 — Session summary (paper realism, regime cleanup, net-EV learner)
 

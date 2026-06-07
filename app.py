@@ -147,6 +147,8 @@ ENRICH_TOP_N = 30           # enrich only the top N base signals to limit API ca
 AGENT_TOP_N = 10            # run agent pipeline only on the top N base signals
 ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
 DB_PATH = "data/signals.db"
+EDGE_LAB_DB_PATH = "data/edge_lab.db"
+EDGE_LAB_REPORT_PATH = "data/factor_report.json"
 RISK_GATES_PATH = "data/risk_gates.json"
 STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
 EXPERIMENT_LEDGER_PATH = "data/experiment_ledger.json"
@@ -10708,6 +10710,257 @@ def api_paper_stats():
             },
         })
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _parse_iso_to_epoch(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return None
+
+
+def _load_edge_factor_report() -> dict:
+    try:
+        with open(EDGE_LAB_REPORT_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _edge_factor_matches(feature: dict, direction: str, report: dict) -> list[dict]:
+    side = "long" if str(direction).upper() == "LONG" else "short"
+    groups = report.get("groups") if isinstance(report.get("groups"), dict) else {}
+    specs = [
+        ("volatility_regime", feature.get("volatility_regime")),
+        ("trend_state", feature.get("trend_state")),
+        ("compression_state", feature.get("compression_state")),
+        ("rsi_decile", feature.get("rsi_decile")),
+        ("volume_decile", feature.get("volume_decile")),
+        ("atr_decile", feature.get("atr_decile")),
+    ]
+    if feature.get("volatility_regime") and feature.get("trend_state"):
+        specs.append(("regime_x_trend", f"{feature.get('volatility_regime')}_{feature.get('trend_state')}"))
+
+    tag_map = {
+        "tag_compressed": "compressed",
+        "tag_expanded": "expanded",
+        "tag_bullish_trend": "bullish_trend",
+        "tag_bearish_trend": "bearish_trend",
+        "tag_extreme_vol": "extreme_vol",
+        "tag_low_vol": "low_vol",
+    }
+    for col, label in tag_map.items():
+        if feature.get(col):
+            specs.append(("tag_presence", label))
+
+    matches = []
+    seen = set()
+    for group, raw_key in specs:
+        if raw_key is None:
+            continue
+        key = str(raw_key)
+        group_payload = groups.get(group) or {}
+        if not isinstance(group_payload, dict):
+            continue
+        for side_key, rows in group_payload.items():
+            if not str(side_key).endswith("." + side):
+                continue
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if str(row.get("group_key")) != key:
+                    continue
+                stable = (group, side_key, key)
+                if stable in seen:
+                    continue
+                seen.add(stable)
+                matches.append({
+                    "group": group,
+                    "template": row.get("template"),
+                    "side": row.get("side"),
+                    "group_key": key,
+                    "tp_rate": row.get("tp_rate"),
+                    "baseline_rate": row.get("baseline_rate"),
+                    "edge_delta": row.get("edge_delta"),
+                    "n": row.get("n"),
+                    "sample_quality": row.get("sample_quality"),
+                })
+    return sorted(matches, key=lambda r: float(r.get("edge_delta") or -999), reverse=True)
+
+
+def _edge_alignment_from_matches(matches: list[dict]) -> dict:
+    if not matches:
+        return {"label": "unmatched", "score": None, "best_edge_delta": None}
+    deltas = [float(m.get("edge_delta") or 0.0) for m in matches]
+    best = max(deltas)
+    score = round(sum(deltas[: min(4, len(deltas))]) / max(1, min(4, len(deltas))), 2)
+    if best >= 3.0:
+        label = "favorable"
+    elif best >= 1.0:
+        label = "mild"
+    elif best > -1.0:
+        label = "neutral"
+    else:
+        label = "unfavorable"
+    return {"label": label, "score": score, "best_edge_delta": round(best, 2)}
+
+
+@app.route("/api/paper/cohort-edge")
+def api_paper_cohort_edge():
+    """Attribute paper cohort trades to Edge Lab factor states.
+
+    This is research-only. It never changes paper config or scoring.
+    """
+    try:
+        cfg = _load_paper_config()
+        since = request.args.get("since") or cfg.get("current_cohort_started_at")
+        if not since:
+            return jsonify({"success": False, "error": "No cohort start configured"}), 400
+
+        since_ts = _parse_iso_to_epoch(since)
+        if since_ts is None:
+            return jsonify({"success": False, "error": "Invalid since timestamp"}), 400
+
+        if not os.path.exists(EDGE_LAB_DB_PATH):
+            return jsonify({"success": False, "error": "edge_lab.db not found"}), 404
+
+        report = _load_edge_factor_report()
+        report_meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+
+        sig_con = sqlite3.connect(DB_PATH)
+        sig_con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in sig_con.execute("""
+            SELECT id, symbol, strategy_key, direction, status, result, pnl_pct,
+                   size_usd, queued_at, filled_at, opened_at, closed_at
+            FROM paper_trades
+            WHERE COALESCE(filled_at, opened_at, queued_at, closed_at, '') >= ?
+              AND status IN ('closed', 'open', 'pending')
+            ORDER BY COALESCE(closed_at, opened_at, queued_at) DESC
+            LIMIT 200
+        """, (str(since),)).fetchall()]
+        sig_con.close()
+
+        edge_con = sqlite3.connect(EDGE_LAB_DB_PATH)
+        edge_con.row_factory = sqlite3.Row
+        max_ts_row = edge_con.execute("SELECT MAX(timestamp) FROM candle_features").fetchone()
+        edge_max_ts = int(max_ts_row[0]) if max_ts_row and max_ts_row[0] is not None else None
+
+        attributed = []
+        max_age_seconds = int(request.args.get("max_age_minutes") or 30) * 60
+        for trade in rows:
+            trade_ts = _parse_iso_to_epoch(
+                trade.get("filled_at") or trade.get("opened_at") or trade.get("queued_at") or trade.get("closed_at")
+            )
+            feature = None
+            age_seconds = None
+            if trade_ts is not None:
+                row = edge_con.execute("""
+                    SELECT symbol, timeframe, timestamp, volatility_regime, trend_state,
+                           compression_state, rsi_decile, volume_decile, atr_decile,
+                           stddev_decile, tag_compressed, tag_expanded, tag_bullish_trend,
+                           tag_bearish_trend, tag_extreme_vol, tag_low_vol
+                    FROM candle_features
+                    WHERE symbol=? AND timeframe='Min15' AND timestamp <= ?
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (str(trade.get("symbol") or "").upper(), trade_ts)).fetchone()
+                if row:
+                    candidate = dict(row)
+                    age_seconds = int(trade_ts - int(candidate.get("timestamp") or 0))
+                    if 0 <= age_seconds <= max_age_seconds:
+                        feature = candidate
+
+            matches = _edge_factor_matches(feature or {}, trade.get("direction"), report) if feature else []
+            alignment = _edge_alignment_from_matches(matches)
+            pnl = trade.get("pnl_pct")
+            attributed.append({
+                **trade,
+                "edge_lab": {
+                    "matched": bool(feature),
+                    "age_minutes": round(age_seconds / 60, 1) if age_seconds is not None else None,
+                    "feature": feature,
+                    "alignment": alignment,
+                    "top_matches": matches[:5],
+                },
+                "pnl_usd": round(float(trade.get("size_usd") or 0.0) * float(pnl or 0.0) / 100.0, 2)
+                if pnl is not None else None,
+            })
+        edge_con.close()
+
+        closed = [t for t in attributed if t.get("status") == "closed"]
+
+        def _bucket_stats(items: list[dict]) -> dict:
+            pnls = [float(t.get("pnl_pct") or 0.0) for t in items if t.get("pnl_pct") is not None]
+            wins = [t for t in items if t.get("result") == "WIN"]
+            partials = [t for t in items if t.get("result") == "PARTIAL"]
+            losses = [t for t in items if t.get("result") == "LOSS"]
+            return {
+                "count": len(items),
+                "closed": len([t for t in items if t.get("status") == "closed"]),
+                "win_partial_rate": round((len(wins) + len(partials)) / len(items) * 100, 1) if items else 0,
+                "avg_pnl": round(sum(pnls) / len(pnls), 2) if pnls else 0,
+                "total_pnl": round(sum(pnls), 2) if pnls else 0,
+                "wins": len(wins),
+                "partials": len(partials),
+                "losses": len(losses),
+            }
+
+        by_alignment = defaultdict(list)
+        by_strategy = defaultdict(list)
+        by_factor = defaultdict(list)
+        for t in closed:
+            edge = t.get("edge_lab") or {}
+            label = ((edge.get("alignment") or {}).get("label")) or "unmatched"
+            by_alignment[label].append(t)
+            by_strategy[t.get("strategy_key") or "unknown"].append(t)
+            for match in (edge.get("top_matches") or [])[:3]:
+                if match.get("edge_delta") is not None and float(match.get("edge_delta") or 0) > 0:
+                    by_factor[f"{match.get('group')}:{match.get('group_key')}"].append(t)
+
+        coverage_count = len([t for t in attributed if (t.get("edge_lab") or {}).get("matched")])
+        summary = {
+            "total_trades": len(attributed),
+            "closed_trades": len(closed),
+            "matched_trades": coverage_count,
+            "coverage_pct": round(coverage_count / len(attributed) * 100, 1) if attributed else 0,
+            "by_alignment": {k: _bucket_stats(v) for k, v in sorted(by_alignment.items())},
+            "by_strategy": {k: _bucket_stats(v) for k, v in sorted(by_strategy.items())},
+            "top_positive_factors": [
+                {"factor": k, **_bucket_stats(v)}
+                for k, v in sorted(by_factor.items(), key=lambda kv: len(kv[1]), reverse=True)[:8]
+            ],
+        }
+
+        return jsonify({
+            "success": True,
+            "cohort": {
+                "label": cfg.get("current_cohort_label") or "Current cohort",
+                "started_at": since,
+                "active_strategies": sorted(set(get_strategy_registry().keys()) - set(cfg.get("disabled_strategies") or [])),
+            },
+            "edge_lab": {
+                "db_path": EDGE_LAB_DB_PATH,
+                "report_path": EDGE_LAB_REPORT_PATH,
+                "max_timestamp": edge_max_ts,
+                "max_timestamp_iso": datetime.utcfromtimestamp(edge_max_ts).isoformat() if edge_max_ts else None,
+                "report_meta": report_meta,
+                "max_match_age_minutes": max_age_seconds // 60,
+            },
+            "summary": summary,
+            "trades": attributed[:80],
+        })
+    except Exception as e:
+        print(f"[api/paper/cohort-edge] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
