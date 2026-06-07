@@ -1,0 +1,1111 @@
+00:00 A couple of days ago, I published a
+00:02 
+
+00:02 video testing 131,000
+00:05 
+
+00:05 trading strategies across 31 different
+00:08 
+
+00:08 assets. It did something to people. I
+00:10 
+
+00:10 know because I watched the comments come
+00:13 
+
+00:13 in for days. Some of you got excited.
+00:15 
+
+00:15 Some of you got angry. A few of you had
+00:17 
+
+00:17 what I can only describe as an
+00:20 
+
+00:20 existential crisis about your trading
+00:22 
+
+00:22 career in a YouTube comment section.
+00:25 
+
+00:25 65 strategies survived that test. On
+00:29 
+
+00:29 stocks, on Bitcoin, zero. That number is
+00:33 
+
+00:33 going to make some of you emotional. I'm
+00:35 
+
+00:35 going to ask you up front, don't be.
+00:37 
+
+00:37 Stay with me. Because what the data is
+00:39 
+
+00:39 actually saying is more interesting than
+00:42 
+
+00:42 the headline. To everyone who joined the
+00:44 
+
+00:44 member section after the last video,
+00:47 
+
+00:47 genuinely, thank you. That's what keeps
+00:49 
+
+00:49 this work going at the depth it needs to
+00:52 
+
+00:52 go. What you're looking at on screen
+00:54 
+
+00:54 right now is what members get access to.
+00:57 
+
+00:57 Fully executed research environment that
+00:60 
+
+00:60 runs locally on your machine, pulls real
+01:02 
+
+01:02 data directly from Binance, and
+01:04 
+
+01:04 reproduces every single number in this
+01:06 
+
+01:06 video independently. You can modify the
+01:09 
+
+01:09 filters, add your own strategies, test
+01:12 
+
+01:12 your own ideas. It is a serious research
+01:15 
+
+01:15 tool, not a result sheet. For everyone
+01:18 
+
+01:18 else, this is buildable. The code is
+01:20 
+
+01:20 standard Python. The methodology is
+01:22 
+
+01:22 documented. And with AI assistance, you
+01:24 
+
+01:24 can put something similar together in a
+01:26 
+
+01:26 weekend. Both paths are genuinely fine.
+01:28 
+
+01:28 If you want to support my work, consider
+01:31 
+
+01:31 becoming a channel member.
+01:33 
+
+01:33 Now, before I show you the Bitcoin
+01:35 
+
+01:35 results properly, I need to set
+01:37 
+
+01:37 something up. Because this video is not
+01:40 
+
+01:40 what you think it is. Here's the problem
+01:42 
+
+01:42 with most trading research you'll ever
+01:44 
+
+01:44 see. Someone backtests a strategy. It
+01:46 
+
+01:46 looks good. They publish it. You try it.
+01:49 
+
+01:49 It doesn't work. And you're left
+01:50 
+
+01:50 wondering whether you did something
+01:52 
+
+01:52 wrong or whether the strategy was never
+01:54 
+
+01:54 real to begin with. The answer, almost
+01:57 
+
+01:57 always, is that the strategy was never
+01:59 
+
+01:59 real to begin with. It was a product of
+02:01 
+
+02:01 optimization on historical data.
+02:03 
+
+02:03 You take enough indicators, enough
+02:05 
+
+02:05 parameter combinations, enough assets,
+02:07 
+
+02:07 and eventually something fits the past.
+02:08 
+
+02:08 That fit looks like edge. It isn't. This
+02:12 
+
+02:12 chart from the last video tells that
+02:14 
+
+02:14 story in one image. Most strategies that
+02:17 
+
+02:17 looked good in testing fell apart on
+02:20 
+
+02:20 unseen data. That's not a surprise.
+02:23 
+
+02:23 That's how optimization works. The
+02:25 
+
+02:25 question this video or notebook is
+02:27 
+
+02:27 trying to answer is not what works in a
+02:29 
+
+02:29 backtest. It's what survives when you
+02:31 
+
+02:31 take the results and test them again,
+02:33 
+
+02:33 completely blind, on data they were
+02:35 
+
+02:35 never optimized on. That's what
+02:37 
+
+02:37 walk-forward validation does. And on
+02:40 
+
+02:40 Bitcoin, almost nothing survives it. Let
+02:43 
+
+02:43 me show you exactly what we tested, what
+02:45 
+
+02:45 happened, and why before we even get to
+02:48 
+
+02:48 strategies. Look at the data we're
+02:50 
+
+02:50 working with. 777,000
+02:53 
+
+02:53 5-minute bars, 259,000
+02:55 
+
+02:55 15-minute bars, 64,000 hourly bars, all
+02:59 
+
+02:59 the way down to 2,700
+03:01 
+
+03:01 daily bars. Every single one pulled
+03:03 
+
+03:03 natively from Binance going back to
+03:05 
+
+03:05 January 2019. Not resampled, not
+03:07 
+
+03:07 approximated, native data at each time
+03:10 
+
+03:10 frame independently. One asset, Bitcoin,
+03:13 
+
+03:13 five time frames from 5-minute bars all
+03:16 
+
+03:16 the way up to daily. Over 1 million
+03:19 
+
+03:19 individual price bars in total before a
+03:21 
+
+03:21 single strategy is even tested. 70
+03:25 
+
+03:25 strategies, everything retail traders
+03:28 
+
+03:28 actually use. The full list of
+03:31 
+
+03:31 indicators covered was discussed in the
+03:34 
+
+03:34 previous video and is available in the
+03:36 
+
+03:36 code. Each strategy ran through a
+03:39 
+
+03:39 Bayesian parameter optimizer up to 100
+03:43 
+
+03:43 different parameter combinations per
+03:45 
+
+03:45 strategy, per time frame, and the
+03:47 
+
+03:47 parameter ranges were scaled per time
+03:50 
+
+03:50 frame. A 200-period moving average on
+03:53 
+
+03:53 daily bars represents 200 days of market
+03:55 
+
+03:55 history. On 5-minute bars, that same 200
+03:58 
+
+03:58 periods is 17 hours. Meaningless. So,
+04:02 
+
+04:02 every look-back window was compressed
+04:04 
+
+04:04 proportionally as the time frame
+04:06 
+
+04:06 shortened. This matters. We're not just
+04:09 
+
+04:09 running daily strategies on shorter bars
+04:12 
+
+04:12 and calling it a rigorous test. This is
+04:14 
+
+04:14 what it actually cost to run a study
+04:17 
+
+04:17 like this. 4 hours and 42 minutes of
+04:19 
+
+04:19 continuous computation on a modern
+04:21 
+
+04:21 laptop. 26,000 results generated,
+04:25 
+
+04:25 filtered down to 17,856.
+04:28 
+
+04:28 They produced enough trades to be
+04:30 
+
+04:30 statistically meaningful. The rest fired
+04:32 
+
+04:32 so rarely, particularly on the shorter
+04:35 
+
+04:35 time frames, that they contained no
+04:37 
+
+04:37 usable information. And for the people
+04:39 
+
+04:39 who've been asking whether this could
+04:41 
+
+04:41 run faster, yes, Python is not the
+04:44 
+
+04:44 fastest language for this kind of
+04:47 
+
+04:47 numerical work. There's a version of
+04:49 
+
+04:49 this that could run in under 30 minutes
+04:52 
+
+04:52 in a compiled language. If enough of
+04:54 
+
+04:54 you're interested in that direction, a C
+04:56 
+
+04:56 or Rust implementation of the
+04:59 
+
+04:59 backtesting engine, tell me in the
+05:01 
+
+05:01 comments. That's genuinely an
+05:04 
+
+05:04 interesting problem and worth covering
+05:06 
+
+05:06 if there's appetite for it. But, the
+05:08 
+
+05:08 result doesn't change regardless of how
+05:11 
+
+05:11 fast you get there. 18 survived
+05:13 
+
+05:13 walk-forward validation. 18 out of
+05:16 
+
+05:16 17,856.
+05:19 
+
+05:19 Every one of those 17,856
+05:23 
+
+05:23 results went through walk-forward
+05:25 
+
+05:25 validation. The data split into five
+05:28 
+
+05:28 sequential windows, optimize on the
+05:30 
+
+05:30 training portion of each window, apply
+05:32 
+
+05:32 those parameters completely blind to the
+05:36 
+
+05:36 out-of-sample portion, the part the
+05:39 
+
+05:39 optimizer never saw. Stitch all five
+05:44 
+
+05:44 out-of-sample periods together. That
+05:46 
+
+05:46 combined curve is the honest result.
+05:50 
+
+05:50 Not the in-sample performance, not the
+05:52 
+
+05:52 best window. All windows in sequence on
+05:55 
+
+05:55 data the strategy never trained on. 18
+05:59 
+
+05:59 passed. Now to the drawdown filter on
+06:01 
+
+06:01 the equity study, I used a maximum out
+06:05 
+
+06:05 of sample drawdown of minus 35%.
+06:08 
+
+06:08 That gave 65 survivors. For Bitcoin, I
+06:11 
+
+06:11 relaxed it to minus 40% acknowledging
+06:15 
+
+06:15 that crypto is more volatile and
+06:18 
+
+06:18 applying a pure equity standard isn't
+06:22 
+
+06:22 entirely fair.
+06:25 
+
+06:25 Minus 40%
+06:27 
+
+06:27 zero
+06:29 
+
+06:29 minus 50%
+06:32 
+
+06:32 two
+06:35 
+
+06:35 minus 60%
+06:37 
+
+06:37 four
+06:39 
+
+06:39 To find anything that works
+06:40 
+
+06:40 systematically on Bitcoin, you have to
+06:42 
+
+06:42 be willing to sit through a 60% drawdown
+06:45 
+
+06:45 on your strategies equity curve on data
+06:48 
+
+06:48 it was never optimized on. Not the
+06:51 
+
+06:51 Bitcoin asset drawdown, the strategy
+06:53 
+
+06:53 drawdown on genuinely unseen data. Let
+06:56 
+
+06:56 that sit. I want to pause here because I
+06:58 
+
+06:58 know what's happening in some of your
+06:59 
+
+06:59 heads right now.
+07:01 
+
+07:01 Either you're thinking this proves
+07:03 
+
+07:03 systematic trading doesn't work and you
+07:05 
+
+07:05 should just buy and hold or you're
+07:07 
+
+07:07 thinking the methodology missed
+07:09 
+
+07:09 something and your approach works even
+07:11 
+
+07:11 if it didn't show up here. Both
+07:13 
+
+07:13 reactions are understandable. Both are
+07:15 
+
+07:15 slightly missing the point. Here's what
+07:17 
+
+07:17 this study is, a systematic test of the
+07:20 
+
+07:20 most common retail strategies on
+07:23 
+
+07:23 publicly available Bitcoin data across
+07:25 
+
+07:25 five time frames using walk-forward
+07:28 
+
+07:28 methodology with serious filters. The
+07:31 
+
+07:31 most thorough publicly available
+07:33 
+
+07:33 analysis of this kind that I'm aware of.
+07:35 
+
+07:35 Here's what it isn't, a complete
+07:37 
+
+07:37 picture. Order flow wasn't tested,
+07:39 
+
+07:39 funding rates weren't tested, on-chain
+07:42 
+
+07:42 signals weren't tested. Portfolio
+07:44 
+
+07:44 combinations of multiple strategies
+07:46 
+
+07:46 weren't tested. And combining strategies
+07:49 
+
+07:49 often produces dramatically better
+07:51 
+
+07:51 risk-adjusted results than any single
+07:53 
+
+07:53 strategy alone. There is a lot more to
+07:55 
+
+07:55 cover. What I am saying, with 350,000
+07:59 
+
+07:59 data points behind it, is that the
+08:01 
+
+08:01 standard retail indicator toolkit
+08:04 
+
+08:04 applied to Bitcoin in isolation does not
+08:07 
+
+08:07 produce consistent out-of-sample edge
+08:10 
+
+08:10 within a 40% drawdown limit. That's a
+08:12 
+
+08:12 specific claim. It's not trading doesn't
+08:15 
+
+08:15 work. It's this specific thing tested
+08:18 
+
+08:18 this specific way doesn't work. Keep
+08:20 
+
+08:20 that distinction in your head. The
+08:22 
+
+08:22 equity study found 65 survivors. Bitcoin
+08:26 
+
+08:26 found four at a much more relaxed
+08:28 
+
+08:28 threshold. Why? The answer is regimes,
+08:31 
+
+08:31 and it's the most important concept in
+08:33 
+
+08:33 all of systematic trading. Bitcoin
+08:35 
+
+08:35 between 2019 and today went through at
+08:39 
+
+08:39 least four completely distinct market
+08:42 
+
+08:42 environments. A multi-year bear market,
+08:45 
+
+08:45 an explosive bull run that produced 10
+08:48 
+
+08:48 times returns on Bitcoin itself. A 75%
+08:52 
+
+08:52 crash. A recovery cycle that looked
+08:54 
+
+08:54 structurally different from the previous
+08:56 
+
+08:56 one. Each regime has completely
+08:59 
+
+08:59 different volatility, different trend
+09:01 
+
+09:01 persistence, different mean reversion
+09:03 
+
+09:03 dynamics. A strategy that learns the
+09:06 
+
+09:06 right parameters for one regime will be
+09:08 
+
+09:08 wrong in the next. Walk-forward testing
+09:11 
+
+09:11 exposes this. It doesn't let the
+09:13 
+
+09:13 strategy hide in the one period where it
+09:16 
+
+09:16 happened to fit. It forces it across all
+09:19 
+
+09:19 regimes sequentially, and across
+09:21 
+
+09:21 Bitcoin's extreme regime changes, almost
+09:24 
+
+09:24 nothing generalizes. Equities in the
+09:27 
+
+09:27 same period had one dominant structural
+09:30 
+
+09:30 regime, slow uptrend, two sharp crashes,
+09:34 
+
+09:34 both recovered within months, consistent
+09:37 
+
+09:37 institutional behavior. Mean reversion
+09:39 
+
+09:39 strategies work on equities because
+09:41 
+
+09:41 institutional market makers create
+09:43 
+
+09:43 consistent short-term price equilibrium
+09:46 
+
+09:46 that can be systematically faded.
+09:49 
+
+09:49 Bitcoin has no such equilibrium. It
+09:51 
+
+09:51 trends violently in both directions for
+09:54 
+
+09:54 extended periods. Strategies built to
+09:57 
+
+09:57 fade moves get destroyed. Not because
+10:00 
+
+10:00 they're bad strategies in isolation, but
+10:03 
+
+10:03 because the asset doesn't support what
+10:04 
+
+10:04 they're designed to detect. On equities,
+10:07 
+
+10:07 mean reversion strategies dominated the
+10:10 
+
+10:10 verified results. On Bitcoin, the only
+10:13 
+
+10:13 thing that didn't get completely
+10:15 
+
+10:15 destroyed is trend following. The right
+10:18 
+
+10:18 strategy depends on the asset, not on
+10:20 
+
+10:20 the indicator. That is the core finding
+10:22 
+
+10:22 across both studies. And it's something
+10:24 
+
+10:24 almost no retail trading content will
+10:27 
+
+10:27 tell you directly. Given a max drawdown
+10:30 
+
+10:30 of 60%, we got four robust strategies.
+10:33 
+
+10:33 Let me walk through each one
+10:34 
+
+10:34 specifically. The first is a volatility
+10:38 
+
+10:38 breakout strategy on the hourly chart.
+10:40 
+
+10:40 Out of sample sharp ratio of 1.08,
+10:44 
+
+10:44 drawdown of minus 42%, 863 trades, a
+10:49 
+
+10:49 serious sample size, not a handful of
+10:54 
+
+10:54 lucky entries. 143%
+10:57 
+
+10:57 total return across the out of sample
+11:01 
+
+11:01 windows. It enters when price makes a
+11:05 
+
+11:05 statistically significant move relative
+11:08 
+
+11:08 to recent volatility. What it's really
+11:10 
+
+11:10 doing is identifying when Bitcoin is
+11:13 
+
+11:13 starting to trend and positioning early.
+11:15 
+
+11:15 On the hourly chart, this captures the
+11:18 
+
+11:18 intraday momentum that Bitcoin
+11:21 
+
+11:21 structurally produces. Momentum that's
+11:24 
+
+11:24 well documented in the academic
+11:26 
+
+11:26 literature on cryptocurrency
+11:29 
+
+11:29 microstructure. Parabolic SAR on the
+11:32 
+
+11:32 daily chart. Sharp ratio of 0.69.
+11:36 
+
+11:36 Drawdown minus 42%. 134 trades. 55% out
+11:41 
+
+11:41 of sample return. This indicator was
+11:44 
+
+11:44 invented in 1978. It trails a move and
+11:48 
+
+11:48 flips when the trend reverses. No
+11:50 
+
+11:50 machine learning. No complex parameter
+11:53 
+
+11:53 tuning. It has been in every trading
+11:55 
+
+11:55 textbook for 40 years. And it survived
+11:58 
+
+11:58 350,000
+12:00 
+
+12:00 combinations.
+12:02 
+
+12:02 Five rounds of walk forward validation
+12:05 
+
+12:05 and a serious drawdown filter on six
+12:08 
+
+12:08 years of Bitcoin data. Sometimes the old
+12:11 
+
+12:11 tools work because the old tools were
+12:13 
+
+12:13 built to solve a real problem. Dual
+12:15 
+
+12:15 momentum on the 4-hour chart. Sharp
+12:18 
+
+12:18 ratio of 0.68.
+12:21 
+
+12:21 357 trades. And an adaptive strategy on
+12:25 
+
+12:25 the 4-hour chart that switches between
+12:27 
+
+12:27 trend following and mean reversion
+12:30 
+
+12:30 depending on measured market conditions.
+12:32 
+
+12:32 1,315
+12:34 
+
+12:34 trades. The highest trade count of any
+12:37 
+
+12:37 survivor. More trades means more
+12:39 
+
+12:39 statistical confidence that what we're
+12:41 
+
+12:41 seeing isn't luck. Look at what these
+12:44 
+
+12:44 four share. Every single one is either a
+12:46 
+
+12:46 pure trend following system or a hybrid
+12:50 
+
+12:50 that adapts based on whether the market
+12:52 
+
+12:52 is currently trending. Not one pure mean
+12:55 
+
+12:55 reversion strategy survived. Not one
+12:58 
+
+12:58 pattern recognition approach. Not one
+12:59 
+
+12:59 oscillator running alone. Bitcoin
+13:01 
+
+13:01 trends. The data says stay in the trend.
+13:05 
+
+13:05 There's something I need to say that
+13:07 
+
+13:07 some of you won't like. Over the full
+13:09 
+
+13:09 test period from 2019 to today, simply
+13:12 
+
+13:12 buying and holding Bitcoin produced
+13:14 
+
+13:14 better raw returns than the vast
+13:17 
+
+13:17 majority of systematic strategies we
+13:19 
+
+13:19 tested. The asset itself was the alpha.
+13:21 
+
+13:21 Most of what looked like trading edge
+13:23 
+
+13:23 was leveraged exposure to a structural
+13:26 
+
+13:26 bull market that happened to be one of
+13:29 
+
+13:29 the most extreme in financial history.
+13:32 
+
+13:32 The strategies that survived did add
+13:34 
+
+13:34 something real. The volatility breakout
+13:36 
+
+13:36 produced its 143%
+13:38 
+
+13:38 out of sample return with roughly half
+13:41 
+
+13:41 the drawdown of Bitcoin itself in the
+13:43 
+
+13:43 same period. That is genuine risk
+13:45 
+
+13:45 management value. You're getting most of
+13:48 
+
+13:48 the upside with significantly less of
+13:50 
+
+13:50 the pain, but it required a 60% drawdown
+13:54 
+
+13:54 tolerance to find. Remember that the
+13:56 
+
+13:56 next time someone tells you their
+13:58 
+
+13:58 Bitcoin strategy never has more than a
+13:60 
+
+14:00 10% drawdown. What this gives you is the
+14:03 
+
+14:03 shortest list I know how to produce of
+14:06 
+
+14:06 strategies that survived serious
+14:08 
+
+14:08 scrutiny. What you do with that list is
+14:10 
+
+14:10 your decision. If you want to run this
+14:13 
+
+14:13 yourself, and I genuinely think you
+14:15 
+
+14:15 should, here's what's involved. The data
+14:17 
+
+14:17 pipeline pulls directly from Binance.
+14:20 
+
+14:20 The backtesting engine is vectorized and
+14:23 
+
+14:23 fast. The optimizer uses Bayesian search
+14:26 
+
+14:26 rather than brute force. The
+14:28 
+
+14:28 walk-forward framework handles the
+14:30 
+
+14:30 window logic automatically. The database
+14:34 
+
+14:34 stores every result. The notebook
+14:36 
+
+14:36 connects all of it and runs end-to-end.
+14:40 
+
+14:40 4 hours and 42 minutes on a laptop.
+14:44 
+
+14:44 That's the real cost. If you want to
+14:46 
+
+14:46 build this from scratch, go ahead.
+14:48 
+
+14:48 Seriously, it's a great project and AI
+14:51 
+
+14:51 makes it much more accessible than it
+14:53 
+
+14:53 used to be. The methodology is
+14:55 
+
+14:55 documented in these videos and the
+14:57 
+
+14:57 concepts are not proprietary. If you'd
+14:60 
+
+14:60 rather have it working today with
+15:02 
+
+15:02 everything tested and ready to run, the
+15:05 
+
+15:05 member section has it available. You're
+15:07 
+
+15:07 not paying for the strategies. You're
+15:09 
+
+15:09 paying for the weeks of work that went
+15:11 
+
+15:11 into making the infrastructure actually
+15:13 
+
+15:13 reliable. The difference between code
+15:16 
+
+15:16 that runs and code that runs correctly
+15:18 
+
+15:18 on real data with proper caching and
+15:21 
+
+15:21 proper walk-forward logic is not
+15:24 
+
+15:24 trivial. Ask anyone who's tried. This
+15:26 
+
+15:26 series gets shaped by what you want to
+15:28 
+
+15:28 see. Order flow, trade management,
+15:30 
+
+15:30 position sizing, portfolio combinations,
+15:33 
+
+15:33 machine learning, a faster
+15:35 
+
+15:35 implementation in a compiled language.
+15:38 
+
+15:38 Tell me what matters most to you and
+15:40 
+
+15:40 I'll build it. And if you've made it
+15:42 
+
+15:42 this far, genuinely thank you. Watch the
+15:44 
+
+15:44 video again if something didn't land.
+15:46 
+
+15:46 Share it with someone who needs to hear
+15:48 
+
+15:48 the data rather than the sales pitch.
+15:50 
+
+15:50 And let me know what you are interested
+15:52 
+
+15:52 in below.

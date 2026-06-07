@@ -1,8 +1,8 @@
 # Matrix Trader 7.0
 
-Matrix Trader 7.0 is a local web dashboard for scanning MEXC and Hyperliquid perpetual swap markets, ranking high-conviction LONG/SHORT setups, tracking paper trades, and reviewing trade outcomes.
+Matrix Trader 7.0 is a local web dashboard for scanning MEXC and Hyperliquid perpetual swap markets, ranking high-conviction LONG/SHORT setups, running an automated paper bot, and reviewing trade outcomes with AI coaching.
 
-It is built for manual traders. It does not place orders, manage exchange accounts, or auto-trade.
+It is built for manual traders who want research-grade tooling without giving up execution control.
 
 ## What It Does
 
@@ -11,16 +11,22 @@ It is built for manual traders. It does not place orders, manage exchange accoun
 - Generates ATR-based entry, take-profit, and stop-loss ladders (3-tier).
 - Shows a live open-position monitor with current price, leveraged P&L, stop/TP distance, funding rate, and settlement countdown via SSE stream.
 - Logs signals to local SQLite history for paper-trading analysis.
-- Auto-evaluates open paper trades against klines every 15 minutes; records leveraged P&L and blended exit prices for partial outcomes.
+- **Paper bot**: automated simulated trading with pending-entry wait, max-hold expiry, configurable fee/slippage deduction, and chunked Min1 evaluator parity. Hard-dollar P&L tracking.
+- **Pair Workspace**: deep-dive panel for any paper trade — native MT7 chart with order-flow event markers (Absorb / Δ Div / Sweep / Exhaust), trade lifecycle markers, chart toggle controls, strategy context card.
 - Strategy Lab: four built-in scoring strategies plus custom strategy clones with adjustable weights, filters, leverage cap, and conviction floor.
-- Risk Gates: live block/shadow/off control for high-volatility circuit breakers and symbol conviction penalties.
-- Bot Readiness panel: per-strategy readiness score based on trade count, win rate, and profit factor.
-- Agent shadow layer: 8-analyst AI pipeline runs on every signal in Phase 1 shadow mode — recording conviction deltas for forward-testing without affecting live scores.
-- AI trade briefs, closed-trade coach reviews, and strategy reviews via provider fallback chain.
+- Risk Gates: live block/shadow/off control for high-volatility circuit breakers.
+- **mt-learner**: external VPS service — analyzes closed trade outcomes, proposes threshold and regime suppression changes, tracks applied experiments in a ledger.
+- **Cipher Research Group**: 12 named analysts producing daily and weekly intelligence reports. First-person narratives with domain-specific data. Clickable analyst org-chart with profile modals.
+- **Hermes Advisory Group**: external consultancy bridge — weekly memo sync, on-demand run button, context packet with health score, recommendation, and blindspots.
+- **Edge Lab**: standalone factor research pipeline — fetches candles, labels price paths, computes features, materializes to columnar SQLite, runs factor group analysis (ATR / RSI / regime / trend / volume / tags).
+- Agent layer: 8-analyst AI pipeline runs on every enriched signal. Phase 2 live — `agent_shadow_delta` applied to conviction. Regime labels feed learner suppressions.
+- AI trade briefs, closed-trade coach reviews (Thomas Chen persona), and strategy reviews via provider fallback chain.
+- Per-feature AI model pinning: global model + coach review model independently selectable.
+- Execution layer built (Hyperliquid order placement, kill switch, EIP-712 signing) — gated behind `LIVE_TRADING_ENABLED=false`.
 
 ## What It Is Not
 
-- Not an auto-trading bot.
+- Not an auto-trading bot (execution layer built but not activated).
 - Not financial advice.
 - Not a price prediction engine.
 - Not a SaaS app.
@@ -29,11 +35,11 @@ You still make the final trading decision and manually execute any trade.
 
 ## Stack
 
-- Backend: Python 3.11+, Flask
-- Frontend: single-file vanilla HTML/CSS/JS dashboard (no build step)
+- Backend: Python 3.11+, Flask (~9,400 lines, single file)
+- Frontend: single-file vanilla HTML/CSS/JS dashboard (~9,200 lines, no build step)
 - Data: MEXC public contract APIs, Hyperliquid public API, OKX sentiment APIs, optional CoinGlass V4
-- History: local SQLite (`data/signals.db`)
-- AI: optional provider fallback through `lib/ai_client.py`
+- History: local SQLite (`data/signals.db`); Edge Lab uses `data/edge_lab.db`
+- AI: provider fallback chain — Claude → Gemini → DeepSeek → Groq — through `lib/ai_client.py`
 
 ## Quick Start
 
@@ -49,25 +55,13 @@ cp .env.example .env
 python3 app.py
 ```
 
-Open:
-
-```text
-http://localhost:8080
-```
-
-For iPhone access on the same WiFi, use the LAN URL printed by `python3 app.py`.
+Open `http://localhost:8080`. For iPhone access on the same WiFi, use the LAN URL printed on startup.
 
 ## Environment Variables
 
 Copy `.env.example` to `.env` and fill only what you need.
 
-```bash
-cp .env.example .env
-```
-
-Required for market scanning:
-
-- None. MEXC and Hyperliquid public market data require no API key.
+Required for market scanning: **none**. MEXC and Hyperliquid public data require no API key.
 
 Optional:
 
@@ -75,56 +69,46 @@ Optional:
 |---|---|
 | `ANTHROPIC_API_KEY` | AI trade briefs, coach reviews, strategy analysis |
 | `GEMINI_API_KEY` | AI fallback (provider 2) |
-| `OPENAI_API_KEY` | AI fallback (provider 3) |
+| `DEEPSEEK_API_KEY` | AI fallback (provider 3) |
 | `GROQ_API_KEY` | AI fallback (provider 4) |
 | `MEXC_API_KEY` + `MEXC_API_SECRET` | MEXC read-only account status in Bot Readiness panel |
 | `COINGLASS_API_KEY` | CoinGlass V4 derivatives context (OI, liquidations, funding) |
-| `HL_WALLET_ADDRESS` | Hyperliquid read-only account status (0x... wallet address) |
+| `HL_WALLET_ADDRESS` | Hyperliquid read-only account status |
+| `HL_PRIVATE_KEY` | Hyperliquid execution (P11 — not yet activated) |
+| `LIVE_TRADING_ENABLED` | Master gate for live order placement — must be `true` to enable |
 | `MATRIX_PORT` | Override default port 8080 |
+| `SCORE_VERSION` | `v1` (step) or `v2` (saturating ramp) scoring |
+| `REPORT_NARRATIVE_MODE` | `deterministic` / `free` / `auto` for Cipher report AI polish |
 
-AI provider order: Claude → Gemini → OpenAI → Groq. If one provider is missing or errors, the next is tried automatically. The app runs without any AI provider — AI sections show unavailable states.
+AI providers fall through automatically. App runs without any AI key — AI sections degrade gracefully.
 
 ## Security
 
-Never commit real API keys. The repo ignores `.env`, `data/`, and Python caches. Only `.env.example` should be public.
-
-If a key was ever pasted into chat, logs, or a public place, rotate it immediately.
-
-## Running The App
-
-```bash
-python3 app.py
-```
-
-Default port is `8080`. Override:
-
-```bash
-MATRIX_PORT=5000 python3 app.py
-```
+Never commit real API keys. The repo ignores `.env`, `data/`, and Python caches. Only `.env.example` is public. If a key was ever pasted into chat or logs, rotate it immediately.
 
 ## Workflow
 
 1. Open the dashboard.
 2. Select an **exchange** (MEXC or Hyperliquid) and a **strategy**.
-3. Click **Scan**.
+3. Click **Scan** — scores 800+ pairs, enriches top 30 with klines, agents, and AI.
 4. Review ranked LONG/SHORT signals with conviction scores, tags, and why-lines.
-5. Click a signal for the full trade plan — chart, AI report, entry/TP/SL ladders, orderbook context.
-6. Use the risk calculator to size the position manually.
-7. Track paper-trade outcomes in History — leveraged P&L is computed automatically when a TP or stop is hit.
-8. Use **Strategy Review** for an AI analysis of your recent outcomes.
+5. Click a signal for the full trade plan — chart, AI report, entry/TP/SL ladders, order book context, liquidation price.
+6. Use the **Risk Calculator** (Tools tab) to size the position manually.
+7. Track paper-trade outcomes in **History** — leveraged P&L auto-computed.
+8. Open any paper trade's **Pair Workspace** for the chart, order-flow markers, and strategy context.
+9. Read **Cipher daily/weekly reports** and **Hermes memos** in the Intelligence tab.
 
-## Paper Trading And History
+## Paper Trading
 
-Every scan logs enriched signals into local SQLite.
+The paper bot runs autonomously on a configurable scan interval. Trades lifecycle:
 
-The History tab separates:
+1. **Pending** — waiting for price to touch entry1
+2. **Open** — position active, monitored against Min1 klines
+3. **Closed** — TP / stop hit, or max-hold expired (no loss assigned on expiry)
 
-- **Open positions**: untagged paper trades being monitored, with live prices via SSE stream.
-- **Closed trades**: auto-tagged or manually tagged outcomes with leveraged P&L recorded.
+P&L is net after configurable maker/taker fee and slippage. Hard-dollar stats (total P&L $, avg $ per trade, profit factor, best/worst trade) are shown in the Paper tab alongside gross and cost breakdowns.
 
-Auto-evaluation waits for the first ladder entry to be touched before counting TP or stop. Partial outcomes use a blended exit price. P&L is computed as `raw_move% × leverage`. Signals open longer than 80 hours are auto-expired.
-
-Closed trades can be filtered by strategy, direction, and result, and opened for a detailed review including an AI coach comment and trade journey metrics (MAE, MFE, capture ratio, path label).
+Closed paper trades are clickable — opening a detail panel with full lifecycle, entry/exit/stop/TP, flow score, duration, journey metrics, and linked coach review.
 
 ## Strategy Lab
 
@@ -137,39 +121,34 @@ Four built-in scoring strategies:
 | Momentum Breakout | Strong directional moves | 25× |
 | Mean Reversion | Overextended RSI setups | 15× |
 
-Clone any built-in, adjust weights (momentum, funding, basis), filters (RSI gates, min volume, volatility allowlist), conviction floor, and leverage cap. Custom strategies appear as pills in the scanner and are tracked separately in history.
+Clone any built-in to adjust weights, filters, conviction floor, and leverage cap. See [STRATEGIES.md](STRATEGIES.md).
 
-For full strategy docs see [STRATEGIES.md](STRATEGIES.md).
+## Self-Improving Loop
 
-## Risk Gates
+MT7 tracks its own performance and proposes improvements:
 
-Live circuit breakers configurable in the Strategies tab:
+- **Goals file** (`data/goals.json`) — defines account balance targets and benchmark metrics.
+- **mt-learner** (external VPS service) — analyzes feature importance, conviction thresholds, and regime performance from closed trades. Proposes threshold raises/lowers and regime suppressions optimized for net EV.
+- **Suggestions sub-tab** — review, apply, or reject proposed changes. Applied changes write to `data/strategy_overrides.json` and log to `data/experiment_ledger.json` (append-only, reversible).
+- **Learner overlays** are tracked as named experiments with baseline snapshots so their impact can be measured.
 
-- **Long vol gate**: blocks or shadows high/extreme-volatility LONG signals
-- **Short vol gate**: blocks or shadows extreme-volatility SHORT signals on Balanced
-- **Symbol conviction penalties**: auto-docks conviction on symbols with consistently negative historical P&L (5+ closed trades)
+## Intelligence
 
-Gates have three modes: `block` (signal dropped), `shadow` (signal passes with a warning tag), `off` (gate disabled).
+- **Cipher Research Group**: 12 named analysts (trader, risk manager, funding, microstructure, cross-venue, technical, sentiment, tokenomics, narrative, structural). Daily and weekly reports cached to `data/reports/`. Clickable analyst cards with profile modals and domain evidence tables.
+- **Hermes Advisory Group**: external consultancy that reviews the MT7 evidence packet and writes advisory memos. Runs weekly via systemd timer on VPS; also triggerable on demand from the UI. Advisory only — no execution authority.
+- **Edge Lab** (`edge_lab/` package): standalone factor research pipeline that fetches candles, labels price paths, materializes features, and runs factor group analysis (ATR decile, RSI decile, compression, regime × trend, volume, tag presence). Outputs `data/factor_report.json`.
 
-## Agent Shadow Layer
+## Pair Workspace Chart
 
-An 8-analyst AI pipeline runs on every enriched signal in Phase 1 shadow mode:
+The pair workspace (Paper tab → click any trade) shows an MT7 native chart with:
 
-- Tokenomics, sentiment, news, technical, microstructure, funding, cross-venue, and regime analysts each assess a data slice
-- A bull/bear debate synthesises narrative and structural views
-- A Trader produces a `conviction_delta`; a Risk Manager checks hard blocks
-
-All outputs are stored in `signal_json` as shadow fields (`agent_shadow_delta`, `agent_regime`, etc.) for forward-testing. **In Phase 1, agent deltas do not affect live conviction scores.** Phase 2 activation requires 50+ closed signals with shadow data showing predictive correlation between delta and outcome.
-
-## AI Reviews
-
-AI is optional. Matrix Trader can generate:
-
-- 4-section signal reports (Setup, Structure, Invalidation, Risk)
-- Closed-trade coach reviews
-- Strategy reviews across recent outcomes
-
-All AI calls go through `lib/ai_client.py`. Do not call individual AI SDKs directly from Flask routes.
+- **Trade lifecycle markers**: Queued, Entry, TP hits, Stop
+- **Order-flow event markers**: Absorption (diamond), Delta Divergence (circle), Liquidity Sweep (arrow), Exhaustion (square)
+- **Large print markers**: significant buy/sell prints
+- **Levels**: entry / stop / TP lines
+- **Liquidation line**
+- **Toggle controls** — turn any marker group on/off; preferences saved in localStorage
+- **Strategy Context card** — recent 20/10 performance, symbol EV, direction fit, cold streak warnings
 
 ## Server Deployment
 
@@ -187,28 +166,51 @@ Keep server secrets in `/opt/matrix-trader/.env`. Do not sync local `.env` or `d
 
 ```text
 Matrix_Trader_7.0/
-├── app.py                  # entire Flask backend
+├── app.py                  # entire Flask backend (~9,400 lines)
 ├── backtest.py             # standalone backtest script
-├── analyze.py              # strategy audit report
+├── analyze.py              # standalone signal audit
+├── fade_hypothesis.py      # standalone fragility fade analysis
+├── edge_lab_build.py       # Edge Lab dataset builder CLI
+├── edge_lab_factors.py     # Edge Lab factor analysis CLI
+├── edge_lab_materialize.py # Edge Lab materializer CLI
 ├── requirements.txt
 ├── .env.example
-├── STRATEGIES.md           # strategy guide
-├── HANDOFF.md              # session state and task list
+├── STRATEGIES.md
+├── HANDOFF.md              # session state and task list (authoritative)
 ├── templates/
-│   └── index.html          # entire frontend
+│   └── index.html          # entire frontend (~9,200 lines)
 ├── lib/
 │   ├── ai_client.py        # AI provider fallback chain
-│   ├── agents.py           # 8-analyst shadow agent pipeline
+│   ├── agents.py           # 8-analyst signal pipeline + 12-analyst Cipher group
+│   ├── risk_liquidation.py # exchange-aware liquidation price engine
 │   ├── exchange_context.py # canonical exchange-agnostic data contract
 │   ├── adapters/           # MEXC and Hyperliquid normalizers
 │   ├── hyperliquid_client.py
+│   ├── hl_execution.py     # Hyperliquid order placement + kill switch
 │   ├── coinglass_client.py
-│   ├── indicators.py       # RSI, EMA, ATR, VWAP
-│   ├── laddering.py        # ATR-based entry/TP/SL ladders
-│   ├── mexc_private.py     # MEXC account read (optional)
-│   └── mexc_stream.py      # WebSocket client (built, not active)
-├── docs/
+│   ├── indicators.py
+│   ├── laddering.py
+│   ├── mexc_private.py
+│   └── risk_controls.py
+├── edge_lab/               # standalone factor research package
+│   ├── storage.py          # edge_lab.db schema + helpers
+│   ├── mexc_data.py        # candle/ticker fetchers
+│   ├── path_labeler.py     # price path outcome labeling
+│   ├── feature_engine.py   # feature computation
+│   ├── materializer.py     # columnar feature materialization
+│   └── factor_engine.py    # factor group analysis
+├── mt-learner/             # external VPS service mirror
+│   ├── learner.py          # scheduler: 4 jobs on 30min/2hr/6hr/24hr
+│   ├── analyzer.py         # feature/threshold/regime analysis
+│   ├── suggester.py        # generates pending.json proposals
+│   ├── researcher.py       # strategy hypothesis briefs
+│   └── coach_analyst.py    # coach review pattern analysis
+├── scripts/                # VPS deployment and maintenance scripts
 └── data/                   # gitignored runtime data
+    ├── signals.db
+    ├── edge_lab.db
+    ├── reports/
+    └── hermes/
 ```
 
 ## Disclaimer

@@ -49,7 +49,7 @@ See **HANDOFF.md** — that file is updated every session and is authoritative.
 
 As of May 22, 2026:
 `app.py` is 7,868 lines. `templates/index.html` is 8,478 lines. The app is live on a VPS at
-`root@62.238.15.113`.
+`root@207.148.66.39`.
 
 **Signal count (live SQLite as of May 22, 2026): 1,399 total**
 - 307 WIN / 621 LOSS / 318 PARTIAL / 27 open
@@ -212,8 +212,8 @@ python3 app.py
 ```bash
 cd /Users/bnortey/Documents/coding_projects/Matrix_Trader_7.0
 rsync -avz --exclude='.env' --exclude='data/' --exclude='__pycache__' \
-      --exclude='.git' --exclude='*.pyc' ./ root@62.238.15.113:/opt/matrix-trader/
-ssh root@62.238.15.113 "systemctl restart matrix-trader"
+      --exclude='.git' --exclude='*.pyc' ./ root@207.148.66.39:/opt/matrix-trader/
+ssh root@207.148.66.39 "systemctl restart matrix-trader"
 ```
 
 ---

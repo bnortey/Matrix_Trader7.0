@@ -1,5 +1,5 @@
 # Matrix Trader 7.0 — State of the System Report
-*Updated 2026-05-23 after Vultr migration and MEXC private API repair*
+*Updated 2026-05-24 after Hermes Advisory Group bridge*
 
 ---
 
@@ -24,6 +24,7 @@ It is not a blind execution bot, not a price forecasting engine, and not a SaaS 
 | Learner directory | `/opt/mt-learner` |
 | SSH | `root@207.148.66.39`, key auth only |
 | Old host | `62.238.15.113` Hetzner, legacy only |
+| Hermes workstation | `62.238.15.113`, isolated advisory runner only |
 
 Services active on Vultr:
 
@@ -32,6 +33,7 @@ Services active on Vultr:
 | `matrix-trader.service` | Flask dashboard/API on port 8080 |
 | `mt-learner.service` | External learner reading `signals.db` read-only |
 | `edge-lab-lite.timer` | Weekly bounded Edge Lab refresh |
+| `mt7-hermes-weekly.timer` | Weekly old-VPS Hermes consultancy memo + archive sync |
 
 ---
 
@@ -45,6 +47,7 @@ Services active on Vultr:
 | `data/signals.db` | Runtime signal/outcome/paper data | Server-side, gitignored |
 | `/opt/mt-learner/` | External learner | VPS-only service |
 | Edge Lab Lite | Research-only candle/factor engine | Weekly bounded systemd timer |
+| Hermes Advisory Group | External systems auditor and research consultancy | Old-VPS runner, MT7 memo display |
 
 Tech stack: Python 3.11 / Flask / SQLite3 / vanilla JS / SSE / TradingView embeds. AI provider chain uses the configured fallback providers through `lib/ai_client.py`.
 
@@ -92,6 +95,15 @@ Tech stack: Python 3.11 / Flask / SQLite3 / vanilla JS / SSE / TradingView embed
   - DB: `/opt/matrix-trader/data/edge_lab.db`
 - Initial smoke run succeeded: labels/materialization updated, `edge_lab.db` present, factor report regenerated.
 
+### Hermes Advisory Group
+- Hermes runs outside production MT7 on the old VPS (`62.238.15.113`) as an isolated advisory consultant.
+- MT7 exposes `/api/intelligence/hermes`, which builds a read-only context packet from goals, live/manual signal outcomes, paper bot outcomes, learner suggestions, Cipher report metadata, Edge Lab metadata, and a research queue.
+- The old-VPS runner `/opt/mt7-hermes/run_consultancy.sh` fetches that packet, invokes the installed Hermes CLI, writes `/opt/mt7-hermes/out/latest_memo.json`, and archives dated memos under `/opt/mt7-hermes/out/archive/`.
+- Vultr runs `mt7-hermes-weekly.timer` Sundays at 05:30 UTC plus randomized delay. It calls the old-VPS runner, syncs the latest memo, and pulls the archive into `/opt/matrix-trader/data/hermes/archive/`.
+- The latest memo and archive are displayed in Intelligence -> Hermes.
+- Hermes has an org-chart style UI with these advisory desks: Managing Partner, Performance Audit, Quant Validation, Risk & Capital, Execution Quality, Cipher Oversight, Research Institute, and Red Team.
+- Hermes is advisory only: no private exchange keys, no config mutation, no order placement, no auto-apply.
+
 ---
 
 ## Current Gaps And Watch Items
@@ -105,6 +117,7 @@ Tech stack: Python 3.11 / Flask / SQLite3 / vanilla JS / SSE / TradingView embed
 | Anthropic credits | ⚠️ User action if depleted | Cipher/coach can fall back, but Claude-quality reports require credits |
 | Paper/live data separation | Watch | Paper trades and live-tagged signals must stay analytically separate when judging EV |
 | Edge Lab output | Watch | Research output should inform human/system review, not directly mutate live scoring |
+| Hermes memo cycle | Watch | Run on demand or weekly; memos should recommend one controlled experiment at a time |
 
 ---
 
@@ -116,6 +129,7 @@ Tech stack: Python 3.11 / Flask / SQLite3 / vanilla JS / SSE / TradingView embed
 4. Let paper bot run with the new ATR/trend fields and review whether high-volatility junk is being filtered.
 5. Let Edge Lab Lite run weekly; check `edge_lab_lite.log` and `factor_report.json` after the first scheduled Sunday run.
 6. Continue validating mt-learner suggestions through the review UI before any threshold changes become trusted.
+7. Run Hermes periodically for external audit, then sync `latest_memo.json` into MT7 for review in the Hermes tab.
 
 ---
 

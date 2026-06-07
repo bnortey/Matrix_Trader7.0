@@ -12,9 +12,10 @@
 | App dir | `/opt/matrix-trader/` |
 | Learner dir | `/opt/mt-learner/` |
 | Port | `8080` |
-| Services | `matrix-trader`, `mt-learner`, `edge-lab-lite.timer` |
+| Services | `matrix-trader`, `mt-learner`, `edge-lab-lite.timer`, `mt7-hermes-weekly.timer` |
+| Hermes workstation | Old VPS `62.238.15.113` only, isolated advisory runner |
 
-Legacy host: `62.238.15.113` was the old Hetzner VPS. Do not deploy there unless explicitly doing legacy recovery.
+Legacy/consultancy host: `62.238.15.113` was the old Hetzner VPS. Do not deploy production MT7 there. It now hosts the isolated Hermes consultancy runner.
 
 ---
 
@@ -114,9 +115,62 @@ curl -s http://localhost:8080/api/paper/stats
 curl -s http://localhost:8080/api/account/status
 curl -s http://localhost:8080/api/account/balance
 curl -s http://localhost:8080/api/account/positions
+curl -s http://localhost:8080/api/intelligence/hermes
 ```
 
 Expected current MEXC private status: `connected: true`, USDT equity/balance may be `0.0` until the subaccount is funded.
+
+---
+
+## Hermes Advisory Group
+
+Hermes is an outside consultancy layer, not a production trading service. It runs from the old VPS so it can review MT7 from outside the production box.
+
+| Item | Value |
+|---|---|
+| Host | `62.238.15.113` |
+| Runner | `/opt/mt7-hermes/run_consultancy.sh` |
+| Output dir | `/opt/mt7-hermes/out/` |
+| Latest old-VPS memo | `/opt/mt7-hermes/out/latest_memo.json` |
+| Production memo path | `/opt/matrix-trader/data/hermes/latest_memo.json` |
+| Production archive | `/opt/matrix-trader/data/hermes/archive/` |
+| Weekly timer | `mt7-hermes-weekly.timer` on Vultr |
+| Schedule | Sundays at `05:30 UTC` with up to 30 minutes randomized delay |
+| MT7 API | `/api/intelligence/hermes` |
+| MT7 UI | Intelligence -> Hermes |
+
+Run a fresh Hermes memo:
+
+```bash
+ssh root@62.238.15.113 "/opt/mt7-hermes/run_consultancy.sh"
+```
+
+Sync the latest memo into production MT7:
+
+```bash
+rsync -avz root@62.238.15.113:/opt/mt7-hermes/out/latest_memo.json /private/tmp/mt7-latest-hermes-memo.json
+ssh root@207.148.66.39 "mkdir -p /opt/matrix-trader/data/hermes"
+rsync -avz /private/tmp/mt7-latest-hermes-memo.json root@207.148.66.39:/opt/matrix-trader/data/hermes/latest_memo.json
+```
+
+Weekly automation:
+
+```bash
+# Check next scheduled run
+systemctl list-timers mt7-hermes-weekly.timer --no-pager
+
+# Run immediately from Vultr
+systemctl start mt7-hermes-weekly.service
+journalctl -u mt7-hermes-weekly.service -n 80 --no-pager
+```
+
+Safety rules:
+
+- Hermes does not get MEXC or Hyperliquid private keys.
+- Hermes does not write MT7 config files.
+- Hermes does not auto-apply learner suggestions.
+- Hermes does not place trades.
+- Hermes memos are advisory; apply changes through MT7 review flows only.
 
 ---
 

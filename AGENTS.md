@@ -275,77 +275,88 @@ Do not start a new task until the previous one works end-to-end.
 <claude-mem-context>
 # Memory Context
 
-# [Matrix_Trader_7.0] recent context, 2026-05-21 2:24pm EDT
+# [Matrix_Trader_7.0] recent context, 2026-06-07 10:16am EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (18,853t read) | 510,090t work | 96% savings
+Stats: 50 obs (20,926t read) | 677,266t work | 97% savings
 
-### May 19, 2026
-249 10:19a 🔵 Live Balanced Strategy Scan Returns Zero Signals Across 884 Pairs
-250 10:20a 🔵 Direction Lock Filtering Nearly All Signals — balanced_focus_short Blocking LONG Entries
-251 " 🔵 enrich_signal Returns None for Top Candidate — Root Cause of Zero Paper Trades Found
-252 " 🔵 enrich_signal Silently Returns None — Internal Failure Path Not Yet Isolated
-253 10:21a 🔵 Root Cause Found: fetch_klines Returns None for RON_USDT — All enrich_signal Calls Fail
-254 10:37a 🔵 fetch_klines Not Defined in app.py — Import Error Causing enrich_signal Failures
-255 " 🔵 fetch_klines Lives in lib/exchange_data.py — Imported into app.py at Line 35
-256 " 🔵 fetch_klines MEXC Path Calls fetch_mexc — Failure Traced to fetch_mexc Returning Non-Dict
-257 " 🔵 MEXC Kline API Works With "Min60" But fetch_klines Uses "Hour1" — Interval Mismatch Bug
-258 " 🔵 fetch_mexc Returns None When MEXC API Returns success=False — Interval "Hour1" Likely Invalid
-259 " 🔵 MEXC Kline API Rejects "Hour1" Interval — _MEXC_INTERVAL Mapping Is Wrong
-260 10:38a 🔵 MEXC Kline Interval Values Confirmed — Only "Hour1" Is Invalid
-261 " 🔴 Fixed MEXC Kline Interval Mapping — "Hour1" → "Min60" in lib/exchange_data.py
-262 10:39a 🔴 Deployed exchange_data.py Fix to Production VPS — Paper Bot Kline Fetch Now Working
-263 " 🔴 Paper Bot Pipeline Fully Unblocked — Enriched Signals With ATR% Now Flowing
-### May 20, 2026
-264 11:57p 🔵 Matrix Trader 7.0 — Project State and Roadmap Discovery
-265 " 🔵 Matrix Trader 7.0 — Full API Surface and External Learner Architecture
-266 " 🔵 Matrix Trader 7.0 — Signal Schema, DB Columns, Journey Metrics, and P8+ Table Plan
-267 " 🔵 Matrix Trader 7.0 — Phase Status: P9 Done, P10–P12 Pending, P11 Execution Layer Shipped
-268 " 🔵 Matrix Trader 7.0 — Current Next Actions and Pending User Steps
-269 " 🔵 0-Signal Bug Root Cause: ThreadPoolExecutor Overloading MEXC Kline Endpoint
-### May 21, 2026
-270 12:13a ⚖️ Matrix Trader Strategic Direction: Market Structure Intelligence Over Signal Generation
-271 " ⚖️ Research Firm Persona Upgrade: Named Agents, Job Titles, Org Chart, and Daily/Weekly/Quarterly Reports
-272 " ⚖️ New Signal Logging Fields Proposed: Market Structure Metadata for Backtesting
-273 12:14a 🔵 lib/ Directory Contains bybit_client.py and mexc_client.py Not Previously Documented
-274 " ⚖️ Multi-Exchange Architecture Standing Rule Codified in Project Memory
-275 12:15a ✅ MEMORY.md Updated With Multi-Exchange Standing Rule Entry
-276 12:21a 🔵 lib/agents.py Internal Structure: 8-Analyst Layer With NarrativeMarketState and StructuralMarketState Dataclasses
-277 12:22a 🔵 agents.py: AgentOutput Dataclass, REGIME_WEIGHTS, LLM Availability Sentinel, and Pipeline Entry Point
-278 " 🔵 All 8 Analyst Function Names Identified in agents.py for Persona Mapping
-279 " 🔵 Intelligence Tab JS: loadIntelligence() Fetches 3 APIs, renderIntelligence() Builds All UI at Line 6578
-280 12:23a 🔵 renderResearchFirm() Already Exists at Line 6782 — Research Firm Section Has Prior Implementation
-281 " 🔵 renderResearchFirm() Brief Card Structure: 5 Confidence Levels, Progress Bar, Evidence Stats
-282 " 🟣 Visual Companion Server Started, Layout Options Mockup Presented at localhost:52341
-S88 Report structure v2 — significantly richer Daily Brief and Weekly Report mockup created with top movers table, explosive move autopsy, and "What's Coiling" forward-looking section (May 21 at 12:47 AM)
-S89 Report structure v2 presented — richer Daily Brief with Top Movers, Explosive Move Autopsy, What's Coiling, and Weekly Move Patterns sections, awaiting user approval (May 21 at 12:54 AM)
-S90 Report enhancement brainstorm — identified high-value additions to Daily Brief and Weekly Report, categorized by data availability and implementation cost (May 21 at 12:55 AM)
-S91 Report structure v3 — full intelligence treatment with 11 sections implemented and served, awaiting user approval before spec writing (May 21 at 12:56 AM)
-283 1:03a ⚖️ Report enhancements confirmed — incorporating Tier 1 + high-value sections into design before spec
-S92 Additional weekly report sections proposed — paper desk performance, events calendar, agent spotlight, week ahead outlook — plus decision point on "The Firm" org chart mockup (May 21 at 1:03 AM)
-S93 Data source mapping finalized — each report section mapped to its system data source, full context available for AI narrative calls, design phase complete and ready for spec writing (May 21 at 1:05 AM)
-S94 Cipher Research Group spec written, committed, and Task 6 completed — ready for user review before implementation planning (May 21 at 1:07 AM)
-284 1:08a ✅ Task 5 marked completed — design sections presentation phase done
-285 " ✅ Spec writing phase started — docs/superpowers/specs/ directory created
-286 1:10a 🟣 Cipher Research Group design spec written — comprehensive implementation reference document
-287 " ✅ Spec updated — AI call strategy batched to minimize credit usage (2 calls daily, 3 weekly)
-288 " ✅ Spec updated — Agent Spotlight rotation state persisted to spotlight_state.json (not gitignored)
-289 1:11a 🟣 Cipher Research Group design spec committed to git — commit b52edac
-S95 Deployment clarification — reports run on same Flask app (local + VPS), but real data only on VPS; user ready to move to implementation plan (May 21 at 1:11 AM)
-S96 Public release architecture discussion — three data layers identified, Docker/SaaS path considered, mt-learner integration decision needed before implementation (May 21 at 1:14 AM)
-S97 mt-learner architecture decision — keep separate service, bring into repo as learner/ directory, parallel task to research firm build (May 21 at 1:18 AM)
-290 1:20a ✅ Task 7 started — writing implementation plan for Cipher Research Group feature
-291 " 🔵 Existing /api/intelligence routes confirmed in app.py — new routes will extend this pattern
-292 1:21a 🔵 Reference implementation for fail-closed mt-learner reads confirmed at app.py line 6001
-293 " 🟣 Cipher Research Group Implementation Plan Created
-294 12:39p 🟣 AGENT_ROSTER and FIRM_META added to lib/agents.py
-295 " 🔴 Audit §02 fix: LLM silent-fallback ambiguity resolved in agent pipeline
-296 12:48p 🔵 AGENT_ROSTER voice strings use mixed quote styles to avoid escaping
-297 12:50p 🔵 Code quality review passed for lib/agents.py Task 1 changes
-298 " ✅ Task 8 closed, Task 9 started in Matrix Trader 7.0 development pipeline
+### May 30, 2026
+S234 Add evaluation progress display and fix missing Expected value for learner suggestions — design decisions finalized, awaiting go-ahead to implement (May 30 at 10:16 PM)
+### May 31, 2026
+S235 Add evaluation progress display and fix missing Expected value for learner suggestions — diagnosis complete, design finalized, ready to implement (May 31 at 12:10 AM)
+S232 Add evaluation progress display and fix missing Expected value for learner suggestions during evaluation review (May 31 at 12:10 AM)
+S233 Add evaluation progress display and fix missing Expected value for learner suggestions — clarifying design decisions with user before implementation (May 31 at 12:10 AM)
+S236 Add evaluation progress display and fix missing Expected value for learner suggestions — user confirmed to proceed, implementation starting (May 31 at 12:10 AM)
+S237 Checking if per-strategy consecutive loss cooldown feature is already implemented in Matrix Trader 7.0 (May 31 at 12:13 AM)
+S238 Audit paper bot config panel for missing loss streak cooldown UI controls (May 31 at 12:22 AM)
+S239 User confirmed satisfaction ("great") with completed Safety Controls feature on paper config panel (May 31 at 12:28 AM)
+S240 Project status check — where are we at with Matrix Trader 7.0 (May 31 at 12:31 AM)
+### Jun 1, 2026
+805 10:00a 🔵 MT7 Current Task Priority List from HANDOFF.md
+806 10:01a 🔵 Production Paper Bot Live Stats — 108 Closed Trades, W+P 47.2%, Net +$106.48
+807 " 🟣 Complete Diff of Footprint/Order Flow Chart Overlay Changes in templates/index.html
+808 " 🔵 Production Server Already Has the Footprint/Order Flow Fix Deployed
+809 10:02a 🔵 Production renderPrimaryOrderFlowView Has OLD Bug — Still Replaces Chart for All Three Modes
+810 " 🔴 Footprint/Order Flow Chart Overlay Fix Deployed to Production
+811 " 🔴 Production Patch Verified — Chart Overlay CSS and JS Both Confirmed in Place
+812 10:03a 🔵 Production Still Has Old renderPrimaryOrderFlowView — Patch Did Not Fix the Core Bug
+813 " 🔵 mt-learner Active Suggestion: Suppress balanced Strategy in low_liquidity Regime
+814 " 🔵 Diff Shows Only One Line Different Between Production and Local — Safe to rsync
+815 " 🔴 Chart Overlay Fix Fully Deployed to Production — renderPrimaryOrderFlowView Confirmed Fixed
+816 " 🔵 Live Production Browser Test Failed — Footprint Button Not Found on 207.148.66.39
+817 10:04a 🔵 Production Trade ID 2 Not Found — Production DB Has Different Trade IDs Than Local
+818 10:05a 🔵 Production Paper Trades Have IDs 700+ — Bot is Actively Trading Multiple Symbols
+819 " 🔴 Chart Overlay Fix Fully Verified on Production — Footprint and Order Flow Both Pass
+820 " ✅ HANDOFF.md Updated with 2026-06-01 Session Summary and Revised Priority Queue
+821 10:06a ✅ HANDOFF.md Paper Gate Stats Updated to Current 108-Trade Numbers
+822 " 🔵 Paper Bot Gate Evaluation: 108 Trades, W+P 47.2% — Below P12 Threshold
+823 " 🔵 SSH Direct to Production Blocked — "Operation Not Permitted" Error
+824 " ✅ HANDOFF.md Significantly Updated with Current Project State
+827 " 🔵 paper_trades Table Missing pnl_usd Column — Schema Differs from API Output
+825 10:10a 🔵 Production VPS Missing sqlite3 CLI — DB Queries Must Use Python
+826 " 🔵 Paper Bot Configuration: paper_config.json Full State Captured
+828 10:14a 🔵 Full SQLite Schema for paper_trades and signals Tables Captured
+829 " 🔵 Deep Paper Bot Analysis: LONG Direction and funding_arb Strategy Are Primary Drag on W+P
+830 10:16a 🔵 Custom Strategy System Supports direction_lock and blocked_agent_regimes — Actionable Fix Path for Paper Bot
+831 " 🔵 Live Paper Bot State: 5 Open/Pending Positions, Recent 20 Trades Show ORBS_USDT Double-Loss Pattern
+832 10:17a 🔵 PATCH /api/paper/config Returns Empty Response — Strategy Disable Attempt May Have Failed
+833 " 🔵 Production Service Had 5-Second Crash on 2026-06-01 at 14:03:56 — Likely Import or Startup Error
+834 " 🔵 Paper Config Confirmed: PATCH from External IP Failed, disabled_strategies Still Only Has 2 Entries
+835 " 🔵 Effective Conviction Thresholds: funding_arb Floor at 69, Lower Than Strategy Default of 76
+836 10:18a ✅ Paper Bot Strategy Filter Tightened: funding_arb and momentum_breakout Now Disabled
+837 " ✅ HANDOFF.md Updated with Paper Gate Analysis Session Summary
+### Jun 2, 2026
+838 11:17a 🔵 Matrix Trader 7.0 Paper EV Deep Analysis — Session Initiated
+839 11:18a 🔵 Paper Bot Has ALL Strategies Disabled — EV Sample Critically Thin
+840 " 🔵 Paper Bot Architecture: Entry Touch, Exit Evaluation, Safety Controls
+841 " 🔵 Production Paper Bot Has 116 Closed Trades — Key EV Breakdown by Strategy/Direction
+842 " 🔵 Flow Score and Trend Score Are Strong Paper EV Predictors — Agent Regime Also Material
+### Jun 4, 2026
+843 10:36a 🔵 Matrix Trader 7.0 Current Project State
+844 10:37a 🔵 MT7 Paper Bot P12 Gate Status: Below Threshold, Post-Tightening Cohort Active
+845 " 🔵 MT7 Working Tree Has Significant Uncommitted Changes Including New Edge Lab and MT-Learner Files
+846 " 🔵 Production Paper Bot Live Stats 2026-06-04: 133 Total Closed, Post-Tightening Cohort Negative EV
+847 10:38a 🔵 Production Paper Bot Has 2 Open Underwater SHORT Positions and 1 Pending (Flow Not Confirmed)
+848 " 🔵 MT-Learner Active With New Pending Suggestion: Block Choppy Agent Regime
+### Jun 6, 2026
+849 1:45p 🔵 Matrix Trader 7.0 — Full Project State as of 2026-06-06
+850 2:00p 🔵 mt-learner Service Health Confirmed — Top Features Stable
+851 2:01p 🔵 mt-learner job_regime Completes in 0.0s — Regime Analysis Effectively a No-Op
+852 " 🔵 mt-learner Stuck at 3 Suggestions — Proposal and Regime Jobs Producing Nothing New
+853 " 🔵 paper_trades Schema — Full Column List Confirmed on Production
+854 " 🔵 Post-Tightening Paper Cohort Stats — funding_arb_focus_short Showing Strong Edge
+S241 SSH check of mt-learner status and post-tightening paper cohort analysis (Jun 6 at 2:02 PM)
+**Investigated**: mt-learner service health via systemctl and log inspection; full learner.log searched for suggestion/regime/proposal job activity; paper_trades schema confirmed; post-tightening paper cohort stats queried directly from production signals.db
 
-Access 510k tokens of past work via get_observations([IDs]) or mem-search skill.
+**Learned**: mt-learner is healthy and running — job_proposal fires daily at 03:26 UTC and explicitly logs "0 new suggestions, 3 total" (confirmed June 5 and June 6). job_regime completes in 0.0s with no output. The suggestion freeze is correct behavior, not a bug. There is one unreviewed pending suggestion: regime_funding_arb_choppy_20260529_001 (suppress funding_arb in choppy regime). Post-tightening cohort (since Jun 1): funding_arb_focus_short is the only positive-EV strategy at 28 trades, W+P 50%, avg net +10.56%. mean_reversion is badly negative at -20.15% avg over 7 trades. Disabled strategies (balanced, funding_arb base, momentum_breakout) leaked a few residual trades from before the config change.
+
+**Completed**: Read-only investigation completed — no code changes. Full paper cohort analysis surfaced actionable signal: funding_arb_focus_short is approaching P12 gate criteria; mean_reversion should likely be disabled; one unreviewed learner suggestion exists.
+
+**Next Steps**: User was asked whether to: (1) investigate why disabled strategies are still leaking through into paper trades, and/or (2) review the pending choppy-regime suppression suggestion for funding_arb. Session is paused awaiting user direction.
+
+
+Access 677k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>

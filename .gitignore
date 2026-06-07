@@ -8,3 +8,7 @@ logs/
 data/
 *.db
 .superpowers/
+.gstack/
+mt-learner/models/
+mt-learner/research/
+mt-learner/suggestions/

@@ -31,7 +31,7 @@ Built-in and custom strategies all use the same pipeline. What changes is the we
 |---|---|---:|---:|
 | Balanced | Broad all-market setup using momentum, funding, basis, and volume | 20x | 55 |
 | Funding Arb | Funding extremes may signal crowded positioning and squeeze risk | 10x | 60 |
-| Momentum Breakout | Strong directional moves with volume can continue | 25x | 55 |
+| Momentum Breakout | Fresh 1h volatility expansion with volume and trend confirmation | 12x | 68 |
 | Mean Reversion | Stretched RSI and overextended moves may snap back | 15x | 65 |
 
 ### Balanced
@@ -68,13 +68,14 @@ Watch for:
 
 ### Momentum Breakout
 
-Momentum Breakout focuses on strong directional movement and volume expansion. The thesis is that some moves continue when participation is high enough.
+Momentum Breakout focuses on fresh 1h volatility expansion rather than broad 24h movement. The thesis is that a move is more tradable when the latest hourly candle is large relative to ATR, volume is expanding, and EMA structure agrees with the direction.
 
 Use it when:
 
-- Multiple timeframes are moving in the same direction.
-- Volume supports the move.
-- Trend alignment is clean.
+- The 1h move is large enough relative to current ATR.
+- Volume is above its recent hourly baseline.
+- EMA trend alignment supports the same direction.
+- ATR is not in the extreme-volatility regime.
 
 Watch for:
 
@@ -514,4 +515,3 @@ When reviewing a strategy, ask:
 10. Would I trust this with tiny real size after a paper-bot simulation?
 
 If the answer is not clearly yes, keep collecting data.
-
