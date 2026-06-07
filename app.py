@@ -11471,6 +11471,228 @@ def api_paper_cohort_edge():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def _paper_review_stats(trades: list[dict]) -> dict:
+    wins = [t for t in trades if str(t.get("result") or "").upper() in ("WIN", "TP3")]
+    partials = [t for t in trades if str(t.get("result") or "").upper() == "PARTIAL"]
+    losses = [t for t in trades if str(t.get("result") or "").upper() == "LOSS"]
+    pnls = [float(t.get("pnl_pct")) for t in trades if t.get("pnl_pct") is not None]
+    pnl_usd = [
+        float(t.get("size_usd") or 0.0) * float(t.get("pnl_pct") or 0.0) / 100.0
+        for t in trades
+        if t.get("pnl_pct") is not None
+    ]
+    gains = [x for x in pnl_usd if x > 0]
+    drawdowns = []
+    running = 0.0
+    peak = 0.0
+    for x in pnl_usd:
+        running += x
+        peak = max(peak, running)
+        drawdowns.append(running - peak)
+    losses_usd = [abs(x) for x in pnl_usd if x < 0]
+    return {
+        "count": len(trades),
+        "wins": len(wins),
+        "partials": len(partials),
+        "losses": len(losses),
+        "win_partial_rate": round((len(wins) + len(partials)) / len(trades) * 100, 1) if trades else 0,
+        "avg_pnl": round(sum(pnls) / len(pnls), 2) if pnls else 0,
+        "total_pnl": round(sum(pnls), 2) if pnls else 0,
+        "avg_pnl_usd": round(sum(pnl_usd) / len(pnl_usd), 2) if pnl_usd else 0,
+        "total_pnl_usd": round(sum(pnl_usd), 2) if pnl_usd else 0,
+        "profit_factor": round(sum(gains) / sum(losses_usd), 2) if losses_usd else (round(sum(gains), 2) if gains else 0),
+        "max_drawdown_usd": round(min(drawdowns), 2) if drawdowns else 0,
+    }
+
+
+def _paper_review_breakdown(trades: list[dict], key: str, limit: int = 8) -> list[dict]:
+    buckets = defaultdict(list)
+    for trade in trades:
+        buckets[trade.get(key) or "unknown"].append(trade)
+    rows = []
+    for bucket_key, items in buckets.items():
+        rows.append({"key": bucket_key, **_paper_review_stats(items)})
+    return sorted(rows, key=lambda r: (r.get("count", 0), r.get("total_pnl_usd", 0)), reverse=True)[:limit]
+
+
+def _paper_cohort_gate(name: str, status: str, value, target: str, detail: str) -> dict:
+    return {
+        "name": name,
+        "status": status,
+        "value": value,
+        "target": target,
+        "detail": detail,
+    }
+
+
+def _build_paper_cohort_review() -> dict:
+    cfg = _load_paper_config()
+    since = cfg.get("current_cohort_started_at")
+    target = int(cfg.get("current_cohort_target_count") or 20)
+    active_strategies = sorted(set(get_strategy_registry().keys()) - set(cfg.get("disabled_strategies") or []))
+    research = _hermes_research_pipeline_summary()
+
+    if not since:
+        return {
+            "label": cfg.get("current_cohort_label") or "Current cohort",
+            "started_at": None,
+            "target_count": target,
+            "active_strategies": active_strategies,
+            "decision": "configure_cohort",
+            "decision_label": "Configure Cohort",
+            "decision_color": "amber",
+            "summary": "No current paper cohort start is configured, so MT7 cannot isolate this test from older paper trades.",
+            "recommendation": "Set a cohort start timestamp before judging paper changes.",
+            "gates": [_paper_cohort_gate("Sample", "fail", f"0/{target}", f"{target} closed", "No isolated cohort sample yet.")],
+            "cohort": _paper_review_stats([]),
+            "baseline": _paper_review_stats([]),
+            "strategy_breakdown": [],
+            "direction_breakdown": [],
+            "hermes": {
+                "source_count": ((research.get("library") or {}).get("source_count") or 0),
+                "shadow_experiment_count": research.get("shadow_experiment_count") or 0,
+                "latest_memo_at": ((research.get("weekly_memo") or {}).get("generated_at")),
+            },
+        }
+
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute("""
+            SELECT id, symbol, strategy_key, direction, status, result, pnl_pct,
+                   size_usd, queued_at, filled_at, opened_at, closed_at,
+                   fee_cost_pct, slippage_cost_pct, flow_confirmed, flow_score
+            FROM paper_trades
+            WHERE status='closed'
+            ORDER BY closed_at ASC
+        """).fetchall()]
+        open_count = con.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE status IN ('pending','open') AND COALESCE(opened_at, queued_at, '') >= ?",
+            (str(since),),
+        ).fetchone()[0] or 0
+    finally:
+        con.close()
+
+    cohort = [t for t in rows if (t.get("closed_at") or "") >= str(since)]
+    baseline = [t for t in rows if (t.get("closed_at") or "") < str(since)]
+    cohort_stats = _paper_review_stats(cohort)
+    baseline_stats = _paper_review_stats(baseline)
+
+    count = int(cohort_stats.get("count") or 0)
+    wp = float(cohort_stats.get("win_partial_rate") or 0.0)
+    avg = float(cohort_stats.get("avg_pnl") or 0.0)
+    pf = float(cohort_stats.get("profit_factor") or 0.0)
+    avg_usd = float(cohort_stats.get("avg_pnl_usd") or 0.0)
+    baseline_avg = float(baseline_stats.get("avg_pnl") or 0.0)
+    baseline_wp = float(baseline_stats.get("win_partial_rate") or 0.0)
+
+    gates = [
+        _paper_cohort_gate(
+            "Sample",
+            "pass" if count >= target else ("watch" if count >= max(5, target // 2) else "wait"),
+            f"{count}/{target}",
+            f"{target} closed",
+            "Minimum isolated closed-trade count before promoting a paper change.",
+        ),
+        _paper_cohort_gate(
+            "W+P Rate",
+            "pass" if count >= target and wp >= 50 else ("watch" if wp >= 45 else "fail"),
+            f"{wp:.1f}%",
+            ">= 50%",
+            "Wins plus partial wins should clear breakeven reliability.",
+        ),
+        _paper_cohort_gate(
+            "Net EV",
+            "pass" if count >= target and avg > 0 and avg_usd > 0 else ("watch" if avg > 0 else "fail"),
+            f"{avg:.2f}%",
+            "> 0%",
+            "Average net paper P&L after estimated fees and slippage.",
+        ),
+        _paper_cohort_gate(
+            "Profit Factor",
+            "pass" if count >= target and pf >= 1.25 else ("watch" if pf >= 1.0 else "fail"),
+            f"{pf:.2f}",
+            ">= 1.25",
+            "Gross dollars won divided by gross dollars lost.",
+        ),
+        _paper_cohort_gate(
+            "Baseline Delta",
+            "pass" if count >= target and avg > baseline_avg and wp >= baseline_wp else ("watch" if avg > baseline_avg else "fail"),
+            f"{avg - baseline_avg:+.2f}%",
+            "> prior sample",
+            "Current cohort should improve on the older mixed-strategy paper sample.",
+        ),
+    ]
+
+    if count < target:
+        decision = "hold_collect_sample"
+        label = "Hold: Collect Sample"
+        color = "blue"
+        summary = f"{count}/{target} closed trades are in the current cohort. MT7 should keep observing before changing paper settings."
+        recommendation = "Keep the paper bot unchanged until the cohort reaches the sample gate."
+    elif avg > 0 and avg_usd > 0 and wp >= 50 and pf >= 1.25 and avg > baseline_avg:
+        decision = "ready_next_test"
+        label = "Ready For Next Test"
+        color = "green"
+        summary = "The cohort clears sample, reliability, EV, profit-factor, and baseline-improvement gates."
+        recommendation = "Review Edge Lab alignment and Hermes notes, then choose one next paper-only experiment."
+    elif avg <= 0 or pf < 1.0:
+        decision = "tighten_or_pause"
+        label = "Tighten Or Pause"
+        color = "red"
+        summary = "The cohort has enough sample but paper EV or profit factor is not holding up."
+        recommendation = "Inspect the worst strategy/symbol buckets before allowing another configuration change."
+    else:
+        decision = "hold_review"
+        label = "Hold: Review"
+        color = "amber"
+        summary = "The cohort is mixed: enough sample to study, but not enough evidence to promote automation."
+        recommendation = "Use strategy split, Edge Lab attribution, and Hermes research before applying a paper config change."
+
+    edge_available = os.path.exists(EDGE_LAB_DB_PATH) and bool(_load_edge_factor_report())
+    return {
+        "label": cfg.get("current_cohort_label") or "Current cohort",
+        "started_at": since,
+        "target_count": target,
+        "active_strategies": active_strategies,
+        "open_or_pending_count": open_count,
+        "decision": decision,
+        "decision_label": label,
+        "decision_color": color,
+        "summary": summary,
+        "recommendation": recommendation,
+        "gates": gates,
+        "cohort": cohort_stats,
+        "baseline": baseline_stats,
+        "baseline_delta": {
+            "avg_pnl": round(avg - baseline_avg, 2),
+            "win_partial_rate": round(wp - baseline_wp, 1),
+        },
+        "strategy_breakdown": _paper_review_breakdown(cohort, "strategy_key"),
+        "direction_breakdown": _paper_review_breakdown(cohort, "direction"),
+        "recent_trades": list(reversed(cohort[-8:])),
+        "edge_lab": {
+            "available": edge_available,
+            "note": "Use the Edge Lab Cohort Attribution card below this review to confirm whether cohort trades are occurring in historically favorable states.",
+        },
+        "hermes": {
+            "source_count": ((research.get("library") or {}).get("source_count") or 0),
+            "shadow_experiment_count": research.get("shadow_experiment_count") or 0,
+            "latest_memo_at": ((research.get("weekly_memo") or {}).get("generated_at")),
+        },
+    }
+
+
+@app.route("/api/paper/cohort-review")
+def api_paper_cohort_review():
+    """Return an advisory paper cohort review. This never mutates trading config."""
+    try:
+        return jsonify({"success": True, "review": _build_paper_cohort_review()})
+    except Exception as e:
+        print(f"[api/paper/cohort-review] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/paper/account")
 def api_paper_account():
     """Return the current paper account scoreboard derived from goals + trades."""

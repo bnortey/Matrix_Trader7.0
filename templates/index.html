@@ -11064,13 +11064,14 @@ async function loadPaperTrading() {
   if (!el) return;
   el.innerHTML = '<div style="color:var(--muted);padding:2rem;">Loading...</div>';
   try {
-    const [cfgR, statsR, tradesR, stratR, filterStatsR, accountR, edgeCohortR] = await Promise.all([
+    const [cfgR, statsR, tradesR, stratR, filterStatsR, accountR, cohortReviewR, edgeCohortR] = await Promise.all([
       fetch('/api/paper/config'),
       fetch('/api/paper/stats'),
       fetch('/api/paper/trades'),
       fetch('/api/strategies'),
       fetch('/api/paper/filter-stats'),
       fetch('/api/paper/account'),
+      fetch('/api/paper/cohort-review').catch(() => null),
       fetch('/api/paper/cohort-edge').catch(() => null),
     ]);
     const cfg         = await cfgR.json();
@@ -11079,6 +11080,7 @@ async function loadPaperTrading() {
     const stratD      = await stratR.json();
     const filterStats = await filterStatsR.json();
     const account     = await accountR.json();
+    const cohortReview = cohortReviewR ? await cohortReviewR.json().catch(() => null) : null;
     const edgeCohort  = edgeCohortR ? await edgeCohortR.json().catch(() => null) : null;
     if (!cfg.success) { el.innerHTML = '<div style="color:var(--red);padding:2rem;">Config unavailable</div>'; return; }
 
@@ -11244,6 +11246,7 @@ async function loadPaperTrading() {
       const acct = account && account.success ? account.account : {};
       statsHtml = `
         ${renderPaperCohortStrip(s.current_cohort)}
+        ${renderPaperCohortReview(cohortReview)}
         ${renderPaperCohortEdge(edgeCohort)}
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-bottom:10px;">
           ${paperStat('Paper Account', fmtUsd(acct.current_value_usd), (acct.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', `Started at ${fmtUsd(acct.starting_balance_usd)}`)}
@@ -11545,6 +11548,94 @@ function renderPaperCohortStrip(cohort) {
     </div>
     <div style="height:4px;background:#111827;border-radius:99px;overflow:hidden;margin-top:8px;">
       <div style="height:100%;width:${progress}%;background:${okColor};border-radius:99px;"></div>
+    </div>
+  </div>`;
+}
+
+function renderPaperCohortReview(payload) {
+  if (!payload) return '';
+  if (!payload.success) {
+    return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px 11px;margin-bottom:10px;color:#777;font-size:12px;">
+      Cohort Review unavailable: ${esc(payload.error || 'report not ready')}
+    </div>`;
+  }
+  const r = payload.review || {};
+  const colorMap = { green:'#22c55e', amber:'#f59e0b', red:'#ef4444', blue:'#60a5fa' };
+  const decisionColor = colorMap[r.decision_color] || '#9ca3af';
+  const cohort = r.cohort || {};
+  const baseline = r.baseline || {};
+  const delta = r.baseline_delta || {};
+  const gates = r.gates || [];
+  const strategies = r.strategy_breakdown || [];
+  const directions = r.direction_breakdown || [];
+  const hermes = r.hermes || {};
+  const gateColor = status => ({
+    pass:'#22c55e',
+    watch:'#f59e0b',
+    wait:'#60a5fa',
+    fail:'#ef4444',
+  })[status] || '#9ca3af';
+  const gateHtml = gates.map(g => `
+    <div title="${esc(g.detail || '')}" style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:7px 9px;">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:3px;">
+        <span style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;">${esc(g.name || '')}</span>
+        <span style="font-size:9px;color:${gateColor(g.status)};text-transform:uppercase;font-weight:800;">${esc(g.status || '')}</span>
+      </div>
+      <div style="font-family:var(--mono);font-size:13px;font-weight:800;color:var(--text2);">${esc(g.value ?? '—')}</div>
+      <div style="font-size:10px;color:#667085;margin-top:2px;">Target ${esc(g.target || '—')}</div>
+    </div>`).join('');
+  const row = item => {
+    const avg = Number(item.avg_pnl || 0);
+    return `<div style="display:flex;justify-content:space-between;gap:10px;border-top:1px solid #18202b;padding-top:5px;margin-top:5px;font-size:11px;">
+      <span style="color:#9ca3af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(String(item.key || 'unknown').replace(/_/g, ' '))}</span>
+      <span style="font-family:var(--mono);color:${avg >= 0 ? '#22c55e' : '#ef4444'}">${Number(item.count || 0)} · ${fmtPct(avg)} · PF ${Number(item.profit_factor || 0).toFixed(2)}</span>
+    </div>`;
+  };
+  const stratRows = strategies.slice(0, 4).map(row).join('');
+  const dirRows = directions.slice(0, 2).map(row).join('');
+  let memoAt = 'none';
+  if (hermes.latest_memo_at) {
+    const memoDate = new Date(String(hermes.latest_memo_at).endsWith('Z') ? hermes.latest_memo_at : hermes.latest_memo_at + 'Z');
+    memoAt = Number.isNaN(memoDate.getTime())
+      ? String(hermes.latest_memo_at)
+      : memoDate.toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+  }
+  return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 11px;margin-bottom:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+      <div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Cohort Review</div>
+        <div style="font-size:16px;font-weight:850;color:${decisionColor};margin-top:2px;">${esc(r.decision_label || 'Review')}</div>
+      </div>
+      <button onclick="loadPaperTrading()" title="Refresh cohort review" style="background:transparent;border:1px solid #263244;color:#9ca3af;border-radius:5px;padding:6px 9px;font-size:11px;cursor:pointer;">Refresh</button>
+    </div>
+    <div style="font-size:12px;color:var(--text2);line-height:1.5;margin-bottom:8px;">${esc(r.summary || '')}</div>
+    <div style="font-size:11px;color:#9ca3af;line-height:1.45;border-left:3px solid ${decisionColor};padding-left:8px;margin-bottom:9px;">${esc(r.recommendation || '')}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:7px;margin-bottom:9px;">
+      ${gateHtml}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:9px;">
+      <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;">
+        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Baseline Comparison</div>
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:7px;font-family:var(--mono);font-size:12px;">
+          <div><span style="color:#667085;">Cohort</span><br><b style="color:${Number(cohort.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(cohort.avg_pnl || 0)}</b> <span style="color:#667085;">W+P ${Number(cohort.win_partial_rate || 0).toFixed(1)}%</span></div>
+          <div><span style="color:#667085;">Prior</span><br><b style="color:${Number(baseline.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(baseline.avg_pnl || 0)}</b> <span style="color:#667085;">W+P ${Number(baseline.win_partial_rate || 0).toFixed(1)}%</span></div>
+        </div>
+        <div style="font-size:11px;color:#9ca3af;margin-top:7px;">Delta: <b style="font-family:var(--mono);color:${Number(delta.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(delta.avg_pnl || 0)}</b> avg P&L, <b style="font-family:var(--mono);color:${Number(delta.win_partial_rate || 0) >= 0 ? '#22c55e' : '#ef4444'}">${Number(delta.win_partial_rate || 0).toFixed(1)}%</b> W+P.</div>
+      </div>
+      <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;">
+        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Strategy Split</div>
+        ${stratRows || '<div style="font-size:11px;color:#667085;">No closed cohort strategy sample yet.</div>'}
+        ${dirRows ? `<div style="margin-top:7px;">${dirRows}</div>` : ''}
+      </div>
+      <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;">
+        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Learning Inputs</div>
+        <div style="font-size:11px;color:#9ca3af;line-height:1.55;">
+          Edge Lab: <b style="color:${r.edge_lab?.available ? '#22c55e' : '#f59e0b'}">${r.edge_lab?.available ? 'available' : 'waiting'}</b><br>
+          Hermes sources: <b style="color:var(--text2)">${Number(hermes.source_count || 0)}</b><br>
+          Shadow experiments: <b style="color:var(--text2)">${Number(hermes.shadow_experiment_count || 0)}</b><br>
+          Latest memo: <b style="color:var(--text2)">${esc(memoAt)}</b>
+        </div>
+      </div>
     </div>
   </div>`;
 }
