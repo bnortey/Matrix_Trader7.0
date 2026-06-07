@@ -7,9 +7,9 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-06-07
-Last commit: 9bda491 chore: schedule daily Edge Lab refresh
-app.py: 12,273 lines
-index.html: 13,111 lines
+Last commit: fix: harden symbol loss gate
+app.py: 12,542 lines
+index.html: 13,206 lines
 
 ---
 
@@ -619,6 +619,8 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 - Set up GitHub SSH auth for the first time: generated `ed25519` key on Mac, added to GitHub. Switched remote from HTTPS to SSH (`git remote set-url origin git@github.com:bnortey/Matrix_Trader7.0.git`).
 - Pushed all 7 local commits to GitHub for the first time. Repo is now backed up remotely.
 - Updated HANDOFF.md to reflect current state.
+- Reviewed Claude's uncommitted Symbol Loss Gate work and fixed the safety issues before commit: raw `risk_gates.json` metadata is now read/written without dropping `symbol_overrides`, auto-block writes merge with existing manual overrides, the gate uses a configurable recent live-signal lookback (`symbol_loss_gate_lookback_days`, default `30`) instead of all-time history, auto-blocks clear when the recent window recovers, and manual unblocks create a cooldown (`symbol_loss_gate_unblock_cooldown_hours`, default `168`) so the next scan does not immediately re-block the symbol.
+- Local temp-file smoke test passed: manual overrides survived auto-blocking, old-window and paper rows were ignored, `/api/risk-gates/symbol-loss-stats` returned the configured lookback, and unblock wrote a durable cooldown record.
 
 ### 2026-06-07 — Session summary (learner heartbeat + focus-short paper cohort)
 

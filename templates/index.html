@@ -6145,12 +6145,20 @@ async function loadRiskGates(rerender = true) {
   if (A.riskGateLoading) return;
   A.riskGateLoading = true;
   try {
-    const resp = await fetch('/api/risk-gates');
+    const [resp, lossResp] = await Promise.all([
+      fetch('/api/risk-gates'),
+      fetch('/api/risk-gates/symbol-loss-stats'),
+    ]);
     const data = await resp.json();
     if (!data.success) throw new Error(data.error || 'Risk gates unavailable');
     A.riskGates = data;
+    try {
+      const lossData = await lossResp.json();
+      A.symbolLossStats = lossData.success ? lossData : null;
+    } catch(e) { A.symbolLossStats = null; }
   } catch (e) {
     A.riskGates = { success:false, error:e.message };
+    A.symbolLossStats = null;
   } finally {
     A.riskGateLoading = false;
     if (rerender) renderStrategyAnalytics();
@@ -6583,6 +6591,80 @@ function renderRiskGatesPanel() {
       ${overridesHTML}
     </div>` : '';
 
+  // Symbol Loss Gate panel
+  const sls = A.symbolLossStats;
+  let symbolLossGatePanel = '';
+  if (sls) {
+    const threshold = sls.threshold;
+    const minTrades = sls.min_trades;
+    const lookbackDays = sls.lookback_days || 30;
+    const unblockHours = sls.unblock_cooldown_hours || 168;
+    const blocked = (sls.symbols || []).filter(s => s.auto_blocked);
+    const atRisk = (sls.symbols || []).filter(s => s.at_risk);
+    const manualUnblocked = (sls.symbols || []).filter(s => s.manual_unblocked);
+    const summary = `Gate: ${lookbackDays}d live sum P&L < ${threshold}% over ${minTrades}+ trades · ${sls.blocked_count} auto-blocked · ${sls.at_risk_count} breaching · ${sls.manual_unblocked_count || 0} manual unblocks`;
+    const blockedRows = blocked.map(s => `
+      <tr>
+        <td style="color:var(--red);font-weight:600">${esc(s.symbol.replace('_USDT',''))}</td>
+        <td style="color:var(--red)">${saSigned(s.sum_pnl)}</td>
+        <td class="sa-muted">${s.trade_count}</td>
+        <td style="color:${saPnlColor(s.avg_pnl)}">${saSigned(s.avg_pnl)}</td>
+        <td class="sa-muted" style="font-size:10px">${s.blocked_at ? s.blocked_at.slice(0,10) : ''}</td>
+        <td><button class="sa-refresh" onclick="unblockLossGateSymbol('${esc(s.symbol)}')" ${A.riskGateLoading ? 'disabled' : ''}>Unblock</button></td>
+      </tr>`).join('');
+    const atRiskRows = atRisk.map(s => `
+      <tr>
+        <td style="color:var(--amber);font-weight:600">${esc(s.symbol.replace('_USDT',''))}</td>
+        <td style="color:var(--amber)">${saSigned(s.sum_pnl)}</td>
+        <td class="sa-muted">${s.trade_count}</td>
+        <td style="color:${saPnlColor(s.avg_pnl)}">${saSigned(s.avg_pnl)}</td>
+        <td class="sa-muted" style="font-size:10px">—</td>
+        <td class="sa-muted" style="font-size:10px">breaching</td>
+      </tr>`).join('');
+    const manualRows = manualUnblocked.map(s => `
+      <tr>
+        <td style="color:#60a5fa;font-weight:600">${esc(s.symbol.replace('_USDT',''))}</td>
+        <td style="color:${saPnlColor(s.sum_pnl)}">${saSigned(s.sum_pnl)}</td>
+        <td class="sa-muted">${s.trade_count}</td>
+        <td style="color:${saPnlColor(s.avg_pnl)}">${saSigned(s.avg_pnl)}</td>
+        <td class="sa-muted" style="font-size:10px">${s.unblock_expires_at ? s.unblock_expires_at.slice(0,10) : ''}</td>
+        <td class="sa-muted" style="font-size:10px">cooldown</td>
+      </tr>`).join('');
+    const tableHeader = `<thead><tr><th>Symbol</th><th>Sum P&L</th><th>Trades</th><th>Avg P&L</th><th>Blocked</th><th></th></tr></thead>`;
+    const blockedSection = blockedRows ? `
+      <div style="margin-top:12px">
+        <div class="sa-muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Auto-blocked</div>
+        <div style="overflow-x:auto">
+          <table class="sa-table" style="min-width:0">${tableHeader}<tbody>${blockedRows}</tbody></table>
+        </div>
+      </div>` : '';
+    const atRiskSection = atRiskRows ? `
+      <div style="margin-top:12px">
+        <div class="sa-muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Breaching but not blocked</div>
+        <div style="overflow-x:auto">
+          <table class="sa-table" style="min-width:0">${tableHeader}<tbody>${atRiskRows}</tbody></table>
+        </div>
+      </div>` : '';
+    const manualSection = manualRows ? `
+      <div style="margin-top:12px">
+        <div class="sa-muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Manual unblock cooldown</div>
+        <div style="overflow-x:auto">
+          <table class="sa-table" style="min-width:0">${tableHeader}<tbody>${manualRows}</tbody></table>
+        </div>
+      </div>` : '';
+    const emptyMsg = (!blockedRows && !atRiskRows && !manualRows) ? `<div class="sa-empty" style="margin-top:10px">No symbols breaching the loss gate threshold.</div>` : '';
+    symbolLossGatePanel = `
+      <div class="sa-panel" style="margin:14px 0">
+        <div class="sa-panel-title">Symbol Loss Gate</div>
+        <div class="sa-chart-desc">Auto-blocks symbols whose recent live P&L breaches the threshold. Blocked symbols get conviction=0 at scan time and are excluded from results. Manual unblock removes the auto-block for ${Number(unblockHours).toFixed(0)} hours.</div>
+        <div class="sa-muted" style="font-size:11px;margin-top:6px">${esc(summary)}</div>
+        ${blockedSection}
+        ${atRiskSection}
+        ${manualSection}
+        ${emptyMsg}
+      </div>`;
+  }
+
   return `
     <div class="sa-panel" style="margin:14px 0">
       <div class="sa-panel-title">Risk Gates</div>
@@ -6590,6 +6672,7 @@ function renderRiskGatesPanel() {
       <div class="sa-section-stack">${gateCards}</div>
     </div>
     ${symbolPenaltiesPanel}
+    ${symbolLossGatePanel}
   `;
 }
 
@@ -6613,6 +6696,18 @@ async function removeSymbolOverride(symbol) {
     await fetch('/api/risk-gates/symbol-override/' + encodeURIComponent(symbol), {method: 'DELETE'});
     await loadRiskGates(false);
   } catch(e) { console.warn('removeSymbolOverride failed:', e); }
+  A.riskGateLoading = false;
+  renderStrategyAnalytics();
+}
+
+async function unblockLossGateSymbol(symbol) {
+  A.riskGateLoading = true;
+  try {
+    const r = await fetch('/api/risk-gates/symbol-loss-gate/unblock/' + encodeURIComponent(symbol), {method: 'POST'});
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error || 'Unblock failed');
+    await loadRiskGates(false);
+  } catch(e) { console.warn('unblockLossGateSymbol failed:', e); }
   A.riskGateLoading = false;
   renderStrategyAnalytics();
 }

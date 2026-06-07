@@ -1356,14 +1356,70 @@ def _set_disabled_builtins(disabled: set) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
+def _load_risk_gates_raw() -> dict:
+    """Load raw risk_gates.json, including metadata outside DEFAULT_RISK_GATES."""
+    try:
+        if os.path.exists(RISK_GATES_PATH):
+            with open(RISK_GATES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"load raw risk_gates error: {e}", file=sys.stderr)
+    return {}
+
+
+def _save_risk_gates_raw(data: dict) -> None:
+    os.makedirs("data", exist_ok=True)
+    with open(RISK_GATES_PATH, "w", encoding="utf-8") as f:
+        json.dump(data if isinstance(data, dict) else {}, f, indent=2, sort_keys=True)
+
+
 def _get_symbol_overrides() -> dict:
     """Return the symbol_overrides dict from risk_gates.json. Returns {} on any error."""
+    overrides = _load_risk_gates_raw().get("symbol_overrides", {})
+    return overrides if isinstance(overrides, dict) else {}
+
+
+def _symbol_loss_gate_config(raw: dict | None = None) -> dict:
+    data = raw if isinstance(raw, dict) else _load_risk_gates_raw()
+
+    def _num(key: str, default: float, min_value: float | None = None) -> float:
+        try:
+            value = float(data.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if min_value is not None:
+            value = max(min_value, value)
+        return value
+
+    return {
+        "threshold": _num("symbol_loss_gate_threshold", -75.0),
+        "min_trades": int(_num("symbol_loss_gate_min_trades", 3, 1)),
+        "lookback_days": int(_num("symbol_loss_gate_lookback_days", 30, 1)),
+        "unblock_cooldown_hours": _num("symbol_loss_gate_unblock_cooldown_hours", 168, 1),
+    }
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
     try:
-        with open(RISK_GATES_PATH, "r") as f:
-            data = json.load(f)
-        return data.get("symbol_overrides", {})
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
     except Exception:
-        return {}
+        return None
+
+
+def _active_symbol_loss_unblock(entry: dict, now: datetime | None = None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    expires_at = _parse_iso_datetime(entry.get("expires_at"))
+    return bool(expires_at and expires_at > (now or datetime.utcnow()))
 
 
 def _load_symbol_performance_cache(min_trades: int = 5) -> dict:
@@ -1390,6 +1446,125 @@ def _load_symbol_performance_cache(min_trades: int = 5) -> dict:
     except Exception as e:
         print(f'[sym_penalty] cache load error: {e}', file=sys.stderr)
         return {}
+
+
+def _compute_symbol_loss_stats(min_trades: int = 3, lookback_days: int = 30) -> dict:
+    """
+    Returns recent per-symbol cumulative (sum) pnl_pct for live closed signals.
+    {symbol: {sum_pnl, avg_pnl, trade_count, worst_pnl}}
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(signals)").fetchall()}
+        where = [
+            "result IS NOT NULL",
+            "pnl_pct IS NOT NULL",
+            "result NOT IN ('EXPIRED', 'SKIPPED')",
+        ]
+        params: list = []
+        if "source" in cols:
+            where.append("(source IS NULL OR source = 'live')")
+        if lookback_days and lookback_days > 0:
+            if "result_at" in cols and "logged_at" in cols:
+                date_expr = "COALESCE(result_at, logged_at)"
+            elif "result_at" in cols:
+                date_expr = "result_at"
+            elif "logged_at" in cols:
+                date_expr = "logged_at"
+            else:
+                date_expr = None
+            if date_expr:
+                cutoff = (datetime.utcnow() - timedelta(days=int(lookback_days))).isoformat()
+                where.append(f"{date_expr} >= ?")
+                params.append(cutoff)
+
+        params.append(int(min_trades))
+        rows = con.execute(f'''
+            SELECT symbol,
+                   COUNT(*) as n,
+                   ROUND(SUM(pnl_pct), 2) as sum_pnl,
+                   ROUND(AVG(pnl_pct), 2) as avg_pnl,
+                   ROUND(MIN(pnl_pct), 2) as worst_pnl
+            FROM signals
+            WHERE {' AND '.join(where)}
+            GROUP BY symbol
+            HAVING COUNT(*) >= ?
+        ''', params).fetchall()
+        con.close()
+        return {r[0]: {'trade_count': r[1], 'sum_pnl': r[2], 'avg_pnl': r[3], 'worst_pnl': r[4]} for r in rows}
+    except Exception as e:
+        print(f'[symbol_loss_gate] stats error: {e}', file=sys.stderr)
+        return {}
+
+
+def _apply_symbol_auto_blocks() -> list:
+    """
+    Check per-symbol cumulative pnl_pct against the loss gate threshold.
+    Auto-adds breaching symbols to symbol_overrides with action='blocked'.
+    Respects manual overrides (only writes if existing reason == 'auto_loss_gate' or absent).
+    Returns list of newly blocked symbols.
+    """
+    try:
+        raw = _load_risk_gates_raw()
+        cfg = _symbol_loss_gate_config(raw)
+        threshold = cfg["threshold"]
+        stats = _compute_symbol_loss_stats(
+            min_trades=cfg["min_trades"],
+            lookback_days=cfg["lookback_days"],
+        )
+        overrides = raw.get('symbol_overrides', {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+        unblocks = raw.get('symbol_loss_gate_unblocks', {})
+        if not isinstance(unblocks, dict):
+            unblocks = {}
+        now = datetime.utcnow()
+        newly_blocked = []
+        changed = False
+
+        for symbol, existing in list(overrides.items()):
+            if not isinstance(existing, dict):
+                continue
+            if existing.get('action') == 'blocked' and existing.get('reason') == 'auto_loss_gate':
+                s = stats.get(symbol)
+                if not s or s['sum_pnl'] >= threshold:
+                    del overrides[symbol]
+                    changed = True
+                    print(f'[symbol_loss_gate] auto-cleared {symbol}', file=sys.stderr)
+
+        for symbol, s in stats.items():
+            if s['sum_pnl'] >= threshold:
+                continue
+            if _active_symbol_loss_unblock(unblocks.get(symbol, {}), now):
+                continue
+            if symbol in unblocks:
+                del unblocks[symbol]
+                changed = True
+            existing = overrides.get(symbol, {})
+            existing_reason = existing.get('reason', '')
+            if existing_reason not in ('', 'auto_loss_gate'):
+                continue  # manual override in place — respect it
+            if existing.get('action') == 'blocked' and existing_reason == 'auto_loss_gate':
+                continue  # already blocked by this gate
+            overrides[symbol] = {
+                'action': 'blocked',
+                'reason': 'auto_loss_gate',
+                'sum_pnl': s['sum_pnl'],
+                'trade_count': s['trade_count'],
+                'blocked_at': datetime.utcnow().isoformat(),
+            }
+            newly_blocked.append(symbol)
+            changed = True
+            print(f'[symbol_loss_gate] auto-blocked {symbol} '
+                  f'(sum_pnl={s["sum_pnl"]}, n={s["trade_count"]})', file=sys.stderr)
+        if changed:
+            raw['symbol_overrides'] = overrides
+            raw['symbol_loss_gate_unblocks'] = unblocks
+            _save_risk_gates_raw(raw)
+        return newly_blocked
+    except Exception as e:
+        print(f'[symbol_loss_gate] apply error: {e}', file=sys.stderr)
+        return []
 
 
 def builtin_strategy_config(key: str, cfg: dict) -> dict:
@@ -2133,6 +2308,9 @@ def score_ticker(
             elif _action == 'force_mild':
                 result['conviction_base'] = max(0, _conviction_before_penalty - 5)
                 result['tags'].append('sym_penalty_mild')
+            elif _action == 'blocked':
+                result['conviction_base'] = 0
+                result['tags'].append('sym_blocked')
 
         return result
     except Exception as e:
@@ -3180,6 +3358,9 @@ def run_scan(
     coinglass_snapshot = get_coin_market_snapshot()
 
     total_pairs = len(tickers)
+
+    # Auto-block symbols that have breached the cumulative loss gate before scoring
+    _apply_symbol_auto_blocks()
 
     sym_perf_cache = _load_symbol_performance_cache()
     sym_overrides = _get_symbol_overrides()
@@ -6462,14 +6643,16 @@ def api_symbol_override_add():
         symbol = (body.get('symbol') or '').strip().upper()
         action = body.get('action', '')
         reason = body.get('reason', '')
-        valid_actions = {'exempt', 'force_mild', 'force_moderate', 'force_severe'}
+        valid_actions = {'exempt', 'force_mild', 'force_moderate', 'force_severe', 'blocked'}
         if not symbol or action not in valid_actions:
             return jsonify({'success': False, 'error': 'symbol and valid action required'}), 400
-        gates = load_risk_gates()
-        if 'symbol_overrides' not in gates:
-            gates['symbol_overrides'] = {}
-        gates['symbol_overrides'][symbol] = {'action': action, 'reason': reason}
-        save_risk_gates(gates)
+        raw = _load_risk_gates_raw()
+        overrides = raw.get('symbol_overrides', {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+        overrides[symbol] = {'action': action, 'reason': reason or 'manual'}
+        raw['symbol_overrides'] = overrides
+        _save_risk_gates_raw(raw)
         return jsonify({'success': True, 'symbol': symbol, 'action': action})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -6480,14 +6663,100 @@ def api_symbol_override_remove(symbol):
     """Removes a symbol from symbol_overrides in risk_gates.json."""
     try:
         symbol = symbol.strip().upper()
-        gates = load_risk_gates()
-        overrides = _get_symbol_overrides()
+        raw = _load_risk_gates_raw()
+        overrides = raw.get('symbol_overrides', {})
+        if not isinstance(overrides, dict):
+            overrides = {}
         if symbol not in overrides:
             return jsonify({'success': False, 'error': f'{symbol} not in overrides'}), 404
         del overrides[symbol]
-        gates['symbol_overrides'] = overrides
-        save_risk_gates(gates)
+        raw['symbol_overrides'] = overrides
+        _save_risk_gates_raw(raw)
         return jsonify({'success': True, 'removed': symbol})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route("/api/risk-gates/symbol-loss-stats", methods=["GET"])
+def api_symbol_loss_stats():
+    """Per-symbol cumulative P&L stats plus current auto-block status."""
+    try:
+        raw = _load_risk_gates_raw()
+        cfg = _symbol_loss_gate_config(raw)
+        threshold = cfg["threshold"]
+        stats = _compute_symbol_loss_stats(
+            min_trades=cfg["min_trades"],
+            lookback_days=cfg["lookback_days"],
+        )
+        overrides = raw.get('symbol_overrides', {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+        unblocks = raw.get('symbol_loss_gate_unblocks', {})
+        if not isinstance(unblocks, dict):
+            unblocks = {}
+        now = datetime.utcnow()
+        result = []
+        for sym, s in sorted(stats.items(), key=lambda x: x[1]['sum_pnl']):
+            override = overrides.get(sym, {})
+            auto_blocked = (override.get('action') == 'blocked'
+                            and override.get('reason') == 'auto_loss_gate')
+            manual_unblocked = _active_symbol_loss_unblock(unblocks.get(sym, {}), now)
+            result.append({
+                'symbol': sym,
+                'sum_pnl': s['sum_pnl'],
+                'avg_pnl': s['avg_pnl'],
+                'worst_pnl': s['worst_pnl'],
+                'trade_count': s['trade_count'],
+                'auto_blocked': auto_blocked,
+                'manual_unblocked': manual_unblocked,
+                'at_risk': s['sum_pnl'] < threshold and not auto_blocked and not manual_unblocked,
+                'blocked_at': override.get('blocked_at') if auto_blocked else None,
+                'unblock_expires_at': unblocks.get(sym, {}).get('expires_at') if manual_unblocked else None,
+            })
+        return jsonify({
+            'success': True,
+            'threshold': threshold,
+            'min_trades': cfg["min_trades"],
+            'lookback_days': cfg["lookback_days"],
+            'unblock_cooldown_hours': cfg["unblock_cooldown_hours"],
+            'symbols': result,
+            'blocked_count': sum(1 for r in result if r['auto_blocked']),
+            'at_risk_count': sum(1 for r in result if r['at_risk']),
+            'manual_unblocked_count': sum(1 for r in result if r['manual_unblocked']),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route("/api/risk-gates/symbol-loss-gate/unblock/<symbol>", methods=["POST"])
+def api_symbol_loss_gate_unblock(symbol):
+    """Manually unblock a symbol from the auto loss gate."""
+    try:
+        symbol = symbol.strip().upper()
+        raw = _load_risk_gates_raw()
+        cfg = _symbol_loss_gate_config(raw)
+        overrides = raw.get('symbol_overrides', {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+        entry = overrides.get(symbol, {})
+        if entry.get('action') != 'blocked' or entry.get('reason') != 'auto_loss_gate':
+            return jsonify({'success': False, 'error': f'{symbol} is not auto-blocked by loss gate'}), 404
+        del overrides[symbol]
+        unblocks = raw.get('symbol_loss_gate_unblocks', {})
+        if not isinstance(unblocks, dict):
+            unblocks = {}
+        now = datetime.utcnow()
+        expires_at = now + timedelta(hours=float(cfg["unblock_cooldown_hours"]))
+        unblocks[symbol] = {
+            'reason': 'manual_unblock',
+            'unblocked_at': now.isoformat(),
+            'expires_at': expires_at.isoformat(),
+        }
+        raw['symbol_overrides'] = overrides
+        raw['symbol_loss_gate_unblocks'] = unblocks
+        _save_risk_gates_raw(raw)
+        print(f'[symbol_loss_gate] manually unblocked {symbol}', file=sys.stderr)
+        return jsonify({'success': True, 'unblocked': symbol, 'expires_at': expires_at.isoformat()})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
