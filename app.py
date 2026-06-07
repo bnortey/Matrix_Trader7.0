@@ -8,9 +8,11 @@ import time
 import threading
 import copy
 import re
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import partial
+from urllib.parse import quote_plus
 
 import requests
 import pandas as pd
@@ -7358,6 +7360,226 @@ def _research_seed_local_corpus() -> dict:
     return {"added": added, "total": len(existing)}
 
 
+def _research_default_web_queries() -> list[dict]:
+    return [
+        {
+            "query": "crypto perpetual futures funding rate crowding liquidation cascade",
+            "tags": ["funding", "liquidity", "risk"],
+            "reason": "Funding Arb and liquidation-risk filters need outside priors on crowding and squeeze behavior.",
+        },
+        {
+            "query": "cryptocurrency order book imbalance market depth short horizon returns",
+            "tags": ["order_flow", "liquidity", "execution"],
+            "reason": "MT7 uses flow_score and depth imbalance; Hermes should track whether literature supports those priors.",
+        },
+        {
+            "query": "cryptocurrency momentum reversal RSI overbought oversold intraday trading",
+            "tags": ["momentum", "mean_reversion", "volatility"],
+            "reason": "Focus-short and balanced filters rely on regime-specific continuation versus reversal behavior.",
+        },
+        {
+            "query": "volatility regime position sizing stop loss cryptocurrency futures",
+            "tags": ["volatility", "risk", "execution"],
+            "reason": "Paper bot outcomes depend heavily on ATR regimes, stop distance, fees, and slippage.",
+        },
+    ]
+
+
+def _research_source_exists(sources: list[dict], candidate: dict) -> bool:
+    url = str(candidate.get("url") or "").strip().lower()
+    title = str(candidate.get("title") or "").strip().lower()
+    cid = candidate.get("id")
+    for source in sources:
+        if cid and source.get("id") == cid:
+            return True
+        if url and str(source.get("url") or "").strip().lower() == url:
+            return True
+        if title and str(source.get("title") or "").strip().lower() == title:
+            return True
+    return False
+
+
+def _research_web_relevance(query: str, title: str, summary: str, tags: list[str]) -> float | None:
+    text = f"{query} {title} {summary}".lower()
+    source_text = f"{title} {summary}".lower()
+    domain_terms = [
+        "crypto", "cryptocurrency", "bitcoin", "btc", "ethereum", "digital asset",
+        "perpetual", "perpetual swap", "funding rate", "liquidation", "liquidations",
+        "order book", "limit order", "market depth", "market microstructure",
+        "trading", "exchange", "futures market", "derivatives", "volatility",
+        "momentum", "mean reversion", "overbought", "oversold",
+    ]
+    tag_terms = [str(t).replace("_", " ").lower() for t in tags or []]
+    domain_hits = sum(1 for term in domain_terms if term in source_text)
+    tag_hits = sum(1 for term in tag_terms if term and term in text)
+
+    # Require actual source text to mention the trading/crypto domain. Query
+    # terms alone do not count, which avoids generic "futures" false positives.
+    if domain_hits < 2 and not any(term in source_text for term in ("crypto", "cryptocurrency", "bitcoin", "ethereum", "perpetual swap", "funding rate", "order book")):
+        return None
+    return round(min(0.94, 0.55 + domain_hits * 0.045 + tag_hits * 0.025), 2)
+
+
+def _research_fetch_arxiv(query: str, tags: list[str], limit: int) -> list[dict]:
+    url = (
+        "https://export.arxiv.org/api/query"
+        f"?search_query=all:{quote_plus(query)}&start=0&max_results={max(1, min(limit, 8))}"
+        "&sortBy=submittedDate&sortOrder=descending"
+    )
+    resp = requests.get(url, timeout=12, headers={"User-Agent": "MatrixTrader7-HermesResearch/1.0"})
+    resp.raise_for_status()
+    root = ET.fromstring(resp.text)
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    out: list[dict] = []
+    for entry in root.findall("a:entry", ns):
+        title = re.sub(r"\s+", " ", (entry.findtext("a:title", "", ns) or "")).strip()
+        summary = re.sub(r"\s+", " ", (entry.findtext("a:summary", "", ns) or "")).strip()
+        link = entry.findtext("a:id", "", ns) or ""
+        published = entry.findtext("a:published", "", ns) or None
+        authors = [
+            re.sub(r"\s+", " ", a.findtext("a:name", "", ns) or "").strip()
+            for a in entry.findall("a:author", ns)
+        ]
+        if not title:
+            continue
+        relevance = _research_web_relevance(query, title, summary, tags)
+        if relevance is None:
+            continue
+        payload = {
+            "id": "web_" + _research_slug_id("arxiv", link, title),
+            "title": title[:180],
+            "url": link,
+            "source_type": "web_academic_arxiv",
+            "author": ", ".join([a for a in authors if a][:3]) or None,
+            "published_at": published,
+            "added_at": _research_now(),
+            "discovered_at": _research_now(),
+            "discovery_provider": "arxiv",
+            "discovery_query": query,
+            "discovery_reason": "",
+            "tags": sorted(set((tags or []) + _research_extract_tags(title + " " + summary)))[:8],
+            "summary": _research_summarize_text(summary),
+            "raw_excerpt": summary[:3000],
+            "quality_score": 0.82,
+            "relevance_score": relevance,
+            "status": "web_discovered",
+        }
+        payload["hypotheses"] = _research_hypotheses_from_source(payload)
+        out.append(payload)
+    return out
+
+
+def _research_fetch_crossref(query: str, tags: list[str], limit: int) -> list[dict]:
+    url = (
+        "https://api.crossref.org/works"
+        f"?query.bibliographic={quote_plus(query)}&rows={max(1, min(limit, 8))}"
+        "&sort=published&order=desc"
+    )
+    resp = requests.get(url, timeout=12, headers={"User-Agent": "MatrixTrader7-HermesResearch/1.0 (mailto:research@example.invalid)"})
+    resp.raise_for_status()
+    items = (((resp.json() or {}).get("message") or {}).get("items") or [])
+    out: list[dict] = []
+    for item in items:
+        titles = item.get("title") or []
+        title = re.sub(r"\s+", " ", str(titles[0] if titles else "")).strip()
+        if not title:
+            continue
+        abstract = re.sub(r"<[^>]+>", " ", str(item.get("abstract") or ""))
+        abstract = re.sub(r"\s+", " ", abstract).strip()
+        doi = item.get("DOI")
+        link = item.get("URL") or (f"https://doi.org/{doi}" if doi else "")
+        date_parts = (((item.get("published-print") or item.get("published-online") or item.get("issued") or {}).get("date-parts") or [[]])[0])
+        published = "-".join(str(x) for x in date_parts[:3]) if date_parts else None
+        authors = item.get("author") or []
+        author_names = [
+            " ".join(x for x in [a.get("given"), a.get("family")] if x)
+            for a in authors[:3] if isinstance(a, dict)
+        ]
+        container = item.get("container-title", [""])[0] if item.get("container-title") else ""
+        summary = abstract or f"{container or 'Crossref indexed source'}."
+        relevance = _research_web_relevance(query, title, summary, tags)
+        if relevance is None:
+            continue
+        payload = {
+            "id": "web_" + _research_slug_id("crossref", link, title),
+            "title": title[:180],
+            "url": link or None,
+            "source_type": "web_academic_crossref",
+            "author": ", ".join(author_names) or None,
+            "published_at": published,
+            "added_at": _research_now(),
+            "discovered_at": _research_now(),
+            "discovery_provider": "crossref",
+            "discovery_query": query,
+            "discovery_reason": "",
+            "tags": sorted(set((tags or []) + _research_extract_tags(title + " " + summary)))[:8],
+            "summary": _research_summarize_text(summary),
+            "raw_excerpt": summary[:3000],
+            "quality_score": 0.78,
+            "relevance_score": relevance,
+            "status": "web_discovered",
+        }
+        payload["hypotheses"] = _research_hypotheses_from_source(payload)
+        out.append(payload)
+    return out
+
+
+def _research_discover_web_sources(payload: dict | None = None) -> dict:
+    payload = payload if isinstance(payload, dict) else {}
+    raw_queries = payload.get("queries")
+    if isinstance(raw_queries, list) and raw_queries:
+        query_specs = []
+        for q in raw_queries[:8]:
+            if isinstance(q, dict):
+                query_specs.append({
+                    "query": str(q.get("query") or "").strip(),
+                    "tags": q.get("tags") if isinstance(q.get("tags"), list) else [],
+                    "reason": str(q.get("reason") or "User requested Hermes external research discovery.").strip(),
+                })
+            else:
+                query_specs.append({"query": str(q).strip(), "tags": [], "reason": "User requested Hermes external research discovery."})
+        query_specs = [q for q in query_specs if q["query"]]
+    else:
+        query_specs = _research_default_web_queries()
+
+    providers = payload.get("providers") if isinstance(payload.get("providers"), list) else ["arxiv", "crossref"]
+    providers = [str(p).lower() for p in providers if str(p).lower() in {"arxiv", "crossref"}] or ["arxiv", "crossref"]
+    per_query = max(1, min(int(payload.get("per_query") or 3), 6))
+    sources = _research_load_sources()
+    added_sources: list[dict] = []
+    errors: list[dict] = []
+
+    for spec in query_specs:
+        query = spec["query"]
+        tags = [str(t).strip() for t in spec.get("tags") or [] if str(t).strip()]
+        candidates: list[dict] = []
+        for provider in providers:
+            try:
+                if provider == "arxiv":
+                    candidates.extend(_research_fetch_arxiv(query, tags, per_query))
+                elif provider == "crossref":
+                    candidates.extend(_research_fetch_crossref(query, tags, per_query))
+            except Exception as e:
+                errors.append({"query": query, "provider": provider, "error": str(e)[:300]})
+        for candidate in candidates:
+            candidate["discovery_reason"] = spec.get("reason") or ""
+            if _research_source_exists(sources, candidate) or _research_source_exists(added_sources, candidate):
+                continue
+            sources.insert(0, candidate)
+            added_sources.append(candidate)
+
+    if added_sources:
+        _research_save_sources(sources)
+    return {
+        "queries": query_specs,
+        "providers": providers,
+        "added": len(added_sources),
+        "added_sources": added_sources[:12],
+        "errors": errors,
+        "total": len(sources),
+    }
+
+
 def _research_ingest_source(payload: dict) -> dict:
     title = str(payload.get("title") or "").strip()
     url = str(payload.get("url") or "").strip()
@@ -8690,6 +8912,22 @@ def api_research_seed_local():
         return jsonify({"success": True, **result, "pipeline": _hermes_research_pipeline_summary()})
     except Exception as e:
         print(f"[api/research/seed-local] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/research/web-discover', methods=['POST'])
+def api_research_web_discover():
+    """Run controlled external web discovery for Hermes Research.
+
+    Uses curated/default queries unless a small query list is supplied. Results
+    are stored as advisory sources and converted only into shadow hypotheses.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = _research_discover_web_sources(payload)
+        return jsonify({"success": True, **result, "pipeline": _hermes_research_pipeline_summary()})
+    except Exception as e:
+        print(f"[api/research/web-discover] error: {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
 
 

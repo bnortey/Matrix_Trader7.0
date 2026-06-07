@@ -9472,6 +9472,7 @@ function renderHermesResearchPipeline(research) {
           <div style="font-size:12px;color:var(--muted);line-height:1.45;margin-top:4px;">Library items and source-derived hypotheses are advisory only. They do not change MT7 scoring until validated out of sample.</div>
         </div>
         <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center;">
+          <button onclick="runHermesWebDiscovery()" id="btn-research-web" style="background:#18251d;border:1px solid rgba(0,230,118,0.28);color:var(--green);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Web Discover</button>
           <button onclick="seedHermesResearch()" id="btn-research-seed" style="background:#1a2535;border:1px solid #2a4060;color:#7eb8f7;padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Index Local Corpus</button>
           <button onclick="runHermesResearchMemo()" id="btn-research-memo" style="background:rgba(0,230,118,0.12);border:1px solid rgba(0,230,118,0.35);color:var(--green);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Generate Memo</button>
           <button onclick="showAddResearchSource()" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Add Source</button>
@@ -9529,6 +9530,32 @@ async function seedHermesResearch() {
   } catch(e) {
     if (el) el.textContent = 'Research indexing failed: ' + (e.message || e);
     showOverrideMsg('Research indexing failed: ' + (e.message || e), true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function runHermesWebDiscovery() {
+  const el = document.getElementById('research-pipeline-status');
+  const btn = document.getElementById('btn-research-web');
+  if (btn) btn.disabled = true;
+  if (el) el.textContent = 'Searching arXiv and Crossref for Hermes research sources...';
+  try {
+    const res = await fetch('/api/intelligence/research/web-discover', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({per_query: 3}),
+    });
+    const d = await res.json();
+    if (!d.success) throw new Error(d.error || 'web discovery failed');
+    I.researchPipeline = d.pipeline || null;
+    if (I.hermes) I.hermes.research = Object.assign({}, I.hermes.research || {}, d.pipeline || {});
+    renderIntelligence();
+    const errMsg = (d.errors || []).length ? ` (${d.errors.length} provider warnings)` : '';
+    showOverrideMsg(`Hermes web discovery added ${d.added || 0} sources${errMsg}.`);
+  } catch(e) {
+    if (el) el.textContent = 'Web discovery failed: ' + (e.message || e);
+    showOverrideMsg('Hermes web discovery failed: ' + (e.message || e), true);
   } finally {
     if (btn) btn.disabled = false;
   }
