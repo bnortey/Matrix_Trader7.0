@@ -11,10 +11,13 @@ PENDING_PATH = os.path.join(SUGGESTIONS_DIR, 'pending.json')
 REJECTED_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'rejected_suggestions.json')
 
 THRESHOLD_MIN_SAMPLE = 80
-THRESHOLD_MIN_NE_DELTA = 5.0
+THRESHOLD_MIN_NE_DELTA = 1.0
 REGIME_MIN_SAMPLE = 50
 REGIME_MAX_WIN_RATE = 0.35
+REGIME_MAX_WIN_PARTIAL_RATE = 0.45
+REGIME_MAX_AVG_PNL = 0.0
 REGIME_MIN_OTHER_WIN_RATE = 0.55
+REGIME_MIN_OTHER_AVG_PNL = 0.0
 NEW_STRAT_MIN_SAMPLE = 100
 NEW_STRAT_MIN_WIN_RATE = 0.55
 NEW_STRAT_MIN_AVG_PNL = -2.0  # after assumed costs
@@ -89,12 +92,22 @@ def run_strategy_proposal_check(db_path=None):
             current = info.get('current_implied_threshold')
             sample = info.get('optimal_sample_size', 0)
             ne = info.get('optimal_net_expectancy')
+            current_ne = info.get('current_net_expectancy')
+            ne_delta = info.get('net_expectancy_delta')
             delta = info.get('delta_from_current', 0)
             wr = info.get('optimal_win_rate')
+            wpr = info.get('optimal_win_partial_rate')
+            current_wpr = info.get('current_win_partial_rate')
+            loss_streak = info.get('optimal_max_loss_streak')
+            current_loss_streak = info.get('current_max_loss_streak')
 
             if sample < THRESHOLD_MIN_SAMPLE:
                 continue
             if ne is None or delta <= 0:
+                continue
+            if ne_delta is None or ne_delta < THRESHOLD_MIN_NE_DELTA:
+                continue
+            if current_ne is not None and ne <= current_ne:
                 continue
             if _already_exists(existing, 'threshold', strat, 'suggested_value', optimal):
                 continue
@@ -112,18 +125,28 @@ def run_strategy_proposal_check(db_path=None):
                 'status': 'pending_review',
                 'confidence': info.get('confidence', 'low'),
                 'sample_size': sample,
-                'evidence_summary': f'{strat}: raising min conviction from {current} to {optimal} improves net expectancy (sample: {sample} trades)',
+                'evidence_summary': (
+                    f'{strat}: raising min conviction from {current} to {optimal} improves net EV '
+                    f'from {round(current_ne or 0, 2)}% to {round(ne, 2)}%/trade '
+                    f'(sample: {sample} trades)'
+                ),
                 'reasoning': (
-                    f'Based on {sample} closed trades for {strat}, the optimal conviction threshold '
-                    f'is {optimal} (current implied: {current}). At threshold {optimal}, win rate is '
-                    f'{round((wr or 0)*100,1)}% with net expectancy {round(ne,2)}. '
+                    f'Based on {sample} closed trades with net P&L, the optimal conviction threshold '
+                    f'is {optimal} (current implied: {current}). Average net EV improves by '
+                    f'{round(ne_delta,2)} percentage points per trade, from '
+                    f'{round(current_ne or 0,2)}% to {round(ne,2)}%. W+P rate moves from '
+                    f'{round((current_wpr or 0)*100,1)}% to {round((wpr or 0)*100,1)}%, while '
+                    f'max loss streak moves from {current_loss_streak} to {loss_streak}. '
                     f'Raising the threshold will reduce trade count by roughly {trade_pct_drop}% '
-                    f'but improve quality of entries.'
+                    f'but improves the actual optimization target: net EV.'
                 ),
                 'current_value': current,
                 'suggested_value': optimal,
-                'expected_win_rate_delta': f'+{round((wr or 0)*100,1)}% at new threshold',
+                'expected_net_ev_delta': f'+{round(ne_delta, 2)} pct/trade',
+                'expected_win_rate_delta': f'{round((wr or 0)*100,1)}% strict WIN at new threshold',
+                'expected_win_partial_rate': f'{round((wpr or 0)*100,1)}% W+P at new threshold',
                 'expected_trade_count_delta': f'-{trade_pct_drop}% fewer trades',
+                'objective': info.get('objective', 'net_ev_primary'),
                 'api_payload': {'min_conviction': optimal},
             }
             new_suggestions.append(sug)
@@ -134,13 +157,23 @@ def run_strategy_proposal_check(db_path=None):
             for regime, info in regimes.items():
                 count = info.get('count', 0)
                 wr = info.get('win_rate')
+                wpr = info.get('win_partial_rate')
+                avg_pnl = info.get('avg_pnl')
                 if count < REGIME_MIN_SAMPLE or wr is None:
                     continue
-                if wr >= REGIME_MAX_WIN_RATE:
+                if avg_pnl is None:
+                    continue
+                poor_labels = wr < REGIME_MAX_WIN_RATE and (wpr or 0) < REGIME_MAX_WIN_PARTIAL_RATE
+                poor_ev = avg_pnl < REGIME_MAX_AVG_PNL
+                if not (poor_labels or poor_ev):
                     continue
                 # check other regimes have decent win rates
                 others = {r: d for r, d in regimes.items()
-                          if r != regime and (d.get('win_rate') or 0) >= REGIME_MIN_OTHER_WIN_RATE}
+                          if r != regime
+                          and (
+                              (d.get('win_partial_rate') or d.get('win_rate') or 0) >= REGIME_MIN_OTHER_WIN_RATE
+                              or (d.get('avg_pnl') is not None and d.get('avg_pnl') >= REGIME_MIN_OTHER_AVG_PNL)
+                          )}
                 if not others:
                     continue
                 if _already_exists(existing, 'regime_suppress', strat, 'regime', regime):
@@ -148,9 +181,9 @@ def run_strategy_proposal_check(db_path=None):
                 if (strat, 'regime_suppress', regime) in rejected_keys:
                     continue
 
-                allowed = [r for r in regimes if r != regime]
                 others_str = ', '.join(
-                    r + ':' + str(round(d['win_rate'] * 100, 1)) + '%'
+                    r + ':W+P ' + str(round((d.get('win_partial_rate') or d.get('win_rate') or 0) * 100, 1)) + '%'
+                    + ', EV ' + str(round(d.get('avg_pnl') or 0, 2)) + '%'
                     for r, d in others.items()
                 )
                 sid = f'regime_{strat}_{regime}_{datetime.now(timezone.utc).strftime("%Y%m%d")}_{len(new_suggestions)+1:03d}'
@@ -162,18 +195,33 @@ def run_strategy_proposal_check(db_path=None):
                     'status': 'pending_review',
                     'confidence': 'medium' if count < 80 else 'high',
                     'sample_size': count,
-                    'evidence_summary': f'{strat} in {regime}: win rate {round(wr*100,1)}% across {count} trades — suppress regime',
+                    'evidence_summary': (
+                        f'{strat} in {regime}: strict win {round(wr*100,1)}%, '
+                        f'W+P {round((wpr or 0)*100,1)}%, net EV {round(avg_pnl,2)}% '
+                        f'across {count} trades — suppress regime'
+                    ),
                     'reasoning': (
-                        f'{strat} performs poorly in {regime} regime: {round(wr*100,1)}% win rate '
-                        f'across {count} trades. Other regimes show better results '
+                        f'{strat} performs poorly in {regime}: strict win {round(wr*100,1)}%, '
+                        f'W+P {round((wpr or 0)*100,1)}%, and net EV {round(avg_pnl,2)}% '
+                        f'across {count} trades. Other regimes show better net or W+P results '
                         f'({others_str}). '
                         f'Suppressing {regime} should improve overall quality.'
                     ),
                     'regime': regime,
                     'current_behavior': 'active',
                     'win_rate_in_regime': round(wr, 4),
-                    'comparison_regimes': {r: round(d['win_rate'], 4) for r, d in others.items()},
-                    'api_payload': {'allowed_volatility': allowed},
+                    'win_partial_rate_in_regime': round(wpr, 4) if wpr is not None else None,
+                    'net_ev_in_regime': round(avg_pnl, 2),
+                    'comparison_regimes': {
+                        r: {
+                            'win_rate': round(d.get('win_rate') or 0, 4),
+                            'win_partial_rate': round((d.get('win_partial_rate') or d.get('win_rate') or 0), 4),
+                            'avg_pnl': round(d.get('avg_pnl') or 0, 2),
+                        }
+                        for r, d in others.items()
+                    },
+                    'expected_ev_label': f'Regime EV: {round(avg_pnl, 2)}%/trade (drag removed if suppressed)',
+                    'api_payload': {'blocked_agent_regimes': [regime]},
                 }
                 new_suggestions.append(sug)
 
