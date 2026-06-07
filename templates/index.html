@@ -8989,6 +8989,7 @@ function suggestionStatusBadge(status) {
     rejected: ['Rejected', '#ef4444', '#190909'],
     evaluated: ['Evaluated', '#22c55e', '#07180f'],
     applied: ['Applied', '#22c55e', '#07180f'],
+    parked: ['Parked', '#a78bfa', '#171027'],
     dismissed: ['Dismissed', '#667085', '#111'],
   };
   const [label, color, bg] = map[status] || [status || 'Unknown', '#667085', '#111'];
@@ -9030,6 +9031,7 @@ function renderSuggestionCard(sug, active = false) {
         <div style="background:#0d1b2e;border-radius:3px;height:5px;overflow:hidden;">
           <div style="background:#3b82f6;height:100%;width:${pct}%;transition:width .3s;border-radius:3px;"></div>
         </div>
+        <button onclick="parkSuggestion('${encodeURIComponent(sug.id || '')}')" style="margin-top:9px;background:#211536;color:#c4b5fd;border:1px solid #6d28d9;padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Park Evaluation</button>
       </div>`;
     })() : ''}
     ${canAct ? `<div style="display:flex;gap:8px;">
@@ -9037,6 +9039,7 @@ function renderSuggestionCard(sug, active = false) {
       <button onclick="rejectSuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#1b0808;color:#fca5a5;border:1px solid #7f1d1d;padding:8px;border-radius:5px;font-size:12px;cursor:pointer;">Reject</button>
     </div>` : ''}
     ${sug.reject_reason ? `<div style="font-size:10px;color:#9ca3af;margin-top:8px;">Reason: ${esc(sug.reject_reason)}</div>` : ''}
+    ${sug.park_reason ? `<div style="font-size:10px;color:#9ca3af;margin-top:8px;">Parked: ${esc(sug.park_reason)}</div>` : ''}
   </div>`;
 }
 
@@ -9044,7 +9047,7 @@ function renderSuggestionsPanel() {
   const suggestions = I.suggestions || [];
   const pending = suggestions.filter(s => ['pending_review', 'pending'].includes(s.status));
   const evaluating = suggestions.filter(s => s.status === 'evaluating');
-  const history = suggestions.filter(s => ['rejected', 'evaluated', 'applied', 'dismissed'].includes(s.status));
+  const history = suggestions.filter(s => ['rejected', 'evaluated', 'applied', 'dismissed', 'parked'].includes(s.status));
   const active = evaluating[0] || pending[0];
   const queue = pending.filter(s => !active || s.id !== active.id);
   const baseline = I.suggestionBaseline || {};
@@ -9652,6 +9655,26 @@ async function rejectSuggestion(sid) {
     if (typeof loadGoalBenchmark === 'function') loadGoalBenchmark();
   } catch (e) {
     alert('Reject failed: ' + (e.message || e));
+  }
+}
+
+async function parkSuggestion(sid) {
+  sid = decodeURIComponent(sid || '');
+  const reason = prompt('Why park this evaluation?', 'Strategy disabled; evaluation cannot reach trade window') ?? '';
+  if (!reason.trim()) return;
+  try {
+    const res = await fetch(`/api/intelligence/suggestions/${encodeURIComponent(sid)}/park`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({reason}),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'park failed');
+    showOverrideMsg('Evaluation parked. Learner queue unlocked.');
+    await loadSuggestions(true);
+    if (typeof loadGoalBenchmark === 'function') loadGoalBenchmark();
+  } catch (e) {
+    alert('Park failed: ' + (e.message || e));
   }
 }
 

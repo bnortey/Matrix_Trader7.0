@@ -8295,6 +8295,50 @@ def api_suggestion_reject(suggestion_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/intelligence/suggestions/<suggestion_id>/park", methods=["POST"])
+def api_suggestion_park(suggestion_id):
+    """Park an evaluating suggestion that cannot reach its evaluation window.
+
+    Parking is intentionally neutral: it unlocks the one-at-a-time learner queue
+    without writing a rejection record or reverting any applied overlay.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = body.get("reason") or "evaluation parked manually"
+        suggestions = _load_suggestions()
+        suggestion = next((s for s in suggestions if s.get("id") == suggestion_id), None)
+        if not suggestion:
+            return jsonify({"success": False, "error": "Suggestion not found"}), 404
+        if suggestion.get("status") != "evaluating":
+            return jsonify({
+                "success": False,
+                "error": f"Status is {suggestion.get('status')}, not evaluating",
+            }), 409
+
+        parked_at = datetime.utcnow().isoformat()
+        extra = {
+            "parked_at": parked_at,
+            "park_reason": reason,
+            "previous_status": "evaluating",
+        }
+        if not _update_suggestion_status(suggestion_id, "parked", extra):
+            return jsonify({"success": False, "error": "Failed to update suggestion"}), 500
+        _append_experiment_record({
+            "id": suggestion_id,
+            "type": "suggestion_parked",
+            "strategy": suggestion.get("strategy"),
+            "suggestion_type": suggestion.get("type"),
+            "reason": reason,
+            "parked_at": parked_at,
+            "baseline": suggestion.get("baseline"),
+            "trades_since_baseline": suggestion.get("trades_since_baseline"),
+        })
+        return jsonify({"success": True, "parked": suggestion_id, "parked_at": parked_at})
+    except Exception as e:
+        print(f"[api/suggestion/park] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/intelligence/research')
 def api_intelligence_research():
     """Read strategy hypothesis briefs from the mt-learner research firm."""

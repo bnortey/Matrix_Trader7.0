@@ -268,6 +268,7 @@ Sentiment APIs (no key needed):
 | `/api/intelligence/suggestions/<id>` | PATCH | Legacy apply/dismiss (backward compat) |
 | `/api/intelligence/suggestions/<id>/apply` | POST | Apply suggestion — one-at-a-time enforced |
 | `/api/intelligence/suggestions/<id>/reject` | POST | Reject suggestion, write to rejection log |
+| `/api/intelligence/suggestions/<id>/park` | POST | Park stale evaluating suggestion without rejecting or reverting overlay |
 | `/api/intelligence/research` | GET | Strategy hypothesis briefs |
 | `/api/intelligence/roster` | GET | Cipher Research Group analyst roster |
 | `/api/intelligence/reports/daily` | GET | Daily Cipher report (cached); rejects future dates |
@@ -617,6 +618,10 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 - Tightened paper config again: disabled `mean_reversion` after the post-tightening sample showed `7` closed trades with negative avg net P&L on both LONG and SHORT sides.
 - Started new paper cohort: `current_cohort_started_at="2026-06-07T14:50:00"`, `current_cohort_label="Focus-short only cohort"`. Active strategies are now `balanced_focus_short` and `funding_arb_focus_short`; current cohort count starts at `0/20`.
 - The pending `regime_funding_arb_choppy_20260529_001` suggestion was not applied. The app correctly blocks it because `regime_balanced_low_liquidity_20260524_001` is still `evaluating`; also, base `funding_arb` is disabled, so applying it now would create another stale evaluation guard. Revisit after adding an explicit "finish/park experiment" path or re-enabling base `funding_arb`.
+- Added `POST /api/intelligence/suggestions/<id>/park` plus a Suggestions-tab `Park Evaluation` button for evaluating suggestions that cannot reach the trade window. Parking is neutral: it unlocks the learner queue, records `parked_at` / `park_reason`, appends an experiment-ledger note, and does not write a rejection record or revert overlays.
+- Parked `regime_balanced_low_liquidity_20260524_001` because `balanced` is disabled and the evaluation was stuck at `9/20`; the `balanced.blocked_agent_regimes=["low_liquidity"]` guard remains active.
+- Applied then parked `regime_funding_arb_choppy_20260529_001`: production `strategy_overrides.json` now has `funding_arb.blocked_agent_regimes=["choppy"]` and `funding_arb.min_conviction=69`; it is parked because base `funding_arb` is disabled and cannot generate an active evaluation cohort.
+- Final learner status: `learner_running=true`; suggestions are `thresh_balanced_20260523_001=applied`, `regime_balanced_low_liquidity_20260524_001=parked`, `regime_funding_arb_choppy_20260529_001=parked`. Learner queue is unlocked for future suggestions.
 
 ### 2026-05-24 — Session summary (paper realism, regime cleanup, net-EV learner)
 
