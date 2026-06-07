@@ -6,7 +6,7 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-06-01
+Last updated: 2026-06-07
 Last commit: 70dfed4 docs: update Vultr production handoff
 app.py: 9,388 lines
 index.html: 9,214 lines
@@ -608,6 +608,15 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 ---
 
 ## Session Notes
+
+### 2026-06-07 — Session summary (learner heartbeat + focus-short paper cohort)
+
+- Fixed misleading `learner_running: false` UI/API status: `mt-learner/learner.py` now writes `logs/last_heartbeat.txt` every 60 seconds while the scheduler loop is alive, not only when the 30-minute feature job runs.
+- Deployed `mt-learner/learner.py` to production `207.148.66.39`; restarted `mt-learner`; service is active and `/api/intelligence/suggestions` now reports `learner_running: true`.
+- Confirmed Claude's earlier diagnosis: disabled-strategy "leaks" in the post-tightening cohort were old open/pending trades closing after the cutoff, not new disabled entries. Current paper config was already blocking `balanced`, `custom_balanced_no_extreme_vol`, `funding_arb`, and `momentum_breakout`.
+- Tightened paper config again: disabled `mean_reversion` after the post-tightening sample showed `7` closed trades with negative avg net P&L on both LONG and SHORT sides.
+- Started new paper cohort: `current_cohort_started_at="2026-06-07T14:50:00"`, `current_cohort_label="Focus-short only cohort"`. Active strategies are now `balanced_focus_short` and `funding_arb_focus_short`; current cohort count starts at `0/20`.
+- The pending `regime_funding_arb_choppy_20260529_001` suggestion was not applied. The app correctly blocks it because `regime_balanced_low_liquidity_20260524_001` is still `evaluating`; also, base `funding_arb` is disabled, so applying it now would create another stale evaluation guard. Revisit after adding an explicit "finish/park experiment" path or re-enabling base `funding_arb`.
 
 ### 2026-05-24 — Session summary (paper realism, regime cleanup, net-EV learner)
 

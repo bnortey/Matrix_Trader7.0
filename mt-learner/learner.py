@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import sched
+import threading
 import logging
 import logging.handlers
 from datetime import datetime, timezone
@@ -45,6 +46,7 @@ INTERVAL_PROPOSAL   = 24 * 60 * 60 # 24 hr
 INTERVAL_HYPOTHESIS = 6  * 60 * 60 # 6 hr
 INTERVAL_REEVAL     = 24 * 60 * 60 # 24 hr
 INTERVAL_COACH      = 12 * 60 * 60 # 12 hr
+INTERVAL_HEARTBEAT  = 60            # service liveness marker
 
 
 def _heartbeat():
@@ -53,6 +55,18 @@ def _heartbeat():
             f.write(datetime.now(timezone.utc).isoformat())
     except Exception:
         pass
+
+
+def start_heartbeat_loop():
+    """Keep the liveness heartbeat fresh between scheduled learner jobs."""
+    def _loop():
+        while True:
+            _heartbeat()
+            time.sleep(INTERVAL_HEARTBEAT)
+
+    t = threading.Thread(target=_loop, name='mt-learner-heartbeat', daemon=True)
+    t.start()
+    return t
 
 
 def job_feature():
@@ -216,6 +230,7 @@ if __name__ == '__main__':
         logger.info('DRY RUN: complete, exiting 0')
         sys.exit(0)
     else:
+        start_heartbeat_loop()
         logger.info('Running initial jobs on startup...')
         run_all_once()
         logger.info('Starting scheduler loop...')
