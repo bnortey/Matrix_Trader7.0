@@ -29,7 +29,13 @@ from lib.indicators import (
 from lib.laddering import generate_ladders
 from lib.ai_client import call_ai
 from lib.risk_controls import compute_daily_pnl, compute_position_size, get_readiness_verdict
-from lib.order_flow import flow_confirm as _flow_confirm
+from lib.order_flow import (
+    flow_confirm as _flow_confirm,
+    fetch_recent_trades as _fetch_recent_trades,
+    fetch_depth_snapshot as _fetch_depth_snapshot,
+    compute_delta as _compute_flow_delta,
+    compute_depth_walls as _compute_depth_walls,
+)
 from lib.exchange_data import (
     normalize_ticker_for_scoring,
     fetch_klines,
@@ -52,6 +58,8 @@ from lib.hyperliquid_client import (
     fetch_hl_account,
     normalize_hl_tickers,
 )
+from lib.bybit_client import fetch_bybit_candles, bybit_symbol_to_raw
+from lib.risk_liquidation import estimate_liquidation_price
 
 load_dotenv()
 
@@ -141,6 +149,7 @@ ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
 DB_PATH = "data/signals.db"
 RISK_GATES_PATH = "data/risk_gates.json"
 STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
+EXPERIMENT_LEDGER_PATH = "data/experiment_ledger.json"
 AI_SETTINGS_PATH   = "data/ai_settings.json"
 PAPER_CONFIG_PATH  = "data/paper_config.json"
 GOALS_PATH         = "data/trading_goals.json"
@@ -152,6 +161,10 @@ LEARNER_REJECTED_PATH = (
 LEARNER_HEARTBEAT_PATH = os.getenv("LEARNER_HEARTBEAT_PATH") or "/opt/mt-learner/logs/last_heartbeat.txt"
 REPORT_NARRATIVE_MODE = (os.getenv("REPORT_NARRATIVE_MODE") or "free").strip().lower()
 REPORT_FREE_AI_PROVIDERS = {"gemini", "groq", "ollama"}
+HERMES_DIR = os.path.join("data", "hermes")
+HERMES_RESEARCH_DIR = os.path.join(HERMES_DIR, "research")
+HERMES_RESEARCH_SOURCES_PATH = os.path.join(HERMES_RESEARCH_DIR, "sources.json")
+HERMES_RESEARCH_MEMO_PATH = os.path.join(HERMES_RESEARCH_DIR, "latest_weekly_memo.json")
 
 _PAPER_CONFIG_DEFAULT = {
     "enabled":               False,
@@ -165,6 +178,24 @@ _PAPER_CONFIG_DEFAULT = {
     "max_open_positions":    4,
     "max_atr_pct":           3.43,
     "max_trend_score_abs":   41,
+    "entry_timeout_hours":   24,
+    "max_holding_hours":     80,
+    "paper_maker_fee_bps":   0.0,
+    "paper_taker_fee_bps":   2.0,
+    "paper_slippage_bps":    3.0,
+    "paper_stop_mode":       "static",  # static | breakeven_after_tp1 | tp_ladder_lock | atr_trailing
+    "paper_breakeven_buffer_bps": 5.0,
+    "paper_trailing_atr_mult":    1.0,
+    "paper_margin_mode":     "isolated",
+    # Safety controls
+    "loss_streak_pause_n":        4,      # consecutive losses per strategy → cooldown
+    "loss_streak_cooldown_hours": 12.0,   # hours to pause that strategy
+    "drawdown_reduce_pct":        20.0,   # account drawdown % to trigger risk reduction
+    "cold_streak_flow_boost_n":   3,      # last N all-losses → boost min_flow_score
+    "current_cohort_started_at":   None,   # ISO timestamp for current paper validation cohort
+    "current_cohort_label":        None,   # short UI label for the current paper validation cohort
+    "_strategy_cooldowns":        {},     # internal: strategy_key → resume_at ISO
+    "_known_strategies":          [],     # internal: strategies seen before (new ones auto-blocked)
 }
 
 
@@ -459,6 +490,8 @@ def init_db() -> None:
     """Create the signals history table if it doesn't exist."""
     os.makedirs("data", exist_ok=True)
     os.makedirs("data/reports", exist_ok=True)
+    os.makedirs(HERMES_DIR, exist_ok=True)
+    os.makedirs(HERMES_RESEARCH_DIR, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS signals (
@@ -696,11 +729,64 @@ def init_db() -> None:
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades (status, opened_at)")
-    for _col, _type in [("atr_pct", "REAL"), ("trend_score", "REAL")]:
+    for _col, _type in [
+        ("atr_pct", "REAL"),
+        ("trend_score", "REAL"),
+        ("queued_at", "TEXT"),
+        ("filled_at", "TEXT"),
+        ("gross_pnl_pct", "REAL"),
+        ("fee_cost_pct", "REAL"),
+        ("slippage_cost_pct", "REAL"),
+        ("exchange", "TEXT DEFAULT 'MEXC'"),
+        ("margin_mode", "TEXT DEFAULT 'isolated'"),
+        ("liquidation_px", "REAL"),
+        ("liquidation_distance_pct", "REAL"),
+        ("liquidation_mmr", "REAL"),
+        ("liquidation_fee_rate", "REAL"),
+        ("liquidation_formula", "TEXT"),
+        ("liquidation_tier", "TEXT"),
+    ]:
         try:
             con.execute(f"ALTER TABLE paper_trades ADD COLUMN {_col} {_type}")
         except sqlite3.OperationalError:
             pass
+    con.execute("UPDATE paper_trades SET queued_at=opened_at WHERE queued_at IS NULL")
+    con.execute("UPDATE paper_trades SET filled_at=opened_at WHERE filled_at IS NULL AND status IN ('open','closed')")
+    con.execute("UPDATE paper_trades SET gross_pnl_pct=pnl_pct WHERE gross_pnl_pct IS NULL AND pnl_pct IS NOT NULL")
+    con.execute("UPDATE paper_trades SET fee_cost_pct=0 WHERE fee_cost_pct IS NULL AND pnl_pct IS NOT NULL")
+    con.execute("UPDATE paper_trades SET slippage_cost_pct=0 WHERE slippage_cost_pct IS NULL AND pnl_pct IS NOT NULL")
+    con.commit()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS order_flow_trades (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange   TEXT NOT NULL DEFAULT 'MEXC',
+            symbol     TEXT NOT NULL,
+            ts         INTEGER NOT NULL,
+            price      REAL NOT NULL,
+            volume     REAL NOT NULL,
+            side       TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(exchange, symbol, ts, price, volume, side)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_of_trades_sym_ts ON order_flow_trades (exchange, symbol, ts)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS order_flow_depth_snapshots (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange    TEXT NOT NULL DEFAULT 'MEXC',
+            symbol      TEXT NOT NULL,
+            ts          INTEGER NOT NULL,
+            best_bid    REAL,
+            best_ask    REAL,
+            bid_total   REAL,
+            ask_total   REAL,
+            imbalance   REAL,
+            bids_json   TEXT NOT NULL,
+            asks_json   TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_of_depth_sym_ts ON order_flow_depth_snapshots (exchange, symbol, ts)")
     con.commit()
     con.close()
 
@@ -808,7 +894,11 @@ def get_latest_market_context() -> dict | None:
         return None
 
 
-def log_signals(signals: list[dict], source: str = "live") -> None:
+def log_signals(
+    signals: list[dict],
+    source: str = "live",
+    allow_duplicate_open: bool = False,
+) -> list[int | None]:
     """
     Append enriched signals to the history DB after every scan.
     Failures are swallowed — logging must never crash the scan.
@@ -816,21 +906,24 @@ def log_signals(signals: list[dict], source: str = "live") -> None:
     for the same symbol + direction + strategy_key. Different strategies may
     each hold the same symbol simultaneously — that is intentional.
     """
+    inserted_ids: list[int | None] = []
     try:
         con = sqlite3.connect(DB_PATH)
         for sig in signals:
             entries = sig.get("entries") or [None, None, None]
             exits   = sig.get("exits")   or [None, None, None]
             skey = sig.get("strategy_key") or strategy_name_to_key(sig.get("strategy", ""))
-            exists = con.execute("""
-                SELECT 1 FROM signals
-                WHERE symbol=? AND direction=? AND strategy_key=? AND result IS NULL
-                LIMIT 1
-            """, (sig["symbol"], sig["direction"], skey)).fetchone()
-            if exists:
-                continue
+            if not allow_duplicate_open:
+                exists = con.execute("""
+                    SELECT 1 FROM signals
+                    WHERE symbol=? AND direction=? AND strategy_key=? AND source=? AND result IS NULL
+                    LIMIT 1
+                """, (sig["symbol"], sig["direction"], skey, source)).fetchone()
+                if exists:
+                    inserted_ids.append(None)
+                    continue
             leverage_val = sig.get("leverage_cap") or sig.get("max_leverage") or None
-            con.execute("""
+            cur = con.execute("""
                 INSERT INTO signals
                 (logged_at, symbol, exchange, direction, strategy, strategy_key, conviction,
                  price, entry1, entry2, entry3, tp1, tp2, tp3, stop_loss,
@@ -864,10 +957,12 @@ def log_signals(signals: list[dict], source: str = "live") -> None:
                 1 if sig.get("flow_confirmed") else (0 if sig.get("flow_confirmed") is False else None),
                 source,
             ))
+            inserted_ids.append(cur.lastrowid)
         con.commit()
         con.close()
     except Exception as e:
         print(f"log_signals error: {e}", file=sys.stderr)
+    return inserted_ids
 
 
 def load_risk_gates() -> dict:
@@ -954,8 +1049,7 @@ def _load_strategy_overrides() -> dict:
     """
     Read data/strategy_overrides.json.
     Returns {} if missing or malformed. Never raises.
-    Only min_conviction overrides are supported in this phase.
-    Structure: {"balanced": {"min_conviction": 65}, ...}
+    Structure: {"balanced": {"min_conviction": 65, "blocked_agent_regimes": [...]}, ...}
     """
     try:
         if os.path.exists(STRATEGY_OVERRIDES_PATH):
@@ -970,9 +1064,9 @@ def _save_strategy_override(strategy_key: str, field: str, value) -> None:
     """
     Persist a single field override for a built-in strategy.
     Preserves all existing overrides. Atomic write.
-    Only permitted fields: ["min_conviction", "allowed_volatility"]
+    Only permitted fields: ["min_conviction", "allowed_volatility", "blocked_agent_regimes"]
     """
-    PERMITTED = {"min_conviction", "allowed_volatility"}
+    PERMITTED = {"min_conviction", "allowed_volatility", "blocked_agent_regimes"}
     if field not in PERMITTED:
         return
     os.makedirs("data", exist_ok=True)
@@ -988,6 +1082,63 @@ def _save_strategy_override(strategy_key: str, field: str, value) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2, sort_keys=True)
     os.replace(tmp, STRATEGY_OVERRIDES_PATH)
+
+
+def _normalize_agent_regime_list(raw) -> list[str]:
+    """Return clean agent-regime labels without hard-coding the current taxonomy."""
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[str] = []
+    for item in raw:
+        label = str(item or "").strip().lower()
+        if not label or not re.match(r"^[a-z][a-z0-9_]{1,48}$", label):
+            continue
+        if label not in cleaned:
+            cleaned.append(label)
+    return cleaned
+
+
+def _append_experiment_record(record: dict) -> None:
+    """Append a reversible learner experiment record to data/experiment_ledger.json."""
+    os.makedirs("data", exist_ok=True)
+    try:
+        with open(EXPERIMENT_LEDGER_PATH, "r", encoding="utf-8") as f:
+            ledger = json.load(f)
+        if not isinstance(ledger, list):
+            ledger = []
+    except Exception:
+        ledger = []
+    ledger.append(record)
+    tmp = EXPERIMENT_LEDGER_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ledger, f, indent=2, sort_keys=True)
+    os.replace(tmp, EXPERIMENT_LEDGER_PATH)
+
+
+def _read_experiment_ledger() -> list[dict]:
+    try:
+        if os.path.exists(EXPERIMENT_LEDGER_PATH):
+            with open(EXPERIMENT_LEDGER_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[experiment ledger] read error: {e}", file=sys.stderr)
+    return []
+
+
+def _append_experiment_record_once(record: dict, key: str = "id") -> bool:
+    """Append a research experiment if its stable id is not already present."""
+    os.makedirs("data", exist_ok=True)
+    ledger = _read_experiment_ledger()
+    rid = record.get(key)
+    if rid and any(item.get(key) == rid for item in ledger if isinstance(item, dict)):
+        return False
+    ledger.append(record)
+    tmp = EXPERIMENT_LEDGER_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ledger, f, indent=2, sort_keys=True)
+    os.replace(tmp, EXPERIMENT_LEDGER_PATH)
+    return True
 
 
 def _get_custom_strategy_keys() -> set:
@@ -1113,19 +1264,33 @@ STRATEGIES: dict = {
     },
     "momentum_breakout": {
         "name": "Momentum Breakout",
-        "description": "Trending markets with volume expansion",
+        "description": "Fresh 1h volatility expansion with volume and trend confirmation",
         "risk_level": "high",
         "weights": {
-            "momentum":    50,
-            "funding":     10,
-            "basis":        5,
+            "momentum":    42,
+            "funding":      6,
+            "basis":        4,
             "volume_mult": 1.2,
         },
-        "leverage_cap":    25,
-        "min_conviction":  55,
+        "leverage_cap":    12,
+        "min_conviction":  68,
         "filters": {
-            # Only fire if 24h change exceeds ±3% (stored as percent, e.g. 3.0 = 3%)
-            "min_24h_change_pct": 3.0,
+            # Stage 1 only shortlists liquid movers; the real breakout rule
+            # runs in enrich_signal() after 1h candles, ATR, volume, and trend
+            # structure are available.
+            "min_24h_change_pct": 0.8,
+            "min_volume_24h": 5_000_000,
+            "min_breakout_atr_mult": 0.45,
+            "min_breakout_move_pct": 0.35,
+            "min_volume_spike_ratio": 1.2,
+            "max_breakout_atr_pct": 4.0,
+            "max_breakout_rsi_long": 82,
+            "min_breakout_rsi_short": 18,
+            "require_trend_alignment": True,
+        },
+        "risk_gates": {
+            "block_long_volatility": ["extreme"],
+            "block_short_volatility": ["extreme"],
         },
     },
     "mean_reversion": {
@@ -1406,6 +1571,12 @@ def validate_custom_strategy_payload(
                 return None, f"allowed_volatility contains invalid regime: {v}"
         allowed_volatility = list(allowed_volatility)
 
+    blocked_agent_regimes = payload.get("blocked_agent_regimes", None)
+    if blocked_agent_regimes is not None:
+        blocked_agent_regimes = _normalize_agent_regime_list(blocked_agent_regimes)
+        if not blocked_agent_regimes:
+            return None, "blocked_agent_regimes must contain valid agent regime labels or null"
+
     config = {
         "key": key,
         "name": name,
@@ -1421,6 +1592,7 @@ def validate_custom_strategy_payload(
         "is_custom": True,
         "direction_lock": direction_lock,
         "allowed_volatility": allowed_volatility,
+        "blocked_agent_regimes": blocked_agent_regimes,
     }
     return config, None
 
@@ -1447,6 +1619,7 @@ def strategy_to_api(key: str, cfg: dict, performance: dict | None = None) -> dic
         "base_key":           cfg.get("base_key", key),
         "direction_lock":     cfg.get("direction_lock", None),
         "allowed_volatility": cfg.get("allowed_volatility", None),
+        "blocked_agent_regimes": cfg.get("blocked_agent_regimes", None),
         "performance":        performance or {},
     }
 
@@ -1750,6 +1923,8 @@ def score_ticker(
         if "min_funding_abs" in filters and abs(funding) < filters["min_funding_abs"]:
             return None
         if "min_24h_change_pct" in filters and abs(change_pct) < filters["min_24h_change_pct"]:
+            return None
+        if "min_volume_24h" in filters and volume < filters["min_volume_24h"]:
             return None
 
         long_score = 0
@@ -2226,6 +2401,8 @@ def enrich_signal(
     strategy: dict | None = None,
     filter_stats: dict | None = None,
     agent_min_conviction: int | None = None,
+    strict_kline_gate: bool = True,
+    strict_trade_gates: bool = True,
 ) -> dict | None:
     """
     Stage 2: fetch klines and depth for one symbol, run RSI/ATR indicators,
@@ -2279,13 +2456,13 @@ def enrich_signal(
         kline4h_data = fetch_klines(exchange, symbol, "4h", 50)
         n4h = len(kline4h_data.get("close", [])) if kline4h_data else 0
 
-        if n1h < 50 or n4h < 20:
+        if strict_kline_gate and (n1h < 50 or n4h < 20):
             print(f"[kline gate] {symbol} skipped — 1h:{n1h} 4h:{n4h}", file=sys.stderr)
             return None
 
         # --- Direction lock filter ---
         direction_lock = strat.get("direction_lock")
-        if direction_lock and direction != direction_lock:
+        if strict_trade_gates and direction_lock and direction != direction_lock:
             print(
                 f"[direction lock] {symbol} skipped — strategy={strat.get('key')} "
                 f"locked={direction_lock} signal={direction}",
@@ -2352,7 +2529,7 @@ def enrich_signal(
         # Blocks all extreme-vol signals before any strategy-specific gate logic.
         # The ×0.85 conviction multiplier below is a secondary safeguard that
         # still applies when this gate is OFF.
-        if vol_regime == "extreme" and _load_extreme_vol_firebreak():
+        if strict_trade_gates and vol_regime == "extreme" and _load_extreme_vol_firebreak():
             return None
 
         gate_key = "short_vol_short" if direction == "SHORT" else "long_vol_long"
@@ -2394,13 +2571,13 @@ def enrich_signal(
                 file=sys.stderr,
             )
             log_filtered_candidate(candidate)
-            if should_block:
+            if strict_trade_gates and should_block:
                 return None
             tags.append(reason)
 
         # --- Volatility allowlist filter (custom strategies only) ---
         allowed_volatility = strat.get("allowed_volatility")
-        if allowed_volatility and vol_regime not in allowed_volatility:
+        if strict_trade_gates and allowed_volatility and vol_regime not in allowed_volatility:
             print(
                 f"[vol allowlist] {symbol} skipped — strategy={strat.get('key')} "
                 f"allowed={allowed_volatility} actual={vol_regime}",
@@ -2449,6 +2626,44 @@ def enrich_signal(
         # Applied after RSI is computed but before any conviction adjustment.
         # Mean reversion only makes sense when price is already stretched.
         strat_filters = strat.get("filters", {})
+
+        # Momentum Breakout is a fresh hourly volatility-expansion setup, not
+        # the old broad 24h-mover scan. Stage 1 only makes a cheap shortlist;
+        # the actual breakout has to be confirmed here with candles.
+        if strat.get("key") == "momentum_breakout":
+            abs_1h = abs(change_1h_pct)
+            min_atr_mult = float(strat_filters.get("min_breakout_atr_mult", 0.45))
+            min_move_pct = float(strat_filters.get("min_breakout_move_pct", 0.35))
+            breakout_threshold = max(min_move_pct, atr_pct_val * min_atr_mult)
+            if abs_1h < breakout_threshold:
+                return None
+            if direction == "LONG" and change_1h_pct <= 0:
+                return None
+            if direction == "SHORT" and change_1h_pct >= 0:
+                return None
+            max_atr = strat_filters.get("max_breakout_atr_pct")
+            if max_atr is not None and atr_pct_val > float(max_atr):
+                return None
+            min_vol_spike = float(strat_filters.get("min_volume_spike_ratio", 1.0))
+            if _vol_spike_ratio is None or _vol_spike_ratio < min_vol_spike:
+                return None
+            if direction == "LONG" and last_rsi > float(strat_filters.get("max_breakout_rsi_long", 100)):
+                return None
+            if direction == "SHORT" and last_rsi < float(strat_filters.get("min_breakout_rsi_short", 0)):
+                return None
+            if strat_filters.get("require_trend_alignment", True):
+                if direction == "LONG" and trend_score <= 0:
+                    return None
+                if direction == "SHORT" and trend_score >= 0:
+                    return None
+            tags.append("hourly_vol_breakout")
+            if _vol_spike_ratio >= min_vol_spike:
+                tags.append("breakout_volume_confirmed")
+            if direction == "LONG" and trend_score > 0:
+                tags.append("breakout_trend_aligned")
+            elif direction == "SHORT" and trend_score < 0:
+                tags.append("breakout_trend_aligned")
+
         if "rsi_long_max" in strat_filters and direction == "LONG":
             if last_rsi >= strat_filters["rsi_long_max"]:
                 return None
@@ -2543,6 +2758,12 @@ def enrich_signal(
                 conviction -= 5
                 tags.append("vol_low_participation")
 
+        if strat.get("key") == "momentum_breakout":
+            move_quality = min(10, int(abs(change_1h_pct) / max(atr_pct_val, 0.01) * 6))
+            conviction += move_quality
+            if "breakout_trend_aligned" in tags:
+                conviction += 4
+
         conviction = max(0, min(100, conviction))
 
         # --- Ladders ---
@@ -2552,7 +2773,7 @@ def enrich_signal(
             tiers=3,
             direction=direction,
         )
-        if entries and price > 0:
+        if strict_trade_gates and entries and price > 0:
             ladder_spread_pct = abs(entries[0] - stop_loss) / price
             if ladder_spread_pct < 0.001:
                 print(
@@ -2950,6 +3171,8 @@ def run_scan(
                 strat["min_conviction"] = int(value)
             elif field == "allowed_volatility":
                 strat["allowed_volatility"] = list(value) if isinstance(value, list) else None
+            elif field == "blocked_agent_regimes":
+                strat["blocked_agent_regimes"] = _normalize_agent_regime_list(value) or None
 
     effective_threshold = max(threshold, strat["min_conviction"])
     coinglass_snapshot = get_coin_market_snapshot()
@@ -2991,9 +3214,17 @@ def run_scan(
         agent_min_conviction=effective_threshold,
     )
     signals: list[dict] = []
+    blocked_agent_regimes = set(_normalize_agent_regime_list(strat.get("blocked_agent_regimes")))
+    blocked_agent_count = 0
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as executor:
         for sig in executor.map(enrich, top):
-            if sig and sig["conviction"] >= effective_threshold:
+            if not sig or sig["conviction"] < effective_threshold:
+                continue
+            agent_regime = str(sig.get("agent_regime") or "").strip().lower()
+            if agent_regime in blocked_agent_regimes:
+                blocked_agent_count += 1
+                continue
+            if sig:
                 signals.append(sig)
 
     refused = int(filter_stats.get("long_vol_refuse") or 0)
@@ -3005,6 +3236,12 @@ def run_scan(
             f"[scan risk gates] strategy={strategy_key} "
             f"long_vol_refuse={refused} long_vol_shadow={shadowed} "
             f"short_vol_refuse={short_refused} short_vol_shadow={short_shadowed}",
+            file=sys.stderr,
+        )
+    if blocked_agent_count:
+        print(
+            f"[scan strategy overlay] strategy={strategy_key} "
+            f"blocked_agent_regimes={sorted(blocked_agent_regimes)} blocked={blocked_agent_count}",
             file=sys.stderr,
         )
 
@@ -3488,11 +3725,208 @@ def api_signal(symbol: str):
         if not base:
             return jsonify({"success": False, "error": "Unable to score ticker"}), 422
 
-        signal = enrich_signal(base, strategy=strat)
+        signal = enrich_signal(
+            base,
+            strategy=strat,
+            strict_kline_gate=False,
+            strict_trade_gates=False,
+        )
         if not signal:
             return jsonify({"success": False, "error": "Insufficient kline data"}), 422
+        _apply_liquidation_to_signal(signal)
 
         return jsonify({"success": True, "signal": signal})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+_CHART_INTERVALS = {
+    "1m": {"mexc": "Min1",  "hl": "1m"},
+    "5m": {"mexc": "Min5",  "hl": "5m"},
+    "15m": {"mexc": "Min15", "hl": "15m"},
+    "30m": {"mexc": "Min30", "hl": "30m"},
+    "1h": {"mexc": "Min60", "hl": "1h"},
+    "4h": {"mexc": "Hour4", "hl": "4h"},
+    "8h": {"mexc": "Hour8", "hl": "8h"},
+    "1d": {"mexc": "Day1",  "hl": "1d"},
+}
+
+
+def _chart_limit(raw: str | None) -> int:
+    try:
+        return max(50, min(int(raw or 300), 1000))
+    except Exception:
+        return 300
+
+
+def _hl_chart_lookback_hours(interval: str, limit: int) -> int:
+    minutes = {
+        "1m": 1,
+        "5m": 5,
+        "15m": 15,
+        "30m": 30,
+        "1h": 60,
+        "4h": 240,
+        "8h": 480,
+        "1d": 1440,
+    }.get(interval, 60)
+    return max(24, int(math.ceil(limit * minutes / 60 * 1.2)))
+
+
+def _mexc_chart_candles(symbol: str, interval: str, limit: int) -> list[dict]:
+    mexc_interval = _CHART_INTERVALS[interval]["mexc"]
+    raw = fetch_mexc(f"/contract/kline/{symbol}", params={"interval": mexc_interval, "limit": limit})
+    if not raw or not isinstance(raw, dict):
+        return []
+    times = raw.get("time") or []
+    opens = raw.get("open") or []
+    highs = raw.get("high") or []
+    lows = raw.get("low") or []
+    closes = raw.get("close") or []
+    vols = raw.get("vol") or []
+    candles = []
+    for i in range(min(len(times), len(opens), len(highs), len(lows), len(closes))):
+        try:
+            candles.append({
+                "time": int(float(times[i])),
+                "open": float(opens[i]),
+                "high": float(highs[i]),
+                "low": float(lows[i]),
+                "close": float(closes[i]),
+                "volume": float(vols[i]) if i < len(vols) else 0.0,
+            })
+        except Exception:
+            continue
+    return candles[-limit:]
+
+
+def _hyperliquid_chart_candles(symbol: str, interval: str, limit: int) -> list[dict]:
+    coin = symbol.upper().replace("_USDT", "").replace("_USDC", "")
+    rows = fetch_hl_klines(
+        coin,
+        _CHART_INTERVALS[interval]["hl"],
+        lookback_hours=_hl_chart_lookback_hours(interval, limit),
+    )
+    candles = []
+    for row in rows or []:
+        try:
+            candles.append({
+                "time": int(float(row.get("t")) / 1000),
+                "open": float(row.get("o")),
+                "high": float(row.get("h")),
+                "low": float(row.get("l")),
+                "close": float(row.get("c")),
+                "volume": float(row.get("v") or 0),
+            })
+        except Exception:
+            continue
+    candles.sort(key=lambda x: x["time"])
+    return candles[-limit:]
+
+
+@app.route("/api/chart/<exchange>/<symbol>")
+def api_chart(exchange: str, symbol: str):
+    """Return normalized OHLCV candles for the in-app MT7 chart."""
+    try:
+        exchange_key = (exchange or "mexc").strip().upper()
+        symbol_key = (symbol or "").strip().upper()
+        interval = request.args.get("interval", "15m").strip().lower()
+        limit = _chart_limit(request.args.get("limit"))
+
+        if interval not in _CHART_INTERVALS:
+            return jsonify({
+                "success": False,
+                "error": f"Unsupported interval {interval!r}",
+                "supported_intervals": list(_CHART_INTERVALS.keys()),
+            }), 400
+
+        if exchange_key == "MEXC":
+            candles = _mexc_chart_candles(symbol_key, interval, limit)
+        elif exchange_key == "HYPERLIQUID":
+            candles = _hyperliquid_chart_candles(symbol_key, interval, limit)
+        elif exchange_key == "BYBIT":
+            candles = fetch_bybit_candles(bybit_symbol_to_raw(symbol_key), interval, limit)
+        else:
+            return jsonify({"success": False, "error": f"Unsupported exchange {exchange_key!r}"}), 400
+
+        if not candles:
+            return jsonify({
+                "success": False,
+                "error": f"No chart candles returned for {symbol_key} on {exchange_key}",
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "exchange": exchange_key,
+            "symbol": symbol_key,
+            "interval": interval,
+            "candles": candles,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/liquidation")
+def api_liquidation():
+    """Exchange-aware isolated-margin liquidation estimate."""
+    try:
+        exchange = request.args.get("exchange", "MEXC")
+        symbol = request.args.get("symbol", "")
+        direction = request.args.get("direction", "")
+        entry = float(request.args.get("entry", "0") or 0)
+        leverage = float(request.args.get("leverage", "0") or 0)
+        notional = float(request.args.get("notional", "0") or 0)
+        margin_mode = request.args.get("margin_mode", "isolated")
+        result = estimate_liquidation_price(
+            exchange=exchange,
+            symbol=symbol.upper(),
+            direction=direction.upper(),
+            entry_price=entry,
+            leverage=leverage,
+            notional_usd=notional,
+            margin_mode=margin_mode,
+        )
+        return jsonify(result), (200 if result.get("success") else 422)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/trades/<int:trade_id>/path")
+def api_paper_trade_path(trade_id: int):
+    """Return current path stats for a pending/open/closed paper trade."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone()
+        con.close()
+        if not row:
+            return jsonify({"success": False, "error": "paper trade not found"}), 404
+        pt = dict(row)
+        sig = {
+            "symbol": pt.get("symbol"),
+            "exchange": pt.get("exchange") or "MEXC",
+            "direction": pt.get("direction"),
+            "logged_at": pt.get("queued_at") or pt.get("opened_at"),
+            "entry_at": pt.get("filled_at") or (pt.get("opened_at") if pt.get("status") != "pending" else None),
+            "result_at": pt.get("closed_at") if pt.get("status") in {"closed", "expired", "entry_expired"} else datetime.utcnow().isoformat(),
+            "entry1": pt.get("entry_px"),
+            "entry2": pt.get("entry_px"),
+            "entry3": pt.get("entry_px"),
+            "tp1": pt.get("tp1"),
+            "tp2": pt.get("tp2"),
+            "tp3": pt.get("tp3"),
+            "stop_loss": pt.get("stop_loss"),
+            "exit_price": pt.get("exit_px"),
+            "result": pt.get("result"),
+            "leverage": pt.get("leverage"),
+        }
+        journey = compute_trade_journey(sig, pt.get("pnl_pct"))
+        return jsonify({
+            "success": True,
+            "trade_id": trade_id,
+            "status": pt.get("status"),
+            "journey": journey,
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -3809,6 +4243,10 @@ def _generate_coach_review(
         f"Do not write sentences like 'Here is the review' or 'Let me analyze this trade' or 'Okay, let's tackle'. "
         f"The first word you output must be the first word of paragraph one."
     )
+    from lib.ai_client import load_ai_settings
+    _cr_settings = load_ai_settings()
+    _cr_provider = _cr_settings.get("coach_review_provider") or None
+    _cr_model    = _cr_settings.get("coach_review_model") or None
     review = call_ai(
         system=(
             "You are Thomas Chen, head trader at Cipher Research Group, reviewing a completed trade. "
@@ -3819,7 +4257,9 @@ def _generate_coach_review(
             "Output only the two review paragraphs. Nothing else before or after."
         ),
         user=user_msg,
-        max_tokens=500,
+        max_tokens=600,
+        provider=_cr_provider,
+        model=_cr_model,
     )
 
     if review:
@@ -3853,6 +4293,12 @@ def api_signal_detail(signal_id: int):
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         row = con.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
+        paper_row = con.execute("""
+            SELECT * FROM paper_trades
+            WHERE signal_id=?
+            ORDER BY closed_at DESC, opened_at DESC
+            LIMIT 1
+        """, (signal_id,)).fetchone()
         event_rows = con.execute("""
             SELECT * FROM position_events
             WHERE signal_id=?
@@ -3864,6 +4310,24 @@ def api_signal_detail(signal_id: int):
             return jsonify({"success": False, "error": "not found"}), 404
 
         sig = dict(row)
+        paper_trade = dict(paper_row) if paper_row else None
+        if sig.get("source") == "paper" and paper_trade:
+            sig.update({
+                "logged_at":   paper_trade.get("opened_at") or sig.get("logged_at"),
+                "entry_at":    paper_trade.get("filled_at") or paper_trade.get("opened_at") or sig.get("entry_at"),
+                "result_at":   paper_trade.get("closed_at") or sig.get("result_at"),
+                "entry1":      paper_trade.get("entry_px") or sig.get("entry1"),
+                "entry2":      paper_trade.get("entry_px") or sig.get("entry2"),
+                "entry3":      paper_trade.get("entry_px") or sig.get("entry3"),
+                "tp1":         paper_trade.get("tp1") or sig.get("tp1"),
+                "tp2":         paper_trade.get("tp2") or sig.get("tp2"),
+                "tp3":         paper_trade.get("tp3") or sig.get("tp3"),
+                "stop_loss":   paper_trade.get("stop_loss") or sig.get("stop_loss"),
+                "exit_price":  paper_trade.get("exit_px") or sig.get("exit_price"),
+                "result":      paper_trade.get("result") or sig.get("result"),
+                "pnl_pct":     paper_trade.get("pnl_pct") if paper_trade.get("pnl_pct") is not None else sig.get("pnl_pct"),
+                "leverage":    paper_trade.get("leverage") or sig.get("leverage"),
+            })
         sig["position_events"] = [dict(ev) for ev in event_rows]
 
         # Duration in minutes (both timestamps are UTC ISO without Z)
@@ -3894,6 +4358,8 @@ def api_signal_detail(signal_id: int):
         tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
         journey = compute_trade_journey(sig, pnl_pct)
         journey_prompt = format_journey_for_prompt(journey)
+        liq_notional = paper_trade.get("size_usd") if paper_trade else None
+        _apply_liquidation_to_signal(sig, liq_notional)
 
         sig_json_obj = {}
         try:
@@ -3927,6 +4393,9 @@ def api_signal_detail(signal_id: int):
             "volatility":       sig.get("volatility"),
             "journey":          journey,
             "ai_analysis":      ai_analysis,
+            "liquidation":      sig.get("liquidation"),
+            "liquidation_price": sig.get("liquidation_price"),
+            "liquidation_distance_pct": sig.get("liquidation_distance_pct"),
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -4120,7 +4589,7 @@ def compute_trade_journey(sig: dict, pnl_pct: float | None = None) -> dict:
             leverage = None
     leverage = float(leverage) if leverage else None
 
-    label = _journey_label(
+    label = "entry_not_filled" if entry_hit_ts is None else _journey_label(
         sig.get("result"),
         worst_adverse,
         best_favorable,
@@ -4302,7 +4771,12 @@ def expire_stale_signals() -> int:
         cutoff = (datetime.utcnow() - timedelta(hours=80)).isoformat()
         con = sqlite3.connect(DB_PATH)
         rows = con.execute(
-            "SELECT id FROM signals WHERE result IS NULL AND logged_at < ?",
+            """
+            SELECT id FROM signals
+            WHERE result IS NULL
+              AND logged_at < ?
+              AND COALESCE(source, 'live') != 'paper'
+            """,
             (cutoff,),
         ).fetchall()
         if rows:
@@ -4330,6 +4804,7 @@ def _fetch_klines_for_signal(
     interval: str = "Min15",
     limit: int = 300,
     start_ts: int | None = None,
+    end_ts: int | None = None,
 ) -> "pd.DataFrame":
     """
     Fetch klines for a signal using the correct exchange client.
@@ -4375,26 +4850,89 @@ def _fetch_klines_for_signal(
             return pd.DataFrame()
 
     else:
-        # MEXC path — mirrors existing fetch_mexc kline call
+        # MEXC path — mirrors existing fetch_mexc kline call. For Min1 outcome
+        # evaluation, fetch in chunks so paper/live evaluators can replay the
+        # full 80h holding window instead of only the first 1440 candles.
         try:
-            params: dict = {"interval": interval, "limit": limit}
-            if start_ts is not None:
-                params["start"] = start_ts
-            raw = fetch_mexc(f"/contract/kline/{symbol}", params=params)
-            if not raw or not isinstance(raw, dict):
+            candle_seconds = {
+                "Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800,
+                "Min60": 3600, "Hour4": 14400, "Hour8": 28800, "Day1": 86400,
+            }.get(interval, 900)
+
+            def _raw_to_frame(raw: dict) -> "pd.DataFrame":
+                return pd.DataFrame({
+                    "timestamp": raw.get("time",  []),
+                    "open":      raw.get("open",  []),
+                    "high":      raw.get("high",  []),
+                    "low":       raw.get("low",   []),
+                    "close":     raw.get("close", []),
+                    "volume":    raw.get("vol",   []),
+                })
+
+            frames = []
+            requested_end = int(end_ts or time.time())
+            needs_chunking = (
+                interval == "Min1"
+                and start_ts is not None
+                and requested_end > start_ts + max(1, int(limit)) * candle_seconds
+            )
+            if needs_chunking:
+                chunk_limit = 1000
+                cursor = int(start_ts)
+                max_chunks = 12  # 12k Min1 candles = ~8.3 days; enough for MT7 hold windows.
+                chunks = 0
+                while cursor <= requested_end and chunks < max_chunks:
+                    chunk_end = min(requested_end, cursor + (chunk_limit - 1) * candle_seconds)
+                    raw = fetch_mexc(
+                        f"/contract/kline/{symbol}",
+                        params={"interval": interval, "start": cursor, "end": chunk_end},
+                    )
+                    if raw and isinstance(raw, dict):
+                        frame = _raw_to_frame(raw)
+                        if not frame.empty:
+                            frames.append(frame)
+                            try:
+                                last_ts = int(max(frame["timestamp"].tolist()))
+                                cursor = max(last_ts + candle_seconds, chunk_end + candle_seconds)
+                            except Exception:
+                                cursor = chunk_end + candle_seconds
+                        else:
+                            cursor = chunk_end + candle_seconds
+                    else:
+                        cursor = chunk_end + candle_seconds
+                    chunks += 1
+                    time.sleep(0.04)
+            else:
+                params: dict = {"interval": interval, "limit": limit}
+                if start_ts is not None:
+                    params["start"] = start_ts
+                if end_ts is not None:
+                    params["end"] = end_ts
+                raw = fetch_mexc(f"/contract/kline/{symbol}", params=params)
+                if raw and isinstance(raw, dict):
+                    frame = _raw_to_frame(raw)
+                    if not frame.empty:
+                        frames.append(frame)
+
+            if not frames:
                 return pd.DataFrame()
-            df = pd.DataFrame({
-                "timestamp": raw.get("time",  []),
-                "open":      raw.get("open",  []),
-                "high":      raw.get("high",  []),
-                "low":       raw.get("low",   []),
-                "close":     raw.get("close", []),
-                "volume":    raw.get("vol",   []),
-            })
+            df = pd.concat(frames, ignore_index=True)
             for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            print(f"[mexc_klines] {symbol} fetched {len(df)} {interval} candles", file=sys.stderr)
+            df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            df = (
+                df.dropna(subset=["timestamp"])
+                  .drop_duplicates(subset=["timestamp"])
+                  .sort_values("timestamp")
+                  .reset_index(drop=True)
+            )
+            if end_ts is not None:
+                df = df[df["timestamp"] <= int(end_ts)].reset_index(drop=True)
+            print(
+                f"[mexc_klines] {symbol} fetched {len(df)} {interval} candles"
+                f"{' chunked' if needs_chunking else ''}",
+                file=sys.stderr,
+            )
             return df
         except Exception as e:
             print(f"[mexc_klines] {symbol} error: {e}", file=sys.stderr)
@@ -4405,13 +4943,14 @@ def evaluate_outcome(
     sig: dict,
     interval: str = "Min15",
     kline_limit: int = 336,
+    stop_policy: dict | None = None,
 ) -> tuple[str, str, float | None, str | None, str | None] | None:
     """
     Fetch klines since the signal was logged and determine if stop or TP was hit.
 
-    interval / kline_limit: callers can override. The main signal evaluator uses
-    Min15 / 336 (84 hours). The paper bot uses Min1 / 1440 (24 hours) so that
-    1-minute wicks trigger stops and TPs just as they would in live trading.
+    interval / kline_limit: callers can override. Live and paper evaluators use
+    Min1 so 1-minute wicks trigger stops and TPs just as they would in live
+    trading. _fetch_klines_for_signal chunks long Min1 windows as needed.
 
     Returns (result, note, exit_price, result_at, entry_at) or None if no level
     was hit yet / insufficient data.
@@ -4433,6 +4972,7 @@ def evaluate_outcome(
     tp1       = sig.get("tp1")
     tp2       = sig.get("tp2")
     tp3       = sig.get("tp3")
+    liquidation_price = sig.get("liquidation_price") or sig.get("liquidation_px")
 
     if not symbol or not direction or not entry1 or not stop_loss:
         return None
@@ -4508,12 +5048,40 @@ def evaluate_outcome(
         return None
 
     stop_hit   = False
+    liquidation_hit = False
     best_tp    = 0              # highest TP tier reached before stop: 0=none, 1, 2, 3
     exit_price: float | None = None
     result_at: str | None = None
+    dynamic_stop = float(stop_loss)
+    stop_mode = (stop_policy or {}).get("mode", "static")
+    trail_atr = float((stop_policy or {}).get("trail_atr_value") or 0.0)
+    breakeven_buffer = float((stop_policy or {}).get("breakeven_buffer_bps") or 0.0) / 10000.0
 
     def _iso(ts: int) -> str:
         return datetime.utcfromtimestamp(ts).isoformat()
+
+    def _protective_stop_after_tp(tp_level: int, high: float, low: float) -> float:
+        nonlocal dynamic_stop
+        if stop_mode == "static" or tp_level <= 0:
+            return dynamic_stop
+
+        if direction == "LONG":
+            be = entry1 * (1.0 + breakeven_buffer)
+            candidate = be
+            if stop_mode in {"tp_ladder_lock", "atr_trailing"} and tp_level >= 2 and tp1:
+                candidate = max(candidate, float(tp1))
+            if stop_mode == "atr_trailing" and trail_atr > 0:
+                candidate = max(candidate, high - trail_atr)
+            dynamic_stop = max(dynamic_stop, candidate)
+        else:
+            be = entry1 * (1.0 - breakeven_buffer)
+            candidate = be
+            if stop_mode in {"tp_ladder_lock", "atr_trailing"} and tp_level >= 2 and tp1:
+                candidate = min(candidate, float(tp1))
+            if stop_mode == "atr_trailing" and trail_atr > 0:
+                candidate = min(candidate, low + trail_atr)
+            dynamic_stop = min(dynamic_stop, candidate)
+        return dynamic_stop
 
     for c in candles:
         h, l, ts = c["high"], c["low"], c["time"]
@@ -4545,7 +5113,18 @@ def evaluate_outcome(
         # This converts a subset of LOSS rows into PARTIAL (TP1 then stop).
         # Not perfect — only tick data is — but better than "stop always wins".
         if direction == "LONG":
-            _both_touched = (l <= stop_loss) and (
+            if liquidation_price and l <= float(liquidation_price):
+                liquidation_hit = True
+                exit_price = float(liquidation_price)
+                result_at = _iso(ts)
+                log_position_event(
+                    sig, "LIQUIDATED", result_at, exit_price,
+                    _leveraged_level_pnl(sig, exit_price, 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)),
+                    0.0, f"Estimated liquidation touched at {exit_price}"
+                )
+                break
+            active_stop = dynamic_stop
+            _both_touched = (l <= active_stop) and (
                 (tp1 and h >= tp1) or (tp2 and h >= tp2) or (tp3 and h >= tp3)
             )
             _bullish_candle = cl > o
@@ -4569,18 +5148,20 @@ def evaluate_outcome(
                             max(0.0, (3 - tier) / 3 * 100),
                             f"TP{tier} touched at {tier_price} (in-candle heuristic)",
                         )
-            if l <= stop_loss:
+                    _protective_stop_after_tp(best_tp, h, l)
+                    if best_tp == 3:
+                        break
+            active_stop = dynamic_stop
+            if l <= active_stop:
                 stop_hit   = True
                 stop_size = 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)
                 remaining = 0.0
-                exit_price = stop_loss if best_tp == 0 else (
-                    tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
-                )
+                exit_price = active_stop if best_tp == 0 else active_stop
                 result_at = _iso(ts)
                 log_position_event(
-                    sig, "STOP_HIT", result_at, stop_loss,
-                    _leveraged_level_pnl(sig, stop_loss, stop_size),
-                    remaining, f"Stop touched after TP{best_tp}" if best_tp else "Stop touched"
+                    sig, "STOP_HIT", result_at, active_stop,
+                    _leveraged_level_pnl(sig, active_stop, stop_size),
+                    remaining, f"Dynamic stop touched after TP{best_tp}" if best_tp and active_stop != stop_loss else (f"Stop touched after TP{best_tp}" if best_tp else "Stop touched")
                 )
                 break
             prev_tp = best_tp
@@ -4601,13 +5182,15 @@ def evaluate_outcome(
                         max(0.0, (3 - tier) / 3 * 100),
                         f"TP{tier} touched at {tier_price}",
                     )
+                _protective_stop_after_tp(best_tp, h, l)
                 if best_tp == 3:
                     break
         else:  # SHORT
             # Mirror heuristic for SHORT: bearish candle (close < open) means
             # the move down dominated, so a TP touch likely happened before
             # the stop touch in the same candle.
-            _short_both_touched = (h >= stop_loss) and (
+            active_stop = dynamic_stop
+            _short_both_touched = (h >= active_stop) and (
                 (tp1 and l <= tp1) or (tp2 and l <= tp2) or (tp3 and l <= tp3)
             )
             _bearish_candle = cl < o
@@ -4630,18 +5213,30 @@ def evaluate_outcome(
                             max(0.0, (3 - tier) / 3 * 100),
                             f"TP{tier} touched at {tier_price} (in-candle heuristic)",
                         )
-            if h >= stop_loss:
+                    _protective_stop_after_tp(best_tp, h, l)
+                    if best_tp == 3:
+                        break
+            active_stop = dynamic_stop
+            if liquidation_price and h >= float(liquidation_price):
+                liquidation_hit = True
+                exit_price = float(liquidation_price)
+                result_at = _iso(ts)
+                log_position_event(
+                    sig, "LIQUIDATED", result_at, exit_price,
+                    _leveraged_level_pnl(sig, exit_price, 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)),
+                    0.0, f"Estimated liquidation touched at {exit_price}"
+                )
+                break
+            if h >= active_stop:
                 stop_hit   = True
                 stop_size = 1.0 if best_tp == 0 else (2 / 3 if best_tp == 1 else 1 / 3)
                 remaining = 0.0
-                exit_price = stop_loss if best_tp == 0 else (
-                    tp3 if best_tp == 3 else tp2 if best_tp == 2 else tp1
-                )
+                exit_price = active_stop if best_tp == 0 else active_stop
                 result_at = _iso(ts)
                 log_position_event(
-                    sig, "STOP_HIT", result_at, stop_loss,
-                    _leveraged_level_pnl(sig, stop_loss, stop_size),
-                    remaining, f"Stop touched after TP{best_tp}" if best_tp else "Stop touched"
+                    sig, "STOP_HIT", result_at, active_stop,
+                    _leveraged_level_pnl(sig, active_stop, stop_size),
+                    remaining, f"Dynamic stop touched after TP{best_tp}" if best_tp and active_stop != stop_loss else (f"Stop touched after TP{best_tp}" if best_tp else "Stop touched")
                 )
                 break
             prev_tp = best_tp
@@ -4662,18 +5257,28 @@ def evaluate_outcome(
                         max(0.0, (3 - tier) / 3 * 100),
                         f"TP{tier} touched at {tier_price}",
                     )
+                _protective_stop_after_tp(best_tp, h, l)
                 if best_tp == 3:
                     break
 
+    if liquidation_hit:
+        if best_tp == 0:
+            return ("LOSS", f"Estimated liquidation hit at {exit_price}", exit_price, result_at, entry_at)
+        if best_tp == 1:
+            blended = round(tp1 * (1 / 3) + exit_price * (2 / 3), 8)
+        else:
+            blended = round(tp1 * (1 / 3) + tp2 * (1 / 3) + exit_price * (1 / 3), 8)
+        return ("PARTIAL", f"TP{best_tp} hit then estimated liquidation at {exit_price}", blended, result_at, entry_at)
     if stop_hit and best_tp == 0:
-        return ("LOSS",    f"Stop hit at {stop_loss}",              exit_price, result_at, entry_at)
+        return ("LOSS",    f"Stop hit at {exit_price}",              exit_price, result_at, entry_at)
     if stop_hit and best_tp > 0:
         # Blended exit: ladder exits 1/3 of position at each TP hit before stop takes the rest
         if best_tp == 1:
-            blended = round(tp1 * (1 / 3) + stop_loss * (2 / 3), 8)
+            blended = round(tp1 * (1 / 3) + exit_price * (2 / 3), 8)
         else:  # best_tp == 2 (TP3 + stop can't co-occur — TP3 breaks the loop)
-            blended = round(tp1 * (1 / 3) + tp2 * (1 / 3) + stop_loss * (1 / 3), 8)
-        return ("PARTIAL", f"TP{best_tp} hit then stopped at {stop_loss}", blended, result_at, entry_at)
+            blended = round(tp1 * (1 / 3) + tp2 * (1 / 3) + exit_price * (1 / 3), 8)
+        stop_label = "dynamic stop" if stop_mode != "static" and exit_price != stop_loss else "stop"
+        return ("PARTIAL", f"TP{best_tp} hit then {stop_label} at {exit_price}", blended, result_at, entry_at)
     if best_tp == 3:
         return ("WIN",     f"TP3 hit at {tp3}",                    exit_price, result_at, entry_at)
     if best_tp in {1, 2}:
@@ -4684,7 +5289,7 @@ def evaluate_outcome(
 @app.route("/api/outcomes/check", methods=["POST"])
 def api_outcomes_check():
     """
-    Evaluate open positions against Min15 kline history and auto-tag any that
+    Evaluate open positions against Min1 kline history and auto-tag any that
     have hit their stop loss or take profit levels.
 
     Returns a summary of how many signals were evaluated and tagged.
@@ -4700,6 +5305,7 @@ def api_outcomes_check():
                    logged_at, entry_at, leverage, strategy_key, signal_json
             FROM signals
             WHERE result IS NULL
+              AND COALESCE(source, 'live') != 'paper'
             ORDER BY logged_at ASC
         """).fetchall()
         con.close()
@@ -4709,7 +5315,7 @@ def api_outcomes_check():
         skipped = 0
 
         for sig in open_sigs:
-            outcome = evaluate_outcome(sig)
+            outcome = evaluate_outcome(sig, interval="Min1", kline_limit=1440)
             if outcome is None:
                 # Persist entry_at if ENTRY_FILLED was logged this run but signals.entry_at is still NULL
                 if not sig.get("entry_at"):
@@ -4748,7 +5354,7 @@ def api_outcomes_check():
                     exit_price,
                     entry_at,
                     pnl_pct,
-                    "entry_fill_v2",
+                    "min1_chunked_v1",
                     sig["id"],
                 ),
             )
@@ -4898,7 +5504,12 @@ def api_strategies():
         if not cfg.get("enabled", True) and not include_disabled:
             continue
         s = strategy_to_api(key, cfg, performance=perf.get(key, {}))
-        s["conviction_override"] = overrides.get(key, {}).get("min_conviction")
+        override = overrides.get(key, {})
+        s["conviction_override"] = override.get("min_conviction")
+        if "blocked_agent_regimes" in override:
+            s["blocked_agent_regimes"] = _normalize_agent_regime_list(override.get("blocked_agent_regimes"))
+        if "allowed_volatility" in override:
+            s["allowed_volatility"] = override.get("allowed_volatility")
         result.append(s)
     return jsonify({"success": True, "strategies": result})
 
@@ -5381,6 +5992,8 @@ def api_create_custom_strategy():
             row_json_dict["direction_lock"] = cfg["direction_lock"]
         if cfg.get("allowed_volatility") is not None:
             row_json_dict["allowed_volatility"] = cfg["allowed_volatility"]
+        if cfg.get("blocked_agent_regimes") is not None:
+            row_json_dict["blocked_agent_regimes"] = cfg["blocked_agent_regimes"]
         row_json = json.dumps(row_json_dict, sort_keys=True)
 
         con = sqlite3.connect(DB_PATH)
@@ -5437,8 +6050,9 @@ def api_update_custom_strategy(strategy_key: str):
             "regime": existing.get("regime", "any"),
             "direction_lock": existing.get("direction_lock", None),
             "allowed_volatility": existing.get("allowed_volatility", None),
+            "blocked_agent_regimes": existing.get("blocked_agent_regimes", None),
         }
-        for field in ("name", "enabled", "description", "risk_level", "weights", "filters", "min_conviction", "leverage_cap", "max_leverage", "regime", "direction_lock", "allowed_volatility"):
+        for field in ("name", "enabled", "description", "risk_level", "weights", "filters", "min_conviction", "leverage_cap", "max_leverage", "regime", "direction_lock", "allowed_volatility", "blocked_agent_regimes"):
             if field in body:
                 merged[field] = body[field]
 
@@ -5459,6 +6073,8 @@ def api_update_custom_strategy(strategy_key: str):
             row_json_dict["direction_lock"] = cfg["direction_lock"]
         if cfg.get("allowed_volatility") is not None:
             row_json_dict["allowed_volatility"] = cfg["allowed_volatility"]
+        if cfg.get("blocked_agent_regimes") is not None:
+            row_json_dict["blocked_agent_regimes"] = cfg["blocked_agent_regimes"]
         row_json = json.dumps(row_json_dict, sort_keys=True)
 
         con = sqlite3.connect(DB_PATH)
@@ -6084,6 +6700,976 @@ def api_account_balance():
 # Intelligence tab routes
 # ---------------------------------------------------------------------------
 
+def _hermes_rows_to_dicts(rows) -> list[dict]:
+    return [dict(r) for r in rows] if rows else []
+
+
+def _hermes_table_cols(con: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _hermes_read_json(path: str, fallback):
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[hermes] read_json {path}: {e}", file=sys.stderr)
+    return fallback
+
+
+def _hermes_consultancy_profile() -> dict:
+    return {
+        "name": "Hermes Advisory Group",
+        "tagline": "Outside counsel for the trading machine.",
+        "relationship_to_mt7": (
+            "Eight specialist desks. One mandate: find what's broken, name what's working, "
+            "and propose the next controlled experiment. Hermes audits the full system — "
+            "signal quality, paper execution, capital risk, and Cipher output — then returns "
+            "structured memos with verdicts. Advisory only. No trade authority. No config access."
+        ),
+        "divisions": [
+            {
+                "key": "managing_partner",
+                "name": "Managing Partner",
+                "person": "Boyd Nietzsche",
+                "mandate": "Owns the final verdict, priorities, and one recommended experiment.",
+                "report_section": "Executive Verdict",
+            },
+            {
+                "key": "performance_audit",
+                "name": "Performance Audit Desk",
+                "person": "Jade Hume",
+                "mandate": "Audits P&L, EV, win/partial rate, drawdown, and trade volume.",
+                "report_section": "Bottom-Line Scoreboard",
+            },
+            {
+                "key": "quant_validation",
+                "name": "Quant Validation Desk",
+                "person": "Victor Descartes",
+                "mandate": "Checks sample size, overfitting risk, outliers, and statistical confidence.",
+                "report_section": "Evidence Quality",
+            },
+            {
+                "key": "risk_committee",
+                "name": "Risk & Capital Committee",
+                "person": "Donna Kant",
+                "mandate": "Reviews bankroll, sizing, loss streaks, drawdown, and risk of ruin.",
+                "report_section": "Capital Survival",
+            },
+            {
+                "key": "execution_quality",
+                "name": "Execution Quality Desk",
+                "person": "Kenny Locke",
+                "mandate": "Compares paper execution, live-tagged signals, liquidity, ATR, and slippage assumptions.",
+                "report_section": "Paper vs Live",
+            },
+            {
+                "key": "cipher_oversight",
+                "name": "Cipher Oversight Desk",
+                "person": "Kristi Baudrillard",
+                "mandate": "Judges whether Cipher intelligence is actionable and aligned with outcomes.",
+                "report_section": "Cipher Quality Review",
+            },
+            {
+                "key": "research_institute",
+                "name": "Research Institute",
+                "person": "Tabitha Plato",
+                "mandate": "Searches academic and industry research, then converts useful ideas into shadow experiments.",
+                "report_section": "Research Radar",
+            },
+            {
+                "key": "red_team",
+                "name": "Red Team",
+                "person": "Sara Foucault",
+                "mandate": "Attacks assumptions, identifies hidden failure modes, and names what could break.",
+                "report_section": "Adversarial Review",
+            },
+        ],
+    }
+
+
+def _hermes_latest_memo() -> dict | None:
+    candidates = [
+        os.path.join(HERMES_DIR, "latest_memo.json"),
+        os.path.join(HERMES_DIR, "hermes_memo.json"),
+    ]
+    for path in candidates:
+        data = _hermes_read_json(path, None)
+        if isinstance(data, dict):
+            data.setdefault("source_path", path)
+            return data
+    md_path = os.path.join(HERMES_DIR, "latest_memo.md")
+    try:
+        if os.path.exists(md_path):
+            with open(md_path, encoding="utf-8") as f:
+                return {
+                    "generated_at": datetime.utcfromtimestamp(os.path.getmtime(md_path)).isoformat(),
+                    "format": "markdown",
+                    "source_path": md_path,
+                    "body": f.read()[:12000],
+                }
+    except Exception as e:
+        print(f"[hermes] latest_memo markdown: {e}", file=sys.stderr)
+    return None
+
+
+def _hermes_memo_archive(limit: int = 8) -> list[dict]:
+    archive_dir = os.path.join(HERMES_DIR, "archive")
+    if not os.path.isdir(archive_dir):
+        return []
+    memos: list[dict] = []
+    try:
+        files = [
+            os.path.join(archive_dir, name)
+            for name in os.listdir(archive_dir)
+            if name.endswith(".json")
+        ]
+        for path in sorted(files, key=os.path.getmtime, reverse=True)[:limit]:
+            data = _hermes_read_json(path, None)
+            if not isinstance(data, dict):
+                continue
+            body = data.get("body") or ""
+            title = "Hermes memo"
+            match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+            if match:
+                title = match.group(1).strip()
+            memos.append({
+                "generated_at": data.get("generated_at") or datetime.utcfromtimestamp(os.path.getmtime(path)).isoformat(),
+                "source": data.get("source"),
+                "source_path": path,
+                "title": title,
+                "body_preview": body[:700],
+            })
+    except Exception as e:
+        print(f"[hermes] memo_archive: {e}", file=sys.stderr)
+    return memos
+
+
+def _hermes_latest_report_meta() -> dict:
+    meta = {"daily": None, "weekly": None}
+    try:
+        if not os.path.isdir(REPORTS_DIR):
+            return meta
+        files = os.listdir(REPORTS_DIR)
+        for kind in ("daily", "weekly"):
+            prefix = f"{kind}_"
+            candidates = [f for f in files if f.startswith(prefix) and f.endswith(".json")]
+            if not candidates:
+                continue
+            candidates.sort(key=lambda f: os.path.getmtime(os.path.join(REPORTS_DIR, f)), reverse=True)
+            fname = candidates[0]
+            path = os.path.join(REPORTS_DIR, fname)
+            data = _hermes_read_json(path, {})
+            meta[kind] = {
+                "file": fname,
+                "modified_at": datetime.utcfromtimestamp(os.path.getmtime(path)).isoformat(),
+                "generated_at": data.get("generated_at"),
+                "narrative_source": data.get("narrative_source"),
+                "ai_available": data.get("ai_available"),
+            }
+    except Exception as e:
+        print(f"[hermes] latest_report_meta: {e}", file=sys.stderr)
+    return meta
+
+
+def _hermes_edge_lab_meta() -> dict:
+    report_path = os.path.join("data", "factor_report.json")
+    db_path = os.path.join("data", "edge_lab.db")
+    report = _hermes_read_json(report_path, {})
+    top_long = report.get("top_long_states") or []
+    top_short = report.get("top_short_states") or []
+    return {
+        "available": bool(report),
+        "report_path": report_path,
+        "report_modified_at": (
+            datetime.utcfromtimestamp(os.path.getmtime(report_path)).isoformat()
+            if os.path.exists(report_path) else None
+        ),
+        "db_mb": round(os.path.getsize(db_path) / (1024 * 1024), 1) if os.path.exists(db_path) else None,
+        "meta": report.get("meta") or {},
+        "top_long": top_long[:3],
+        "top_short": top_short[:3],
+    }
+
+
+def _hermes_research_queue() -> dict:
+    queue_path = os.path.join(HERMES_DIR, "research_queue.json")
+    data = _hermes_read_json(queue_path, {"items": []})
+    items = data.get("items", []) if isinstance(data, dict) else []
+    pipeline = _hermes_research_pipeline_summary()
+    out = {
+        "status": "manual_queue" if items else "empty",
+        "items": items[:10],
+        "count": len(items),
+        "path": queue_path,
+        "note": "Research arm is scaffolded as a review queue. External research should become shadow experiments, never direct config changes.",
+    }
+    out.update(pipeline)
+    return out
+
+
+def _research_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _research_write_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True, default=str)
+    os.replace(tmp, path)
+
+
+def _research_slug_id(*parts: str) -> str:
+    import hashlib
+    raw = "|".join(str(p or "") for p in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:14]
+
+
+def _research_load_sources() -> list[dict]:
+    data = _hermes_read_json(HERMES_RESEARCH_SOURCES_PATH, {"sources": []})
+    if isinstance(data, dict):
+        sources = data.get("sources", [])
+    elif isinstance(data, list):
+        sources = data
+    else:
+        sources = []
+    return [s for s in sources if isinstance(s, dict)]
+
+
+def _research_save_sources(sources: list[dict]) -> None:
+    _research_write_json(HERMES_RESEARCH_SOURCES_PATH, {
+        "updated_at": _research_now(),
+        "sources": sources,
+    })
+
+
+def _research_extract_tags(text: str) -> list[str]:
+    low = (text or "").lower()
+    vocab = {
+        "funding": ["funding", "perpetual", "perp", "basis"],
+        "momentum": ["momentum", "breakout", "trend following", "trend-following"],
+        "mean_reversion": ["mean reversion", "reversal", "overbought", "oversold"],
+        "volatility": ["volatility", "realized vol", "atr", "variance"],
+        "liquidity": ["liquidity", "order book", "market depth", "spread", "slippage"],
+        "order_flow": ["order flow", "footprint", "delta", "volume profile", "vwap"],
+        "sentiment": ["sentiment", "social", "news", "narrative"],
+        "macro": ["macro", "rates", "dollar", "liquidity cycle", "cpi", "fed"],
+        "risk": ["drawdown", "risk", "position sizing", "leverage"],
+        "execution": ["execution", "fill", "fees", "maker", "taker"],
+    }
+    tags = [tag for tag, words in vocab.items() if any(w in low for w in words)]
+    return tags[:8] or ["general"]
+
+
+def _research_summarize_text(text: str) -> str:
+    clean = re.sub(r"\s+", " ", (text or "")).strip()
+    if not clean:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    picked = [s for s in sentences if 40 <= len(s) <= 260][:3]
+    return " ".join(picked)[:900] if picked else clean[:700]
+
+
+def _research_hypotheses_from_source(source: dict) -> list[dict]:
+    tags = set(source.get("tags") or [])
+    title = source.get("title") or "Research source"
+    sid = source.get("id") or _research_slug_id(title)
+    candidates: list[dict] = []
+    def add(kind: str, thesis: str, strategy: str, fields: list[str], gate: str, overfit: str):
+        hid = "research_" + _research_slug_id(sid, kind, thesis)
+        candidates.append({
+            "id": hid,
+            "source_id": sid,
+            "title": f"{title} — {kind.replace('_', ' ').title()}",
+            "thesis": thesis,
+            "target_strategy": strategy,
+            "mt7_fields_needed": fields,
+            "shadow_tag": f"research_{kind}",
+            "expected_edge": "Improve selectivity by filtering weak regimes or confirming tradeability before strategy promotion.",
+            "gate_impact": gate,
+            "overfitting_risk": overfit,
+            "status": "shadow_proposed",
+            "promotion_criteria": "At least 50 closed forward-tested signals with this shadow tag; positive cohort EV beats baseline and negative/absent cohort does not.",
+            "rollback_condition": "Reject if the tagged cohort underperforms baseline EV or cuts trade count without improving drawdown.",
+        })
+    if {"order_flow", "liquidity"} & tags:
+        add(
+            "order_flow_confirmation",
+            "Require recent tape delta, book imbalance, or volume-profile acceptance to confirm breakouts and avoid thin-liquidity traps.",
+            "momentum_breakout",
+            ["flow_score", "flow_delta_pct", "depth_imbalance", "profile_poc", "order_flow_vwap"],
+            "Could tighten entry gates for momentum and high-volatility setups; should remain shadow until cohort data proves incremental EV.",
+            "Medium: order-flow features can overfit recent microstructure and exchange-specific noise.",
+        )
+    if "funding" in tags:
+        add(
+            "funding_crowding_filter",
+            "Separate funding extremes that create squeeze opportunity from crowded trend-continuation traps.",
+            "funding_arb",
+            ["funding_rate", "basis", "change_1h_pct", "trend_score", "agent_regime"],
+            "May block some Funding Arb candidates when trend and funding crowding align against the entry.",
+            "Medium-high: funding regimes shift quickly; needs rolling validation and no symbol-specific rules.",
+        )
+    if {"sentiment", "macro"} & tags:
+        add(
+            "sentiment_macro_regime",
+            "Use external sentiment and macro stress as a risk regime annotation, not a direct entry signal.",
+            "balanced",
+            ["agent_regime", "btc_beta", "market_context", "news_sentiment"],
+            "Should annotate risk-on/risk-off bias and possibly raise conviction thresholds during macro stress after validation.",
+            "High: narrative data is noisy, delayed, and easy to rationalize after the fact.",
+        )
+    if {"volatility", "risk"} & tags:
+        add(
+            "volatility_stop_quality",
+            "Test whether ATR stop distance and TP laddering need regime-specific treatment in high and extreme volatility.",
+            "balanced",
+            ["atr_pct", "vol_regime", "journey_mae_pct", "journey_mfe_pct", "stop_pressure"],
+            "Could affect stop/target design, but must start as journey analytics only.",
+            "Medium: stop tuning can curve-fit losses unless validated across regimes and strategies.",
+        )
+    return candidates[:4]
+
+
+def _research_local_corpus_candidates(limit: int = 40) -> list[dict]:
+    root = os.path.join("docs", "research")
+    if not os.path.isdir(root):
+        return []
+    out: list[dict] = []
+    for base, _, files in os.walk(root):
+        for name in files:
+            if not name.lower().endswith((".txt", ".md", ".pdf")):
+                continue
+            path = os.path.join(base, name)
+            rel = os.path.relpath(path, ".")
+            title = os.path.splitext(name)[0].replace("_", " ").replace("-", " ")
+            excerpt = ""
+            if name.lower().endswith((".txt", ".md")):
+                try:
+                    with open(path, encoding="utf-8", errors="ignore") as f:
+                        excerpt = f.read(3000)
+                except Exception:
+                    excerpt = ""
+            out.append({
+                "id": "local_" + _research_slug_id(rel),
+                "title": title[:180],
+                "source_type": "local_pdf" if name.lower().endswith(".pdf") else "local_text",
+                "path": rel,
+                "tags": _research_extract_tags(title + " " + excerpt),
+                "summary": _research_summarize_text(excerpt) if excerpt else "Local research document indexed by metadata; full text extraction not yet run.",
+                "quality_score": 0.72 if name.lower().endswith(".pdf") else 0.68,
+                "relevance_score": 0.74,
+                "added_at": _research_now(),
+            })
+    out.sort(key=lambda x: x.get("title", ""))
+    return out[:limit]
+
+
+def _research_seed_local_corpus() -> dict:
+    existing = _research_load_sources()
+    seen = {s.get("id") for s in existing}
+    added = 0
+    for item in _research_local_corpus_candidates(limit=200):
+        if item.get("id") in seen:
+            continue
+        item["status"] = "indexed"
+        item["hypotheses"] = _research_hypotheses_from_source(item)
+        existing.append(item)
+        seen.add(item.get("id"))
+        added += 1
+    if added:
+        _research_save_sources(existing)
+    return {"added": added, "total": len(existing)}
+
+
+def _research_ingest_source(payload: dict) -> dict:
+    title = str(payload.get("title") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    text = str(payload.get("text") or payload.get("summary") or "").strip()
+    source_type = str(payload.get("source_type") or ("url" if url else "note")).strip().lower()
+    fetched = False
+    if url and not text:
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "MatrixTrader7-HermesResearch/1.0"})
+        resp.raise_for_status()
+        text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", resp.text, flags=re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()[:12000]
+        fetched = True
+    if not title:
+        title = (url or text[:90] or "Untitled research note").strip()[:180]
+    tags = payload.get("tags") if isinstance(payload.get("tags"), list) else _research_extract_tags(title + " " + text)
+    source = {
+        "id": "src_" + _research_slug_id(url, title, text[:300]),
+        "title": title,
+        "url": url or None,
+        "source_type": source_type,
+        "author": payload.get("author"),
+        "published_at": payload.get("published_at"),
+        "added_at": _research_now(),
+        "tags": tags,
+        "summary": _research_summarize_text(text) or str(payload.get("summary") or "").strip(),
+        "raw_excerpt": text[:3000],
+        "quality_score": float(payload.get("quality_score") or (0.7 if source_type in {"paper", "academic", "url"} else 0.55)),
+        "relevance_score": float(payload.get("relevance_score") or 0.7),
+        "status": "fetched" if fetched else "manual",
+    }
+    source["hypotheses"] = _research_hypotheses_from_source(source)
+    sources = _research_load_sources()
+    sources = [s for s in sources if s.get("id") != source["id"]]
+    sources.insert(0, source)
+    _research_save_sources(sources)
+    return source
+
+
+def _cipher_review_research_hypotheses(sources: list[dict]) -> list[dict]:
+    reviews: list[dict] = []
+    for source in sources:
+        for hyp in source.get("hypotheses") or []:
+            if not isinstance(hyp, dict):
+                continue
+            quality = float(source.get("quality_score") or 0)
+            relevance = float(source.get("relevance_score") or 0)
+            score = round((quality * 0.45 + relevance * 0.35 + (0.2 if hyp.get("mt7_fields_needed") else 0)) * 100)
+            verdict = "shadow_only"
+            if score >= 78:
+                verdict = "shadow_priority"
+            elif score < 55:
+                verdict = "weak_prior"
+            reviews.append({
+                **hyp,
+                "source_title": source.get("title"),
+                "source_tags": source.get("tags") or [],
+                "cipher_score": score,
+                "cipher_verdict": verdict,
+                "cipher_notes": [
+                    "Advisory only: no live scoring, sizing, or gate changes.",
+                    "Prefer broad regime features over symbol-specific rules.",
+                    "Promotion requires out-of-sample forward results and a rollback condition.",
+                ],
+            })
+    reviews.sort(key=lambda x: x.get("cipher_score", 0), reverse=True)
+    return reviews
+
+
+def _research_generate_weekly_memo(register_experiments: bool = True) -> dict:
+    sources = _research_load_sources()
+    reviews = _cipher_review_research_hypotheses(sources)
+    top = reviews[:8]
+    tag_counts: dict[str, int] = {}
+    for s in sources:
+        for tag in s.get("tags") or []:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    registered = 0
+    if register_experiments:
+        for hyp in top:
+            record = {
+                "id": hyp.get("id"),
+                "created_at": _research_now(),
+                "source": "hermes_research_pipeline",
+                "status": "shadow_proposed",
+                "hypothesis": hyp.get("thesis"),
+                "target_strategy": hyp.get("target_strategy"),
+                "shadow_tag": hyp.get("shadow_tag"),
+                "mt7_fields_needed": hyp.get("mt7_fields_needed"),
+                "expected_edge": hyp.get("expected_edge"),
+                "gate_impact": hyp.get("gate_impact"),
+                "overfitting_risk": hyp.get("overfitting_risk"),
+                "promotion_criteria": hyp.get("promotion_criteria"),
+                "rollback_condition": hyp.get("rollback_condition"),
+                "source_title": hyp.get("source_title"),
+            }
+            if record["id"] and _append_experiment_record_once(record):
+                registered += 1
+    memo = {
+        "generated_at": _research_now(),
+        "title": "Hermes Weekly Research Memo",
+        "mode": "research_to_shadow_experiments",
+        "source_count": len(sources),
+        "tag_counts": tag_counts,
+        "sections": {
+            "executive_summary": (
+                "Hermes Research is operating as an external-prior engine. Findings are converted into Cipher-reviewed shadow hypotheses only; "
+                "no strategy gates, sizing, or live execution settings are changed by this memo."
+            ),
+            "research_radar": top,
+            "cipher_review": [
+                {
+                    "id": h.get("id"),
+                    "verdict": h.get("cipher_verdict"),
+                    "score": h.get("cipher_score"),
+                    "target_strategy": h.get("target_strategy"),
+                    "shadow_tag": h.get("shadow_tag"),
+                    "overfitting_risk": h.get("overfitting_risk"),
+                    "gate_impact": h.get("gate_impact"),
+                } for h in top
+            ],
+            "anti_overfit_rules": [
+                "Do not promote from a single source or a single week of market behavior.",
+                "Require at least 50 closed forward-tested tagged signals before live effect.",
+                "Reject symbol-specific hacks unless they are explicitly liquidity/execution safety rules.",
+                "Measure trade-count reduction, EV, drawdown, and false-negative opportunity cost.",
+            ],
+        },
+        "registered_shadow_experiments": registered,
+    }
+    _research_write_json(HERMES_RESEARCH_MEMO_PATH, memo)
+    archive_dir = os.path.join(HERMES_RESEARCH_DIR, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    _research_write_json(os.path.join(archive_dir, f"weekly_research_{stamp}.json"), memo)
+    return memo
+
+
+def _hermes_research_pipeline_summary() -> dict:
+    sources = _research_load_sources()
+    memo = _hermes_read_json(HERMES_RESEARCH_MEMO_PATH, None)
+    reviews = _cipher_review_research_hypotheses(sources)
+    ledger = _read_experiment_ledger()
+    research_experiments = [x for x in ledger if isinstance(x, dict) and x.get("source") == "hermes_research_pipeline"]
+    return {
+        "library": {
+            "source_count": len(sources),
+            "sources": sources[:8],
+            "local_candidates": _research_local_corpus_candidates(limit=8),
+        },
+        "weekly_memo": memo,
+        "cipher_reviews": reviews[:10],
+        "shadow_experiment_count": len(research_experiments),
+        "source_path": HERMES_RESEARCH_SOURCES_PATH,
+        "memo_path": HERMES_RESEARCH_MEMO_PATH,
+    }
+
+
+def _hermes_signal_audit(con: sqlite3.Connection) -> dict:
+    cols = _hermes_table_cols(con, "signals")
+    if not cols:
+        return {"count": 0, "closed": 0, "sample_warning": "signals table unavailable"}
+
+    source_filter = "AND COALESCE(source, 'live') != 'paper'" if "source" in cols else ""
+    date_col = (
+        "logged_at" if "logged_at" in cols else
+        "created_at" if "created_at" in cols else
+        "result_at" if "result_at" in cols else
+        "ts" if "ts" in cols else
+        None
+    )
+    recent_filter = f"AND datetime({date_col}) >= datetime('now', '-30 days')" if date_col else ""
+
+    closed = con.execute(f"""
+        SELECT result, pnl_pct, strategy_key, symbol
+        FROM signals
+        WHERE result IS NOT NULL
+          AND pnl_pct IS NOT NULL
+          {source_filter}
+    """).fetchall()
+    recent = con.execute(f"""
+        SELECT result, pnl_pct, strategy_key, symbol
+        FROM signals
+        WHERE result IS NOT NULL
+          AND pnl_pct IS NOT NULL
+          {source_filter}
+          {recent_filter}
+    """).fetchall() if date_col else closed[-200:]
+
+    def _summary(rows) -> dict:
+        pnls = [float(r["pnl_pct"] or 0) for r in rows]
+        wins = sum(1 for r in rows if r["result"] == "WIN")
+        partials = sum(1 for r in rows if r["result"] == "PARTIAL")
+        losses = sum(1 for r in rows if r["result"] == "LOSS")
+        return {
+            "closed": len(rows),
+            "wins": wins,
+            "partials": partials,
+            "losses": losses,
+            "win_partial_rate": round((wins + partials) / len(rows), 3) if rows else None,
+            "ev_per_trade_pct": round(sum(pnls) / len(pnls), 2) if pnls else None,
+            "total_pnl_pct": round(sum(pnls), 2) if pnls else 0,
+        }
+
+    strategy_rows = con.execute(f"""
+        SELECT strategy_key, COUNT(*) AS n, AVG(pnl_pct) AS ev, SUM(pnl_pct) AS total_pnl,
+               SUM(CASE WHEN result IN ('WIN','PARTIAL') THEN 1 ELSE 0 END) AS good
+        FROM signals
+        WHERE result IS NOT NULL
+          AND pnl_pct IS NOT NULL
+          {source_filter}
+        GROUP BY strategy_key
+        HAVING n >= 3
+        ORDER BY total_pnl DESC
+        LIMIT 12
+    """).fetchall()
+    symbol_rows = con.execute(f"""
+        SELECT symbol, COUNT(*) AS n, AVG(pnl_pct) AS ev, SUM(pnl_pct) AS total_pnl
+        FROM signals
+        WHERE result IS NOT NULL
+          AND pnl_pct IS NOT NULL
+          {source_filter}
+        GROUP BY symbol
+        HAVING n >= 2
+        ORDER BY total_pnl ASC
+        LIMIT 8
+    """).fetchall()
+
+    # ── Coach reviews: tier-1 summary (always included) + recent 20 full text ──
+    COACH_THEMES = {
+        "stop_pressure":      ["stop pressure", "stop was hit", "stop hit", "touched the stop"],
+        "funding_misaligned": ["funding misalign", "carry was fighting", "misaligned", "carry fighting"],
+        "entry_timing":       ["entry too early", "entry too late", "early entry", "late entry", "entered too"],
+        "regime_mismatch":    ["choppy", "no trend", "range-bound", "sideways", "regime"],
+        "conviction_issue":   ["overconfident", "low conviction", "weak setup"],
+        "size_management":    ["sizing", "position size", "oversize", "too large"],
+        "poor_capture":       ["capture ratio", "gave back", "profit given back", "didn't hold"],
+        "exit_timing":        ["held too long", "exited too early", "exit timing"],
+        "liquidity":          ["liquidity", "thin market", "spread", "slippage"],
+        "agent_disagreement": ["desk was split", "elevated disagreement", "disagreement score"],
+    }
+
+    coach_summary = {"total_reviews": 0, "by_result": {}, "loss_themes": [], "note": "Use /api/intelligence/hermes/coach-reviews for full corpus."}
+    recent_reviews = []
+    try:
+        all_review_rows = con.execute(f"""
+            SELECT symbol, direction, strategy_key, result, pnl_pct, signal_json
+            FROM signals
+            WHERE result IS NOT NULL
+              AND result NOT IN ('EXPIRED', 'SKIPPED')
+              AND json_extract(signal_json, '$.coach_review') IS NOT NULL
+              {source_filter}
+            ORDER BY logged_at DESC
+        """).fetchall()
+
+        theme_counts = {t: {"total": 0, "LOSS": 0, "WIN": 0, "PARTIAL": 0} for t in COACH_THEMES}
+        by_result: dict = {}
+
+        for i, row in enumerate(all_review_rows):
+            try:
+                sj = json.loads(row["signal_json"] or "{}")
+                review_text = sj.get("coach_review") or ""
+                if not review_text:
+                    continue
+                result = row["result"]
+                by_result[result] = by_result.get(result, 0) + 1
+                text_lower = review_text.lower()
+                for theme, phrases in COACH_THEMES.items():
+                    if any(p in text_lower for p in phrases):
+                        theme_counts[theme]["total"] += 1
+                        if result in theme_counts[theme]:
+                            theme_counts[theme][result] += 1
+                if i < 20:
+                    recent_reviews.append({
+                        "symbol":    row["symbol"],
+                        "direction": row["direction"],
+                        "strategy":  row["strategy_key"],
+                        "result":    result,
+                        "pnl_pct":   row["pnl_pct"],
+                        "review":    review_text,
+                    })
+            except Exception:
+                pass
+
+        loss_themes = sorted(
+            [{"theme": t, "loss_count": c["LOSS"], "win_count": c["WIN"], "total_count": c["total"]}
+             for t, c in theme_counts.items() if c["total"] > 0],
+            key=lambda x: x["loss_count"], reverse=True,
+        )
+        coach_summary = {
+            "total_reviews": len(all_review_rows),
+            "by_result": by_result,
+            "loss_themes": loss_themes,
+            "note": "Use /api/intelligence/hermes/coach-reviews for full corpus.",
+        }
+    except Exception:
+        pass
+
+    all_summary = _summary(closed)
+    recent_summary = _summary(recent)
+    return {
+        "all_time": all_summary,
+        "recent_30d": recent_summary,
+        "strategies": _hermes_rows_to_dicts(strategy_rows),
+        "worst_symbols": _hermes_rows_to_dicts(symbol_rows),
+        "sample_warning": "low sample" if recent_summary["closed"] < 30 else None,
+        "coach_reviews": coach_summary,
+        "coach_reviews_recent_20": recent_reviews,
+    }
+
+
+def _hermes_paper_audit(con: sqlite3.Connection) -> dict:
+    cols = _hermes_table_cols(con, "paper_trades")
+    if not cols:
+        return {"open": 0, "closed": 0, "sample_warning": "paper_trades table unavailable"}
+
+    rows = con.execute("""
+        SELECT symbol, strategy_key, result, pnl_pct, atr_pct, trend_score, status
+        FROM paper_trades
+        WHERE status='closed'
+    """).fetchall()
+    open_n = con.execute("SELECT COUNT(*) FROM paper_trades WHERE status='open'").fetchone()[0] or 0
+    pnls = [float(r["pnl_pct"] or 0) for r in rows if r["pnl_pct"] is not None]
+    wins = sum(1 for r in rows if r["result"] == "WIN")
+    partials = sum(1 for r in rows if r["result"] == "PARTIAL")
+    losses = sum(1 for r in rows if r["result"] == "LOSS")
+    worst = sorted(
+        [{"symbol": r["symbol"], "strategy_key": r["strategy_key"], "pnl_pct": r["pnl_pct"], "atr_pct": r["atr_pct"], "trend_score": r["trend_score"]} for r in rows if r["pnl_pct"] is not None],
+        key=lambda x: float(x["pnl_pct"] or 0),
+    )[:8]
+    return {
+        "open": open_n,
+        "closed": len(rows),
+        "wins": wins,
+        "partials": partials,
+        "losses": losses,
+        "win_partial_rate": round((wins + partials) / len(rows), 3) if rows else None,
+        "ev_per_trade_pct": round(sum(pnls) / len(pnls), 2) if pnls else None,
+        "total_pnl_pct": round(sum(pnls), 2) if pnls else 0,
+        "worst_trades": worst,
+        "sample_warning": "low sample" if len(rows) < 50 else None,
+    }
+
+
+def _hermes_suggestion_audit() -> dict:
+    suggestions = _load_suggestions()
+    counts: dict[str, int] = {}
+    for s in suggestions:
+        status = s.get("status") or "unknown"
+        counts[status] = counts.get(status, 0) + 1
+    active = [s for s in suggestions if s.get("status") in {"pending", "pending_review", "evaluating"}]
+    return {
+        "learner_running": _learner_running(),
+        "counts": counts,
+        "active": active[:5],
+        "total": len(suggestions),
+    }
+
+
+def _hermes_recommendation(packet: dict) -> dict:
+    paper = packet.get("paper") or {}
+    live = (packet.get("signals") or {}).get("recent_30d") or {}
+    suggestions = packet.get("suggestions") or {}
+
+    if paper.get("closed", 0) < 50:
+        return {
+            "title": "Extend the paper-bot validation window",
+            "hypothesis": "The execution dataset is still too small to decide whether MT7's automated selection is profitable.",
+            "experiment": "Keep paper bot running unchanged until it reaches 50 closed trades, then compare paper EV, win+partial rate, and worst-symbol concentration against live-tagged signals.",
+            "success_metric": "Paper win+partial rate >= 50% and EV per trade > 0 after fees/slippage allowance.",
+            "do_not_change": "Do not activate micro-live automation or add Hermes-driven config changes before this sample clears.",
+        }
+    if paper.get("ev_per_trade_pct") is not None and paper.get("ev_per_trade_pct") < 0:
+        return {
+            "title": "Run a volatility/liquidity filter experiment on paper only",
+            "hypothesis": "Paper bot losses are coming from tradeability gaps rather than the broad signal engine.",
+            "experiment": "Shadow-tag and optionally paper-filter high ATR / thin-volume names for 20 paper trades without changing live signal scoring.",
+            "success_metric": "Paper EV improves by at least 3 percentage points without cutting trade count by more than 40%.",
+            "do_not_change": "Do not blend paper outcomes into live signal EV when judging this experiment.",
+        }
+    if suggestions.get("active"):
+        return {
+            "title": "Resolve the active learner queue before adding new hypotheses",
+            "hypothesis": "A clean one-change-at-a-time loop is more valuable than adding research complexity.",
+            "experiment": "Apply, reject, or finish evaluation of the active learner suggestion, then capture before/after EV.",
+            "success_metric": "Every applied change has a baseline, evaluation window, and explicit keep/revert decision.",
+            "do_not_change": "Do not let Hermes propose a second config experiment while mt-learner has one active.",
+        }
+    return {
+        "title": "Create one shadow experiment from external research",
+        "hypothesis": "Hermes Research can improve MT7 if every outside idea is converted into a measurable shadow tag first.",
+        "experiment": "Add one research-queue item with data requirements, a shadow tag, and a 50-signal evaluation plan.",
+        "success_metric": "The hypothesis is testable with MT7/MEXC/Hyperliquid data and does not require live execution changes.",
+        "do_not_change": "Do not modify thresholds or sizing from academic/industry research until the shadow dataset validates it.",
+    }
+
+
+def _build_hermes_audit() -> dict:
+    goals = _load_goals()
+    actuals = _compute_goal_actuals(goals)
+    packet: dict = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "mode": "mt7_context_packet",
+        "consultancy": _hermes_consultancy_profile(),
+        "latest_memo": _hermes_latest_memo(),
+        "memo_archive": _hermes_memo_archive(),
+        "goals": goals,
+        "goal_actuals": actuals,
+        "edge_lab": _hermes_edge_lab_meta(),
+        "cipher_reports": _hermes_latest_report_meta(),
+        "suggestions": _hermes_suggestion_audit(),
+        "research": _hermes_research_queue(),
+        "blindspots": [
+            "Paper trades and live-tagged signals are different data streams and must not be blended.",
+            "Small samples can be dominated by a few outlier meme-token wins or losses.",
+            "Cipher narratives can sound useful without proving they improved EV.",
+            "Edge Lab findings are research priors, not permission to change live scoring.",
+            "With a small account, sizing and drawdown control matter as much as signal accuracy.",
+        ],
+    }
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        packet["signals"] = _hermes_signal_audit(con)
+        packet["paper"] = _hermes_paper_audit(con)
+        con.close()
+    except Exception as e:
+        print(f"[hermes] db audit: {e}", file=sys.stderr)
+        packet["signals"] = {"error": str(e)}
+        packet["paper"] = {"error": str(e)}
+
+    live_ev = (packet.get("signals") or {}).get("recent_30d", {}).get("ev_per_trade_pct")
+    paper_ev = (packet.get("paper") or {}).get("ev_per_trade_pct")
+    score = 50
+    if live_ev is not None:
+        score += 15 if live_ev > 0 else -15
+    if paper_ev is not None:
+        score += 15 if paper_ev > 0 else -15
+    if actuals.get("kill_switch_breached"):
+        score -= 25
+    if packet["suggestions"].get("active"):
+        score -= 5
+    packet["health_score"] = max(0, min(100, score))
+    packet["recommendation"] = _hermes_recommendation(packet)
+    packet["risk_warning"] = (
+        "Do not fund or scale live automation from this MT7 context packet alone. The Hermes agent must remain an outside consultant, not an execution authority."
+    )
+    return packet
+
+
+@app.route('/api/intelligence/hermes')
+def api_intelligence_hermes():
+    """Read-only Hermes context packet plus latest external Hermes memo, when present."""
+    try:
+        return jsonify({"success": True, "audit": _build_hermes_audit()})
+    except Exception as e:
+        print(f"[api/intelligence/hermes] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/hermes/coach-reviews')
+def api_hermes_coach_reviews():
+    """Full coach review corpus for Hermes deep-dive sessions.
+    Query params: result (WIN|LOSS|PARTIAL), strategy, limit (default 200), offset (default 0).
+    """
+    try:
+        result_filter = request.args.get("result", "").strip().upper()
+        strategy_filter = request.args.get("strategy", "").strip().lower()
+        limit  = min(int(request.args.get("limit",  200)), 500)
+        offset = max(int(request.args.get("offset", 0)),   0)
+
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        cols = _hermes_table_cols(con, "signals")
+        source_filter = "AND COALESCE(source, 'live') != 'paper'" if "source" in cols else ""
+
+        clauses = [
+            "result IS NOT NULL",
+            "result NOT IN ('EXPIRED','SKIPPED')",
+            "json_extract(signal_json, '$.coach_review') IS NOT NULL",
+        ]
+        params: list = []
+        if result_filter in ("WIN", "LOSS", "PARTIAL"):
+            clauses.append("result = ?")
+            params.append(result_filter)
+        if strategy_filter:
+            clauses.append("strategy_key = ?")
+            params.append(strategy_filter)
+
+        where = " AND ".join(clauses) + " " + source_filter
+
+        total_count = con.execute(f"SELECT COUNT(*) FROM signals WHERE {where}", params).fetchone()[0]
+        rows = con.execute(
+            f"""SELECT symbol, direction, strategy_key, result, pnl_pct, logged_at, signal_json
+                FROM signals WHERE {where}
+                ORDER BY logged_at DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        con.close()
+
+        reviews = []
+        for row in rows:
+            try:
+                sj = json.loads(row["signal_json"] or "{}")
+                review_text = sj.get("coach_review") or ""
+                if review_text:
+                    reviews.append({
+                        "symbol":    row["symbol"],
+                        "direction": row["direction"],
+                        "strategy":  row["strategy_key"],
+                        "result":    row["result"],
+                        "pnl_pct":   row["pnl_pct"],
+                        "logged_at": row["logged_at"],
+                        "review":    review_text,
+                    })
+            except Exception:
+                pass
+
+        return jsonify({
+            "success": True,
+            "total":   total_count,
+            "limit":   limit,
+            "offset":  offset,
+            "reviews": reviews,
+        })
+    except Exception as e:
+        print(f"[api/hermes/coach-reviews] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+_hermes_run_lock = threading.Lock()
+_hermes_run_state: dict = {"status": "idle", "started_at": None, "finished_at": None, "error": None}
+
+def _hermes_run_script():
+    script = os.path.join(os.path.dirname(__file__), "scripts", "run_hermes_weekly_from_vultr.sh")
+    if not os.path.isfile(script):
+        with _hermes_run_lock:
+            _hermes_run_state.update(status="error", error="Script not found: " + script, finished_at=datetime.utcnow().isoformat())
+        return
+    import subprocess
+    try:
+        env = os.environ.copy()
+        env.setdefault("HOME", "/root")
+        result = subprocess.run(
+            ["bash", script],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.path.dirname(__file__),
+            env=env,
+        )
+        with _hermes_run_lock:
+            if result.returncode == 0:
+                _hermes_run_state.update(status="done", error=None, finished_at=datetime.utcnow().isoformat())
+            else:
+                combined = (result.stderr or result.stdout or "").strip()
+                last_lines = "\n".join(combined.splitlines()[-6:]) if combined else ""
+                msg = f"exit {result.returncode}" + (f": {last_lines}" if last_lines else "")
+                _hermes_run_state.update(status="error", error=msg[:500], finished_at=datetime.utcnow().isoformat())
+    except subprocess.TimeoutExpired:
+        with _hermes_run_lock:
+            _hermes_run_state.update(status="error", error="Timed out after 300s", finished_at=datetime.utcnow().isoformat())
+    except Exception as e:
+        with _hermes_run_lock:
+            _hermes_run_state.update(status="error", error=str(e), finished_at=datetime.utcnow().isoformat())
+
+
+@app.route('/api/intelligence/hermes/run', methods=['POST'])
+def api_hermes_run():
+    """Trigger an on-demand Hermes consultancy run. Returns immediately; poll /status for progress."""
+    with _hermes_run_lock:
+        if _hermes_run_state.get("status") == "running":
+            return jsonify({"success": False, "error": "A run is already in progress"}), 409
+        _hermes_run_state.update(status="running", started_at=datetime.utcnow().isoformat(), finished_at=None, error=None)
+    t = threading.Thread(target=_hermes_run_script, daemon=True)
+    t.start()
+    return jsonify({"success": True, "message": "Hermes run started"})
+
+
+@app.route('/api/intelligence/hermes/run/status')
+def api_hermes_run_status():
+    with _hermes_run_lock:
+        return jsonify(dict(_hermes_run_state))
+
+
 @app.route('/api/intelligence/status')
 def api_intelligence_status():
     """Shadow validation status and agent findings from signals.db."""
@@ -6190,7 +7776,22 @@ def api_intelligence_status():
             phase = 'phase2_ready'
 
         # Regime distribution
-        regime_distribution = {r: 0 for r in ['volatile_squeeze', 'news_catalyst', 'trending', 'choppy', 'institutional', 'unknown']}
+        regime_distribution = {
+            r: 0 for r in [
+                'volatile_squeeze',
+                'liquidation_cascade',
+                'funding_crowded',
+                'low_liquidity',
+                'news_catalyst',
+                'compression',
+                'trending',
+                'breakout_trend',
+                'choppy',
+                'institutional',
+                'risk_off_beta',
+                'unknown',
+            ]
+        }
         try:
             cur.execute("""
                 SELECT json_extract(signal_json, '$.agent_regime') as regime, COUNT(*) as cnt
@@ -6300,6 +7901,133 @@ def api_intelligence_status():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/intelligence/factor-report')
+def api_intelligence_factor_report():
+    """Serve the full Edge Lab factor_report.json."""
+    try:
+        report_path = os.path.join("data", "factor_report.json")
+        if not os.path.exists(report_path):
+            return jsonify({'success': False, 'error': 'factor_report.json not found'}), 404
+        with open(report_path, encoding='utf-8') as f:
+            report = json.load(f)
+        report['success'] = True
+        return jsonify(report)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/intelligence/tag-attribution')
+def api_intelligence_tag_attribution():
+    """EV attribution for Cipher/agent tags across all closed live signals."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        TAGS = [
+            ('agent_confirmed',          'Agent'),
+            ('agent_blocked',            'Agent'),
+            ('no_trade_zone',            'Agent'),
+            ('agent_exchange_stress',    'Agent'),
+            ('agent_float_fragile',      'Agent'),
+            ('agent_late_move_detected', 'Agent'),
+            ('agent_unavailable',        'Agent'),
+            ('cg_funding_confirmed',     'CoinGlass'),
+            ('liq_aligned',              'CoinGlass'),
+            ('liq_contrary',             'CoinGlass'),
+            ('flow_confirmed',           'Flow'),
+            ('spread_z_extreme',         'Market'),
+            ('illiq_high',               'Market'),
+            ('illiq_extreme',            'Market'),
+            ('vol_spike',                'Market'),
+            ('vol_unstable',             'Market'),
+            ('adl_risk',                 'Market'),
+            ('trend_extended',           'Signal'),
+            ('trend_extended_mild',      'Signal'),
+            ('overbought',               'Signal'),
+            ('oversold',                 'Signal'),
+        ]
+
+        cur.execute("""
+            SELECT COUNT(*),
+                   AVG(CASE WHEN result IN ('WIN','PARTIAL') THEN 1.0 ELSE 0.0 END),
+                   AVG(pnl_pct)
+            FROM signals
+            WHERE result IN ('WIN','LOSS','PARTIAL')
+            AND pnl_pct IS NOT NULL
+            AND (source IS NULL OR source != 'paper')
+        """)
+        r = cur.fetchone()
+        base_n = r[0] or 0
+        base_wp = round(r[1] * 100, 1) if r[1] is not None else None
+        base_pnl = round(r[2], 2) if r[2] is not None else None
+
+        tag_rows = []
+        for tag, group in TAGS:
+            try:
+                cur.execute("""
+                    SELECT COUNT(*),
+                           AVG(CASE WHEN result IN ('WIN','PARTIAL') THEN 1.0 ELSE 0.0 END),
+                           AVG(pnl_pct)
+                    FROM signals
+                    WHERE result IN ('WIN','LOSS','PARTIAL')
+                    AND pnl_pct IS NOT NULL
+                    AND (source IS NULL OR source != 'paper')
+                    AND (',' || COALESCE(tags,'') || ',') LIKE ('%,' || ? || ',%')
+                """, (tag,))
+                row = cur.fetchone()
+                n = row[0] or 0
+                if n < 5:
+                    continue
+                wp = round(row[1] * 100, 1) if row[1] is not None else None
+                avg_pnl = round(row[2], 2) if row[2] is not None else None
+                tag_rows.append({
+                    'tag': tag, 'group': group, 'n': n,
+                    'wp_rate': wp, 'avg_pnl': avg_pnl,
+                    'delta_wp': round(wp - base_wp, 1) if wp is not None and base_wp is not None else None,
+                    'delta_pnl': round(avg_pnl - base_pnl, 2) if avg_pnl is not None and base_pnl is not None else None,
+                })
+            except Exception:
+                continue
+
+        regime_rows = []
+        try:
+            cur.execute("""
+                SELECT json_extract(signal_json, '$.agent_regime') as regime,
+                       COUNT(*),
+                       AVG(CASE WHEN result IN ('WIN','PARTIAL') THEN 1.0 ELSE 0.0 END),
+                       AVG(pnl_pct)
+                FROM signals
+                WHERE result IN ('WIN','LOSS','PARTIAL')
+                AND pnl_pct IS NOT NULL
+                AND (source IS NULL OR source != 'paper')
+                AND json_extract(signal_json, '$.agent_regime') IS NOT NULL
+                GROUP BY regime
+                HAVING COUNT(*) >= 5
+                ORDER BY COUNT(*) DESC
+            """)
+            for row in cur.fetchall():
+                wp = round(row[2] * 100, 1) if row[2] is not None else None
+                avg_pnl = round(row[3], 2) if row[3] is not None else None
+                regime_rows.append({
+                    'regime': row[0], 'n': row[1],
+                    'wp_rate': wp, 'avg_pnl': avg_pnl,
+                    'delta_wp': round(wp - base_wp, 1) if wp is not None and base_wp is not None else None,
+                    'delta_pnl': round(avg_pnl - base_pnl, 2) if avg_pnl is not None and base_pnl is not None else None,
+                })
+        except Exception:
+            pass
+
+        conn.close()
+        return jsonify({
+            'success': True,
+            'baseline': {'n': base_n, 'wp_rate': base_wp, 'avg_pnl': base_pnl},
+            'tags': tag_rows,
+            'regimes': regime_rows,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 def _apply_suggestion_config(suggestion: dict) -> tuple[bool, str | None]:
     stype = suggestion.get("type")
     payload = suggestion.get("api_payload") or {}
@@ -6339,10 +8067,48 @@ def _apply_suggestion_config(suggestion: dict) -> tuple[bool, str | None]:
         if stype == "regime_suppress":
             if not strategy_key:
                 return False, "strategy missing"
-            allowed = payload.get("allowed_volatility")
             valid = {"low", "medium", "high", "extreme"}
+            blocked = _normalize_agent_regime_list(payload.get("blocked_agent_regimes"))
+            regime = str(suggestion.get("regime") or "").strip().lower()
+            if not blocked and regime and regime not in valid:
+                blocked = _normalize_agent_regime_list([regime])
+
+            if blocked:
+                if strategy_key in STRATEGIES:
+                    current_override = _load_strategy_overrides().get(strategy_key, {})
+                    existing_blocked = _normalize_agent_regime_list(current_override.get("blocked_agent_regimes"))
+                else:
+                    current_cfg = get_strategy_config(strategy_key, include_disabled=True)
+                    existing_blocked = _normalize_agent_regime_list(current_cfg.get("blocked_agent_regimes"))
+                merged_blocked = existing_blocked + [r for r in blocked if r not in existing_blocked]
+                if strategy_key in STRATEGIES:
+                    _save_strategy_override(strategy_key, "blocked_agent_regimes", merged_blocked)
+                else:
+                    with app.test_client() as c:
+                        r = c.patch(
+                            f"/api/strategies/custom/{strategy_key}",
+                            data=json.dumps({"blocked_agent_regimes": merged_blocked}),
+                            content_type="application/json",
+                        )
+                    if r.status_code not in (200, 201):
+                        return False, "failed to update custom strategy agent-regime filter"
+                _append_experiment_record({
+                    "id": suggestion.get("id"),
+                    "type": "regime_suppress",
+                    "strategy": strategy_key,
+                    "field": "blocked_agent_regimes",
+                    "value": merged_blocked,
+                    "added": blocked,
+                    "evidence_summary": suggestion.get("evidence_summary"),
+                    "sample_size": suggestion.get("sample_size"),
+                    "baseline": _suggestion_baseline_snapshot(),
+                    "applied_at": datetime.utcnow().isoformat(),
+                })
+                return True, None
+
+            allowed = payload.get("allowed_volatility")
             if not isinstance(allowed, list) or not allowed or any(v not in valid for v in allowed):
-                return False, "allowed_volatility payload is invalid"
+                return False, "regime_suppress payload needs blocked_agent_regimes or valid allowed_volatility"
             if strategy_key in STRATEGIES:
                 _save_strategy_override(strategy_key, "allowed_volatility", allowed)
             else:
@@ -6354,12 +8120,17 @@ def _apply_suggestion_config(suggestion: dict) -> tuple[bool, str | None]:
                     )
                 if r.status_code not in (200, 201):
                     return False, "failed to update custom strategy volatility filter"
-            return True, None
-
-        if payload:
-            cfg = _load_paper_config()
-            cfg.update(payload)
-            _save_paper_config(cfg)
+            _append_experiment_record({
+                "id": suggestion.get("id"),
+                "type": "regime_suppress",
+                "strategy": strategy_key,
+                "field": "allowed_volatility",
+                "value": allowed,
+                "evidence_summary": suggestion.get("evidence_summary"),
+                "sample_size": suggestion.get("sample_size"),
+                "baseline": _suggestion_baseline_snapshot(),
+                "applied_at": datetime.utcnow().isoformat(),
+            })
             return True, None
 
         return False, f"unsupported suggestion type: {stype}"
@@ -6372,11 +8143,31 @@ def api_intelligence_suggestions():
     """Read learner suggestions and annotate with current performance baseline."""
     try:
         suggestions = _load_suggestions()
+        evaluating = [s for s in suggestions if s.get('status') == 'evaluating']
+        if evaluating:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                for sug in evaluating:
+                    applied_at = (sug.get('baseline') or {}).get('applied_at')
+                    strategy = sug.get('strategy')
+                    if applied_at and strategy:
+                        row = conn.execute(
+                            "SELECT COUNT(*) FROM signals WHERE result IN ('WIN','LOSS','PARTIAL')"
+                            " AND strategy_key=? AND entry_at>=?",
+                            (strategy, applied_at),
+                        ).fetchone()
+                        sug['trades_since_baseline'] = row[0] if row else 0
+                conn.close()
+            except Exception:
+                pass
+        goals = _load_goals()
+        evaluation_window = int(goals.get('evaluation_window_trades') or 20)
         return jsonify({
             'success': True,
             'suggestions': suggestions,
             'baseline': _suggestion_baseline_snapshot(),
             'learner_running': _learner_running(),
+            'evaluation_window_trades': evaluation_window,
         })
     except Exception as e:
         return jsonify({
@@ -6416,6 +8207,10 @@ def api_intelligence_suggestion_action(suggestion_id):
         }):
             return jsonify({'success': False, 'error': 'failed to update suggestion'}), 500
         return jsonify({'success': True, 'applied': False, 'suggestion_id': suggestion_id})
+
+    evaluating = [s for s in suggestions if s.get("status") == "evaluating" and s.get("id") != suggestion_id]
+    if evaluating:
+        return jsonify({"success": False, "error": f"Cannot apply — '{evaluating[0].get('id')}' is still evaluating"}), 409
 
     ok, err = _apply_suggestion_config(suggestion)
     if not ok:
@@ -6518,6 +8313,7 @@ def api_intelligence_research():
             return jsonify({
                 'success': True, 'briefs': [],
                 'active_count': 0, 'learner_running': learner_running,
+                'hermes_pipeline': _hermes_research_pipeline_summary(),
             })
 
         with open(briefs_path, 'r') as f:
@@ -6533,6 +8329,7 @@ def api_intelligence_research():
             'learner_running': learner_running,
             'total_signals_analyzed': data.get('total_signals_analyzed', 0),
             'generated_at': data.get('generated_at'),
+            'hermes_pipeline': _hermes_research_pipeline_summary(),
         })
     except Exception as e:
         print(f'[api/intelligence/research] error: {e}', file=sys.stderr)
@@ -6540,7 +8337,56 @@ def api_intelligence_research():
             'success': True, 'briefs': [],
             'active_count': 0, 'learner_running': False,
             'error': str(e),
+            'hermes_pipeline': _hermes_research_pipeline_summary(),
         })
+
+
+@app.route('/api/intelligence/research/library')
+def api_research_library():
+    """Hermes external research library and Cipher-reviewed shadow hypotheses."""
+    try:
+        return jsonify({"success": True, **_hermes_research_pipeline_summary()})
+    except Exception as e:
+        print(f"[api/research/library] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/research/sources', methods=['POST'])
+def api_research_add_source():
+    """Add a paper/article/news/sentiment note to Hermes Research.
+
+    Body may include title, url, text/summary, source_type, tags, quality_score,
+    relevance_score. URL ingestion fetches best-effort text and remains advisory.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        source = _research_ingest_source(payload)
+        return jsonify({"success": True, "source": source, "pipeline": _hermes_research_pipeline_summary()})
+    except Exception as e:
+        print(f"[api/research/sources] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/research/seed-local', methods=['POST'])
+def api_research_seed_local():
+    """Index docs/research into Hermes' library without changing strategy behavior."""
+    try:
+        result = _research_seed_local_corpus()
+        return jsonify({"success": True, **result, "pipeline": _hermes_research_pipeline_summary()})
+    except Exception as e:
+        print(f"[api/research/seed-local] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/research/weekly-memo', methods=['POST'])
+def api_research_weekly_memo():
+    """Generate Hermes weekly research memo and register Cipher shadow experiments."""
+    try:
+        memo = _research_generate_weekly_memo(register_experiments=True)
+        return jsonify({"success": True, "memo": memo, "pipeline": _hermes_research_pipeline_summary()})
+    except Exception as e:
+        print(f"[api/research/weekly-memo] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 REPORTS_DIR = "data/reports"
@@ -7422,6 +9268,9 @@ def api_intelligence_roster():
 def api_intelligence_report_daily():
     """Generate or serve a cached Cipher daily brief."""
     key = request.args.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if key > today:
+        return jsonify({"success": False, "error": "Cannot generate reports for future dates"}), 400
     try:
         return jsonify(_load_or_build_report("daily", key))
     except Exception as e:
@@ -7681,16 +9530,44 @@ def api_ai_settings_get():
 
 @app.route("/api/settings/ai", methods=["PATCH"])
 def api_ai_settings_patch():
-    """Update the active AI model. Body: {provider, model}."""
+    """Update AI model settings and spending controls."""
     try:
-        from lib.ai_client import AVAILABLE_MODELS, save_ai_settings
+        from lib.ai_client import AVAILABLE_MODELS, load_ai_settings, save_ai_settings
         body = request.get_json(silent=True) or {}
-        provider = body.get("provider", "").strip()
-        model    = body.get("model", "").strip()
-        valid = any(m["provider"] == provider and m["model"] == model for m in AVAILABLE_MODELS)
-        if not valid:
-            return jsonify({"success": False, "error": "unknown provider/model combination"}), 400
-        settings = {"provider": provider, "model": model}
+        settings = load_ai_settings()
+
+        if "provider" in body or "model" in body:
+            provider = body.get("provider", "").strip()
+            model    = body.get("model", "").strip()
+            valid = any(m["provider"] == provider and m["model"] == model for m in AVAILABLE_MODELS)
+            if not valid:
+                return jsonify({"success": False, "error": "unknown provider/model combination"}), 400
+            settings["provider"] = provider
+            settings["model"]    = model
+
+        if "coach_review_provider" in body or "coach_review_model" in body:
+            cr_provider = body.get("coach_review_provider", "").strip()
+            cr_model    = body.get("coach_review_model", "").strip()
+            if cr_provider == "" and cr_model == "":
+                settings.pop("coach_review_provider", None)
+                settings.pop("coach_review_model", None)
+            else:
+                valid = any(m["provider"] == cr_provider and m["model"] == cr_model for m in AVAILABLE_MODELS)
+                if not valid:
+                    return jsonify({"success": False, "error": "unknown coach_review provider/model combination"}), 400
+                settings["coach_review_provider"] = cr_provider
+                settings["coach_review_model"]    = cr_model
+
+        if "fallback_policy" in body:
+            policy = str(body.get("fallback_policy") or "").strip()
+            if policy not in {"selected_only", "low_cost", "allow_all"}:
+                return jsonify({"success": False, "error": "unknown fallback_policy"}), 400
+            settings["fallback_policy"] = policy
+
+        for key in ("claude_fallback_enabled", "background_ai_enabled", "coach_reviews_enabled"):
+            if key in body:
+                settings[key] = bool(body.get(key))
+
         save_ai_settings(settings)
         return jsonify({"success": True, "current": settings})
     except Exception as e:
@@ -7723,13 +9600,242 @@ def _save_paper_config(cfg: dict) -> None:
         json.dump(cfg, f, indent=2)
 
 
-def _paper_check_exits() -> int:
+def _paper_entry_touched(pt: dict, start_iso: str, limit: int = 1440) -> tuple[bool, str | None]:
+    """Return whether a pending paper trade's entry price was touched on Min1 candles."""
+    start_dt = _parse_utc_iso(start_iso)
+    if not start_dt:
+        return False, None
+    fake_sig = {
+        "symbol":    pt["symbol"],
+        "direction": pt["direction"],
+        "logged_at": start_iso,
+        "entry1":    pt["entry_px"],
+        "stop_loss": pt["stop_loss"],
+        "exchange":  "MEXC",
+    }
+    klines = _fetch_klines_for_signal(fake_sig, interval="Min1", limit=limit, start_ts=int(start_dt.timestamp()))
+    if klines.empty:
+        return False, None
+    for _, c in klines.iterrows():
+        try:
+            ts = int(c["timestamp"])
+            low = float(c["low"])
+            high = float(c["high"])
+            if pt["direction"] == "LONG" and low <= float(pt["entry_px"]):
+                return True, datetime.utcfromtimestamp(ts).isoformat()
+            if pt["direction"] == "SHORT" and high >= float(pt["entry_px"]):
+                return True, datetime.utcfromtimestamp(ts).isoformat()
+        except Exception:
+            continue
+    return False, None
+
+
+def _paper_check_entries(cfg: dict) -> dict:
     """
-    Check all open paper trades against Min15 klines and close those that
+    Promote pending paper trades to open only when entry1 is touched.
+    Expire pending entries after entry_timeout_hours without counting them as losses.
+    """
+    filled = 0
+    expired = 0
+    timeout_hours = float(cfg.get("entry_timeout_hours", 24) or 24)
+    now = datetime.utcnow()
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM paper_trades WHERE status='pending' ORDER BY opened_at ASC"
+        ).fetchall()
+        con.close()
+
+        for row in rows:
+            pt = dict(row)
+            queued_at = pt.get("queued_at") or pt.get("opened_at")
+            queued_parsed = _parse_utc_iso(queued_at)
+            queued_dt = queued_parsed.replace(tzinfo=None) if queued_parsed else now
+
+            if (now - queued_dt).total_seconds() > timeout_hours * 3600:
+                note = f"Entry not filled within {timeout_hours:g}h"
+                closed_at = now.isoformat()
+                con = sqlite3.connect(DB_PATH)
+                con.execute(
+                    """UPDATE paper_trades
+                       SET status='entry_expired', closed_at=?, result='EXPIRED', note=?
+                       WHERE id=? AND status='pending'""",
+                    (closed_at, note, pt["id"]),
+                )
+                if pt.get("signal_id"):
+                    con.execute(
+                        """UPDATE signals
+                           SET result='EXPIRED', result_note=?, result_at=?
+                           WHERE id=? AND result IS NULL AND source='paper'""",
+                        (note, closed_at, pt["signal_id"]),
+                    )
+                con.commit()
+                con.close()
+                expired += 1
+                continue
+
+            touched, entry_at = _paper_entry_touched(pt, queued_at)
+            if not touched or not entry_at:
+                continue
+
+            con = sqlite3.connect(DB_PATH)
+            con.execute(
+                """UPDATE paper_trades
+                   SET status='open', opened_at=?, filled_at=?, note=NULL
+                   WHERE id=? AND status='pending'""",
+                (entry_at, entry_at, pt["id"]),
+            )
+            if pt.get("signal_id"):
+                con.execute(
+                    "UPDATE signals SET entry_at=? WHERE id=? AND entry_at IS NULL AND source='paper'",
+                    (entry_at, pt["signal_id"]),
+                )
+            con.commit()
+            con.close()
+            if pt.get("signal_id"):
+                log_position_event(
+                    {"id": pt["signal_id"], "direction": pt["direction"], "entry1": pt["entry_px"], "leverage": pt.get("leverage")},
+                    "ENTRY_FILLED",
+                    entry_at,
+                    pt["entry_px"],
+                    0.0,
+                    100.0,
+                    f"Paper entry touched at {pt['entry_px']}",
+                )
+            filled += 1
+            print(f"[paper_bot] FILLED {pt['symbol']} {pt['direction']} @ {pt['entry_px']}", file=sys.stderr)
+    except Exception as e:
+        print(f"[paper_bot] _paper_check_entries error: {e}", file=sys.stderr)
+    return {"filled": filled, "expired": expired}
+
+
+def _paper_cost_adjustment(
+    cfg: dict,
+    result: str,
+    leverage: float,
+) -> tuple[float, float, float]:
+    """
+    Return fee, slippage, and total costs as leveraged P&L percentage points.
+    Paper entries are modeled as maker limit fills. Stops are taker exits;
+    TP wins are maker exits with a small adverse-fill buffer.
+    """
+    maker_bps = max(0.0, float(cfg.get("paper_maker_fee_bps", 0.0) or 0.0))
+    taker_bps = max(0.0, float(cfg.get("paper_taker_fee_bps", 2.0) or 2.0))
+    slip_bps = max(0.0, float(cfg.get("paper_slippage_bps", 3.0) or 3.0))
+    lev = max(1.0, float(leverage or 1.0))
+
+    entry_fee_bps = maker_bps
+    if result == "WIN":
+        exit_fee_bps = maker_bps
+        slippage_bps = slip_bps * 0.25
+    elif result == "PARTIAL":
+        exit_fee_bps = (maker_bps / 3.0) + (taker_bps * 2.0 / 3.0)
+        slippage_bps = slip_bps * 0.75
+    else:
+        exit_fee_bps = taker_bps
+        slippage_bps = slip_bps
+
+    fee_cost_pct = round(((entry_fee_bps + exit_fee_bps) / 100.0) * lev, 2)
+    slippage_cost_pct = round((slippage_bps / 100.0) * lev, 2)
+    return fee_cost_pct, slippage_cost_pct, round(fee_cost_pct + slippage_cost_pct, 2)
+
+
+def _paper_stop_policy(cfg: dict, pt: dict) -> dict:
+    """Build the paper-only dynamic stop policy for evaluate_outcome()."""
+    valid_modes = {"static", "breakeven_after_tp1", "tp_ladder_lock", "atr_trailing"}
+    mode = str(cfg.get("paper_stop_mode") or "static").strip().lower()
+    if mode not in valid_modes:
+        mode = "static"
+    atr_value = 0.0
+    try:
+        atr_pct = float(pt.get("atr_pct") or 0.0)
+        entry = float(pt.get("entry_px") or 0.0)
+        if atr_pct > 0 and entry > 0:
+            atr_value = entry * atr_pct / 100.0
+    except Exception:
+        atr_value = 0.0
+    return {
+        "mode": mode,
+        "breakeven_buffer_bps": float(cfg.get("paper_breakeven_buffer_bps", 5.0) or 0.0),
+        "trail_atr_value": atr_value * float(cfg.get("paper_trailing_atr_mult", 1.0) or 1.0),
+    }
+
+
+def _liquidation_summary_for_position(
+    *,
+    exchange: str,
+    symbol: str,
+    direction: str,
+    entry_px: float,
+    leverage: float,
+    size_usd: float,
+    margin_mode: str = "isolated",
+) -> dict:
+    try:
+        return estimate_liquidation_price(
+            exchange=exchange,
+            symbol=symbol,
+            direction=direction,
+            entry_price=float(entry_px),
+            leverage=float(leverage or 1.0),
+            notional_usd=float(size_usd or 0.0),
+            margin_mode=margin_mode or "isolated",
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _apply_liquidation_to_signal(sig: dict, notional_usd: float | None = None) -> dict:
+    """Attach exchange-aware liquidation fields to a signal-like dict."""
+    try:
+        entry = sig.get("entry1")
+        if entry is None and sig.get("entries"):
+            entry = (sig.get("entries") or [None])[0]
+        if entry is None:
+            entry = sig.get("price")
+        leverage = sig.get("leverage") or sig.get("leverage_cap") or sig.get("max_leverage") or 1
+        notional = float(notional_usd or sig.get("size_usd") or 100.0)
+        liq = _liquidation_summary_for_position(
+            exchange=sig.get("exchange") or "MEXC",
+            symbol=sig.get("symbol"),
+            direction=sig.get("direction"),
+            entry_px=float(entry),
+            leverage=float(leverage),
+            size_usd=notional,
+            margin_mode=sig.get("margin_mode") or "isolated",
+        )
+        sig["liquidation"] = liq
+        if liq.get("success"):
+            sig["liquidation_price"] = liq.get("liquidation_price")
+            sig["liquidation_distance_pct"] = liq.get("distance_pct")
+            sig["liquidation_mmr"] = liq.get("maintenance_margin_rate")
+            sig["liquidation_formula"] = liq.get("formula")
+            tags = sig.get("tags")
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            elif not isinstance(tags, list):
+                tags = []
+            dist = liq.get("distance_pct")
+            if dist is not None:
+                if float(dist) < 2.0 and "liq_tight" not in tags:
+                    tags.append("liq_tight")
+                elif float(dist) >= 5.0 and "liq_safe" not in tags:
+                    tags.append("liq_safe")
+            sig["tags"] = tags
+    except Exception as e:
+        sig["liquidation"] = {"success": False, "error": str(e)}
+    return sig
+
+
+def _paper_check_exits(cfg: dict | None = None) -> int:
+    """
+    Check filled/open paper trades against Min1 klines and close those that
     have hit a TP or stop level. Returns number of trades closed.
     Reuses evaluate_outcome() by mapping paper trade columns to the expected dict shape.
     """
     closed = 0
+    cfg = cfg or _load_paper_config()
     try:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
@@ -7740,12 +9846,44 @@ def _paper_check_exits() -> int:
 
         for row in rows:
             pt = dict(row)
+            entry_at = pt.get("filled_at") or pt.get("opened_at")
+            if not pt.get("liquidation_px"):
+                liq = _liquidation_summary_for_position(
+                    exchange=pt.get("exchange") or "MEXC",
+                    symbol=pt["symbol"],
+                    direction=pt["direction"],
+                    entry_px=pt["entry_px"],
+                    leverage=pt.get("leverage") or 1,
+                    size_usd=pt.get("size_usd") or 100,
+                    margin_mode=pt.get("margin_mode") or "isolated",
+                )
+                if liq.get("success"):
+                    pt["liquidation_px"] = liq.get("liquidation_price")
+                    con = sqlite3.connect(DB_PATH)
+                    con.execute(
+                        """UPDATE paper_trades
+                           SET liquidation_px=?, liquidation_distance_pct=?,
+                               liquidation_mmr=?, liquidation_fee_rate=?,
+                               liquidation_formula=?, liquidation_tier=?
+                           WHERE id=?""",
+                        (
+                            liq.get("liquidation_price"),
+                            liq.get("distance_pct"),
+                            liq.get("maintenance_margin_rate"),
+                            liq.get("liquidation_fee_rate"),
+                            liq.get("formula"),
+                            json.dumps(liq.get("risk_tier"), default=str),
+                            pt["id"],
+                        ),
+                    )
+                    con.commit()
+                    con.close()
             # Build a signals-compatible dict for evaluate_outcome
             fake_sig = {
                 "symbol":    pt["symbol"],
                 "direction": pt["direction"],
-                "logged_at": pt["opened_at"],
-                "entry_at":  pt["opened_at"],   # already entered
+                "logged_at": entry_at,
+                "entry_at":  entry_at,   # already entered
                 "entry1":    pt["entry_px"],
                 "entry2":    pt["entry_px"],
                 "entry3":    pt["entry_px"],
@@ -7753,13 +9891,20 @@ def _paper_check_exits() -> int:
                 "tp2":       pt["tp2"],
                 "tp3":       pt["tp3"],
                 "stop_loss": pt["stop_loss"],
-                "exchange":  "MEXC",
+                "leverage":  pt.get("leverage"),
+                "exchange":  pt.get("exchange") or "MEXC",
+                "liquidation_price": pt.get("liquidation_px"),
             }
             # Min1 klines: catch 1-minute wicks hitting stop/TP, matching live
             # trading behaviour where stop orders execute on any price touch.
-            # 1440 candles = 24 hours; sufficient since the loop runs every 60s
-            # and the paper bot doesn't hold positions beyond a day by design.
-            outcome = evaluate_outcome(fake_sig, interval="Min1", kline_limit=1440)
+            # Long holds are chunked inside _fetch_klines_for_signal, so the
+            # full configured holding window is evaluated instead of only 24h.
+            outcome = evaluate_outcome(
+                fake_sig,
+                interval="Min1",
+                kline_limit=1440,
+                stop_policy=_paper_stop_policy(cfg, pt),
+            )
             if outcome is None:
                 continue  # no level hit yet — position stays open
 
@@ -7774,36 +9919,218 @@ def _paper_check_exits() -> int:
                     if pt["direction"] == "LONG"
                     else (pt["entry_px"] - exit_px) / pt["entry_px"] * 100
                 )
-                pnl_pct = round(raw_pnl * leverage, 2)
+                gross_pnl_pct = round(raw_pnl * leverage, 2)
+                fee_cost_pct, slippage_cost_pct, total_cost_pct = _paper_cost_adjustment(
+                    cfg, result, leverage
+                )
+                pnl_pct = round(gross_pnl_pct - total_cost_pct, 2)
             else:
+                gross_pnl_pct = None
+                fee_cost_pct = None
+                slippage_cost_pct = None
                 pnl_pct = None
 
             closed_at = result_at or datetime.utcnow().isoformat()
             con = sqlite3.connect(DB_PATH)
             con.execute(
                 """UPDATE paper_trades
-                   SET status='closed', closed_at=?, exit_px=?, result=?, pnl_pct=?, note=?
+                   SET status='closed', closed_at=?, exit_px=?, result=?,
+                       gross_pnl_pct=?, fee_cost_pct=?, slippage_cost_pct=?,
+                       pnl_pct=?, note=?
                    WHERE id=?""",
-                (closed_at, exit_px, result, pnl_pct, note, pt["id"]),
+                (
+                    closed_at, exit_px, result, gross_pnl_pct, fee_cost_pct,
+                    slippage_cost_pct, pnl_pct, note, pt["id"],
+                ),
             )
             if pt.get("signal_id"):
                 con.execute(
                     """UPDATE signals
-                       SET result=?, exit_price=?, result_at=?, pnl_pct=?
-                       WHERE id=? AND result IS NULL""",
-                    (result, exit_px, closed_at, pnl_pct, pt["signal_id"]),
+                       SET result=?, exit_price=?, result_at=?, pnl_pct=?,
+                           evaluation_version=?, entry_at=COALESCE(entry_at, ?),
+                           entry1=?, entry2=?, entry3=?, tp1=?, tp2=?, tp3=?,
+                           stop_loss=?, leverage=COALESCE(leverage, ?)
+                       WHERE id=? AND result IS NULL AND source='paper'""",
+                    (
+                        result, exit_px, closed_at, pnl_pct, "paper_min1_chunked_v1",
+                        entry_at, pt["entry_px"], pt["entry_px"], pt["entry_px"],
+                        pt["tp1"], pt["tp2"], pt["tp3"], pt["stop_loss"],
+                        pt.get("leverage"), pt["signal_id"],
+                    ),
                 )
             con.commit()
             con.close()
+            if pt.get("signal_id"):
+                journey_sig = dict(fake_sig)
+                journey_sig.update({
+                    "result": result,
+                    "result_at": closed_at,
+                    "exit_price": exit_px,
+                })
+                _persist_journey_to_signal_json(pt["signal_id"], journey_sig, pnl_pct)
             closed += 1
             print(
                 f"[paper_bot] closed {pt['symbol']} {pt['direction']} → {result} "
-                f"pnl={pnl_pct}% exit={exit_px}",
+                f"gross={gross_pnl_pct}% net={pnl_pct}% exit={exit_px}",
                 file=sys.stderr,
             )
     except Exception as e:
         print(f"[paper_bot] _paper_check_exits error: {e}", file=sys.stderr)
     return closed
+
+
+def _paper_expire_stale_open_trades(cfg: dict) -> int:
+    """
+    Free paper slots that stayed open past the configured holding window.
+    These are marked EXPIRED, not LOSS, because neither TP nor stop was touched.
+    """
+    expired = 0
+    max_hours = float(cfg.get("max_holding_hours", 80) or 80)
+    now = datetime.utcnow()
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM paper_trades WHERE status='open' ORDER BY opened_at ASC"
+        ).fetchall()
+        con.close()
+
+        for row in rows:
+            pt = dict(row)
+            opened = _parse_utc_iso(pt.get("filled_at") or pt.get("opened_at"))
+            opened_dt = opened.replace(tzinfo=None) if opened else now
+            if (now - opened_dt).total_seconds() <= max_hours * 3600:
+                continue
+
+            note = f"Open paper trade expired after {max_hours:g}h without TP/SL"
+            closed_at = now.isoformat()
+            con = sqlite3.connect(DB_PATH)
+            con.execute(
+                """UPDATE paper_trades
+                   SET status='expired', closed_at=?, result='EXPIRED', note=?
+                   WHERE id=? AND status='open'""",
+                (closed_at, note, pt["id"]),
+            )
+            if pt.get("signal_id"):
+                con.execute(
+                    """UPDATE signals
+                       SET result='EXPIRED', result_note=?, result_at=?
+                       WHERE id=? AND result IS NULL AND source='paper'""",
+                    (note, closed_at, pt["signal_id"]),
+                )
+            con.commit()
+            con.close()
+            expired += 1
+            print(
+                f"[paper_bot] EXPIRED {pt['symbol']} {pt['direction']} "
+                f"after {max_hours:g}h hold",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(f"[paper_bot] _paper_expire_stale_open_trades error: {e}", file=sys.stderr)
+    return expired
+
+
+def _paper_safety_controls(cfg: dict) -> dict:
+    """
+    Evaluate recent paper bot performance and return protective parameter overrides.
+    Never mutates cfg — returns a plain dict of overrides.
+
+    Controls:
+      1. Per-strategy consecutive loss pause: N losses in a row → cooldown (persisted in cfg)
+      2. Drawdown risk reduction: account down >X% → scale risk_pct down
+      3. Cold streak flow boost: last N closed trades all losses → raise min_flow_score
+      4. New strategy auto-block: strategy in registry not previously seen → auto-disable
+
+    Returns:
+      extra_disabled   — set of strategy keys currently in cooldown
+      risk_multiplier  — float (1.0 = no change, 0.5 = halved)
+      flow_score_boost — float to add to min_flow_score
+      cooldowns        — updated cooldown dict to persist
+      reasons          — list of human-readable active control strings
+    """
+    streak_n          = int(cfg.get("loss_streak_pause_n", 4))
+    cooldown_h        = float(cfg.get("loss_streak_cooldown_hours", 12.0))
+    drawdown_thresh   = float(cfg.get("drawdown_reduce_pct", 20.0))
+    cold_n            = int(cfg.get("cold_streak_flow_boost_n", 3))
+    account_balance   = float(cfg.get("account_balance_usd", 200.0))
+
+    extra_disabled    = set()
+    risk_multiplier   = 1.0
+    flow_score_boost  = 0.0
+    reasons           = []
+    stored_cooldowns  = dict(cfg.get("_strategy_cooldowns") or {})
+    now               = datetime.utcnow()
+    now_iso           = now.isoformat()
+    new_cooldowns     = {}
+
+    try:
+        con = sqlite3.connect(DB_PATH)
+
+        # 1. Per-strategy loss streak → cooldown
+        rows = con.execute(
+            "SELECT strategy_key, result FROM paper_trades "
+            "WHERE result IN ('WIN','LOSS','PARTIAL') "
+            "ORDER BY closed_at DESC LIMIT 120"
+        ).fetchall()
+        by_strat: dict[str, list] = defaultdict(list)
+        for strat_key, result in rows:
+            by_strat[strat_key].append(result)
+
+        for strat, results in by_strat.items():
+            streak = 0
+            for r in results:  # newest-first
+                if r == "LOSS":
+                    streak += 1
+                else:
+                    break
+            existing_resume = stored_cooldowns.get(strat)
+            if existing_resume and existing_resume > now_iso:
+                extra_disabled.add(strat)
+                new_cooldowns[strat] = existing_resume
+                reasons.append(f"{strat} paused (cooldown until {existing_resume[:16]}Z)")
+            elif streak >= streak_n:
+                resume_at = (now + timedelta(hours=cooldown_h)).isoformat()
+                extra_disabled.add(strat)
+                new_cooldowns[strat] = resume_at
+                reasons.append(f"{strat} paused ({streak} losses → resume {resume_at[:16]}Z)")
+                print(f"[paper_safety] {strat}: {streak} consecutive losses → cooldown until {resume_at}", file=sys.stderr)
+
+        # 2. Drawdown risk reduction
+        pnl_rows = con.execute(
+            "SELECT size_usd, pnl_pct FROM paper_trades "
+            "WHERE status='closed' AND pnl_pct IS NOT NULL"
+        ).fetchall()
+        total_pnl_usd = sum(float(r[0]) * float(r[1]) / 100.0 for r in pnl_rows)
+        if total_pnl_usd < 0 and account_balance > 0:
+            drawdown_pct = abs(total_pnl_usd) / account_balance * 100.0
+            if drawdown_pct >= drawdown_thresh:
+                overage = drawdown_pct - drawdown_thresh
+                risk_multiplier = max(0.4, 1.0 - overage / 100.0)
+                reasons.append(f"drawdown {drawdown_pct:.1f}% → risk ×{risk_multiplier:.2f}")
+
+        # 3. Cold streak → elevated flow score
+        recent_results = con.execute(
+            "SELECT result FROM paper_trades "
+            "WHERE result IN ('WIN','LOSS','PARTIAL') "
+            "ORDER BY closed_at DESC LIMIT ?",
+            (cold_n,)
+        ).fetchall()
+        if len(recent_results) >= cold_n and all(r[0] == "LOSS" for r in recent_results):
+            flow_score_boost = 20.0
+            reasons.append(f"cold streak (last {cold_n} all losses) → flow_score +{flow_score_boost:.0f}")
+
+        con.close()
+    except Exception as e:
+        print(f"[paper_safety] error computing controls: {e}", file=sys.stderr)
+
+    return {
+        "extra_disabled":   extra_disabled,
+        "risk_multiplier":  risk_multiplier,
+        "flow_score_boost": flow_score_boost,
+        "cooldowns":        new_cooldowns,
+        "reasons":          reasons,
+    }
 
 
 def _paper_bot_scan(cfg: dict) -> dict:
@@ -7818,7 +10145,7 @@ def _paper_bot_scan(cfg: dict) -> dict:
     skipped = 0
 
     try:
-        disabled_strategies  = cfg.get("disabled_strategies") or []
+        disabled_strategies  = {str(k).strip() for k in (cfg.get("disabled_strategies") or []) if str(k).strip()}
         min_conviction       = int(cfg.get("min_conviction", 55))
         account_balance      = float(cfg.get("account_balance_usd", 200.0))
         risk_pct             = float(cfg.get("risk_pct_per_trade", 5.0))
@@ -7828,19 +10155,46 @@ def _paper_bot_scan(cfg: dict) -> dict:
         max_atr_pct          = float(cfg.get("max_atr_pct", 4.0))
         max_trend_score_abs  = int(cfg.get("max_trend_score_abs", 25))
 
-        # Count current open positions
+        # Safety controls: streak pauses, drawdown reduction, cold streak flow boost
+        safety = _paper_safety_controls(cfg)
+        if safety["cooldowns"] != dict(cfg.get("_strategy_cooldowns") or {}):
+            cfg["_strategy_cooldowns"] = safety["cooldowns"]
+            _save_paper_config(cfg)
+        disabled_strategies |= safety["extra_disabled"]
+        risk_pct             = risk_pct * safety["risk_multiplier"]
+        min_flow_score       = min_flow_score + safety["flow_score_boost"]
+        if safety["reasons"]:
+            print(f"[paper_safety] active: {safety['reasons']}", file=sys.stderr)
+
+        # Auto-block new strategies that haven't been seen before
+        registry_keys = set(get_strategy_registry().keys())
+        known = set(cfg.get("_known_strategies") or [])
+        brand_new = registry_keys - known - disabled_strategies - set(cfg.get("disabled_strategies") or [])
+        if brand_new:
+            for k in sorted(brand_new):
+                print(f"[paper_safety] new strategy '{k}' auto-disabled (not previously seen)", file=sys.stderr)
+            cfg["disabled_strategies"] = list(set(cfg.get("disabled_strategies") or []) | brand_new)
+            cfg["_known_strategies"] = list(known | registry_keys)
+            disabled_strategies |= brand_new
+            _save_paper_config(cfg)
+        elif known != registry_keys:
+            cfg["_known_strategies"] = list(known | registry_keys)
+            _save_paper_config(cfg)
+
+        # Count current active paper positions. Pending entries reserve a slot
+        # because a live system would already have a working limit order.
         con = sqlite3.connect(DB_PATH)
-        open_count = con.execute(
-            "SELECT COUNT(*) FROM paper_trades WHERE status='open'"
+        active_count = con.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE status IN ('pending','open')"
         ).fetchone()[0]
         open_symbols = {
             r[0] for r in con.execute(
-                "SELECT symbol FROM paper_trades WHERE status='open'"
+                "SELECT symbol FROM paper_trades WHERE status IN ('pending','open')"
             ).fetchall()
         }
         con.close()
 
-        if open_count >= max_open:
+        if active_count >= max_open:
             print(f"[paper_bot] at max open positions ({max_open}), skipping scan", file=sys.stderr)
             return {"entered": 0, "rejected": 0, "skipped": 0, "reason": "max_positions"}
 
@@ -7848,7 +10202,8 @@ def _paper_bot_scan(cfg: dict) -> dict:
         if not tickers:
             return {"entered": 0, "rejected": 0, "skipped": 0, "reason": "no_tickers"}
 
-        # Run all enabled strategies, dedup by symbol keeping highest conviction
+        # Run all active strategies, dedup by symbol keeping highest conviction.
+        # Active/inactive state is controlled by paper_config.disabled_strategies.
         registry = get_strategy_registry()
         best: dict[str, dict] = {}  # symbol → best signal across all strategies
         for key in registry:
@@ -7868,7 +10223,7 @@ def _paper_bot_scan(cfg: dict) -> dict:
         now = datetime.utcnow().isoformat()
 
         for sig in signals:
-            if open_count >= max_open:
+            if active_count >= max_open:
                 break
             if sig.get("conviction", sig.get("conviction_base", 0)) < min_conviction:
                 skipped += 1
@@ -7908,7 +10263,8 @@ def _paper_bot_scan(cfg: dict) -> dict:
                 flow_score    = flow_result["score"]
                 flow_reasons_str = json.dumps(flow_result["reasons"])
 
-            entry_px  = sig.get("price", 0)
+            entries = sig.get("entries") or []
+            entry_px  = entries[0] if entries else sig.get("entry1") or sig.get("price", 0)
             leverage  = float(sig.get("leverage_cap") or sig.get("leverage") or 1)
             conviction = sig.get("conviction", sig.get("conviction_base", 0))
             size_usd = compute_paper_position_size(
@@ -7926,7 +10282,22 @@ def _paper_bot_scan(cfg: dict) -> dict:
             tp2 = exits[1] if len(exits) > 1 else sig.get("tp2")
             tp3 = exits[2] if len(exits) > 2 else sig.get("tp3")
 
-            status = "open" if confirmed else "flow_rejected"
+            status = "pending" if confirmed else "flow_rejected"
+            exchange = sig.get("exchange") or "MEXC"
+            margin_mode = str(cfg.get("paper_margin_mode") or "isolated").lower()
+            liq = _liquidation_summary_for_position(
+                exchange=exchange,
+                symbol=sig["symbol"],
+                direction=sig["direction"],
+                entry_px=entry_px,
+                leverage=leverage,
+                size_usd=size_usd,
+                margin_mode=margin_mode,
+            )
+            if liq.get("success"):
+                sig["liquidation"] = liq
+                sig["liquidation_price"] = liq.get("liquidation_price")
+                sig["liquidation_distance_pct"] = liq.get("distance_pct")
 
             # Log confirmed entries to signals table so they appear in History tab
             signal_id = sig.get("signal_id")
@@ -7934,18 +10305,9 @@ def _paper_bot_scan(cfg: dict) -> dict:
                 sig["strategy_key"]   = sig.get("_strategy_key", "balanced")
                 sig["flow_score"]     = flow_score
                 sig["flow_confirmed"] = True
-                log_signals([sig], source="paper")
-                try:
-                    _sc  = sqlite3.connect(DB_PATH)
-                    _row = _sc.execute(
-                        "SELECT id FROM signals WHERE symbol=? AND direction=? AND strategy_key=? AND result IS NULL ORDER BY logged_at DESC LIMIT 1",
-                        (sig["symbol"], sig["direction"], sig["strategy_key"]),
-                    ).fetchone()
-                    _sc.close()
-                    if _row:
-                        signal_id = _row[0]
-                except Exception:
-                    pass
+                inserted_ids = log_signals([sig], source="paper", allow_duplicate_open=True)
+                if inserted_ids and inserted_ids[0]:
+                    signal_id = inserted_ids[0]
 
             con = sqlite3.connect(DB_PATH)
             con.execute(
@@ -7953,8 +10315,10 @@ def _paper_bot_scan(cfg: dict) -> dict:
                    (opened_at, symbol, strategy_key, direction, entry_px, size_usd,
                     tp1, tp2, tp3, stop_loss, leverage, conviction,
                     flow_confirmed, flow_score, flow_reasons, status, signal_id,
-                    atr_pct, trend_score)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    atr_pct, trend_score, queued_at, filled_at, exchange, margin_mode,
+                    liquidation_px, liquidation_distance_pct, liquidation_mmr,
+                    liquidation_fee_rate, liquidation_formula, liquidation_tier)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     now,
                     sig["symbol"],
@@ -7975,6 +10339,16 @@ def _paper_bot_scan(cfg: dict) -> dict:
                     signal_id,
                     sig.get("atr_pct"),
                     sig.get("trend_score"),
+                    now,
+                    None,
+                    exchange,
+                    margin_mode,
+                    liq.get("liquidation_price") if liq.get("success") else None,
+                    liq.get("distance_pct") if liq.get("success") else None,
+                    liq.get("maintenance_margin_rate") if liq.get("success") else None,
+                    liq.get("liquidation_fee_rate") if liq.get("success") else None,
+                    liq.get("formula") if liq.get("success") else None,
+                    json.dumps(liq.get("risk_tier"), default=str) if liq.get("success") else None,
                 ),
             )
             con.commit()
@@ -7982,11 +10356,11 @@ def _paper_bot_scan(cfg: dict) -> dict:
 
             if confirmed:
                 entered += 1
-                open_count += 1
+                active_count += 1
                 open_symbols.add(sig["symbol"])
                 print(
-                    f"[paper_bot] ENTER {sig['symbol']} {sig['direction']} "
-                    f"@ {entry_px} flow_score={flow_score:.0f}",
+                    f"[paper_bot] QUEUED {sig['symbol']} {sig['direction']} "
+                    f"entry={entry_px} flow_score={flow_score:.0f}",
                     file=sys.stderr,
                 )
             else:
@@ -8012,10 +10386,22 @@ def _paper_bot_loop():
         try:
             cfg = _load_paper_config()
             if cfg.get("enabled"):
+                # First promote working limit orders whose entry was actually touched.
+                entry_result = _paper_check_entries(cfg)
+                if entry_result.get("filled") or entry_result.get("expired"):
+                    print(
+                        f"[paper_bot] entries — filled={entry_result['filled']} "
+                        f"expired={entry_result['expired']}",
+                        file=sys.stderr,
+                    )
+
                 # Always check exits — positions must close the moment a level is hit
-                closed = _paper_check_exits()
+                closed = _paper_check_exits(cfg)
                 if closed:
                     print(f"[paper_bot] closed {closed} position(s)", file=sys.stderr)
+                expired_open = _paper_expire_stale_open_trades(cfg)
+                if expired_open:
+                    print(f"[paper_bot] expired {expired_open} stale open position(s)", file=sys.stderr)
 
                 # Only scan for new entries on the configured interval
                 scan_interval = int(cfg.get("scan_interval_minutes", 5)) * 60
@@ -8053,7 +10439,55 @@ def api_paper_trades():
                 "SELECT * FROM paper_trades ORDER BY opened_at DESC LIMIT 200"
             ).fetchall()
         con.close()
-        return jsonify({"success": True, "trades": [dict(r) for r in rows]})
+        trades = []
+        live_symbols = {
+            str(r["symbol"]).upper()
+            for r in rows
+            if r["status"] in ("open", "pending") and r["symbol"]
+        }
+        live_prices = {}
+        if live_symbols:
+            try:
+                tickers = fetch_mexc("/contract/ticker") or []
+                for ticker in tickers:
+                    sym = str(ticker.get("symbol") or "").upper()
+                    if sym in live_symbols:
+                        px = float(ticker.get("lastPrice") or ticker.get("fairPrice") or 0)
+                        if px > 0:
+                            live_prices[sym] = px
+            except Exception as e:
+                print(f"[paper_trades] live price seed failed: {e}", file=sys.stderr)
+        for r in rows:
+            t = dict(r)
+            live_px = live_prices.get(str(t.get("symbol") or "").upper())
+            if live_px:
+                t["current_px"] = live_px
+            size = float(t.get("size_usd") or 0.0)
+            pnl = t.get("pnl_pct")
+            gross = t.get("gross_pnl_pct")
+            fee = float(t.get("fee_cost_pct") or 0.0)
+            slip = float(t.get("slippage_cost_pct") or 0.0)
+            t["pnl_usd"] = round(size * float(pnl) / 100.0, 2) if pnl is not None else None
+            t["gross_pnl_usd"] = round(size * float(gross) / 100.0, 2) if gross is not None else None
+            t["cost_usd"] = round(size * (fee + slip) / 100.0, 2) if pnl is not None else None
+            if not t.get("liquidation_px") and t.get("entry_px"):
+                liq = _liquidation_summary_for_position(
+                    exchange=t.get("exchange") or "MEXC",
+                    symbol=t.get("symbol"),
+                    direction=t.get("direction"),
+                    entry_px=t.get("entry_px"),
+                    leverage=t.get("leverage") or 1,
+                    size_usd=t.get("size_usd") or 100,
+                    margin_mode=t.get("margin_mode") or "isolated",
+                )
+                if liq.get("success"):
+                    t["liquidation_px"] = liq.get("liquidation_price")
+                    t["liquidation_distance_pct"] = liq.get("distance_pct")
+                    t["liquidation_mmr"] = liq.get("maintenance_margin_rate")
+                    t["liquidation_formula"] = liq.get("formula")
+                    t["liquidation"] = liq
+            trades.append(t)
+        return jsonify({"success": True, "trades": trades})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -8108,19 +10542,72 @@ def api_paper_stats():
         open_trades = [dict(r) for r in con.execute(
             "SELECT * FROM paper_trades WHERE status='open'"
         ).fetchall()]
+        pending_trades = [dict(r) for r in con.execute(
+            "SELECT * FROM paper_trades WHERE status='pending'"
+        ).fetchall()]
         rejected = con.execute(
             "SELECT COUNT(*) FROM paper_trades WHERE status='flow_rejected'"
+        ).fetchone()[0]
+        entry_expired = con.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE status='entry_expired'"
+        ).fetchone()[0]
+        hold_expired = con.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE status='expired'"
         ).fetchone()[0]
         con.close()
 
         def _stats(trades):
             wins  = [t for t in trades if t.get("result") in ("WIN", "TP3")]
+            partials = [t for t in trades if t.get("result") == "PARTIAL"]
             pnls  = [t["pnl_pct"] for t in trades if t.get("pnl_pct") is not None]
+            pnl_usd = [
+                float(t.get("size_usd") or 0.0) * float(t.get("pnl_pct") or 0.0) / 100.0
+                for t in trades
+                if t.get("pnl_pct") is not None
+            ]
+            gross = [
+                t["gross_pnl_pct"] if t.get("gross_pnl_pct") is not None else t.get("pnl_pct")
+                for t in trades
+                if t.get("gross_pnl_pct") is not None or t.get("pnl_pct") is not None
+            ]
+            gross_usd = [
+                float(t.get("size_usd") or 0.0)
+                * float((t.get("gross_pnl_pct") if t.get("gross_pnl_pct") is not None else t.get("pnl_pct")) or 0.0)
+                / 100.0
+                for t in trades
+                if t.get("gross_pnl_pct") is not None or t.get("pnl_pct") is not None
+            ]
+            costs = [
+                float(t.get("fee_cost_pct") or 0.0) + float(t.get("slippage_cost_pct") or 0.0)
+                for t in trades
+                if t.get("pnl_pct") is not None
+            ]
+            cost_usd = [
+                float(t.get("size_usd") or 0.0)
+                * (float(t.get("fee_cost_pct") or 0.0) + float(t.get("slippage_cost_pct") or 0.0))
+                / 100.0
+                for t in trades
+                if t.get("pnl_pct") is not None
+            ]
+            gains = [x for x in pnl_usd if x > 0]
+            losses = [abs(x) for x in pnl_usd if x < 0]
+            best = max(pnl_usd) if pnl_usd else None
+            worst = min(pnl_usd) if pnl_usd else None
             return {
                 "count":      len(trades),
                 "win_rate":   round(len(wins) / len(trades) * 100, 1) if trades else 0,
+                "win_partial_rate": round((len(wins) + len(partials)) / len(trades) * 100, 1) if trades else 0,
                 "avg_pnl":    round(sum(pnls) / len(pnls), 2) if pnls else 0,
                 "total_pnl":  round(sum(pnls), 2) if pnls else 0,
+                "avg_pnl_usd": round(sum(pnl_usd) / len(pnl_usd), 2) if pnl_usd else 0,
+                "total_pnl_usd": round(sum(pnl_usd), 2) if pnl_usd else 0,
+                "total_gross_pnl_usd": round(sum(gross_usd), 2) if gross_usd else 0,
+                "total_cost_usd": round(sum(cost_usd), 2) if cost_usd else 0,
+                "profit_factor": round(sum(gains) / sum(losses), 2) if losses else (round(sum(gains), 2) if gains else 0),
+                "best_pnl_usd": round(best, 2) if best is not None else 0,
+                "worst_pnl_usd": round(worst, 2) if worst is not None else 0,
+                "avg_gross_pnl": round(sum(gross) / len(gross), 2) if gross else 0,
+                "avg_cost": round(sum(costs) / len(costs), 2) if costs else 0,
             }
 
         confirmed   = [t for t in closed if t.get("flow_confirmed")]
@@ -8135,14 +10622,46 @@ def api_paper_stats():
                 running += t["pnl_pct"]
                 equity.append({"closed_at": t["closed_at"], "cumulative_pnl": round(running, 2)})
 
+        cfg = _load_paper_config()
+        safety = _paper_safety_controls(cfg)
+        cohort_started_at = cfg.get("current_cohort_started_at")
+        cohort_label = cfg.get("current_cohort_label") or "Current cohort"
+        current_cohort = None
+        if cohort_started_at:
+            cohort_closed = [
+                t for t in closed
+                if (t.get("closed_at") or "") >= str(cohort_started_at)
+            ]
+            active_keys = sorted(
+                set(get_strategy_registry().keys()) - set(cfg.get("disabled_strategies") or [])
+            )
+            current_cohort = {
+                "label": cohort_label,
+                "started_at": cohort_started_at,
+                "target_count": 20,
+                "active_strategies": active_keys,
+                "stats": _stats(cohort_closed),
+            }
+
         return jsonify({
             "success":       True,
             "open_count":    len(open_trades),
+            "pending_count": len(pending_trades),
             "rejected_count": rejected,
+            "entry_expired_count": entry_expired,
+            "hold_expired_count": hold_expired,
             "all_closed":    _stats(closed),
             "flow_confirmed":   _stats(confirmed),
             "flow_unconfirmed": _stats(unconfirmed),
+            "current_cohort": current_cohort,
             "equity_curve":  equity,
+            "safety_controls": {
+                "active_reasons":   safety["reasons"],
+                "paused_strategies": sorted(safety["extra_disabled"]),
+                "risk_multiplier":  safety["risk_multiplier"],
+                "flow_score_boost": safety["flow_score_boost"],
+                "cooldowns":        safety["cooldowns"],
+            },
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -8169,6 +10688,99 @@ def api_paper_account():
         })
     except Exception as e:
         print(f"[api/paper/account] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/strategy-context/<int:trade_id>")
+def api_paper_strategy_context(trade_id: int):
+    """Return compact paper-performance context for a paper trade's strategy/symbol."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        trade = con.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone()
+        if not trade:
+            con.close()
+            return jsonify({"success": False, "error": "paper trade not found"}), 404
+        t = dict(trade)
+        strategy_key = t.get("strategy_key") or "balanced"
+        symbol = t.get("symbol")
+        direction = t.get("direction")
+
+        def rows(where: str, params: tuple) -> list[dict]:
+            return [
+                dict(r) for r in con.execute(
+                    f"""SELECT id,symbol,direction,result,pnl_pct,closed_at,strategy_key
+                        FROM paper_trades
+                        WHERE status='closed' AND result IS NOT NULL AND pnl_pct IS NOT NULL
+                          AND {where}
+                        ORDER BY closed_at DESC""",
+                    params,
+                ).fetchall()
+            ]
+
+        def stats(items: list[dict]) -> dict:
+            wins = [r for r in items if r.get("result") == "WIN"]
+            partials = [r for r in items if r.get("result") == "PARTIAL"]
+            losses = [r for r in items if r.get("result") == "LOSS"]
+            pnls = [float(r.get("pnl_pct") or 0.0) for r in items]
+            pos = [p for p in pnls if p > 0]
+            neg = [p for p in pnls if p <= 0]
+            return {
+                "count": len(items),
+                "wins": len(wins),
+                "partials": len(partials),
+                "losses": len(losses),
+                "win_rate": round(len(wins) / len(items) * 100, 1) if items else None,
+                "win_partial_rate": round((len(wins) + len(partials)) / len(items) * 100, 1) if items else None,
+                "avg_pnl": round(sum(pnls) / len(pnls), 2) if pnls else None,
+                "avg_win": round(sum(pos) / len(pos), 2) if pos else None,
+                "avg_loss": round(sum(neg) / len(neg), 2) if neg else None,
+                "total_pnl": round(sum(pnls), 2) if pnls else None,
+            }
+
+        strategy_rows = rows("strategy_key=?", (strategy_key,))
+        symbol_rows = rows("strategy_key=? AND symbol=?", (strategy_key, symbol))
+        direction_rows = rows("strategy_key=? AND direction=?", (strategy_key, direction))
+        recent = strategy_rows[:20]
+        recent10 = strategy_rows[:10]
+        streak = 0
+        streak_type = None
+        for r in strategy_rows:
+            positive = r.get("result") in {"WIN", "PARTIAL"}
+            current_type = "positive" if positive else "loss"
+            if streak_type is None:
+                streak_type = current_type
+            if current_type != streak_type:
+                break
+            streak += 1
+
+        recent_stats = stats(recent)
+        symbol_stats = stats(symbol_rows)
+        warnings = []
+        if streak_type == "loss" and streak >= 3:
+            warnings.append(f"{strategy_key} is on a {streak}-loss paper streak.")
+        if recent_stats.get("count", 0) >= 10 and (recent_stats.get("win_partial_rate") or 0) < 40:
+            warnings.append("Recent strategy win+partial rate is below 40%.")
+        if symbol_stats.get("count", 0) >= 3 and (symbol_stats.get("avg_pnl") or 0) < 0:
+            warnings.append(f"{symbol} has negative paper EV for this strategy.")
+
+        con.close()
+        return jsonify({
+            "success": True,
+            "trade_id": trade_id,
+            "strategy_key": strategy_key,
+            "symbol": symbol,
+            "direction": direction,
+            "strategy": stats(strategy_rows),
+            "recent_20": recent_stats,
+            "recent_10": stats(recent10),
+            "symbol_fit": symbol_stats,
+            "direction_fit": stats(direction_rows),
+            "streak": {"type": streak_type, "count": streak},
+            "recent_trades": recent10,
+            "warnings": warnings,
+        })
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -8202,16 +10814,6 @@ def api_goals():
                 elif k in allowed:
                     goals[k] = v
             _save_goals(goals)
-
-            # Keep paper bot risk controls aligned with the goal definition.
-            paper_cfg = _load_paper_config()
-            if "account_balance_usd" in body:
-                paper_cfg["account_balance_usd"] = goals["account_balance_usd"]
-            if "risk_pct_per_trade" in body:
-                paper_cfg["risk_pct_per_trade"] = goals["risk_pct_per_trade"]
-            if "max_positions" in body:
-                paper_cfg["max_open_positions"] = goals["max_positions"]
-            _save_paper_config(paper_cfg)
 
             return jsonify({
                 "success": True,
@@ -8303,17 +10905,194 @@ def api_paper_config():
             "enabled", "account_balance_usd", "risk_pct_per_trade",
             "disabled_strategies", "min_conviction",
             "flow_required", "min_flow_score", "scan_interval_minutes", "max_open_positions",
-            "max_atr_pct", "max_trend_score_abs",
+            "max_atr_pct", "max_trend_score_abs", "entry_timeout_hours",
+            "max_holding_hours",
+            "paper_maker_fee_bps", "paper_taker_fee_bps", "paper_slippage_bps",
+            "paper_stop_mode", "paper_breakeven_buffer_bps", "paper_trailing_atr_mult",
+            "paper_margin_mode",
+            "current_cohort_started_at", "current_cohort_label",
         }
         for k, v in body.items():
             if k in allowed:
                 cfg[k] = v
+        if "disabled_strategies" in cfg:
+            valid_keys = set(get_strategy_registry().keys())
+            cfg["disabled_strategies"] = [
+                str(k).strip()
+                for k in (cfg.get("disabled_strategies") or [])
+                if str(k).strip() in valid_keys
+            ]
         _save_paper_config(cfg)
         return jsonify({
             "success": True,
             "config": cfg,
             "effective_thresholds": _compute_effective_paper_thresholds(cfg),
         })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/trades/<int:trade_id>/plan", methods=["PATCH"])
+def api_paper_trade_plan(trade_id: int):
+    """Edit stop/TP levels for an open or pending paper trade."""
+    try:
+        body = request.get_json(force=True) or {}
+        editable = ("stop_loss", "tp1", "tp2", "tp3")
+        updates: dict[str, float] = {}
+        for key in editable:
+            if key not in body:
+                continue
+            try:
+                val = float(body[key])
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": f"{key} must be numeric"}), 400
+            if val <= 0:
+                return jsonify({"success": False, "error": f"{key} must be greater than zero"}), 400
+            updates[key] = val
+        if not updates and "leverage" not in body:
+            return jsonify({"success": False, "error": "No editable plan fields supplied"}), 400
+
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone()
+        if not row:
+            con.close()
+            return jsonify({"success": False, "error": "paper trade not found"}), 404
+        pt = dict(row)
+        if pt.get("status") not in {"pending", "open"}:
+            con.close()
+            return jsonify({"success": False, "error": "Only pending or open paper trades can be edited"}), 400
+
+        direction = pt.get("direction")
+        entry = float(pt.get("entry_px") or 0.0)
+        leverage = float(pt.get("leverage") or 1.0)
+        leverage_update = None
+        if "leverage" in body:
+            if pt.get("status") != "pending":
+                con.close()
+                return jsonify({"success": False, "error": "Leverage can only be changed before a paper entry fills"}), 400
+            try:
+                leverage_update = float(body["leverage"])
+            except (TypeError, ValueError):
+                con.close()
+                return jsonify({"success": False, "error": "leverage must be numeric"}), 400
+            if leverage_update < 1 or leverage_update > 100:
+                con.close()
+                return jsonify({"success": False, "error": "leverage must be between 1 and 100"}), 400
+            leverage = leverage_update
+
+        final = {k: float(pt.get(k) or 0.0) for k in editable}
+        final.update(updates)
+        if direction == "LONG":
+            if not (final["stop_loss"] < entry < final["tp1"] <= final["tp2"] <= final["tp3"]):
+                con.close()
+                return jsonify({"success": False, "error": "LONG plan must satisfy stop < entry < TP1 <= TP2 <= TP3"}), 400
+        else:
+            if not (final["stop_loss"] > entry > final["tp1"] >= final["tp2"] >= final["tp3"]):
+                con.close()
+                return jsonify({"success": False, "error": "SHORT plan must satisfy stop > entry > TP1 >= TP2 >= TP3"}), 400
+
+        liq = _liquidation_summary_for_position(
+            exchange=pt.get("exchange") or "MEXC",
+            symbol=pt.get("symbol"),
+            direction=direction,
+            entry_px=entry,
+            leverage=leverage,
+            size_usd=pt.get("size_usd") or 100,
+            margin_mode=pt.get("margin_mode") or "isolated",
+        )
+        warnings = []
+        if liq.get("success"):
+            liq_px = float(liq.get("liquidation_price") or 0.0)
+            if direction == "LONG":
+                stop_gap = (final["stop_loss"] - liq_px) / entry * 100 if entry else 0
+                if final["stop_loss"] <= liq_px:
+                    con.close()
+                    return jsonify({
+                        "success": False,
+                        "error": f"LONG stop must be above liquidation ({liq_px:g})",
+                        "liquidation": liq,
+                    }), 400
+            else:
+                stop_gap = (liq_px - final["stop_loss"]) / entry * 100 if entry else 0
+                if final["stop_loss"] >= liq_px:
+                    con.close()
+                    return jsonify({
+                        "success": False,
+                        "error": f"SHORT stop must be below liquidation ({liq_px:g})",
+                        "liquidation": liq,
+                    }), 400
+            if stop_gap < 0.5:
+                warnings.append(f"Stop is only {stop_gap:.2f}% away from estimated liquidation")
+
+        update_values = dict(updates)
+        if leverage_update is not None:
+            update_values["leverage"] = leverage_update
+        if liq.get("success"):
+            update_values.update({
+                "liquidation_px": liq.get("liquidation_price"),
+                "liquidation_distance_pct": liq.get("distance_pct"),
+                "liquidation_mmr": liq.get("maintenance_margin_rate"),
+                "liquidation_fee_rate": liq.get("liquidation_fee_rate"),
+                "liquidation_formula": liq.get("formula"),
+                "liquidation_tier": json.dumps(liq.get("risk_tier"), default=str),
+            })
+
+        set_sql = ", ".join(f"{k}=?" for k in update_values)
+        params = [update_values[k] for k in update_values] + [trade_id]
+        con.execute(f"UPDATE paper_trades SET {set_sql}, note='Plan edited manually' WHERE id=?", params)
+        if pt.get("signal_id"):
+            signal_updates = {k: updates[k] for k in updates}
+            if "stop_loss" in updates:
+                signal_updates["stop_loss"] = updates["stop_loss"]
+            if leverage_update is not None:
+                signal_updates["leverage"] = leverage_update
+            sig_set = ", ".join(f"{k}=?" for k in signal_updates)
+            sig_params = [signal_updates[k] for k in signal_updates] + [pt["signal_id"]]
+            if signal_updates:
+                con.execute(f"UPDATE signals SET {sig_set} WHERE id=? AND source='paper'", sig_params)
+        con.commit()
+        row = con.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone()
+        con.close()
+        return jsonify({"success": True, "trade": dict(row), "liquidation": liq, "warnings": warnings})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/trades/<int:trade_id>/cancel", methods=["POST"])
+def api_paper_trade_cancel(trade_id: int):
+    """Cancel a pending paper order without counting it as a loss."""
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = str(body.get("reason") or "Cancelled manually from pair workspace").strip()[:240]
+        closed_at = datetime.utcnow().isoformat()
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone()
+        if not row:
+            con.close()
+            return jsonify({"success": False, "error": "paper trade not found"}), 404
+        pt = dict(row)
+        if pt.get("status") != "pending":
+            con.close()
+            return jsonify({"success": False, "error": "Only pending paper trades can be cancelled"}), 400
+        con.execute(
+            """UPDATE paper_trades
+               SET status='entry_cancelled', closed_at=?, result='CANCELLED', note=?
+               WHERE id=? AND status='pending'""",
+            (closed_at, reason, trade_id),
+        )
+        if pt.get("signal_id"):
+            con.execute(
+                """UPDATE signals
+                   SET result='CANCELLED', result_note=?, result_at=?
+                   WHERE id=? AND result IS NULL AND source='paper'""",
+                (reason, closed_at, pt["signal_id"]),
+            )
+        con.commit()
+        updated = con.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone()
+        con.close()
+        return jsonify({"success": True, "trade": dict(updated), "message": reason})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -8337,6 +11116,651 @@ def api_order_flow(symbol: str):
             depth_levels=depth_levels,
         )
         return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _flow_price_profile(trades: list[dict], bins: int = 32) -> dict:
+    prices = [float(t.get("price") or 0) for t in trades if float(t.get("price") or 0) > 0]
+    if not prices:
+        return {"bins": [], "poc": None, "value_area_high": None, "value_area_low": None}
+    lo, hi = min(prices), max(prices)
+    if lo == hi:
+        hi = lo * 1.0001 if lo else 1
+    bins = max(8, min(80, int(bins or 32)))
+    step = (hi - lo) / bins
+    rows = [{
+        "low": lo + i * step,
+        "high": lo + (i + 1) * step,
+        "mid": lo + (i + 0.5) * step,
+        "buy_volume": 0.0,
+        "sell_volume": 0.0,
+        "ticks": 0,
+    } for i in range(bins)]
+    for t in trades:
+        try:
+            px = float(t.get("price") or 0)
+            vol = float(t.get("volume") or 0)
+            idx = min(bins - 1, max(0, int((px - lo) / step)))
+            if t.get("side") == "buy":
+                rows[idx]["buy_volume"] += vol
+            else:
+                rows[idx]["sell_volume"] += vol
+            rows[idx]["ticks"] += 1
+        except Exception:
+            continue
+    for r in rows:
+        r["volume"] = r["buy_volume"] + r["sell_volume"]
+        r["delta"] = r["buy_volume"] - r["sell_volume"]
+    nonzero = [r for r in rows if r["volume"] > 0]
+    if not nonzero:
+        return {"bins": [], "poc": None, "value_area_high": None, "value_area_low": None}
+    poc_row = max(nonzero, key=lambda r: r["volume"])
+    total = sum(r["volume"] for r in rows)
+    target = total * 0.70
+    ordered = sorted(nonzero, key=lambda r: r["volume"], reverse=True)
+    selected = []
+    acc = 0.0
+    for r in ordered:
+        selected.append(r)
+        acc += r["volume"]
+        if acc >= target:
+            break
+    return {
+        "bins": rows,
+        "poc": poc_row["mid"],
+        "value_area_high": max(r["high"] for r in selected),
+        "value_area_low": min(r["low"] for r in selected),
+        "price_low": lo,
+        "price_high": hi,
+        "total_volume": total,
+        "max_bin_volume": max(r["volume"] for r in rows),
+    }
+
+
+def _flow_footprint(
+    trades: list[dict],
+    bucket_seconds: int = 300,
+    price_rows: int = 24,
+    max_buckets: int = 24,
+) -> dict:
+    """Build a compact footprint grid: time buckets x price rows."""
+    clean = []
+    for t in trades or []:
+        try:
+            px = float(t.get("price") or 0)
+            vol = float(t.get("volume") or 0)
+            ts = _of_trade_ts_seconds(t.get("ts") or t.get("time"))
+            side = "buy" if str(t.get("side") or "").lower() == "buy" else "sell"
+            if px > 0 and vol > 0 and ts > 0:
+                clean.append({"price": px, "volume": vol, "ts": ts, "side": side})
+        except Exception:
+            continue
+    if not clean:
+        return {
+            "bucket_seconds": bucket_seconds,
+            "price_rows": price_rows,
+            "buckets": [],
+            "price_low": None,
+            "price_high": None,
+            "max_cell_volume": 0,
+            "max_bucket_volume": 0,
+        }
+
+    bucket_seconds = max(60, min(3600, int(bucket_seconds or 300)))
+    price_rows = max(8, min(80, int(price_rows or 24)))
+    max_buckets = max(4, min(80, int(max_buckets or 24)))
+
+    lo = min(t["price"] for t in clean)
+    hi = max(t["price"] for t in clean)
+    if lo == hi:
+        hi = lo * 1.0001 if lo else 1
+    step = (hi - lo) / price_rows
+
+    buckets: dict[int, dict] = {}
+    max_cell_volume = 0.0
+    for t in sorted(clean, key=lambda x: x["ts"]):
+        bkey = int(t["ts"] / bucket_seconds) * bucket_seconds
+        bucket = buckets.setdefault(bkey, {
+            "time": bkey,
+            "buy_volume": 0.0,
+            "sell_volume": 0.0,
+            "total_volume": 0.0,
+            "delta": 0.0,
+            "rows": {},
+        })
+        idx = min(price_rows - 1, max(0, int((t["price"] - lo) / step)))
+        row_low = lo + idx * step
+        row_high = lo + (idx + 1) * step
+        row_mid = lo + (idx + 0.5) * step
+        row = bucket["rows"].setdefault(idx, {
+            "idx": idx,
+            "low": row_low,
+            "high": row_high,
+            "mid": row_mid,
+            "buy_volume": 0.0,
+            "sell_volume": 0.0,
+            "volume": 0.0,
+            "delta": 0.0,
+            "ticks": 0,
+        })
+        if t["side"] == "buy":
+            row["buy_volume"] += t["volume"]
+            bucket["buy_volume"] += t["volume"]
+        else:
+            row["sell_volume"] += t["volume"]
+            bucket["sell_volume"] += t["volume"]
+        row["volume"] += t["volume"]
+        row["delta"] = row["buy_volume"] - row["sell_volume"]
+        row["ticks"] += 1
+        bucket["total_volume"] += t["volume"]
+        bucket["delta"] = bucket["buy_volume"] - bucket["sell_volume"]
+        max_cell_volume = max(max_cell_volume, row["volume"])
+
+    out = []
+    for bucket in sorted(buckets.values(), key=lambda x: x["time"])[-max_buckets:]:
+        rows = list(bucket["rows"].values())
+        rows.sort(key=lambda r: r["mid"], reverse=True)
+        bucket_total = bucket["total_volume"]
+        bucket["delta_pct"] = (bucket["delta"] / bucket_total * 100) if bucket_total else 0.0
+        bucket["poc"] = max(rows, key=lambda r: r["volume"])["mid"] if rows else None
+        bucket["rows"] = rows
+        out.append(bucket)
+
+    return {
+        "bucket_seconds": bucket_seconds,
+        "price_rows": price_rows,
+        "buckets": out,
+        "price_low": lo,
+        "price_high": hi,
+        "max_cell_volume": max_cell_volume,
+        "max_bucket_volume": max((b["total_volume"] for b in out), default=0),
+    }
+
+
+def _order_flow_feature_packet(
+    *,
+    profile: dict,
+    delta: dict,
+    depth: dict,
+    footprint: dict,
+    events: list[dict] | None = None,
+) -> dict:
+    """Compact order-flow facts suitable for agents, Hermes, and learner logs."""
+    buckets = footprint.get("buckets") or []
+    latest = buckets[-1] if buckets else {}
+    strongest = max(buckets, key=lambda b: abs(float(b.get("delta_pct") or 0)), default={})
+    return {
+        "flow_delta_pct": round(float(delta.get("delta_pct") or 0), 2),
+        "trade_count": int(delta.get("trade_count") or 0),
+        "profile_poc": profile.get("poc"),
+        "value_area_high": profile.get("value_area_high"),
+        "value_area_low": profile.get("value_area_low"),
+        "depth_imbalance": depth.get("imbalance_ratio"),
+        "bid_wall_count": len(depth.get("bid_walls") or []),
+        "ask_wall_count": len(depth.get("ask_walls") or []),
+        "footprint_latest_delta_pct": round(float(latest.get("delta_pct") or 0), 2),
+        "footprint_latest_volume": round(float(latest.get("total_volume") or 0), 6),
+        "footprint_strongest_delta_pct": round(float(strongest.get("delta_pct") or 0), 2),
+        "footprint_bucket_seconds": footprint.get("bucket_seconds"),
+        "event_types": [str(e.get("type")) for e in (events or [])[:8] if e.get("type")],
+    }
+
+
+def _flow_cumulative_delta(trades: list[dict]) -> list[dict]:
+    running = 0.0
+    points = []
+    for t in sorted(trades, key=lambda x: int(x.get("ts") or 0)):
+        vol = float(t.get("volume") or 0)
+        running += vol if t.get("side") == "buy" else -vol
+        points.append({
+            "time": int(int(t.get("ts") or 0) / 1000) if int(t.get("ts") or 0) > 10_000_000_000 else int(t.get("ts") or 0),
+            "value": round(running, 6),
+            "price": t.get("price"),
+        })
+    return points
+
+
+def _flow_large_trades(trades: list[dict], top_n: int = 24) -> list[dict]:
+    vols = sorted([float(t.get("volume") or 0) for t in trades if float(t.get("volume") or 0) > 0])
+    if not vols:
+        return []
+    p90 = vols[int(max(0, min(len(vols) - 1, round((len(vols) - 1) * 0.90))))]
+    threshold = max(p90, sum(vols) / max(len(vols), 1) * 2)
+    large = [t for t in trades if float(t.get("volume") or 0) >= threshold]
+    large = sorted(large, key=lambda t: float(t.get("volume") or 0), reverse=True)[:top_n]
+    out = []
+    for t in large:
+        ts = int(t.get("ts") or 0)
+        out.append({
+            "time": int(ts / 1000) if ts > 10_000_000_000 else ts,
+            "price": t.get("price"),
+            "volume": t.get("volume"),
+            "side": t.get("side"),
+        })
+    return out
+
+
+def _of_trade_ts_seconds(ts: int | float | str | None) -> int:
+    try:
+        n = int(float(ts or 0))
+        return int(n / 1000) if n > 10_000_000_000 else n
+    except Exception:
+        return 0
+
+
+def _order_flow_active_symbols() -> list[str]:
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute("""
+            SELECT DISTINCT symbol
+            FROM paper_trades
+            WHERE status IN ('pending','open')
+              AND COALESCE(exchange, 'MEXC')='MEXC'
+            ORDER BY symbol
+            LIMIT 12
+        """).fetchall()
+        con.close()
+        return [str(r[0]).upper() for r in rows if r and r[0]]
+    except Exception as e:
+        print(f"[order_flow_recorder] active symbol lookup error: {e}", file=sys.stderr)
+        return []
+
+
+def _record_order_flow_symbol(symbol: str, trade_limit: int = 200, depth_levels: int = 40) -> dict:
+    now = datetime.utcnow()
+    now_iso = now.isoformat()
+    now_ts = int(now.replace(tzinfo=timezone.utc).timestamp())
+    trades = _fetch_recent_trades(symbol, limit=trade_limit)
+    depth_raw = _fetch_depth_snapshot(symbol, levels=depth_levels)
+    depth = _compute_depth_walls(depth_raw)
+    inserted_trades = 0
+    inserted_depth = 0
+    try:
+        con = sqlite3.connect(DB_PATH)
+        for t in trades:
+            ts = _of_trade_ts_seconds(t.get("ts"))
+            if not ts:
+                continue
+            try:
+                cur = con.execute(
+                    """INSERT OR IGNORE INTO order_flow_trades
+                       (exchange, symbol, ts, price, volume, side, recorded_at)
+                       VALUES ('MEXC',?,?,?,?,?,?)""",
+                    (
+                        symbol,
+                        ts,
+                        float(t.get("price") or 0),
+                        float(t.get("volume") or 0),
+                        str(t.get("side") or ""),
+                        now_iso,
+                    ),
+                )
+                inserted_trades += int(cur.rowcount or 0)
+            except Exception:
+                continue
+
+        bids = depth_raw.get("bids") or []
+        asks = depth_raw.get("asks") or []
+        best_bid = float(bids[0][0]) if bids else None
+        best_ask = float(asks[0][0]) if asks else None
+        cur = con.execute(
+            """INSERT INTO order_flow_depth_snapshots
+               (exchange, symbol, ts, best_bid, best_ask, bid_total, ask_total, imbalance,
+                bids_json, asks_json, recorded_at)
+               VALUES ('MEXC',?,?,?,?,?,?,?,?,?,?)""",
+            (
+                symbol,
+                now_ts,
+                best_bid,
+                best_ask,
+                depth.get("bid_total"),
+                depth.get("ask_total"),
+                depth.get("imbalance_ratio"),
+                json.dumps(bids),
+                json.dumps(asks),
+                now_iso,
+            ),
+        )
+        inserted_depth = int(cur.rowcount or 0)
+        cutoff = (now - timedelta(hours=72)).isoformat()
+        cutoff_ts = int((now - timedelta(hours=72)).replace(tzinfo=timezone.utc).timestamp())
+        con.execute("DELETE FROM order_flow_trades WHERE recorded_at < ?", (cutoff,))
+        con.execute("DELETE FROM order_flow_depth_snapshots WHERE ts < ?", (cutoff_ts,))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"[order_flow_recorder] record {symbol} error: {e}", file=sys.stderr)
+    return {"symbol": symbol, "trades": inserted_trades, "depth": inserted_depth}
+
+
+def _load_recorded_order_flow(symbol: str, start_ts: int | None, end_ts: int | None, limit: int = 5000) -> dict:
+    end_ts = end_ts or int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp())
+    start_ts = start_ts or (end_ts - 6 * 3600)
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        trade_rows = con.execute("""
+            SELECT ts, price, volume, side
+            FROM order_flow_trades
+            WHERE exchange='MEXC' AND symbol=? AND ts BETWEEN ? AND ?
+            ORDER BY ts ASC, id ASC
+            LIMIT ?
+        """, (symbol, start_ts, end_ts, limit)).fetchall()
+        depth_rows = con.execute("""
+            SELECT ts, best_bid, best_ask, bid_total, ask_total, imbalance, bids_json, asks_json
+            FROM order_flow_depth_snapshots
+            WHERE exchange='MEXC' AND symbol=? AND ts BETWEEN ? AND ?
+            ORDER BY ts ASC
+            LIMIT 1000
+        """, (symbol, start_ts, end_ts)).fetchall()
+        con.close()
+        trades = [
+            {
+                "ts": int(r["ts"]),
+                "time": int(r["ts"]),
+                "price": float(r["price"]),
+                "volume": float(r["volume"]),
+                "side": r["side"],
+            }
+            for r in trade_rows
+        ]
+        depths = []
+        for r in depth_rows:
+            try:
+                bids = json.loads(r["bids_json"] or "[]")
+                asks = json.loads(r["asks_json"] or "[]")
+            except Exception:
+                bids, asks = [], []
+            depths.append({
+                "ts": int(r["ts"]),
+                "best_bid": r["best_bid"],
+                "best_ask": r["best_ask"],
+                "bid_total": r["bid_total"],
+                "ask_total": r["ask_total"],
+                "imbalance": r["imbalance"],
+                "bids": bids,
+                "asks": asks,
+            })
+        return {"trades": trades, "depth_snapshots": depths}
+    except Exception as e:
+        print(f"[order_flow_history] load {symbol} error: {e}", file=sys.stderr)
+        return {"trades": [], "depth_snapshots": []}
+
+
+def _bucket_flow_trades(trades: list[dict], bucket_seconds: int = 300) -> list[dict]:
+    buckets: dict[int, dict] = {}
+    for t in trades:
+        try:
+            ts = int(t.get("ts") or t.get("time") or 0)
+            key = int(ts / bucket_seconds) * bucket_seconds
+            b = buckets.setdefault(key, {
+                "time": key,
+                "buy_vol": 0.0,
+                "sell_vol": 0.0,
+                "high": float(t.get("price") or 0),
+                "low": float(t.get("price") or 0),
+                "open": float(t.get("price") or 0),
+                "close": float(t.get("price") or 0),
+                "ticks": 0,
+            })
+            price = float(t.get("price") or 0)
+            vol = float(t.get("volume") or 0)
+            if t.get("side") == "buy":
+                b["buy_vol"] += vol
+            else:
+                b["sell_vol"] += vol
+            b["high"] = max(b["high"], price)
+            b["low"] = min(b["low"], price)
+            b["close"] = price
+            b["ticks"] += 1
+        except Exception:
+            continue
+    out = []
+    running = 0.0
+    for b in sorted(buckets.values(), key=lambda x: x["time"]):
+        total = b["buy_vol"] + b["sell_vol"]
+        delta = b["buy_vol"] - b["sell_vol"]
+        running += delta
+        b["total_vol"] = total
+        b["delta"] = delta
+        b["delta_pct"] = (delta / total * 100) if total else 0.0
+        b["cum_delta"] = running
+        out.append(b)
+    return out
+
+
+def _detect_order_flow_events(
+    trades: list[dict],
+    depths: list[dict],
+    profile: dict,
+    direction: str | None = None,
+    bucket_seconds: int = 300,
+) -> dict:
+    buckets = _bucket_flow_trades(trades, bucket_seconds=bucket_seconds)
+    events = []
+    if len(buckets) < 2:
+        return {"events": events, "flow_alignment_score": 50, "buckets": buckets}
+
+    total_buy = sum(b["buy_vol"] for b in buckets)
+    total_sell = sum(b["sell_vol"] for b in buckets)
+    total = total_buy + total_sell
+    delta_pct = ((total_buy - total_sell) / total * 100) if total else 0.0
+    dir_key = (direction or "").upper()
+    if dir_key == "LONG":
+        alignment = 50 + max(-50, min(50, delta_pct / 2))
+    elif dir_key == "SHORT":
+        alignment = 50 + max(-50, min(50, -delta_pct / 2))
+    else:
+        alignment = 50 + max(-25, min(25, abs(delta_pct) / 2))
+
+    if depths:
+        imbs = [float(d.get("imbalance") or 0.5) for d in depths if d.get("imbalance") is not None]
+        if imbs:
+            avg_imb = sum(imbs) / len(imbs)
+            if dir_key == "LONG":
+                alignment += (avg_imb - 0.5) * 30
+            elif dir_key == "SHORT":
+                alignment += (0.5 - avg_imb) * 30
+
+    flow_alignment_score = round(max(0, min(100, alignment)), 1)
+    avg_vol = total / len(buckets) if buckets else 0
+
+    for b in buckets:
+        rng = max(abs(b["high"] - b["low"]), abs(b["close"]) * 0.0001)
+        close_pos = (b["close"] - b["low"]) / rng if rng else 0.5
+        high_delta = abs(b["delta_pct"]) >= 35 and b["total_vol"] >= avg_vol * 1.35
+        if high_delta and b["delta_pct"] < 0 and close_pos > 0.55:
+            events.append({
+                "type": "bullish_absorption",
+                "time": b["time"],
+                "price": b["close"],
+                "confidence": min(95, round(abs(b["delta_pct"]) + close_pos * 30, 1)),
+                "detail": f"Heavy sell delta ({b['delta_pct']:.1f}%) but price closed off the low.",
+            })
+        if high_delta and b["delta_pct"] > 0 and close_pos < 0.45:
+            events.append({
+                "type": "bearish_absorption",
+                "time": b["time"],
+                "price": b["close"],
+                "confidence": min(95, round(abs(b["delta_pct"]) + (1 - close_pos) * 30, 1)),
+                "detail": f"Heavy buy delta ({b['delta_pct']:.1f}%) but price closed off the high.",
+            })
+
+    lows = sorted(buckets, key=lambda b: b["low"])[:3]
+    highs = sorted(buckets, key=lambda b: b["high"], reverse=True)[:3]
+    if len(lows) >= 2:
+        a, b = sorted(lows[:2], key=lambda x: x["time"])
+        if b["low"] < a["low"] and b["cum_delta"] > a["cum_delta"]:
+            events.append({
+                "type": "bullish_delta_divergence",
+                "time": b["time"],
+                "price": b["low"],
+                "confidence": 75,
+                "detail": "Price made a lower low while cumulative delta made a higher low.",
+            })
+    if len(highs) >= 2:
+        a, b = sorted(highs[:2], key=lambda x: x["time"])
+        if b["high"] > a["high"] and b["cum_delta"] < a["cum_delta"]:
+            events.append({
+                "type": "bearish_delta_divergence",
+                "time": b["time"],
+                "price": b["high"],
+                "confidence": 75,
+                "detail": "Price made a higher high while cumulative delta made a lower high.",
+            })
+
+    for prev, cur in zip(buckets, buckets[1:]):
+        if prev["total_vol"] > avg_vol * 1.6 and abs(cur["delta"]) < abs(prev["delta"]) * 0.35:
+            events.append({
+                "type": "exhaustion",
+                "time": cur["time"],
+                "price": cur["close"],
+                "confidence": 65,
+                "detail": "Large tape burst faded on the next bucket.",
+            })
+
+    vah = profile.get("value_area_high")
+    val = profile.get("value_area_low")
+    for b in buckets:
+        if vah and b["high"] > float(vah) and b["close"] < float(vah):
+            events.append({
+                "type": "bearish_liquidity_sweep",
+                "time": b["time"],
+                "price": b["close"],
+                "confidence": 70,
+                "detail": "Price swept above value area high and closed back inside.",
+            })
+        if val and b["low"] < float(val) and b["close"] > float(val):
+            events.append({
+                "type": "bullish_liquidity_sweep",
+                "time": b["time"],
+                "price": b["close"],
+                "confidence": 70,
+                "detail": "Price swept below value area low and closed back inside.",
+            })
+
+    dedup = {}
+    for ev in events:
+        key = (ev["type"], ev["time"])
+        if key not in dedup or ev.get("confidence", 0) > dedup[key].get("confidence", 0):
+            dedup[key] = ev
+    return {
+        "events": sorted(dedup.values(), key=lambda e: (e["time"], -e.get("confidence", 0)))[-30:],
+        "flow_alignment_score": flow_alignment_score,
+        "buckets": buckets,
+    }
+
+
+@app.route("/api/order-flow/overlay/<symbol>")
+def api_order_flow_overlay(symbol: str):
+    """Recent MEXC tape/depth package for chart order-flow overlays."""
+    try:
+        exchange = request.args.get("exchange", "MEXC").strip().upper()
+        if exchange != "MEXC":
+            return jsonify({
+                "success": False,
+                "error": "Order-flow overlays currently support MEXC recent tape/depth only",
+            }), 400
+        trade_limit = max(50, min(1000, int(request.args.get("trade_limit", 500))))
+        depth_levels = max(5, min(100, int(request.args.get("depth_levels", 50))))
+        bins = max(8, min(80, int(request.args.get("bins", 32))))
+        footprint_bucket_seconds = max(60, min(3600, int(request.args.get("footprint_bucket_seconds", 300))))
+        footprint_rows = max(8, min(80, int(request.args.get("footprint_rows", 24))))
+        trades = _fetch_recent_trades(symbol.upper(), limit=trade_limit)
+        depth_raw = _fetch_depth_snapshot(symbol.upper(), levels=depth_levels)
+        profile = _flow_price_profile(trades, bins=bins)
+        delta = _compute_flow_delta(trades)
+        depth = _compute_depth_walls(depth_raw)
+        footprint = _flow_footprint(
+            trades,
+            bucket_seconds=footprint_bucket_seconds,
+            price_rows=footprint_rows,
+            max_buckets=24,
+        )
+        feature_packet = _order_flow_feature_packet(
+            profile=profile,
+            delta=delta,
+            depth=depth,
+            footprint=footprint,
+        )
+        return jsonify({
+            "success": True,
+            "exchange": exchange,
+            "symbol": symbol.upper(),
+            "trades": trades[-trade_limit:],
+            "profile": profile,
+            "cumulative_delta": _flow_cumulative_delta(trades),
+            "large_trades": _flow_large_trades(trades),
+            "delta": delta,
+            "depth": depth,
+            "depth_levels": depth_raw,
+            "footprint": footprint,
+            "features": feature_packet,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/order-flow/history/<symbol>")
+def api_order_flow_history(symbol: str):
+    """Recorded order-flow history for replay, research, and paper-trade audits."""
+    try:
+        exchange = request.args.get("exchange", "MEXC").strip().upper()
+        if exchange != "MEXC":
+            return jsonify({"success": False, "error": "Recorded order flow currently supports MEXC only"}), 400
+        start_raw = request.args.get("start")
+        end_raw = request.args.get("end")
+        direction = request.args.get("direction", "").strip().upper()
+        hours = max(1, min(72, int(request.args.get("hours", 6))))
+        end_ts = _of_trade_ts_seconds(end_raw) if end_raw else int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp())
+        start_ts = _of_trade_ts_seconds(start_raw) if start_raw else end_ts - hours * 3600
+        bins = max(8, min(80, int(request.args.get("bins", 32))))
+        footprint_bucket_seconds = max(60, min(3600, int(request.args.get("footprint_bucket_seconds", 300))))
+        footprint_rows = max(8, min(80, int(request.args.get("footprint_rows", 24))))
+        loaded = _load_recorded_order_flow(symbol.upper(), start_ts, end_ts)
+        trades = loaded["trades"]
+        profile = _flow_price_profile(trades, bins=bins)
+        delta = _compute_flow_delta(trades)
+        depths = loaded["depth_snapshots"]
+        latest_depth = depths[-1] if depths else {}
+        depth_levels = {"bids": latest_depth.get("bids") or [], "asks": latest_depth.get("asks") or []}
+        depth = _compute_depth_walls(depth_levels)
+        event_pack = _detect_order_flow_events(trades, depths, profile, direction=direction)
+        footprint = _flow_footprint(
+            trades,
+            bucket_seconds=footprint_bucket_seconds,
+            price_rows=footprint_rows,
+            max_buckets=48,
+        )
+        feature_packet = _order_flow_feature_packet(
+            profile=profile,
+            delta=delta,
+            depth=depth,
+            footprint=footprint,
+            events=event_pack.get("events", []),
+        )
+        return jsonify({
+            "success": True,
+            "exchange": exchange,
+            "symbol": symbol.upper(),
+            "start": start_ts,
+            "end": end_ts,
+            "recorded": True,
+            "trades": trades,
+            "depth_snapshots": depths,
+            "depth_levels": depth_levels,
+            "profile": profile,
+            "cumulative_delta": _flow_cumulative_delta(trades),
+            "large_trades": _flow_large_trades(trades),
+            "delta": delta,
+            "depth": depth,
+            "events": event_pack.get("events", []),
+            "flow_alignment_score": event_pack.get("flow_alignment_score"),
+            "flow_buckets": event_pack.get("buckets", []),
+            "footprint": footprint,
+            "features": feature_packet,
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -8401,6 +11825,17 @@ def _coach_review_loop():
     _time.sleep(300)  # wait 5 minutes after startup
     while True:
         try:
+            try:
+                from lib.ai_client import load_ai_settings
+                ai_settings = load_ai_settings()
+                if not ai_settings.get("background_ai_enabled", False) or not ai_settings.get("coach_reviews_enabled", True):
+                    _time.sleep(600)
+                    continue
+            except Exception as _settings_e:
+                print(f"[coach_review_loop] settings error: {_settings_e}", file=sys.stderr)
+                _time.sleep(600)
+                continue
+
             con = sqlite3.connect(DB_PATH)
             con.row_factory = sqlite3.Row
             rows = con.execute("""
@@ -8476,7 +11911,35 @@ _coach_review_thread = threading.Thread(target=_coach_review_loop, daemon=True)
 _paper_bot_thread = threading.Thread(target=_paper_bot_loop, daemon=True)
 
 
-# All four background threads (_outcome, _snapshot, _coach_review, _paper_bot)
+def _order_flow_recorder_loop():
+    """Record recent MEXC tape/depth for active paper-trade symbols only."""
+    import time as _time
+    _time.sleep(90)
+    while True:
+        try:
+            symbols = _order_flow_active_symbols()
+            if not symbols:
+                _time.sleep(15)
+                continue
+            totals = {"trades": 0, "depth": 0}
+            for symbol in symbols:
+                result = _record_order_flow_symbol(symbol)
+                totals["trades"] += int(result.get("trades") or 0)
+                totals["depth"] += int(result.get("depth") or 0)
+                _time.sleep(0.35)
+            print(
+                f"[order_flow_recorder] symbols={len(symbols)} trades={totals['trades']} depth={totals['depth']}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"[order_flow_recorder] loop error: {e}", file=sys.stderr)
+        _time.sleep(10)
+
+
+_order_flow_recorder_thread = threading.Thread(target=_order_flow_recorder_loop, daemon=True)
+
+
+# Background threads (_outcome, _snapshot, _coach_review, _paper_bot, _order_flow_recorder)
 # are constructed at module level so they're attribute-accessible, but their
 # .start() calls now live inside the __main__ guard. Previously they fired at
 # import time, which meant any offline script (backtest.py, the reconstruct
@@ -8491,6 +11954,7 @@ if __name__ == "__main__":
     _snapshot_thread.start()
     _coach_review_thread.start()
     _paper_bot_thread.start()
+    _order_flow_recorder_thread.start()
 
     try:
         # SOCK_DGRAM connect trick: doesn't send packets, just resolves the

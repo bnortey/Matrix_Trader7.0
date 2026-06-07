@@ -1328,6 +1328,15 @@
       padding: 10px 12px;
       color: var(--text2);
       font-size: 11px;
+      max-height: 42vh;
+      overflow: auto;
+    }
+    .chart-panel + .orderflow-panel,
+    #pair-chart-container + .orderflow-panel {
+      border-top: 0;
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 6px;
+      margin: 8px 0 0;
     }
     .of-grid {
       display: grid;
@@ -1356,6 +1365,66 @@
       border-radius: 2px;
       background: linear-gradient(90deg, rgba(0,230,118,0.75), rgba(255,82,82,0.75));
       min-width: 2px;
+    }
+    .footprint-wrap {
+      overflow: auto;
+      max-height: 360px;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 6px;
+      background: rgba(0,0,0,0.18);
+    }
+    .footprint-grid {
+      display: flex;
+      align-items: flex-start;
+      gap: 4px;
+      min-width: max-content;
+      padding: 8px;
+    }
+    .fp-bucket {
+      width: 92px;
+      flex: 0 0 92px;
+      font-family: var(--mono);
+      font-size: 9px;
+    }
+    .fp-head {
+      color: var(--text3);
+      text-align: center;
+      margin-bottom: 4px;
+      white-space: nowrap;
+    }
+    .fp-cell {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px;
+      align-items: center;
+      min-height: 15px;
+      padding: 1px 3px;
+      margin-bottom: 1px;
+      border-radius: 2px;
+      color: rgba(255,255,255,0.75);
+      position: relative;
+      overflow: hidden;
+    }
+    .fp-cell::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      width: var(--w, 0%);
+      background: var(--bg, rgba(255,255,255,0.05));
+      opacity: .78;
+    }
+    .fp-cell span { position: relative; z-index: 1; }
+    .fp-sell { text-align: right; color: #ffb4b4; }
+    .fp-buy { text-align: left; color: #a7f3c6; }
+    .fp-poc {
+      outline: 1px solid rgba(250,204,21,0.72);
+      box-shadow: inset 0 0 0 1px rgba(250,204,21,0.18);
+    }
+    .fp-delta {
+      margin-top: 5px;
+      text-align: center;
+      font-weight: 800;
+      font-size: 10px;
     }
     .dom-grid {
       display: grid;
@@ -2390,7 +2459,7 @@ let currentDetailSignal = null;
 let currentChartSource = localStorage.getItem('mt7_chart_source') || 'mt7';
 if (!['mt7','tv'].includes(currentChartSource)) currentChartSource = 'mt7';
 const MT7_TIMEFRAMES = ['1m','5m','15m','30m','1h','4h','8h','1d'];
-const MT7_CHART_MODES = ['indicators','orderflow','dom','hybrid'];
+const MT7_CHART_MODES = ['indicators','orderflow','footprint','dom','hybrid'];
 let currentChartMode = localStorage.getItem('mt7_chart_mode') || 'hybrid';
 if (!MT7_CHART_MODES.includes(currentChartMode)) currentChartMode = 'hybrid';
 let currentMT7Interval = localStorage.getItem('mt7_chart_interval') || '15m';
@@ -2568,6 +2637,7 @@ function hideDashboardForPairWorkspace() {
 }
 
 function exitPairWorkspace() {
+  stopPairPriceStream();
   destroyPairChart();
   if (history.length > 1) {
     history.back();
@@ -2884,6 +2954,52 @@ function orderFlowVwap(trades) {
   const variance = prices.reduce((acc, x) => acc + Math.pow(x.p - vwap, 2) * x.v, 0) / vol;
   return { vwap, stdev: Math.sqrt(variance) };
 }
+function footprintBucketSeconds() {
+  const map = { '1m': 60, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600 };
+  return map[currentMT7Interval] || 300;
+}
+function renderFootprintMode(data) {
+  const fp = data.footprint || {};
+  const buckets = (fp.buckets || []).slice(-18);
+  const maxCell = Math.max(1, Number(fp.max_cell_volume || 1));
+  if (!buckets.length) {
+    return `<div style="color:var(--text3);font-size:11px">No recent footprint prints for this symbol.</div>`;
+  }
+  const cell = (row, poc) => {
+    const buy = Number(row.buy_volume || 0);
+    const sell = Number(row.sell_volume || 0);
+    const vol = buy + sell;
+    const delta = buy - sell;
+    const w = Math.max(4, Math.round(vol / maxCell * 100));
+    const bg = delta >= 0 ? 'rgba(0,230,118,0.38)' : 'rgba(255,82,82,0.38)';
+    const isPoc = Math.abs(Number(row.mid) - Number(poc || 0)) <= Math.max(1e-12, Math.abs(Number(row.high) - Number(row.low)) / 2);
+    return `<div class="fp-cell ${isPoc ? 'fp-poc' : ''}" title="${fmtPrice(Number(row.mid))} · Δ ${fmtBig(delta)}" style="--w:${w}%;--bg:${bg}">
+      <span class="fp-sell">${sell ? fmtBig(sell) : ''}</span>
+      <span class="fp-buy">${buy ? fmtBig(buy) : ''}</span>
+    </div>`;
+  };
+  const features = data.features || {};
+  return `
+    <div class="of-grid">
+      ${pairMetric('Tape Delta', `${Number(features.flow_delta_pct || 0).toFixed(1)}%`, Number(features.flow_delta_pct || 0) >= 0 ? 'var(--green)' : 'var(--red)')}
+      ${pairMetric('Latest FP Delta', `${Number(features.footprint_latest_delta_pct || 0).toFixed(1)}%`, Number(features.footprint_latest_delta_pct || 0) >= 0 ? 'var(--green)' : 'var(--red)')}
+      ${pairMetric('POC', data.profile?.poc ? fmtPrice(Number(data.profile.poc)) : '—', '#facc15')}
+      ${pairMetric('Book Imbalance', data.depth?.imbalance_ratio != null ? Number(data.depth.imbalance_ratio).toFixed(2) : '—', Number(data.depth?.imbalance_ratio || 0.5) >= 0.5 ? 'var(--green)' : 'var(--red)')}
+    </div>
+    <div class="footprint-wrap">
+      <div class="footprint-grid">
+        ${buckets.map(b => {
+          const deltaPct = Number(b.delta_pct || 0);
+          const rows = (b.rows || []).filter(r => Number(r.volume || 0) > 0);
+          return `<div class="fp-bucket">
+            <div class="fp-head">${_fmtChartTime(b.time)}</div>
+            ${rows.map(r => cell(r, b.poc)).join('')}
+            <div class="fp-delta" style="color:${deltaPct >= 0 ? 'var(--green)' : 'var(--red)'}">Δ ${deltaPct.toFixed(0)}%</div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+}
 function renderDomMode(data) {
   const bids = (data.depth_levels?.bids || []).map(x => ({ price: Number(x[0]), qty: Number(x[1]) })).filter(x => x.price && x.qty);
   const asks = (data.depth_levels?.asks || []).map(x => ({ price: Number(x[0]), qty: Number(x[1]) })).filter(x => x.price && x.qty);
@@ -2923,6 +3039,27 @@ function renderDomMode(data) {
       ${recent.map(t => `<div class="dom-print" style="color:${t.side === 'buy' ? 'var(--green)' : 'var(--red)'}">${t.side === 'buy' ? 'BUY' : 'SELL'} ${fmtBig(Number(t.volume || 0))} @ ${fmtPrice(Number(t.price || 0))}</div>`).join('') || '<div style="color:var(--text3);font-size:10px">No recent trades.</div>'}
     </div>`;
 }
+async function renderPrimaryOrderFlowView(container, sig) {
+  if (!container) return false;
+  if (currentChartMode !== 'dom' || _chartExchange(sig) !== 'MEXC') return false;
+  container.innerHTML = '<div class="chart-empty">Loading order flow...</div>';
+  try {
+    const resp = await fetch(`/api/order-flow/overlay/${encodeURIComponent(sig.symbol)}?exchange=MEXC&trade_limit=500&depth_levels=50&bins=32&footprint_bucket_seconds=${footprintBucketSeconds()}&footprint_rows=24`);
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || 'order flow unavailable');
+    const html = currentChartMode === 'footprint'
+      ? renderFootprintMode(data)
+      : currentChartMode === 'dom'
+        ? renderDomMode(data)
+        : renderOrderFlowSummaryMode(data);
+    container.innerHTML = `<div class="orderflow-panel" style="height:100%;overflow:auto;border-top:0">${html}</div>`;
+    startDomRefresh(container, sig);
+    return true;
+  } catch (e) {
+    container.innerHTML = `<div class="chart-empty">Order flow unavailable: ${esc(e.message || e)}</div>`;
+    return true;
+  }
+}
 function stopDomRefresh() {
   if (domRefreshTimer) {
     clearInterval(domRefreshTimer);
@@ -2931,24 +3068,30 @@ function stopDomRefresh() {
 }
 function startDomRefresh(container, sig) {
   stopDomRefresh();
-  if (currentChartMode !== 'dom' || _chartExchange(sig) !== 'MEXC') return;
+  if (!['orderflow','dom','footprint'].includes(currentChartMode) || _chartExchange(sig) !== 'MEXC') return;
   domRefreshTimer = setInterval(async () => {
-    if (currentChartMode !== 'dom' || !container?.isConnected) {
+    if (!['orderflow','dom','footprint'].includes(currentChartMode) || !container?.isConnected) {
       stopDomRefresh();
       return;
     }
     try {
-      const resp = await fetch(`/api/order-flow/overlay/${encodeURIComponent(sig.symbol)}?exchange=MEXC&trade_limit=200&depth_levels=50&bins=16`);
+      const resp = await fetch(`/api/order-flow/overlay/${encodeURIComponent(sig.symbol)}?exchange=MEXC&trade_limit=500&depth_levels=50&bins=32&footprint_bucket_seconds=${footprintBucketSeconds()}&footprint_rows=24`);
       const data = await resp.json();
-      const panel = container.parentElement?.querySelector('.orderflow-panel');
-      if (panel && data.success) panel.innerHTML = renderDomMode(data);
+      const panel = container.querySelector('.orderflow-panel') || container.parentElement?.querySelector('.orderflow-panel');
+      if (panel && data.success) {
+        panel.innerHTML = currentChartMode === 'footprint'
+          ? renderFootprintMode(data)
+          : currentChartMode === 'dom'
+            ? renderDomMode(data)
+            : renderOrderFlowSummaryMode(data);
+      }
     } catch (_) {}
   }, 3000);
 }
 async function applyOrderFlowOverlays(chart, candleSeries, container, candles, sig, baseMarkers = []) {
-  if (!chartModeAllowsOrderFlow() || !activeOrderFlowOverlays.size || _chartExchange(sig) !== 'MEXC') return;
+  if (!chartModeAllowsOrderFlow() || (currentChartMode !== 'footprint' && !activeOrderFlowOverlays.size) || _chartExchange(sig) !== 'MEXC') return;
   try {
-    const resp = await fetch(`/api/order-flow/overlay/${encodeURIComponent(sig.symbol)}?exchange=MEXC&trade_limit=500&depth_levels=50&bins=32`);
+    const resp = await fetch(`/api/order-flow/overlay/${encodeURIComponent(sig.symbol)}?exchange=MEXC&trade_limit=500&depth_levels=50&bins=32&footprint_bucket_seconds=${footprintBucketSeconds()}&footprint_rows=24`);
     const data = await resp.json();
     if (!data.success) throw new Error(data.error || 'order flow unavailable');
     if (orderFlowOverlayOn('of_profile') && data.profile) {
@@ -3008,48 +3151,53 @@ async function applyOrderFlowOverlays(chart, candleSeries, container, candles, s
 function renderOrderFlowPanel(container, data) {
   const old = container.parentElement?.querySelector('.orderflow-panel');
   if (old) old.remove();
-  if (!chartModeAllowsOrderFlow() || !activeOrderFlowOverlays.size) return;
+  if (!chartModeAllowsOrderFlow() || (currentChartMode !== 'footprint' && !activeOrderFlowOverlays.size)) return;
   const panel = document.createElement('div');
   panel.className = 'orderflow-panel';
   if (!data.success) {
     panel.innerHTML = `<span style="color:var(--text3)">Order flow unavailable: ${esc(data.error || 'no data')}</span>`;
+  } else if (currentChartMode === 'footprint') {
+    panel.innerHTML = renderFootprintMode(data);
   } else if (currentChartMode === 'dom') {
     panel.innerHTML = renderDomMode(data);
   } else {
-    const d = data.delta || {};
-    const depth = data.depth || {};
-    const bins = (data.profile?.bins || []).filter(b => b.volume > 0).slice().reverse();
-    const maxVol = Number(data.profile?.max_bin_volume || 1);
-    const bidWalls = (depth.bid_walls || []).slice().sort((a,b) => Number(b.qty || 0) - Number(a.qty || 0)).slice(0, 5);
-    const askWalls = (depth.ask_walls || []).slice().sort((a,b) => Number(b.qty || 0) - Number(a.qty || 0)).slice(0, 5);
-    panel.innerHTML = `
-      <div class="of-grid">
-        ${pairMetric('Tape Delta', `${Number(d.delta_pct || 0).toFixed(1)}%`, Number(d.delta_pct || 0) >= 0 ? 'var(--green)' : 'var(--red)')}
-        ${pairMetric('Trades', d.trade_count ?? '—', 'var(--text2)')}
-        ${pairMetric('POC', data.profile?.poc ? fmtPrice(Number(data.profile.poc)) : '—', '#facc15')}
-        ${pairMetric('Value Area', data.profile?.value_area_low ? `${fmtPrice(Number(data.profile.value_area_low))} - ${fmtPrice(Number(data.profile.value_area_high))}` : '—', '#b26cff')}
-        ${pairMetric('Book Imbalance', depth.imbalance_ratio != null ? Number(depth.imbalance_ratio).toFixed(2) : '—', Number(depth.imbalance_ratio || 0.5) >= 0.5 ? 'var(--green)' : 'var(--red)')}
-        ${pairMetric('Large Prints', (data.large_trades || []).length, 'var(--amber)')}
-      </div>
-      ${orderFlowOverlayOn('of_profile') ? `<div class="of-profile">
-        ${bins.map(b => {
-          const pct = Math.max(2, Math.round(Number(b.volume || 0) / maxVol * 100));
-          const color = Number(b.delta || 0) >= 0 ? 'rgba(0,230,118,0.75)' : 'rgba(255,82,82,0.75)';
-          return `<div class="of-row"><span>${fmtPrice(Number(b.mid))}</span><div class="of-bar" style="width:${pct}%;background:${color}"></div><span style="color:${color}">${fmtBig(b.volume)}</span></div>`;
-        }).join('')}
-      </div>` : ''}
-      ${currentChartMode === 'dom' ? `<div class="dom-grid">
-        <div>
-          <div class="dom-side-title">Bid Walls</div>
-          ${bidWalls.length ? bidWalls.map(w => `<div class="dom-row"><span style="color:var(--green)">${fmtPrice(Number(w.price))}</span><span>${fmtBig(Number(w.qty || 0))}</span></div>`).join('') : '<div style="color:var(--text3);font-size:10px">No large bid walls in snapshot.</div>'}
-        </div>
-        <div>
-          <div class="dom-side-title">Ask Walls</div>
-          ${askWalls.length ? askWalls.map(w => `<div class="dom-row"><span style="color:var(--red)">${fmtPrice(Number(w.price))}</span><span>${fmtBig(Number(w.qty || 0))}</span></div>`).join('') : '<div style="color:var(--text3);font-size:10px">No large ask walls in snapshot.</div>'}
-        </div>
-      </div>` : ''}`;
+    panel.innerHTML = renderOrderFlowSummaryMode(data);
   }
-  container.parentElement?.appendChild(panel);
+  container.insertAdjacentElement('afterend', panel);
+}
+function renderOrderFlowSummaryMode(data) {
+  const d = data.delta || {};
+  const depth = data.depth || {};
+  const bins = (data.profile?.bins || []).filter(b => b.volume > 0).slice().reverse();
+  const maxVol = Number(data.profile?.max_bin_volume || 1);
+  const bidWalls = (depth.bid_walls || []).slice().sort((a,b) => Number(b.qty || 0) - Number(a.qty || 0)).slice(0, 5);
+  const askWalls = (depth.ask_walls || []).slice().sort((a,b) => Number(b.qty || 0) - Number(a.qty || 0)).slice(0, 5);
+  return `
+    <div class="of-grid">
+      ${pairMetric('Tape Delta', `${Number(d.delta_pct || 0).toFixed(1)}%`, Number(d.delta_pct || 0) >= 0 ? 'var(--green)' : 'var(--red)')}
+      ${pairMetric('Trades', d.trade_count ?? '—', 'var(--text2)')}
+      ${pairMetric('POC', data.profile?.poc ? fmtPrice(Number(data.profile.poc)) : '—', '#facc15')}
+      ${pairMetric('Value Area', data.profile?.value_area_low ? `${fmtPrice(Number(data.profile.value_area_low))} - ${fmtPrice(Number(data.profile.value_area_high))}` : '—', '#b26cff')}
+      ${pairMetric('Book Imbalance', depth.imbalance_ratio != null ? Number(depth.imbalance_ratio).toFixed(2) : '—', Number(depth.imbalance_ratio || 0.5) >= 0.5 ? 'var(--green)' : 'var(--red)')}
+      ${pairMetric('Large Prints', (data.large_trades || []).length, 'var(--amber)')}
+    </div>
+    ${orderFlowOverlayOn('of_profile') || currentChartMode === 'orderflow' ? `<div class="of-profile">
+      ${bins.map(b => {
+        const pct = Math.max(2, Math.round(Number(b.volume || 0) / maxVol * 100));
+        const color = Number(b.delta || 0) >= 0 ? 'rgba(0,230,118,0.75)' : 'rgba(255,82,82,0.75)';
+        return `<div class="of-row"><span>${fmtPrice(Number(b.mid))}</span><div class="of-bar" style="width:${pct}%;background:${color}"></div><span style="color:${color}">${fmtBig(b.volume)}</span></div>`;
+      }).join('') || '<div style="padding:8px;color:var(--text3);font-size:10px">No profile bins in this tape sample.</div>'}
+    </div>` : ''}
+    <div class="dom-grid">
+      <div>
+        <div class="dom-side-title">Bid Walls</div>
+        ${bidWalls.length ? bidWalls.map(w => `<div class="dom-row"><span style="color:var(--green)">${fmtPrice(Number(w.price))}</span><span>${fmtBig(Number(w.qty || 0))}</span></div>`).join('') : '<div style="color:var(--text3);font-size:10px">No large bid walls in snapshot.</div>'}
+      </div>
+      <div>
+        <div class="dom-side-title">Ask Walls</div>
+        ${askWalls.length ? askWalls.map(w => `<div class="dom-row"><span style="color:var(--red)">${fmtPrice(Number(w.price))}</span><span>${fmtBig(Number(w.qty || 0))}</span></div>`).join('') : '<div style="color:var(--text3);font-size:10px">No large ask walls in snapshot.</div>'}
+      </div>
+    </div>`;
 }
 function destroyMT7Chart() {
   stopDomRefresh();
@@ -3100,7 +3248,7 @@ function chartModeAllowsIndicators() {
   return currentChartMode === 'indicators' || currentChartMode === 'hybrid';
 }
 function chartModeAllowsOrderFlow() {
-  return currentChartMode === 'orderflow' || currentChartMode === 'dom' || currentChartMode === 'hybrid';
+  return currentChartMode === 'orderflow' || currentChartMode === 'footprint' || currentChartMode === 'dom' || currentChartMode === 'hybrid';
 }
 function chartIndicatorOn(key) {
   return chartModeAllowsIndicators() && activeChartIndicators.has(key);
@@ -3171,10 +3319,38 @@ function _syncChartControls() {
     if (input) input.checked = chartMarkerOn(b.dataset.chartMarker);
   });
 }
-function applyMT7IndicatorSeries(chart, candles) {
+function chartPriceFormat(candles, sig = null) {
+  const vals = [];
+  (candles || []).forEach(c => {
+    ['open','high','low','close'].forEach(k => {
+      const v = Number(c[k]);
+      if (Number.isFinite(v) && v > 0) vals.push(v);
+    });
+  });
+  ['price','entry1','tp1','tp2','tp3','stop_loss','liquidation_price','liquidation_px'].forEach(k => {
+    const v = Number(sig?.[k]);
+    if (Number.isFinite(v) && v > 0) vals.push(v);
+  });
+  const min = vals.length ? Math.min(...vals) : 1;
+  let precision = 2;
+  if (min < 0.000001) precision = 10;
+  else if (min < 0.001) precision = 8;
+  else if (min < 0.01) precision = 7;
+  else if (min < 1) precision = 6;
+  else if (min < 1000) precision = 4;
+  return { type: 'price', precision, minMove: Math.pow(10, -precision) };
+}
+function chartFormatPriceValue(price, priceFormat = null) {
+  const n = Number(price);
+  if (!Number.isFinite(n)) return '';
+  const precision = Number.isFinite(Number(priceFormat?.precision)) ? Number(priceFormat.precision) : 2;
+  return n.toFixed(Math.max(0, Math.min(10, precision)));
+}
+function applyMT7IndicatorSeries(chart, candles, priceFormat = null) {
   if (!chart || !Array.isArray(candles) || !candles.length) return;
   const addLine = opts => chart.addLineSeries ? chart.addLineSeries(opts) : chart.addSeries(LightweightCharts.LineSeries, opts);
   const addHist = opts => chart.addHistogramSeries ? chart.addHistogramSeries(opts) : chart.addSeries(LightweightCharts.HistogramSeries, opts);
+  const priceLineOptions = priceFormat ? { priceFormat } : {};
 
   if (chartIndicatorOn('volume')) {
     const volume = addHist({
@@ -3192,26 +3368,26 @@ function applyMT7IndicatorSeries(chart, candles) {
     })));
   }
   if (chartIndicatorOn('ema20')) {
-    const ema = addLine({ color: '#448aff', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    const ema = addLine({ color: '#448aff', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, ...priceLineOptions });
     ema.setData(_ema(candles, 20));
   }
   if (chartIndicatorOn('ema50')) {
-    const ema = addLine({ color: '#00bcd4', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    const ema = addLine({ color: '#00bcd4', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, ...priceLineOptions });
     ema.setData(_ema(candles, 50));
   }
   if (chartIndicatorOn('ema200')) {
-    const ema = addLine({ color: '#d6d6e8', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    const ema = addLine({ color: '#d6d6e8', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, ...priceLineOptions });
     ema.setData(_ema(candles, 200));
   }
   if (chartIndicatorOn('vwap')) {
-    const vwap = addLine({ color: '#ffab40', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    const vwap = addLine({ color: '#ffab40', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, ...priceLineOptions });
     vwap.setData(_vwap(candles));
   }
   if (chartIndicatorOn('bbands')) {
     const bands = _bollinger(candles, 20, 2);
-    addLine({ color: 'rgba(178,108,255,0.75)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false }).setData(bands.upper);
-    addLine({ color: 'rgba(178,108,255,0.28)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false }).setData(bands.middle);
-    addLine({ color: 'rgba(178,108,255,0.75)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false }).setData(bands.lower);
+    addLine({ color: 'rgba(178,108,255,0.75)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, ...priceLineOptions }).setData(bands.upper);
+    addLine({ color: 'rgba(178,108,255,0.28)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, ...priceLineOptions }).setData(bands.middle);
+    addLine({ color: 'rgba(178,108,255,0.75)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, ...priceLineOptions }).setData(bands.lower);
   }
   if (chartIndicatorOn('rsi')) {
     const rsi = addLine({
@@ -3251,6 +3427,7 @@ async function loadMT7Chart(sig) {
   destroyMT7Chart();
   container.innerHTML = '<div class="chart-empty">Loading MT7 candles...</div>';
   try {
+    if (await renderPrimaryOrderFlowView(container, sig)) return;
     if (!window.LightweightCharts) throw new Error('Chart library did not load');
     const exchange = _chartExchange(sig);
     const url = `/api/chart/${encodeURIComponent(exchange)}/${encodeURIComponent(sig.symbol)}?interval=${encodeURIComponent(currentMT7Interval)}&limit=500`;
@@ -3259,10 +3436,12 @@ async function loadMT7Chart(sig) {
     if (!data.success || !Array.isArray(data.candles) || data.candles.length < 5) {
       throw new Error(data.error || 'Not enough candles returned');
     }
+    const priceFormat = chartPriceFormat(data.candles, sig);
     container.innerHTML = '';
     const chart = LightweightCharts.createChart(container, {
       autoSize: true,
       layout: { background: { color: '#080a0f' }, textColor: 'rgba(255,255,255,0.55)' },
+      localization: { priceFormatter: price => chartFormatPriceValue(price, priceFormat) },
       grid: {
         vertLines: { color: 'rgba(255,255,255,0.04)' },
         horzLines: { color: 'rgba(255,255,255,0.04)' },
@@ -3272,9 +3451,17 @@ async function loadMT7Chart(sig) {
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
     mt7Chart = chart;
+    const candleOptions = {
+      upColor: '#00e676',
+      downColor: '#ff5252',
+      borderVisible: false,
+      wickUpColor: '#00e676',
+      wickDownColor: '#ff5252',
+      priceFormat,
+    };
     const series = chart.addCandlestickSeries
-      ? chart.addCandlestickSeries({ upColor: '#00e676', downColor: '#ff5252', borderVisible: false, wickUpColor: '#00e676', wickDownColor: '#ff5252' })
-      : chart.addSeries(LightweightCharts.CandlestickSeries, { upColor: '#00e676', downColor: '#ff5252', borderVisible: false, wickUpColor: '#00e676', wickDownColor: '#ff5252' });
+      ? chart.addCandlestickSeries(candleOptions)
+      : chart.addSeries(LightweightCharts.CandlestickSeries, candleOptions);
     series.setData(data.candles.map(c => ({
       time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
     })));
@@ -3288,7 +3475,7 @@ async function loadMT7Chart(sig) {
         title: level.title,
       });
     });
-    applyMT7IndicatorSeries(chart, data.candles);
+    applyMT7IndicatorSeries(chart, data.candles, priceFormat);
     applyOrderFlowOverlays(chart, series, container, data.candles, sig);
     attachMT7CrosshairReadout(chart, container, data.candles, sig);
     chart.timeScale().fitContent();
@@ -3323,6 +3510,7 @@ let pairWorkspaceDetail = null;
 let pairWorkspacePath = null;
 let pairWorkspaceFlowHistory = null;
 let pairWorkspaceStrategyContext = null;
+let _pairPriceStream = null;
 
 function destroyPairChart() {
   stopDomRefresh();
@@ -3337,12 +3525,20 @@ function destroyPairChart() {
   document.querySelector('#pair-chart-container')?.parentElement?.querySelector('.orderflow-panel')?.remove();
 }
 
+function stopPairPriceStream() {
+  if (_pairPriceStream) {
+    _pairPriceStream.close();
+    _pairPriceStream = null;
+  }
+}
+
 async function loadPairNativeChart(sig) {
   const container = $('pair-chart-container');
   if (!container) return;
   destroyPairChart();
   container.innerHTML = '<div class="chart-empty">Loading MT7 chart...</div>';
   try {
+    if (await renderPrimaryOrderFlowView(container, sig)) return;
     if (!window.LightweightCharts) throw new Error('Chart library did not load');
     const exchange = _chartExchange(sig);
     const url = `/api/chart/${encodeURIComponent(exchange)}/${encodeURIComponent(sig.symbol)}?interval=${encodeURIComponent(currentMT7Interval)}&limit=700`;
@@ -3351,10 +3547,12 @@ async function loadPairNativeChart(sig) {
     if (!data.success || !Array.isArray(data.candles) || data.candles.length < 5) {
       throw new Error(data.error || 'Not enough candles returned');
     }
+    const priceFormat = chartPriceFormat(data.candles, sig);
     container.innerHTML = '';
     const chart = LightweightCharts.createChart(container, {
       autoSize: true,
       layout: { background: { color: '#080a0f' }, textColor: 'rgba(255,255,255,0.6)' },
+      localization: { priceFormatter: price => chartFormatPriceValue(price, priceFormat) },
       grid: {
         vertLines: { color: 'rgba(255,255,255,0.04)' },
         horzLines: { color: 'rgba(255,255,255,0.04)' },
@@ -3364,9 +3562,17 @@ async function loadPairNativeChart(sig) {
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
     pairChart = chart;
+    const candleOptions = {
+      upColor: '#00e676',
+      downColor: '#ff5252',
+      borderVisible: false,
+      wickUpColor: '#00e676',
+      wickDownColor: '#ff5252',
+      priceFormat,
+    };
     const series = chart.addCandlestickSeries
-      ? chart.addCandlestickSeries({ upColor: '#00e676', downColor: '#ff5252', borderVisible: false, wickUpColor: '#00e676', wickDownColor: '#ff5252' })
-      : chart.addSeries(LightweightCharts.CandlestickSeries, { upColor: '#00e676', downColor: '#ff5252', borderVisible: false, wickUpColor: '#00e676', wickDownColor: '#ff5252' });
+      ? chart.addCandlestickSeries(candleOptions)
+      : chart.addSeries(LightweightCharts.CandlestickSeries, candleOptions);
     series.setData(data.candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
     if (chartMarkerOn('levels')) _chartStopsAndTargets(sig).forEach(level => {
       series.createPriceLine({
@@ -3378,7 +3584,7 @@ async function loadPairNativeChart(sig) {
         title: level.title,
       });
     });
-    applyMT7IndicatorSeries(chart, data.candles);
+    applyMT7IndicatorSeries(chart, data.candles, priceFormat);
     const paperMarkers = buildPaperTradeMarkers(data.candles, sig);
     const flowEventMarkers = buildOrderFlowEventMarkers(data.candles, pairWorkspaceFlowHistory);
     const baseMarkers = paperMarkers.concat(flowEventMarkers).sort((a, b) => Number(a.time) - Number(b.time));
@@ -3725,7 +3931,7 @@ function renderDetail(sig) {
         <button class="chart-pill" data-chart-source="tv" onclick="setChartSource('tv')">TradingView</button>
       </div>
       <div class="chart-btn-row">
-        ${MT7_CHART_MODES.map(mode => `<button class="chart-pill" data-chart-mode="${mode}" onclick="setChartMode('${mode}')">${mode === 'orderflow' ? 'Order Flow' : mode.toUpperCase()}</button>`).join('')}
+        ${MT7_CHART_MODES.map(mode => `<button class="chart-pill" data-chart-mode="${mode}" onclick="setChartMode('${mode}')">${mode === 'orderflow' ? 'Order Flow' : mode === 'footprint' ? 'Footprint' : mode.toUpperCase()}</button>`).join('')}
       </div>
       <div class="chart-btn-row">
         ${MT7_TIMEFRAMES.map(tf => `<button class="chart-pill" data-mt7-interval="${tf}" onclick="setMT7Interval('${tf}')">${tf}</button>`).join('')}
@@ -4350,8 +4556,8 @@ const STRAT_META = {
     tooltip: 'Targets pairs where funding is extreme — shorts paying longs (long setup) or longs paying shorts (short setup). Works best in sideways markets. Low leverage cap.',
   },
   momentum_breakout: {
-    label: 'Momentum Breakout', cap: 25, desc: '|24h Δ| > 3% · trending + volume',
-    tooltip: 'Rides strong directional moves with volume confirmation. Only fires when 24h change exceeds 3%. Works best in trending markets. Higher leverage cap.',
+    label: 'Momentum Breakout', cap: 12, desc: '1h ATR breakout · volume + trend',
+    tooltip: 'Targets fresh 1h volatility expansion confirmed by volume spike and EMA trend alignment. Extreme ATR is still blocked; leverage cap is lower than the old version.',
   },
   mean_reversion: {
     label: 'Mean Reversion', cap: 15, desc: 'RSI extremes · counter-trend',
@@ -5739,6 +5945,7 @@ const I = {
   status:       null,
   suggestions:  [],
   suggestionBaseline: {},
+  evaluationWindowTrades: 20,
   learnerRunning: false,
   briefs:       [],
   briefsLoading: false,
@@ -5752,6 +5959,7 @@ const I = {
   reportCache:  {},
   hermes:       null,
   hermesLoading:false,
+  researchPipeline: null,
   tagAttribution: null,
   edgeLab: null,
   edgeLabLoading: false,
@@ -5773,11 +5981,11 @@ const STRATEGY_LEARN = {
     read: 'Prefer setups where funding is extreme and price momentum is tiring. Avoid fighting fresh breakouts.'
   },
   momentum_breakout: {
-    core: 'Prioritizes strong directional movement with volume expansion and trend continuation.',
-    best: 'Best in high-participation trending markets where breakouts keep extending instead of reverting.',
-    signals: ['24h change', '4h change', '1h change', 'volume expansion', 'trend alignment'],
-    risks: 'Late entries after thin-liquidity pumps can reverse violently. Watch for exhausted moves and weak volume.',
-    read: 'Trust it when multiple timeframes agree and volume supports the move. Fade low-volume spikes mentally, not mechanically.'
+    core: 'Targets fresh 1h volatility expansion where price moves far enough relative to ATR and volume confirms participation.',
+    best: 'Best when a market is leaving compression or beginning a clean intraday trend with real tape behind it.',
+    signals: ['1h ATR-relative move', 'volume spike', 'EMA trend alignment', 'non-extreme ATR', 'directional follow-through'],
+    risks: 'Late entries after thin-liquidity pumps can reverse violently. Extreme ATR remains blocked and weak-volume moves are rejected.',
+    read: 'Trust it when the 1h move, volume, and EMA structure agree. Be cautious when the move is already overextended or flow is weak.'
   },
   mean_reversion: {
     core: 'Fades stretched RSI and one-sided moves, expecting price to snap back toward a fairer zone.',
@@ -8353,6 +8561,7 @@ async function loadIntelligence() {
     I.status = statusRes.success ? statusRes : null;
     I.suggestions = suggestionsRes.suggestions || [];
     I.suggestionBaseline = suggestionsRes.baseline || {};
+    I.evaluationWindowTrades = suggestionsRes.evaluation_window_trades || 20;
     I.learnerRunning = suggestionsRes.learner_running || false;
     if (rosterRes && rosterRes.success) I.roster = rosterRes;
     if (hermesRes && hermesRes.success) I.hermes = hermesRes.audit || null;
@@ -8366,8 +8575,10 @@ async function loadIntelligence() {
       .then(r => r.json())
       .then(d => {
         I.briefs = d.briefs || [];
+        I.researchPipeline = d.hermes_pipeline || null;
         I.briefsLoading = false;
         renderResearchFirm();
+        if (I.activeSubTab === 'hermes') renderIntelligence();
       })
       .catch(() => { I.briefsLoading = false; renderResearchFirm(); });
   } catch(e) {
@@ -8678,6 +8889,7 @@ async function loadSuggestions(rerender = true) {
     if (!data.success) throw new Error(data.error || 'suggestions unavailable');
     I.suggestions = data.suggestions || [];
     I.suggestionBaseline = data.baseline || {};
+    I.evaluationWindowTrades = data.evaluation_window_trades || 20;
     I.learnerRunning = !!data.learner_running;
     if (rerender) renderIntelligence();
   } catch (e) {
@@ -8686,8 +8898,15 @@ async function loadSuggestions(rerender = true) {
 }
 
 let _hermesRunPollId = null;
+let _hermesRunActive = false;
 
 async function triggerHermesRun() {
+  if (_hermesRunActive) return;
+  _hermesRunActive = true;
+  if (_hermesRunPollId) {
+    clearInterval(_hermesRunPollId);
+    _hermesRunPollId = null;
+  }
   const btn = document.getElementById('btn-hermes-run');
   const statusEl = document.getElementById('hermes-run-status');
   if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
@@ -8696,7 +8915,7 @@ async function triggerHermesRun() {
     const res = await fetch('/api/intelligence/hermes/run', { method: 'POST' });
     const data = await res.json();
     if (!data.success) throw new Error(data.error || 'Failed to start');
-    if (statusEl) statusEl.textContent = 'Running…';
+    if (statusEl) statusEl.textContent = 'Hermes is running on the old server. This can take a minute or two.';
     if (btn) btn.textContent = 'Running…';
     _hermesRunPollId = setInterval(async () => {
       try {
@@ -8707,21 +8926,25 @@ async function triggerHermesRun() {
         if (sd.status === 'done') {
           if (statusEl) statusEl.textContent = 'Done — refreshing…';
           if (btn) { btn.disabled = false; btn.textContent = 'Run Now'; }
+          _hermesRunActive = false;
           await loadHermesAudit(true);
           if (statusEl) statusEl.textContent = 'Updated';
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
         } else {
           if (statusEl) { statusEl.style.color = 'var(--red)'; statusEl.textContent = 'Error: ' + (sd.error || 'unknown'); }
           if (btn) { btn.disabled = false; btn.textContent = 'Run Now'; }
+          _hermesRunActive = false;
         }
       } catch (e) {
         clearInterval(_hermesRunPollId); _hermesRunPollId = null;
         if (btn) { btn.disabled = false; btn.textContent = 'Run Now'; }
+        _hermesRunActive = false;
       }
     }, 4000);
   } catch (e) {
     if (btn) { btn.disabled = false; btn.textContent = 'Run Now'; }
     if (statusEl) { statusEl.style.color = 'var(--red)'; statusEl.textContent = e.message || 'Error'; }
+    _hermesRunActive = false;
   }
 }
 
@@ -8777,7 +9000,7 @@ function renderSuggestionCard(sug, active = false) {
   const isEvaluating = sug.status === 'evaluating';
   const canAct = ['pending_review', 'pending'].includes(sug.status);
   const border = active ? (isEvaluating ? '#1e3a5f' : '#5b4214') : '#202936';
-  const expected = sug.expected_win_rate_delta || sug.expected_trade_count_delta || '—';
+  const expected = sug.expected_ev_label || sug.expected_win_rate_delta || sug.expected_trade_count_delta || '—';
   const sample = sug.sample_size || '?';
   const confidenceColor = {high:'var(--green)', medium:'var(--amber)', low:'var(--text3)'}[sug.confidence] || 'var(--text3)';
   return `<div style="background:#10151c;border:1px solid ${border};border-radius:7px;padding:14px;margin-bottom:12px;${active ? '' : 'opacity:.72;'}">
@@ -8795,7 +9018,20 @@ function renderSuggestionCard(sug, active = false) {
       ${suggestionMetric('Sample', baseline.ev_sample_n ?? sample, 'var(--text2)')}
       ${suggestionMetric('Expected', esc(expected), 'var(--amber)')}
     </div>
-    ${isEvaluating ? `<div style="font-size:11px;color:#60a5fa;background:#07111e;border:1px solid #14365f;border-radius:5px;padding:8px;">Monitoring outcomes against the captured baseline. The queue stays locked until this resolves.</div>` : ''}
+    ${isEvaluating ? (() => {
+      const done = sug.trades_since_baseline ?? 0;
+      const target = I.evaluationWindowTrades || 20;
+      const pct = Math.min(100, Math.round((done / target) * 100));
+      return `<div style="background:#07111e;border:1px solid #14365f;border-radius:5px;padding:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <span style="font-size:11px;color:#60a5fa;">Collecting outcomes — queue locked until window closes</span>
+          <span style="font-size:11px;color:#60a5fa;font-weight:700;">${done} / ${target} trades</span>
+        </div>
+        <div style="background:#0d1b2e;border-radius:3px;height:5px;overflow:hidden;">
+          <div style="background:#3b82f6;height:100%;width:${pct}%;transition:width .3s;border-radius:3px;"></div>
+        </div>
+      </div>`;
+    })() : ''}
     ${canAct ? `<div style="display:flex;gap:8px;">
       <button onclick="applySuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#166534;color:#86efac;border:1px solid #15803d;padding:8px;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;">Apply</button>
       <button onclick="rejectSuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#1b0808;color:#fca5a5;border:1px solid #7f1d1d;padding:8px;border-radius:5px;font-size:12px;cursor:pointer;">Reject</button>
@@ -9103,6 +9339,169 @@ function openArchivedMemo(idx) {
   openDrillModal('hermes-archived-memo', html, 'var(--blue)', 820);
 }
 
+function renderHermesResearchPipeline(research) {
+  research = research || {};
+  const library = research.library || {};
+  const memo = research.weekly_memo || null;
+  const reviews = research.cipher_reviews || [];
+  const sources = library.sources || [];
+  const candidates = library.local_candidates || [];
+  const sourceRows = sources.slice(0, 5).map(s => `
+    <div style="border:1px solid #1e2530;border-radius:5px;padding:9px;background:#0b0f15;margin-bottom:7px;">
+      <div style="font-size:12px;color:var(--text);font-weight:750;">${esc(s.title || 'Research source')}</div>
+      <div style="font-size:10px;color:var(--muted);margin-top:3px;">${esc((s.tags || []).join(', ') || s.source_type || 'general')}</div>
+      <div style="font-size:11px;color:var(--text3);line-height:1.4;margin-top:5px;">${esc((s.summary || '').slice(0, 240))}</div>
+    </div>`).join('');
+  const reviewRows = reviews.slice(0, 5).map(h => `
+    <div style="border-left:3px solid ${h.cipher_verdict === 'shadow_priority' ? 'var(--green)' : h.cipher_verdict === 'weak_prior' ? 'var(--red)' : 'var(--blue)'};background:#0b0f15;border-radius:4px;padding:9px;margin-bottom:7px;">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">
+        <div style="font-size:12px;color:var(--text);font-weight:750;">${esc(h.shadow_tag || h.id || 'shadow hypothesis')}</div>
+        <div style="font-size:10px;color:var(--muted);white-space:nowrap;">${esc(h.cipher_verdict || 'shadow')} · ${h.cipher_score ?? '—'}</div>
+      </div>
+      <div style="font-size:11px;color:var(--text2);line-height:1.45;margin-top:4px;">${esc(h.thesis || '')}</div>
+      <div style="font-size:10px;color:var(--amber);line-height:1.4;margin-top:5px;">Gate impact: ${esc(h.gate_impact || 'shadow annotation only')}</div>
+    </div>`).join('');
+  const memoRows = memo && memo.sections ? (memo.sections.cipher_review || []).slice(0, 4).map(r => `
+    <div style="font-size:11px;color:var(--muted);line-height:1.45;margin-bottom:5px;">
+      <b style="color:var(--text2);">${esc(r.shadow_tag || r.id || 'hypothesis')}</b> — ${esc(r.verdict || 'shadow')} (${r.score ?? '—'})
+    </div>`).join('') : '';
+  return `
+    <div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:15px;margin-bottom:14px;">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px;">
+        <div>
+          <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Hermes Research Pipeline</div>
+          <div style="font-size:14px;font-weight:800;color:var(--text);">External research → Cipher review → shadow experiments</div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.45;margin-top:4px;">Library items and source-derived hypotheses are advisory only. They do not change MT7 scoring until validated out of sample.</div>
+        </div>
+        <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center;">
+          <button onclick="seedHermesResearch()" id="btn-research-seed" style="background:#1a2535;border:1px solid #2a4060;color:#7eb8f7;padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Index Local Corpus</button>
+          <button onclick="runHermesResearchMemo()" id="btn-research-memo" style="background:rgba(0,230,118,0.12);border:1px solid rgba(0,230,118,0.35);color:var(--green);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Generate Memo</button>
+          <button onclick="showAddResearchSource()" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Add Source</button>
+        </div>
+      </div>
+      <div id="research-pipeline-status" style="font-size:11px;color:var(--muted);margin-bottom:8px;"></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:12px;">
+        ${hermesMetric('Library Sources', library.source_count || 0, (library.source_count || 0) ? 'var(--green)' : 'var(--amber)')}
+        ${hermesMetric('Cipher Reviews', reviews.length || 0, reviews.length ? 'var(--blue)' : 'var(--muted)')}
+        ${hermesMetric('Shadow Experiments', research.shadow_experiment_count || 0, (research.shadow_experiment_count || 0) ? 'var(--amber)' : 'var(--muted)')}
+        ${hermesMetric('Latest Memo', memo?.generated_at ? memo.generated_at.slice(0,10) : '—', memo?.generated_at ? 'var(--green)' : 'var(--muted)')}
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;">
+        <div>
+          <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Indexed Sources</div>
+          ${sourceRows || `<div style="font-size:12px;color:var(--muted);line-height:1.5;">No sources indexed yet. ${candidates.length ? `${candidates.length} local research files are available to index.` : 'Add a source or place files under docs/research.'}</div>`}
+        </div>
+        <div>
+          <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Cipher Shadow Reviews</div>
+          ${reviewRows || '<div style="font-size:12px;color:var(--muted);">No source-derived hypotheses yet.</div>'}
+        </div>
+        <div>
+          <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Weekly Memo</div>
+          <div style="font-size:12px;color:var(--text2);line-height:1.5;margin-bottom:8px;">${esc(memo?.sections?.executive_summary || 'No Hermes research memo generated yet.')}</div>
+          ${memoRows || '<div style="font-size:12px;color:var(--muted);">Generate a memo after sources are indexed.</div>'}
+        </div>
+      </div>
+    </div>`;
+}
+
+async function refreshHermesResearchPipeline() {
+  const res = await fetch('/api/intelligence/research/library');
+  const d = await res.json();
+  if (!d.success) throw new Error(d.error || 'research library unavailable');
+  I.researchPipeline = d;
+  if (I.hermes) {
+    I.hermes.research = Object.assign({}, I.hermes.research || {}, d);
+  }
+  renderIntelligence();
+}
+
+async function seedHermesResearch() {
+  const el = document.getElementById('research-pipeline-status');
+  const btn = document.getElementById('btn-research-seed');
+  if (btn) btn.disabled = true;
+  if (el) el.textContent = 'Indexing local research corpus...';
+  try {
+    const res = await fetch('/api/intelligence/research/seed-local', { method: 'POST' });
+    const d = await res.json();
+    if (!d.success) throw new Error(d.error || 'seed failed');
+    I.researchPipeline = d.pipeline || null;
+    if (I.hermes) I.hermes.research = Object.assign({}, I.hermes.research || {}, d.pipeline || {});
+    renderIntelligence();
+    showOverrideMsg(`Hermes indexed ${d.added || 0} new research sources.`);
+  } catch(e) {
+    if (el) el.textContent = 'Research indexing failed: ' + (e.message || e);
+    showOverrideMsg('Research indexing failed: ' + (e.message || e), true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function runHermesResearchMemo() {
+  const el = document.getElementById('research-pipeline-status');
+  const btn = document.getElementById('btn-research-memo');
+  if (btn) btn.disabled = true;
+  if (el) el.textContent = 'Generating Hermes research memo and registering shadow experiments...';
+  try {
+    const res = await fetch('/api/intelligence/research/weekly-memo', { method: 'POST' });
+    const d = await res.json();
+    if (!d.success) throw new Error(d.error || 'memo failed');
+    I.researchPipeline = d.pipeline || null;
+    if (I.hermes) I.hermes.research = Object.assign({}, I.hermes.research || {}, d.pipeline || {});
+    renderIntelligence();
+    showOverrideMsg(`Hermes memo generated. ${d.memo?.registered_shadow_experiments || 0} new shadow experiments registered.`);
+  } catch(e) {
+    if (el) el.textContent = 'Memo failed: ' + (e.message || e);
+    showOverrideMsg('Research memo failed: ' + (e.message || e), true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function showAddResearchSource() {
+  const html = `
+    <div style="display:grid;gap:10px;">
+      <div style="font-size:12px;color:var(--muted);line-height:1.5;">Add a paper, article, news item, sentiment note, or macro note. Hermes will extract tags and Cipher will convert useful ideas into shadow-only hypotheses.</div>
+      <input id="research-source-title" placeholder="Title" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
+      <input id="research-source-url" placeholder="URL (optional)" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
+      <textarea id="research-source-text" placeholder="Summary, abstract, notes, or pasted article text" rows="8" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);resize:vertical;"></textarea>
+      <input id="research-source-tags" placeholder="Tags, comma-separated (optional)" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
+      <div id="research-source-result" style="font-size:12px;color:var(--muted);"></div>
+      <button onclick="submitResearchSource()" style="justify-self:start;background:var(--green);color:#000;border:none;border-radius:5px;padding:8px 13px;font-size:12px;font-weight:800;cursor:pointer;">Add to Hermes Library</button>
+    </div>`;
+  openDrillModal('add-research-source', html, 'var(--blue)', 760);
+}
+
+async function submitResearchSource() {
+  const result = document.getElementById('research-source-result');
+  const tags = (document.getElementById('research-source-tags')?.value || '').split(',').map(x => x.trim()).filter(Boolean);
+  const payload = {
+    title: document.getElementById('research-source-title')?.value || '',
+    url: document.getElementById('research-source-url')?.value || '',
+    text: document.getElementById('research-source-text')?.value || '',
+    tags: tags.length ? tags : undefined,
+  };
+  if (!payload.title && !payload.url && !payload.text) {
+    if (result) result.innerHTML = '<span style="color:var(--red);">Add at least a title, URL, or text.</span>';
+    return;
+  }
+  if (result) result.textContent = 'Adding source...';
+  try {
+    const res = await fetch('/api/intelligence/research/sources', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await res.json();
+    if (!d.success) throw new Error(d.error || 'add source failed');
+    I.researchPipeline = d.pipeline || null;
+    if (I.hermes) I.hermes.research = Object.assign({}, I.hermes.research || {}, d.pipeline || {});
+    if (result) result.innerHTML = '<span style="color:var(--green);">Source added. Cipher shadow hypotheses updated.</span>';
+    renderIntelligence();
+  } catch(e) {
+    if (result) result.innerHTML = `<span style="color:var(--red);">Could not add source: ${esc(e.message || e)}</span>`;
+  }
+}
+
 function renderHermesPanel() {
   if (I.hermesLoading && !I.hermes) {
     return `<div style="max-width:1180px;margin:0 auto;color:var(--muted);padding:24px 0;">Loading Hermes audit...</div>`;
@@ -9143,6 +9542,7 @@ function renderHermesPanel() {
     ${renderHermesOrgChart(profile)}
     ${renderHermesMemo(memo)}
     ${renderHermesArchive(h.memo_archive || [])}
+    ${renderHermesResearchPipeline(Object.assign({}, research, I.researchPipeline || {}))}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px;">
       ${hermesMetric('Health Score', score + '/100', scoreColor)}
@@ -10561,6 +10961,18 @@ async function loadPaperTrading() {
               <div style="font-size:10px;color:#555;margin-top:2px">${trendHint}</div>`);
           })()}
         </div>
+        <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;margin:14px 0 8px;">Safety Controls</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;">
+          ${paperConfigField('Pause After N Losses', `<input id="pc-loss-streak-n" type="number" value="${c.loss_streak_pause_n ?? 4}" min="2" max="20" step="1"
+            style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">
+            <div style="font-size:10px;color:#555;margin-top:2px">Consecutive losses per strategy before cooldown</div>`)}
+          ${paperConfigField('Cooldown Duration (h)', `<input id="pc-loss-streak-hours" type="number" value="${c.loss_streak_cooldown_hours ?? 12}" min="1" max="168" step="1"
+            style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">
+            <div style="font-size:10px;color:#555;margin-top:2px">Hours to pause that strategy after streak</div>`)}
+          ${paperConfigField('Flow Boost After N Losses', `<input id="pc-cold-streak-n" type="number" value="${c.cold_streak_flow_boost_n ?? 3}" min="1" max="10" step="1"
+            style="background:#111;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font-size:12px;width:100%">
+            <div style="font-size:10px;color:#555;margin-top:2px">Require stronger flow confirmation during cold streaks</div>`)}
+        </div>
         <button onclick="savePaperConfig()"
           style="margin-top:10px;padding:5px 16px;border-radius:4px;border:1px solid #448aff;background:transparent;color:#448aff;font-size:12px;font-weight:700;cursor:pointer;">
           Save Config
@@ -10575,6 +10987,7 @@ async function loadPaperTrading() {
       const flowU = s.flow_unconfirmed;
       const acct = account && account.success ? account.account : {};
       statsHtml = `
+        ${renderPaperCohortStrip(s.current_cohort)}
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-bottom:10px;">
           ${paperStat('Paper Account', fmtUsd(acct.current_value_usd), (acct.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', `Started at ${fmtUsd(acct.starting_balance_usd)}`)}
           ${paperStat('Hard P&L', fmtUsdSigned(s.all_closed.total_pnl_usd), s.all_closed.total_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Real dollar P&L accrued from paper position sizes')}
@@ -10728,6 +11141,7 @@ async function loadPaperTrading() {
       closedHtml += `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
         <thead><tr style="color:#555;font-size:10px;letter-spacing:.06em;">
           <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #1e2530;">SYMBOL</th>
+          <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #1e2530;">STRATEGY</th>
           <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #1e2530;">DIR</th>
           <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #1e2530;">RESULT</th>
           <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #1e2530;">P&L</th>
@@ -10758,6 +11172,7 @@ async function loadPaperTrading() {
           onmouseover="this.style.background='rgba(255,255,255,0.03)'"
           onmouseout="this.style.background=''">
           <td style="padding:4px 8px;color:#ccc">${sym}</td>
+          <td style="padding:4px 8px;color:#667085;font-size:10px;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(t.strategy_key||t.strategy||'')}">${esc(t.strategy_key||t.strategy||'—')}</td>
           <td style="padding:4px 8px;">${dir}</td>
           <td style="padding:4px 8px;">${res}</td>
           <td style="padding:4px 8px;text-align:right;font-family:var(--mono)">${pnl}</td>
@@ -10840,6 +11255,43 @@ function paperStat(label, value, color, tip) {
   </div>`;
 }
 
+function renderPaperCohortStrip(cohort) {
+  if (!cohort || !cohort.stats) return '';
+  const st = cohort.stats;
+  const count = Number(st.count || 0);
+  const target = Number(cohort.target_count || 20);
+  const progress = target ? Math.min(100, Math.round(count / target * 100)) : 0;
+  const wp = st.win_partial_rate == null ? '—' : `${Number(st.win_partial_rate || 0).toFixed(1)}%`;
+  const avg = fmtPct(st.avg_pnl || 0);
+  const pf = Number(st.profit_factor || 0).toFixed(2);
+  const usd = fmtUsdSigned(st.total_pnl_usd || 0);
+  const okColor = count >= target && Number(st.win_partial_rate || 0) >= 50 && Number(st.avg_pnl || 0) > 0 && Number(st.profit_factor || 0) >= 1.25
+    ? '#22c55e'
+    : count >= target ? '#f59e0b' : '#60a5fa';
+  const started = cohort.started_at
+    ? new Date(String(cohort.started_at).endsWith('Z') ? cohort.started_at : cohort.started_at + 'Z').toLocaleString('en-US', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
+    : '—';
+  const active = (cohort.active_strategies || []).map(k => String(k).replace(/_/g, ' ')).join(', ');
+  return `<div title="Post-change validation cohort. This isolates new paper trades from the older mixed-strategy sample." style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px 11px;margin-bottom:10px;">
+    <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;">
+      <div style="min-width:220px;flex:1;">
+        <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;font-weight:800;">${esc(cohort.label || 'Current Cohort')}</div>
+        <div style="font-size:11px;color:#777;margin-top:2px;">Started ${esc(started)} · ${esc(active || 'No active strategies')}</div>
+      </div>
+      <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;font-family:var(--mono);font-size:12px;color:#888;">
+        <span><b style="color:${okColor};font-size:16px;">${count}</b><span style="color:#555">/${target}</span> trades</span>
+        <span>W+P <b style="color:${Number(st.win_partial_rate || 0) >= 50 ? '#22c55e' : '#ef4444'}">${wp}</b></span>
+        <span>Avg <b style="color:${Number(st.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${avg}</b></span>
+        <span>PF <b style="color:${Number(st.profit_factor || 0) >= 1.25 ? '#22c55e' : '#f59e0b'}">${pf}</b></span>
+        <span>$ <b style="color:${Number(st.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444'}">${usd}</b></span>
+      </div>
+    </div>
+    <div style="height:4px;background:#111827;border-radius:99px;overflow:hidden;margin-top:8px;">
+      <div style="height:100%;width:${progress}%;background:${okColor};border-radius:99px;"></div>
+    </div>
+  </div>`;
+}
+
 function paperStrategyLabel(t) {
   const key = t?.strategy_key || strategyNameToKey(t?.strategy || '') || 'strategy';
   return (STRAT_META[key] && STRAT_META[key].label)
@@ -10895,11 +11347,12 @@ function _paperAge(isoStr) {
 
 // Convert a paper_trade row into the shape showPositionDetail() expects
 function paperTradeToSignal(t) {
+  const current = livePaperPrice(t) || t.entry_px;
   return {
     id:           'paper_' + t.id,
     symbol:       t.symbol,
     direction:    t.direction,
-    price:        t.entry_px,
+    price:        current,
     entry1:       t.entry_px,
     entry2:       null,
     entry3:       null,
@@ -10939,6 +11392,7 @@ async function handlePairWorkspaceHash() {
   const hash = location.hash || '';
   if (!hash.startsWith('#/pair/')) {
     if (!$('pair-workspace')?.classList.contains('hidden')) {
+      stopPairPriceStream();
       destroyPairChart();
       switchTab(currentTab || 'paper');
     }
@@ -10977,6 +11431,7 @@ async function loadPairWorkspace(id) {
     await loadPairRecordedFlow(trade, false);
     loadPairNativeChart(pairWorkspaceSignal);
     refreshPairFlow(trade);
+    subscribePairPriceStream(trade.symbol);
   } catch (e) {
     root.innerHTML = `<div class="pair-shell"><button class="chart-pill" onclick="exitPairWorkspace()">Back</button><div style="color:var(--red);padding:2rem 0;">${esc(e.message)}</div></div>`;
   }
@@ -11035,8 +11490,8 @@ async function ensurePairSignalDetail() {
   renderPairWorkspaceTab();
 }
 
-function pairMetric(label, value, color) {
-  return `<div class="pair-metric"><div class="k">${esc(label)}</div><div class="v" style="${color ? `color:${color}` : ''}">${value}</div></div>`;
+function pairMetric(label, value, color, valueId = '') {
+  return `<div class="pair-metric"><div class="k">${esc(label)}</div><div class="v" ${valueId ? `id="${esc(valueId)}"` : ''} style="${color ? `color:${color}` : ''}">${value}</div></div>`;
 }
 
 function pairPlanInput(id, label, value, step='any', disabled=false) {
@@ -11057,8 +11512,8 @@ function pairPlanSelect(id, label, value, options, onChange='') {
 }
 
 function _pairCurrentPrice(t) {
-  const cached = H.priceCache[t.symbol];
-  return cached && cached.price != null ? Number(cached.price) : Number(t.entry_px || 0);
+  const live = livePaperPrice(t);
+  return live || Number(t.current_px || t.entry_px || 0);
 }
 
 function _pairPnlPct(t) {
@@ -11213,7 +11668,7 @@ function renderPairWorkspace(t, sig) {
         <div style="font-size:11px;color:var(--text3);margin-top:5px">${esc(t.exchange || 'MEXC')} · ${esc(t.status === 'pending' ? 'Working limit order' : t.status === 'open' ? 'Paper position active' : 'Paper trade review')}</div>
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
-        ${MT7_CHART_MODES.map(mode => `<button class="chart-pill ${currentChartMode === mode ? 'active' : ''}" data-chart-mode="${mode}" onclick="setChartMode('${mode}')">${mode === 'orderflow' ? 'Order Flow' : mode.toUpperCase()}</button>`).join('')}
+        ${MT7_CHART_MODES.map(mode => `<button class="chart-pill ${currentChartMode === mode ? 'active' : ''}" data-chart-mode="${mode}" onclick="setChartMode('${mode}')">${mode === 'orderflow' ? 'Order Flow' : mode === 'footprint' ? 'Footprint' : mode.toUpperCase()}</button>`).join('')}
         ${MT7_TIMEFRAMES.map(tf => `<button class="chart-pill ${currentMT7Interval === tf ? 'active' : ''}" data-mt7-interval="${tf}" onclick="setMT7Interval('${tf}')">${tf}</button>`).join('')}
         ${[
           ['ema20','EMA20'],
@@ -11248,11 +11703,11 @@ function renderPairWorkspace(t, sig) {
         <div class="pair-card">
           <div class="pair-card-title">${status === 'pending' ? 'Order Management' : 'Position Management'}</div>
           <div class="pair-metric-grid">
-            ${pairMetric('Current', fmtPrice(current), 'var(--text)')}
-            ${pairMetric('P&L', pnl == null ? '—' : fmtPct(pnl), pnlColor)}
+            ${pairMetric('Current', fmtPrice(current), 'var(--text)', 'pw-current')}
+            ${pairMetric('P&L', pnl == null ? '—' : fmtPct(pnl), pnlColor, 'pw-pnl')}
             ${pairMetric('Entry', fmtPrice(t.entry_px), 'var(--text2)')}
             ${pairMetric('Strategy', esc(strategyLabel), 'var(--text2)')}
-            ${pairMetric(status === 'pending' ? 'Entry Distance' : 'Risk To Stop', status === 'pending' && entryDist != null ? fmtPct(entryDist) : (t.stop_loss && current ? (Math.abs(current - t.stop_loss) / current * 100).toFixed(2) + '%' : '—'), status === 'pending' ? 'var(--amber)' : 'var(--red)')}
+            ${pairMetric(status === 'pending' ? 'Entry Distance' : 'Risk To Stop', status === 'pending' && entryDist != null ? fmtPct(entryDist) : (t.stop_loss && current ? (Math.abs(current - t.stop_loss) / current * 100).toFixed(2) + '%' : '—'), status === 'pending' ? 'var(--amber)' : 'var(--red)', 'pw-risk-stop')}
             ${pairMetric('Stop', fmtPrice(t.stop_loss), 'var(--red)')}
             ${pairMetric('Liquidation', t.liquidation_px ? `${fmtPrice(t.liquidation_px)} / ${Number(liqDist || 0).toFixed(2)}%` : '—', '#b26cff')}
             ${pairMetric('TP1', fmtPrice(t.tp1), 'var(--green)')}
@@ -11564,15 +12019,37 @@ async function refreshPairFlow(t) {
   }
 }
 
+function livePaperPrice(t) {
+  const symbol = typeof t === 'string' ? t : t?.symbol;
+  if (!symbol) return null;
+  const cached = H.priceCache[String(symbol).toUpperCase()];
+  const fallback = typeof t === 'string' ? null : Number(t?.current_px);
+  const price = cached && cached.price != null ? Number(cached.price) : fallback;
+  return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+function paperLiveMetrics(t, price = null) {
+  const current = Number(price || livePaperPrice(t) || t.entry_px || 0);
+  const entry = Number(t.entry_px || 0);
+  const lev = Number(t.leverage || 1);
+  const isLong = t.direction === 'LONG';
+  const pnl = entry > 0 && current > 0
+    ? (isLong ? (current - entry) / entry : (entry - current) / entry) * 100 * lev
+    : 0;
+  const stopDist = t.stop_loss && current > 0
+    ? Math.abs(current - Number(t.stop_loss)) / current * 100 : null;
+  const tp1Dist = t.tp1 && current > 0
+    ? (isLong ? (Number(t.tp1) - current) / current : (current - Number(t.tp1)) / current) * 100 : null;
+  return { current, pnl, stopDist, tp1Dist };
+}
+
 function paperTradeRow(t) {
   const sym      = t.symbol.replace('_USDC','').replace('_USDT','');
-  const cached   = H.priceCache[t.symbol];
-  const current  = cached ? cached.price : t.entry_px;
-  const lev      = t.leverage || 1;
+  const cached   = livePaperPrice(t);
+  const metrics  = paperLiveMetrics(t, cached);
+  const current  = metrics.current;
   const isLong   = t.direction === 'LONG';
-  const pnl      = t.entry_px > 0
-    ? (isLong ? (current - t.entry_px) / t.entry_px : (t.entry_px - current) / t.entry_px) * 100 * lev
-    : 0;
+  const pnl      = metrics.pnl;
   const pnlColor = pnl > 0 ? '#22c55e' : pnl < 0 ? '#ef4444' : '#555';
   const pnlSign  = pnl > 0 ? '+' : '';
   const dirCls   = isLong ? '#22c55e' : '#ef4444';
@@ -11581,10 +12058,8 @@ function paperTradeRow(t) {
     : `<span style="color:#555">—</span>`;
   const strategy = paperStrategyLabel(t);
 
-  const stopDist = t.stop_loss && current > 0
-    ? Math.abs(current - t.stop_loss) / current * 100 : null;
-  const tp1Dist  = t.tp1 && current > 0
-    ? (isLong ? (t.tp1 - current) / current : (current - t.tp1) / current) * 100 : null;
+  const stopDist = metrics.stopDist;
+  const tp1Dist  = metrics.tp1Dist;
   const stopCls  = stopDist !== null && stopDist < 1 ? 'color:#ef4444;font-weight:700' : 'color:#888';
   const tp1Cls   = tp1Dist !== null && tp1Dist < 1   ? 'color:#22c55e;font-weight:700' : 'color:#22c55e';
   const stale    = !cached ? '<sup title="Using entry as price">~</sup>' : '';
@@ -11593,14 +12068,14 @@ function paperTradeRow(t) {
       onclick="openPairWorkspaceForPaperTrade(${t.id})"
       onmouseover="this.style.background='rgba(255,255,255,0.03)'"
       onmouseout="this.style.background=''">
-    <td style="padding:5px 8px;color:#ccc;font-weight:600">${sym}${stale}</td>
+    <td id="pp-sym-${t.id}" style="padding:5px 8px;color:#ccc;font-weight:600">${sym}${stale}</td>
     <td style="padding:5px 8px;color:#888;font-size:11px;white-space:nowrap;" title="${esc(strategy)}">${esc(strategy)}</td>
     <td style="padding:5px 8px;font-weight:700;color:${dirCls}">${t.direction}</td>
     <td style="padding:5px 8px;text-align:right;color:#888;font-family:var(--mono)">${fmtPrice(t.entry_px)}</td>
     <td style="padding:5px 8px;text-align:right;color:#aaa;font-family:var(--mono)" id="pp-cur-${t.id}">${fmtPrice(current)}</td>
     <td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-weight:700;color:${pnlColor}" id="pp-pnl-${t.id}">${pnlSign}${pnl.toFixed(2)}%</td>
-    <td style="padding:5px 8px;text-align:right;font-family:var(--mono);${stopCls}">${stopDist !== null ? stopDist.toFixed(1) + '%' : '—'}</td>
-    <td style="padding:5px 8px;text-align:right;font-family:var(--mono);${tp1Cls}">${tp1Dist !== null ? tp1Dist.toFixed(1) + '%' : '—'}</td>
+    <td id="pp-stop-${t.id}" style="padding:5px 8px;text-align:right;font-family:var(--mono);${stopCls}">${stopDist !== null ? stopDist.toFixed(1) + '%' : '—'}</td>
+    <td id="pp-tp1-${t.id}" style="padding:5px 8px;text-align:right;font-family:var(--mono);${tp1Cls}">${tp1Dist !== null ? tp1Dist.toFixed(1) + '%' : '—'}</td>
     <td style="padding:5px 8px;text-align:right;">${flow}</td>
     <td style="padding:5px 8px;color:#555;font-size:10px;">${_paperAge(t.opened_at)}</td>
     <td style="padding:5px 8px;text-align:right;white-space:nowrap;">
@@ -11931,6 +12406,16 @@ function paperDuration(startIso, endIso) {
 
 let _paperPriceStream = null;
 
+function parsePriceStreamPayload(data) {
+  const payload = JSON.parse(data);
+  const rows = payload && payload.symbol
+    ? [[payload.symbol, payload.price]]
+    : Object.entries(payload || {});
+  return rows
+    .map(([sym, price]) => [String(sym).toUpperCase(), Number(price)])
+    .filter(([, price]) => Number.isFinite(price) && price > 0);
+}
+
 function subscribePaperPriceStream(symbols) {
   if (_paperPriceStream) { _paperPriceStream.close(); _paperPriceStream = null; }
   if (!symbols.length) return;
@@ -11938,10 +12423,10 @@ function subscribePaperPriceStream(symbols) {
   _paperPriceStream = new EventSource(url);
   _paperPriceStream.onmessage = (ev) => {
     try {
-      const updates = JSON.parse(ev.data);
-      for (const [sym, price] of Object.entries(updates)) {
+      for (const [sym, price] of parsePriceStreamPayload(ev.data)) {
         H.priceCache[sym] = { price, ts: Date.now() };
         updatePaperTradeRow(sym, price);
+        updatePairWorkspaceLivePrice(sym, price);
       }
     } catch (_) {}
   };
@@ -11950,24 +12435,84 @@ function subscribePaperPriceStream(symbols) {
   };
 }
 
+function subscribePairPriceStream(symbol) {
+  stopPairPriceStream();
+  if (!symbol) return;
+  const url = '/api/stream/prices?symbols=' + encodeURIComponent(symbol);
+  _pairPriceStream = new EventSource(url);
+  _pairPriceStream.onmessage = (ev) => {
+    try {
+      for (const [sym, price] of parsePriceStreamPayload(ev.data)) {
+        H.priceCache[sym] = { price, ts: Date.now() };
+        updatePaperTradeRow(sym, price);
+        updatePairWorkspaceLivePrice(sym, price);
+      }
+    } catch (_) {}
+  };
+  _pairPriceStream.onerror = () => {
+    stopPairPriceStream();
+  };
+}
+
 function updatePaperTradeRow(symbol, price) {
   const trades = (window._paperOpenTrades || []).filter(t => t.symbol === symbol);
   for (const t of trades) {
-    const lev    = t.leverage || 1;
-    const isLong = t.direction === 'LONG';
-    const pnl    = t.entry_px > 0
-      ? (isLong ? (price - t.entry_px) / t.entry_px : (t.entry_px - price) / t.entry_px) * 100 * lev
-      : 0;
+    t.current_px = price;
+    const metrics = paperLiveMetrics(t, price);
+    const pnl    = metrics.pnl;
     const pnlSign  = pnl > 0 ? '+' : '';
     const pnlColor = pnl > 0 ? '#22c55e' : pnl < 0 ? '#ef4444' : '#555';
+    const stopCls  = metrics.stopDist !== null && metrics.stopDist < 1 ? '#ef4444' : '#888';
+    const tp1Cls   = metrics.tp1Dist !== null && metrics.tp1Dist < 1 ? '#22c55e' : '#22c55e';
 
+    const symEl = $(`pp-sym-${t.id}`);
     const curEl = $(`pp-cur-${t.id}`);
     const pnlEl = $(`pp-pnl-${t.id}`);
+    const stopEl = $(`pp-stop-${t.id}`);
+    const tp1El = $(`pp-tp1-${t.id}`);
+    if (symEl) symEl.textContent = t.symbol.replace('_USDC','').replace('_USDT','');
     if (curEl) curEl.textContent = fmtPrice(price);
     if (pnlEl) {
       pnlEl.textContent = pnlSign + pnl.toFixed(2) + '%';
       pnlEl.style.color = pnlColor;
     }
+    if (stopEl) {
+      stopEl.textContent = metrics.stopDist !== null ? metrics.stopDist.toFixed(1) + '%' : '—';
+      stopEl.style.color = stopCls;
+      stopEl.style.fontWeight = metrics.stopDist !== null && metrics.stopDist < 1 ? '700' : '';
+    }
+    if (tp1El) {
+      tp1El.textContent = metrics.tp1Dist !== null ? metrics.tp1Dist.toFixed(1) + '%' : '—';
+      tp1El.style.color = tp1Cls;
+      tp1El.style.fontWeight = metrics.tp1Dist !== null && metrics.tp1Dist < 1 ? '700' : '';
+    }
+  }
+}
+
+function updatePairWorkspaceLivePrice(symbol, price) {
+  if (!pairWorkspaceTrade || String(pairWorkspaceTrade.symbol).toUpperCase() !== String(symbol).toUpperCase()) return;
+  pairWorkspaceTrade.current_px = price;
+  if (pairWorkspaceSignal) pairWorkspaceSignal.price = price;
+  const current = _pairCurrentPrice(pairWorkspaceTrade);
+  const pnl = _pairPnlPct(pairWorkspaceTrade);
+  const status = String(pairWorkspaceTrade.status || '').toLowerCase();
+  const isLong = pairWorkspaceTrade.direction === 'LONG';
+  const entryDist = current && pairWorkspaceTrade.entry_px
+    ? (isLong ? (Number(pairWorkspaceTrade.entry_px) - current) / current : (current - Number(pairWorkspaceTrade.entry_px)) / current) * 100
+    : null;
+  const risk = status === 'pending'
+    ? entryDist
+    : (pairWorkspaceTrade.stop_loss && current ? Math.abs(current - Number(pairWorkspaceTrade.stop_loss)) / current * 100 : null);
+  const currentEl = $('pw-current');
+  const pnlEl = $('pw-pnl');
+  const riskEl = $('pw-risk-stop');
+  if (currentEl) currentEl.textContent = fmtPrice(current);
+  if (pnlEl) {
+    pnlEl.textContent = pnl == null ? '—' : fmtPct(pnl);
+    pnlEl.style.color = pnl == null ? 'var(--text2)' : pnl >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+  if (riskEl) {
+    riskEl.textContent = risk == null ? '—' : (status === 'pending' ? fmtPct(risk) : risk.toFixed(2) + '%');
   }
 }
 
@@ -12008,6 +12553,9 @@ async function savePaperConfig() {
       min_flow_score:        parseFloat(document.getElementById('pc-flowscore')?.value),
       max_atr_pct:           parseFloat(document.getElementById('pc-maxatr')?.value),
       max_trend_score_abs:   parseInt(document.getElementById('pc-maxtrend')?.value),
+      loss_streak_pause_n:      parseInt(document.getElementById('pc-loss-streak-n')?.value),
+      loss_streak_cooldown_hours: parseFloat(document.getElementById('pc-loss-streak-hours')?.value),
+      cold_streak_flow_boost_n:   parseInt(document.getElementById('pc-cold-streak-n')?.value),
     };
     const r = await fetch('/api/paper/config', {
       method: 'PATCH',

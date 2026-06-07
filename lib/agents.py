@@ -103,12 +103,19 @@ class AgentOutput:
 
 REGIME_WEIGHTS = {
     "trending": {"narrative": 0.50, "structural": 0.50},
+    "breakout_trend": {"narrative": 0.45, "structural": 0.55},
     "choppy": {"narrative": 0.30, "structural": 0.70},
+    "compression": {"narrative": 0.35, "structural": 0.65},
     "volatile_squeeze": {"narrative": 0.20, "structural": 0.80},
+    "liquidation_cascade": {"narrative": 0.20, "structural": 0.80},
+    "funding_crowded": {"narrative": 0.25, "structural": 0.75},
     "news_catalyst": {"narrative": 0.70, "structural": 0.30},
     "low_liquidity": {"narrative": 0.35, "structural": 0.65},
     "institutional": {"narrative": 0.45, "structural": 0.55},
+    "risk_off_beta": {"narrative": 0.40, "structural": 0.60},
 }
+
+AGENT_REGIMES = tuple(REGIME_WEIGHTS.keys())
 
 AGENT_ROSTER = {
     "trader": {
@@ -223,9 +230,19 @@ def _classify_regime(ctx: ExchangeContext, ns: NarrativeMarketState) -> str:
         if abs(ctx.change_4h_pct) > 8:
             return "volatile_squeeze"
         return "news_catalyst"
+    if ctx.volatility == "extreme" and abs(ctx.change_4h_pct) > 8:
+        return "liquidation_cascade"
     if ctx.volatility in ("high", "extreme") and abs(ctx.funding_rate) > 0.001:
         return "volatile_squeeze"
-    if abs(ctx.change_4h_pct) > 5 and ctx.trend_score > 40:
+    if abs(ctx.funding_rate) > 0.0015:
+        return "funding_crowded"
+    if ctx.volatility == "low" and ctx.atr_pct < 1.2 and abs(ctx.change_4h_pct) < 2 and abs(ctx.trend_score) < 20:
+        return "compression"
+    if ctx.change_24h_pct < -8 and ctx.change_4h_pct < -4 and ctx.trend_score < -35:
+        return "risk_off_beta"
+    if abs(ctx.change_4h_pct) > 8 and abs(ctx.trend_score) > 55:
+        return "breakout_trend"
+    if abs(ctx.change_4h_pct) > 5 and abs(ctx.trend_score) > 40:
         return "trending"
     if ctx.volume_24h < 2_000_000:
         return "low_liquidity"
@@ -562,14 +579,105 @@ def _run_regime_analyst(ctx: ExchangeContext, ns_partial: dict) -> dict:
         system = (
             f"You are {persona['name']}, {persona['title']} at Cipher Research Group. "
             f"Personality: {persona['voice']} "
-            "Classify volatility regime as: trending, choppy, volatile_squeeze, "
-            "news_catalyst, low_liquidity, institutional. Output only JSON."
+            "Classify volatility regime as one of: "
+            f"{', '.join(AGENT_REGIMES)}. "
+            "Use compression for tight low-ATR coiling conditions, breakout_trend for fresh directional expansion, "
+            "liquidation_cascade for forced stop/liquidation-driven movement, funding_crowded for extreme perp carry crowding, "
+            "and risk_off_beta only when the move behaves like broad market beta drag. Output only JSON."
         )
         result = _analyst_call(system, data, schema)
         result["atr_pct"] = ctx.atr_pct
         return result
     except Exception:
         return {}
+
+
+def _synthesize_narrative_bull(ns: NarrativeMarketState) -> tuple:
+    """Deterministic narrative bull/bear from 8-analyst outputs. No LLM call."""
+    bull, bear = 50.0, 50.0
+
+    if ns.technical_trend == "bullish":
+        bull += 15; bear -= 10
+    elif ns.technical_trend == "bearish":
+        bear += 15; bull -= 10
+
+    if ns.rsi_context == "oversold":
+        bull += 10; bear -= 5
+    elif ns.rsi_context == "overbought":
+        bear += 10; bull -= 5
+
+    if ns.vwap_position == "above":
+        bull += 8
+    elif ns.vwap_position == "below":
+        bear += 8
+
+    if ns.social_momentum > 30:
+        bull += min(8.0, ns.social_momentum / 12)
+    elif ns.social_momentum < -30:
+        bear += min(8.0, abs(ns.social_momentum) / 12)
+
+    if ns.macro_risk == "high":
+        bear += 10; bull -= 5
+    elif ns.macro_risk == "low":
+        bull += 5
+
+    if ns.exchange_stress_detected:
+        bear += 15; bull -= 10
+
+    if ns.late_move:
+        bear += 8
+
+    if ns.unlock_risk:
+        bear += 8
+
+    return max(20.0, min(80.0, bull)), max(20.0, min(80.0, bear))
+
+
+def _synthesize_structural_bull(ss: StructuralMarketState) -> tuple:
+    """Deterministic structural bull/bear from 8-analyst outputs. No LLM call."""
+    bull, bear = 50.0, 50.0
+
+    if ss.funding_signal == "bullish":
+        bull += 15; bear -= 8
+    elif ss.funding_signal == "bearish":
+        bear += 15; bull -= 8
+
+    if ss.microstructure_pressure == "buy":
+        bull += 12; bear -= 6
+    elif ss.microstructure_pressure == "sell":
+        bear += 12; bull -= 6
+
+    if ss.imbalance > 0.15:
+        bull += 8
+    elif ss.imbalance < -0.15:
+        bear += 8
+    elif ss.imbalance > 0.05:
+        bull += 3
+    elif ss.imbalance < -0.05:
+        bear += 3
+
+    if ss.basis_signal == "bullish":
+        bull += 8
+    elif ss.basis_signal == "bearish":
+        bear += 8
+
+    if ss.oi_delta_trend == "rising":
+        bull += 6
+    elif ss.oi_delta_trend == "falling":
+        bear += 6
+
+    if ss.adl_risk:
+        bear += 10; bull -= 5
+
+    if ss.no_trade_zone:
+        bear += 20; bull -= 15
+
+    if ss.funding_z > 2:
+        bear += 8
+    elif ss.funding_z < -2:
+        bull += 8
+
+    return max(20.0, min(80.0, bull)), max(20.0, min(80.0, bear))
 
 
 def _run_narrative_debate(ns: NarrativeMarketState, ctx: ExchangeContext) -> dict:
@@ -813,6 +921,8 @@ def run_agent_pipeline(
     ss.basis_signal = r.get("cross_venue", {}).get("basis_signal") or "neutral"
     ss.cross_venue_reasoning = r.get("cross_venue", {}).get("cross_venue_reasoning") or ""
     ss.regime = r.get("regime", {}).get("regime") or _classify_regime(ctx, ns)
+    if ss.regime not in AGENT_REGIMES:
+        ss.regime = _classify_regime(ctx, ns)
     ss.atr_pct = float(r.get("regime", {}).get("atr_pct") or ctx.atr_pct)
     ss.leverage_cap_recommendation = int(
         r.get("regime", {}).get("leverage_cap_recommendation") or ctx.max_leverage
@@ -820,21 +930,8 @@ def run_agent_pipeline(
     ss.no_trade_zone = bool(r.get("regime", {}).get("no_trade_zone") or False)
     ss.regime_reasoning = r.get("regime", {}).get("regime_reasoning") or ""
 
-    remaining = timeout - (time.time() - t_start)
-    if remaining > 1.5:
-        nd = _run_with_deadline(lambda: _run_narrative_debate(ns, ctx), min(remaining - 0.5, 2.0))
-        ns.narrative_bull_strength = float(nd.get("narrative_bull_strength") or 50)
-        ns.narrative_bear_strength = float(nd.get("narrative_bear_strength") or 50)
-        ns.narrative_key_disagreement = nd.get("narrative_key_disagreement") or ""
-        ns.narrative_reasoning = nd.get("narrative_reasoning") or ""
-
-    remaining = timeout - (time.time() - t_start)
-    if remaining > 0.8:
-        sd = _run_with_deadline(lambda: _run_structural_debate(ss, ctx), min(remaining - 0.2, 2.0))
-        ss.structural_bull_strength = float(sd.get("structural_bull_strength") or 50)
-        ss.structural_bear_strength = float(sd.get("structural_bear_strength") or 50)
-        ss.structural_key_disagreement = sd.get("structural_key_disagreement") or ""
-        ss.structural_reasoning = sd.get("structural_reasoning") or ""
+    ns.narrative_bull_strength, ns.narrative_bear_strength = _synthesize_narrative_bull(ns)
+    ss.structural_bull_strength, ss.structural_bear_strength = _synthesize_structural_bull(ss)
 
     trader = _run_trader(ns, ss, ctx)
     risk = _run_risk_manager(ss, ctx)

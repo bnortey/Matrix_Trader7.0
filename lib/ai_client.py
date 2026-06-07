@@ -11,6 +11,8 @@ PROVIDERS = [
     {"name": "ollama",   "key_env": "OLLAMA_BASE_URL"},
 ]
 
+FREE_OR_LOW_COST_PROVIDERS = {"deepseek", "gemini", "groq", "ollama"}
+
 AVAILABLE_MODELS = [
     # Claude (paid)
     {"provider": "claude",   "model": "claude-opus-4-7",                    "label": "Claude Opus 4.7",              "key_env": "ANTHROPIC_API_KEY"},
@@ -32,7 +34,14 @@ AVAILABLE_MODELS = [
     {"provider": "ollama",   "model": "qwen2.5:7b",                          "label": "Qwen 2.5 7B (Ollama local)", "key_env": "OLLAMA_BASE_URL"},
 ]
 
-_DEFAULT_SETTINGS = {"provider": "claude", "model": "claude-sonnet-4-6"}
+_DEFAULT_SETTINGS = {
+    "provider": "claude",
+    "model": "claude-sonnet-4-6",
+    "fallback_policy": "selected_only",
+    "claude_fallback_enabled": False,
+    "background_ai_enabled": False,
+    "coach_reviews_enabled": True,
+}
 _AI_SETTINGS_PATH = "data/ai_settings.json"
 
 _KEY_ENV = {p["name"]: p["key_env"] for p in PROVIDERS}
@@ -69,7 +78,7 @@ def load_ai_settings() -> dict:
     try:
         if os.path.exists(_AI_SETTINGS_PATH):
             with open(_AI_SETTINGS_PATH, encoding="utf-8") as f:
-                return json.load(f)
+                return {**_DEFAULT_SETTINGS, **json.load(f)}
     except Exception:
         pass
     return dict(_DEFAULT_SETTINGS)
@@ -92,16 +101,25 @@ def call_ai(
     user: str,
     max_tokens: int = 512,
     allowed_providers: set[str] | list[str] | tuple[str, ...] | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> str | None:
     settings = load_ai_settings()
     cfg_provider = settings.get("provider")
     cfg_model    = settings.get("model")
+    policy = str(settings.get("fallback_policy") or "selected_only").strip().lower()
+    claude_fallback_enabled = bool(settings.get("claude_fallback_enabled"))
     allowed = set(allowed_providers) if allowed_providers else None
+
+    if policy not in {"selected_only", "low_cost", "allow_all"}:
+        policy = "selected_only"
 
     tried: set[tuple[str, str]] = set()
 
-    def _try(provider_name: str, model: str) -> str | None:
-        key = (provider_name, model)
+    def _try(provider_name: str, model_name: str) -> str | None:
+        if allowed is not None and provider_name not in allowed:
+            return None
+        key = (provider_name, model_name)
         if key in tried:
             return None
         tried.add(key)
@@ -112,24 +130,36 @@ def call_ai(
         if fn is None:
             return None
         try:
-            result = fn(system, user, max_tokens, api_key, model)
+            result = fn(system, user, max_tokens, api_key, model_name)
             if result:
                 result = _strip_thinking_blocks(result)
             return result or None
         except Exception as e:
-            print(f"ai_client: {provider_name}/{model} failed: {e}", file=sys.stderr)
+            print(f"ai_client: {provider_name}/{model_name} failed: {e}", file=sys.stderr)
             return None
 
-    # Try the configured model first
-    if cfg_provider and cfg_model and (allowed is None or cfg_provider in allowed):
+    # Try the pinned provider/model first if explicitly specified
+    if provider and model:
+        result = _try(provider, model)
+        if result:
+            return result
+        if policy == "selected_only":
+            return None
+
+    # Try the configured model next
+    if cfg_provider and cfg_model:
         result = _try(cfg_provider, cfg_model)
         if result:
             return result
+        if policy == "selected_only":
+            return None
 
     # Fallback chain — try every model for every provider in order
-    for provider in PROVIDERS:
-        name = provider["name"]
-        if allowed is not None and name not in allowed:
+    for p in PROVIDERS:
+        name = p["name"]
+        if name == "claude" and not claude_fallback_enabled:
+            continue
+        if policy == "low_cost" and name not in FREE_OR_LOW_COST_PROVIDERS:
             continue
         for m in AVAILABLE_MODELS:
             if m["provider"] != name:

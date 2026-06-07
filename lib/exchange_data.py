@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import sys
 import time
+import math
 
 from lib.mexc_client import fetch_mexc
 from lib.hyperliquid_client import fetch_hl_klines, fetch_hl_orderbook
@@ -74,10 +75,28 @@ SUPPORTED_EXCHANGES: dict[str, dict] = {
 }
 
 # MEXC interval string → canonical key
-_MEXC_INTERVAL = {"1h": "Min60", "4h": "Hour4", "1d": "Day1"}
+_MEXC_INTERVAL = {
+    "1m": "Min1",
+    "5m": "Min5",
+    "15m": "Min15",
+    "30m": "Min30",
+    "1h": "Min60",
+    "4h": "Hour4",
+    "1d": "Day1",
+}
 
 # HL lookback hours by interval and limit
 def _hl_lookback(interval: str, limit: int) -> int:
+    if interval == "1m":
+        return max(1, math.ceil(limit / 60))
+    if interval == "3m":
+        return max(1, math.ceil(limit * 3 / 60))
+    if interval == "5m":
+        return max(1, math.ceil(limit * 5 / 60))
+    if interval == "15m":
+        return max(1, math.ceil(limit * 15 / 60))
+    if interval == "30m":
+        return max(1, math.ceil(limit * 30 / 60))
     if interval == "4h":
         return limit * 4
     if interval == "1d":

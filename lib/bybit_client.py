@@ -14,7 +14,17 @@ BYBIT_BASE = "https://api.bybit.com"
 _TIMEOUT   = 10
 
 # Bybit V5 interval keys
-BYBIT_INTERVAL = {"1h": "60", "4h": "240", "1d": "D"}
+BYBIT_INTERVAL = {
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "4h": "240",
+    "8h": "480",
+    "1d": "D",
+}
 
 
 def _fetch_bybit(path: str, params: dict | None = None) -> dict | None:
@@ -97,6 +107,32 @@ def fetch_bybit_klines(raw_symbol: str, interval: str, limit: int) -> dict | Non
         "close":  [float(r[4]) for r in rows],
         "volume": [float(r[5]) for r in rows],
     }
+
+
+def fetch_bybit_candles(raw_symbol: str, interval: str, limit: int) -> list[dict]:
+    """
+    Fetch timestamped OHLCV candles for charting.
+    Returns rows ordered oldest-first with seconds timestamps.
+    """
+    iv = BYBIT_INTERVAL.get(interval, "60")
+    result = _fetch_bybit(
+        "/v5/market/kline",
+        params={"category": "linear", "symbol": raw_symbol, "interval": iv, "limit": limit},
+    )
+    if not result or not result.get("list"):
+        return []
+    rows = list(reversed(result["list"]))
+    return [
+        {
+            "time":   int(int(r[0]) / 1000),
+            "open":   float(r[1]),
+            "high":   float(r[2]),
+            "low":    float(r[3]),
+            "close":  float(r[4]),
+            "volume": float(r[5]),
+        }
+        for r in rows
+    ]
 
 
 def fetch_bybit_depth(raw_symbol: str, limit: int = 20) -> dict | None:
