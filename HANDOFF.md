@@ -511,7 +511,7 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | Strategy Context card | Pair workspace sidebar: recent 20/10 perf, symbol fit, direction fit, cold streak warnings | ✅ Done |
 | Hermes on-demand run | `POST /api/intelligence/hermes/run` + Run Now button with async status polling | ✅ Done |
 | Market fullscreen chart | `.panel-fullscreen .chart-panel` expands to 58vh; chart reloads on toggle | ✅ Done |
-| Edge Lab pipeline | `edge_lab/` package — candle fetch, path labeling, feature engine, materializer, factor analysis → `edge_lab.db` | ✅ Built (local, not deployed) |
+| Edge Lab pipeline | `edge_lab/` package + weekly Lite timer — candle fetch, path labeling, materializer, factor analysis → `edge_lab.db` + `factor_report.json` | ✅ Deployed/running |
 | P12 | Micro-live automation — one proven strategy, automated, exposure caps | ⏳ Pending — gated on paper bot proving edge (50%+ W+P, positive EV after fees, 50+ trades) |
 
 ---
@@ -521,9 +521,9 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 **Next in priority order:**
 
 1. **Evaluate paper bot gate before P12**: production has 100+ closed paper trades, but edge is not strong enough yet. Review strategy/regime concentration, outliers, drawdown, W+P, EV after costs, and whether performance survives without the biggest winner.
-2. **Monitor active learner overlay**: `regime_balanced_low_liquidity_20260524_001` is evaluating. Suppresses `balanced` candidates with `agent_regime=low_liquidity`.
+2. **Monitor focus-short cohort**: production paper config now runs `balanced_focus_short` and `funding_arb_focus_short` only, with `current_cohort_started_at="2026-06-07T14:50:00"`.
 3. **Tighten strategy filters from evidence**: use paper stats, learner suggestions, and Edge Lab output to identify which strategy/regime combinations should remain enabled.
-4. **Edge Lab factor pipeline**: `edge_lab/` is built locally — review, deploy to VPS, wire `data/factor_report.json` into Intelligence tab.
+4. **Use Edge Lab output as research priors**: weekly Lite timer is running; review `data/factor_report.json` top states before changing strategy filters.
 5. **If paper proves edge** (50+ trades, 50%+ W+P, EV > 0 after fees): prepare P12 micro-live design. Do not activate yet.
 
 **Do NOT do yet:**
@@ -622,6 +622,9 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 - Parked `regime_balanced_low_liquidity_20260524_001` because `balanced` is disabled and the evaluation was stuck at `9/20`; the `balanced.blocked_agent_regimes=["low_liquidity"]` guard remains active.
 - Applied then parked `regime_funding_arb_choppy_20260529_001`: production `strategy_overrides.json` now has `funding_arb.blocked_agent_regimes=["choppy"]` and `funding_arb.min_conviction=69`; it is parked because base `funding_arb` is disabled and cannot generate an active evaluation cohort.
 - Final learner status: `learner_running=true`; suggestions are `thresh_balanced_20260523_001=applied`, `regime_balanced_low_liquidity_20260524_001=parked`, `regime_funding_arb_choppy_20260529_001=parked`. Learner queue is unlocked for future suggestions.
+- Verified Edge Lab Lite on production: `edge-lab-lite.timer` is active, last run was `2026-06-07 03:25:28 UTC`, next run is `2026-06-14 03:19:38 UTC`. The run completed at `2026-06-07T03:41:38Z`.
+- Production Edge Lab outputs: `data/edge_lab.db` is present (`9.2G`), `data/factor_report.json` is present (`236K`), and `/api/intelligence/factor-report` returns success with `2,157,163` candles across templates `TP0_5_SL0_5`, `TP1_0_SL0_5`, `TP1_5_SL0_75`, `TP2_0_SL1_0`.
+- Added the production Edge Lab Lite runner and systemd units to the repo: `scripts/run_edge_lab_lite.sh`, `scripts/systemd/edge-lab-lite.service`, `scripts/systemd/edge-lab-lite.timer`. Checksum dry-run against production shows content matches; only timestamp/group metadata differs.
 
 ### 2026-05-24 — Session summary (paper realism, regime cleanup, net-EV learner)
 

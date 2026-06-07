@@ -1,0 +1,16 @@
+[Unit]
+Description=Matrix Trader Edge Lab Lite research refresh
+After=network-online.target matrix-trader.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/matrix-trader
+Environment=EDGE_LAB_TOP_N=200
+Environment=EDGE_LAB_MAX_RUNTIME_MINUTES=75
+Environment=EDGE_LAB_BATCH_SIZE=50
+ExecStart=/opt/matrix-trader/scripts/run_edge_lab_lite.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

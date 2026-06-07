@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Matrix Trader Edge Lab Lite weekly
+
+[Timer]
+OnCalendar=Sun 03:15:00 UTC
+RandomizedDelaySec=20m
+Persistent=true
+Unit=edge-lab-lite.service
+
+[Install]
+WantedBy=timers.target
