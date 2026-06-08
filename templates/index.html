@@ -886,6 +886,19 @@
     .sa-grid { display:grid; grid-template-columns: 1.15fr 0.85fr; gap:14px; }
     .sa-panel { border-top:1px solid var(--border); padding-top:12px; min-width:0; }
     .sa-panel-title { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--text3); margin-bottom:10px; }
+    .sa-collapse { border-top:1px solid var(--border); padding-top:10px; margin-top:14px; }
+    .sa-collapse:first-child { margin-top:0; }
+    .sa-collapse > summary { list-style:none; display:flex; align-items:center; justify-content:space-between; gap:12px; cursor:pointer; padding:3px 0 8px; }
+    .sa-collapse > summary::-webkit-details-marker { display:none; }
+    .sa-collapse-title { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:var(--text2); }
+    .sa-collapse-sub { margin-top:4px; color:var(--text3); font-size:11px; line-height:1.45; max-width:760px; }
+    .sa-collapse-meta { display:flex; align-items:center; gap:8px; flex-shrink:0; color:var(--text3); font-size:10px; font-family:var(--mono); }
+    .sa-collapse-badge { border:1px solid var(--border); border-radius:4px; padding:3px 6px; color:var(--text2); }
+    .sa-collapse-icon { width:18px; height:18px; border:1px solid var(--border); border-radius:4px; display:inline-flex; align-items:center; justify-content:center; color:var(--text3); font-size:12px; }
+    .sa-collapse[open] .sa-collapse-icon { color:var(--green); border-color:rgba(0,230,118,0.35); }
+    .sa-collapse[open] .sa-collapse-icon::before { content:"-"; }
+    .sa-collapse:not([open]) .sa-collapse-icon::before { content:"+"; }
+    .sa-collapse-body { padding-top:2px; }
     .sa-table { width:100%; border-collapse:collapse; font-size:11px; }
     .sa-table th { text-align:left; padding:7px 8px; color:var(--text3); font-size:9px; text-transform:uppercase; letter-spacing:0.06em; border-bottom:1px solid var(--border); white-space:nowrap; }
     .sa-table td { padding:8px; border-bottom:1px solid rgba(255,255,255,0.04); vertical-align:middle; }
@@ -6297,6 +6310,27 @@ function saShortDate(iso) {
   return d.toLocaleDateString('en-US', { month:'short', day:'numeric' });
 }
 
+function saRememberCollapse(id, open) {
+  try { localStorage.setItem('mt7_sa_collapse_' + id, open ? 'open' : 'closed'); } catch (_) {}
+}
+
+function saCollapse(id, title, subtitle, content, opts = {}) {
+  let stored = null;
+  try { stored = localStorage.getItem('mt7_sa_collapse_' + id); } catch (_) {}
+  const open = stored == null ? !!opts.open : stored === 'open';
+  const badge = opts.badge ? `<span class="sa-collapse-badge">${esc(opts.badge)}</span>` : '';
+  return `<details class="sa-collapse" ${open ? 'open' : ''} ontoggle="saRememberCollapse('${esc(id)}', this.open)">
+    <summary>
+      <div>
+        <div class="sa-collapse-title">${esc(title)}</div>
+        ${subtitle ? `<div class="sa-collapse-sub">${esc(subtitle)}</div>` : ''}
+      </div>
+      <div class="sa-collapse-meta">${badge}<span class="sa-collapse-icon" aria-hidden="true"></span></div>
+    </summary>
+    <div class="sa-collapse-body">${content}</div>
+  </details>`;
+}
+
 async function loadReadiness() {
   try {
     const [readyResp, mexcResp, hlResp] = await Promise.all([
@@ -6388,9 +6422,9 @@ function renderStrategyAnalytics() {
     </tr>`;
   }).join('');
 
-  body.innerHTML = `
+  const snapshotHtml = `
     <div class="sa-grid">
-      <div class="sa-panel">
+      <div class="sa-panel" style="border-top:0;padding-top:0">
         <div class="sa-panel-title">Strategy Comparison</div>
         <div class="sa-chart-desc">Ranks each strategy by logged activity and closed-trade outcomes. Use this to decide which strategy deserves attention before opening a signal.</div>
         <div class="sa-table-wrap">
@@ -6402,7 +6436,7 @@ function renderStrategyAnalytics() {
           </table>
         </div>
       </div>
-      <div class="sa-panel">
+      <div class="sa-panel" style="border-top:0;padding-top:0">
         <div class="sa-panel-title">Comparison Bars</div>
         <div class="sa-chart-desc">Top group compares cumulative leveraged P&amp;L; bottom group compares average leveraged P&amp;L per closed trade.</div>
         <div class="sa-bars">
@@ -6435,32 +6469,30 @@ function renderStrategyAnalytics() {
       ${saMetric('Avg P&L', saSigned(selected.summary.avg_pnl), saPnlColor(selected.summary.avg_pnl))}
       ${saMetric('Total P&L', saSigned(selected.summary.total_pnl), saPnlColor(selected.summary.total_pnl))}
       ${saMetric('Open / Closed', `${selected.summary.open} / ${selected.summary.closed}`, selected.summary.open ? 'var(--amber)' : '')}
-    </div>
+    </div>`;
 
-    ${renderRiskGatesPanel()}
-
-    ${renderPortfolioLab(items)}
-
+  const selectedPerformanceHtml = `
     <div class="sa-grid">
-      <div class="sa-panel">
+      <div class="sa-panel" style="border-top:0;padding-top:0">
         <div class="sa-panel-title">Equity Curve (${esc(strat.name)})</div>
         <div class="sa-chart-desc">Cumulative closed-trade leveraged P&amp;L for this strategy. Upward means tagged outcomes have added edge over time; downward means recent outcomes are eroding trust. Hover/tap points for trade detail.</div>
         <div class="sa-chart">${renderSaEquity(selected.equity)}</div>
       </div>
-      <div class="sa-panel">
+      <div class="sa-panel" style="border-top:0;padding-top:0">
         <div class="sa-panel-title">Outcome Breakdown</div>
         <div class="sa-chart-desc">Counts how often this strategy produced wins, losses, partials, expired setups, or skipped signals. A high expired rate means attention is being spent on setups that never resolved.</div>
         ${renderOutcomeBars(selected.outcomes)}
       </div>
-    </div>
+    </div>`;
 
-    <div class="sa-section-stack">
-      <div class="sa-panel">
+  const deepDiveHtml = `
+    <div class="sa-section-stack" style="margin-top:0">
+      <div class="sa-panel" style="border-top:0;padding-top:0">
         <div class="sa-panel-title">P&amp;L Distribution</div>
         <div class="sa-chart-desc">Shows the shape of returns. Use it to spot strategies that win often but take large losses, or lose often but occasionally pay big.</div>
         ${renderDistributionBars(selected.distribution)}
       </div>
-      <div class="sa-panel">
+      <div class="sa-panel" style="border-top:0;padding-top:0">
         <div class="sa-panel-title">Volatility Regime Performance</div>
         <div class="sa-chart-desc">Breaks performance down by scan-time ATR regime. This tells you when the strategy should be trusted, avoided, or edited.</div>
         ${renderRegimeBars(selected.regimes)}
@@ -6475,14 +6507,23 @@ function renderStrategyAnalytics() {
         <div class="sa-chart-desc">Pairs where this strategy has struggled. Treat new signals here with extra skepticism until the pattern improves.</div>
         ${renderSymbolBars(selected.symbols.worst, false)}
       </div>
-    </div>
+    </div>`;
 
-    <div class="sa-panel" style="margin-top:14px">
+  const learningHtml = `
+    <div class="sa-panel" style="border-top:0;padding-top:0">
       <div class="sa-panel-title">Learn This Strategy</div>
       <div class="sa-chart-desc">Concept notes explain what the strategy is designed to capture, when it tends to work, and the failure mode to watch for before taking a trade.</div>
       ${renderStrategyLearning(strat)}
-    </div>
-  `;
+    </div>`;
+
+  body.innerHTML = [
+    saCollapse('snapshot', 'Strategy Snapshot', 'Compare strategies and choose the one you want to inspect.', snapshotHtml, { open: true, badge: `${summaryRows.length} strategies` }),
+    saCollapse('selected-performance', 'Selected Strategy Performance', 'Equity curve and outcome mix for the currently selected strategy.', selectedPerformanceHtml, { open: true, badge: strat.name }),
+    saCollapse('safety-controls', 'Safety Controls', 'Risk gates, symbol penalties, and symbol-loss blocks used by the live scanner.', renderRiskGatesPanel(), { open: false }),
+    saCollapse('portfolio-lab', 'Portfolio Lab', 'Replay strategy mixes and account-risk assumptions without changing live behavior.', renderPortfolioLab(items), { open: false }),
+    saCollapse('deep-dives', 'Deep Dives', 'Distribution, volatility regime, best-symbol, and worst-symbol diagnostics.', deepDiveHtml, { open: false }),
+    saCollapse('strategy-notes', 'Strategy Notes', 'Plain-English notes for when this strategy works, fails, and deserves trust.', learningHtml, { open: false }),
+  ].join('');
   bindSaEquityHover(selected.equity || []);
 }
 
