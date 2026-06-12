@@ -11525,14 +11525,7 @@ async function loadPaperTrading() {
       rejHtml += '</tbody></table></div></div>';
     }
 
-    // ── Reset button ──────────────────────────────────────────────────────
-    const resetHtml = `
-      <div style="margin-top:20px;padding-top:16px;border-top:1px solid #1e2530;">
-        <button onclick="resetPaperTrades()"
-          style="padding:4px 12px;border-radius:4px;border:1px solid #333;background:transparent;color:#555;font-size:11px;cursor:pointer;">
-          Reset All Paper Trades
-        </button>
-      </div>`;
+    const resetHtml = '';
 
     el.innerHTML = headerHtml + explainerHtml + configHtml + statsHtml + pendingHtml + openHtml + closedHtml + rejHtml + resetHtml;
 
@@ -13084,11 +13077,7 @@ async function savePaperConfig() {
 }
 
 async function resetPaperTrades() {
-  if (!confirm('Clear ALL paper trades? This cannot be undone.')) return;
-  try {
-    await fetch('/api/paper/reset?confirm=yes', {method:'POST'});
-    loadPaperTrading();
-  } catch(e) { alert('Reset failed: ' + e.message); }
+  alert('Paper trade reset is disabled on this build.');
 }
 
 // ── Market Summary ────────────────────────────────────────────────────────

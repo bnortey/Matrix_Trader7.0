@@ -6,10 +6,10 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-06-07
+Last updated: 2026-06-12
 Last commit: fix: harden symbol loss gate
-app.py: 12,542 lines
-index.html: 13,206 lines
+app.py: 13,038 lines
+index.html: 13,525 lines
 
 ---
 
@@ -183,6 +183,7 @@ LIVE_TRADING_ENABLED=false # master gate — must be explicitly true to place or
 REPORT_NARRATIVE_MODE=free # deterministic | free | auto
 SCORE_VERSION=v1          # v1 (legacy step) | v2 (saturating ramp)
 MT7_API_TOKEN=            # optional bearer token for API auth
+ALLOW_PAPER_RESET=false   # emergency maintenance only; reset stays disabled unless explicitly true
 MAX_DAILY_LOSS_USDT=0     # optional daily loss circuit breaker
 REGIME_COUNTER_ENABLED=false # counter-trend conviction boost
 LEARNER_PENDING_PATH=     # override for pending.json path
@@ -287,7 +288,7 @@ Sentiment APIs (no key needed):
 | `/api/goals` | GET / PATCH | Goal definition file + computed actuals |
 | `/api/paper/config` | GET / PATCH | Paper bot operational config |
 | `/api/flow/<symbol>` | GET | Order flow data for symbol |
-| `/api/paper/reset` | POST | Reset paper trading state |
+| `/api/paper/reset` | POST | Emergency-only paper reset; disabled unless `ALLOW_PAPER_RESET=true`, bearer token + typed confirmation required, DB backup created first |
 
 Background threads: `_outcome_loop` (15 min), `_snapshot_loop` (1 hr), `_coach_review_loop` (10 min, 5 trades/batch), `_paper_bot_loop` (60s exit check, scan on interval).
 
@@ -521,14 +522,16 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 
 **Next in priority order:**
 
-1. **Monitor focus-short cohort**: Active strategies are `balanced_focus_short` and `funding_arb_focus_short` only. `mean_reversion` disabled June 7 after post-tightening sample showed avg net ~-20%. Cohort target is 20+ clean trades with 50%+ W+P and positive EV. `current_cohort_started_at="2026-06-07T14:50:00"`.
-2. **Apply choppy regime suggestion when guard clears**: `regime_funding_arb_choppy_20260529_001` is `pending_review`. The one-at-a-time evaluating guard must clear before it can be applied. Once learner queue is unlocked, apply via: `curl -X PATCH http://localhost:8080/api/intelligence/suggestions/regime_funding_arb_choppy_20260529_001 -H "Content-Type: application/json" -d '{"action":"apply"}'` from the VPS.
-3. **Use Edge Lab attribution panel**: `/api/paper/cohort-edge` + Paper tab panel now attributes cohort trades to Edge Lab factor states. Use this to validate whether winning trades align with strong Edge Lab states.
-4. **If focus-short cohort proves edge** (50+ clean trades, 50%+ W+P, EV > 0 after fees): prepare P12 micro-live design. Do not activate yet.
+1. **Finish post-reset hardening/deploy verification**: June 8 external scanner traffic called `POST /api/paper/reset` and wiped paper history. Local code now disables reset by default, removes the dashboard reset button, and requires `ALLOW_PAPER_RESET=true`, `MT7_API_TOKEN`, typed confirmation, and an automatic DB backup before reset can run. Verify this on production before trusting new paper stats.
+2. **Rebuild the paper gate from a fresh cohort**: The prior paper history is not a reliable active table after the wipe. Track the clean post-hardening focus-short cohort separately; do not mix pre-reset evidence into P12 readiness.
+3. **Review/apply learner regime suppressions as shadow-first controls**: Hermes 2026-06-12 recommends approving `regime_funding_arb_choppy_20260608_001` and `regime_balanced_low_liquidity_20260608_002` in shadow-only mode first. Collect 50 closed affected signals, compare EV and trade-count impact, then decide whether to promote.
+4. **Use Edge Lab attribution panel**: `/api/paper/cohort-edge` + Paper tab panel attributes cohort trades to Edge Lab factor states. Use this to validate whether winning trades align with strong Edge Lab states.
+5. **If focus-short cohort proves edge** (50+ clean trades, 50%+ W+P, EV > 0 after fees, no drawdown breach): prepare P12 micro-live design. Do not activate yet.
 
 **Do NOT do yet:**
 - Add `HL_PRIVATE_KEY` to VPS — paper bot has not proven edge
 - Build P12 automation — gated on P11 validation
+- Raise risk or scale account size while Hermes drawdown status is yellow/red
 - Let Hermes directly mutate configs, trade, or read private exchange keys — Hermes is advisory only
 
 **Production server:** Vultr Singapore `207.148.66.39` — SSH key-auth only.
@@ -609,6 +612,15 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 ---
 
 ## Session Notes
+
+### 2026-06-12 — Session summary (paper reset hardening + Hermes yellow flag review)
+
+- Reviewed the June 12 Hermes memo. Verdict is Cautious Hold / Yellow Flag: reported account growth is strong, but drawdown breach and paper/live EV divergence override scale-up optimism.
+- Immediate engineering task is reset/auth hardening, not P12. Local reset endpoint is disabled by default with `ALLOW_PAPER_RESET=false`; if deliberately enabled, it requires `MT7_API_TOKEN`, `Authorization: Bearer ...`, typed body confirmation `DELETE PAPER TRADES`, and creates a DB backup before deleting paper trades.
+- Dashboard reset control is removed; `resetPaperTrades()` now only alerts that reset is disabled.
+- `/api/paper/reset` should be treated as emergency maintenance only. Never expose it to the public internet without `MT7_API_TOKEN` set.
+- Hermes recommends approving two learner suppressions in shadow-only mode first: `regime_funding_arb_choppy_20260608_001` and `regime_balanced_low_liquidity_20260608_002`. Do not promote to live blocking until 50 closed affected signals validate EV improvement and trade-count impact.
+- P12 remains blocked: do not add `HL_PRIVATE_KEY`, do not scale risk, and do not blend paper/live metrics while the paper EV discrepancy is unresolved.
 
 ### 2026-06-07 — Session summary (project review, mean_reversion disable, GitHub push)
 

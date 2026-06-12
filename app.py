@@ -8,6 +8,7 @@ import time
 import threading
 import copy
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -124,6 +125,25 @@ def _enforce_bearer_token():
     return None
 
 
+def require_api_token():
+    """Require an explicit bearer token for especially sensitive maintenance routes."""
+    if not MT7_API_TOKEN:
+        return jsonify({
+            "success": False,
+            "error": "MT7_API_TOKEN must be set before this maintenance action is allowed",
+        }), 403
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({
+            "success": False,
+            "error": "auth required: send Authorization: Bearer <MT7_API_TOKEN>",
+        }), 401
+    presented = auth_header[len("Bearer "):].strip()
+    if not _hmac.compare_digest(presented, MT7_API_TOKEN):
+        return jsonify({"success": False, "error": "invalid token"}), 401
+    return None
+
+
 MEXC_BASE    = "https://contract.mexc.com/api/v1"
 BINANCE_FAPI = "https://fapi.binance.com"
 BYBIT_BASE   = "https://api.bybit.com"
@@ -137,6 +157,7 @@ HL_WALLET_ADDRESS    = os.getenv("HL_WALLET_ADDRESS", "")
 HL_PRIVATE_KEY       = os.getenv("HL_PRIVATE_KEY", "")
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 MT7_API_TOKEN        = (os.getenv("MT7_API_TOKEN") or "").strip()
+ALLOW_PAPER_RESET    = os.getenv("ALLOW_PAPER_RESET", "false").lower() == "true"
 MAX_DAILY_LOSS_USDT  = float(os.getenv("MAX_DAILY_LOSS_USDT") or "0")
 # Kill-switch cooldown: in-memory timestamp of last kill_switch invocation.
 # Within 60 seconds of a kill switch firing, /api/execution/place refuses
@@ -12793,15 +12814,30 @@ def api_order_flow_history(symbol: str):
 
 @app.route("/api/paper/reset", methods=["POST"])
 def api_paper_reset():
-    """Clear all paper trades (maintenance). Requires ?confirm=yes."""
-    if request.args.get("confirm") != "yes":
-        return jsonify({"success": False, "error": "Pass ?confirm=yes to reset paper trades"}), 400
+    """Clear paper trades only during an explicitly enabled maintenance window."""
+    if not ALLOW_PAPER_RESET:
+        return jsonify({"success": False, "error": "paper reset disabled"}), 403
+    token_error = require_api_token()
+    if token_error:
+        return token_error
+    body = request.get_json(silent=True) or {}
+    if body.get("confirm") != "DELETE PAPER TRADES":
+        return jsonify({"success": False, "error": "typed confirmation required"}), 400
     try:
+        backup_dir = os.path.join("data", "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        backup_path = os.path.join(backup_dir, f"signals_before_paper_reset_{stamp}.db")
+        shutil.copy2(DB_PATH, backup_path)
         con = sqlite3.connect(DB_PATH)
         con.execute("DELETE FROM paper_trades")
         con.commit()
         con.close()
-        return jsonify({"success": True, "message": "All paper trades cleared"})
+        return jsonify({
+            "success": True,
+            "message": "All paper trades cleared",
+            "backup_path": backup_path,
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

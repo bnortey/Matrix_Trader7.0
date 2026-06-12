@@ -275,13 +275,13 @@ Do not start a new task until the previous one works end-to-end.
 <claude-mem-context>
 # Memory Context
 
-# [Matrix_Trader_7.0] recent context, 2026-06-07 10:16am EDT
+# [Matrix_Trader_7.0] recent context, 2026-06-12 4:50pm EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (20,926t read) | 677,266t work | 97% savings
+Stats: 50 obs (22,467t read) | 762,615t work | 97% savings
 
 ### May 30, 2026
 S234 Add evaluation progress display and fix missing Expected value for learner suggestions — design decisions finalized, awaiting go-ahead to implement (May 30 at 10:16 PM)
@@ -295,26 +295,8 @@ S238 Audit paper bot config panel for missing loss streak cooldown UI controls (
 S239 User confirmed satisfaction ("great") with completed Safety Controls feature on paper config panel (May 31 at 12:28 AM)
 S240 Project status check — where are we at with Matrix Trader 7.0 (May 31 at 12:31 AM)
 ### Jun 1, 2026
-805 10:00a 🔵 MT7 Current Task Priority List from HANDOFF.md
-806 10:01a 🔵 Production Paper Bot Live Stats — 108 Closed Trades, W+P 47.2%, Net +$106.48
-807 " 🟣 Complete Diff of Footprint/Order Flow Chart Overlay Changes in templates/index.html
-808 " 🔵 Production Server Already Has the Footprint/Order Flow Fix Deployed
-809 10:02a 🔵 Production renderPrimaryOrderFlowView Has OLD Bug — Still Replaces Chart for All Three Modes
-810 " 🔴 Footprint/Order Flow Chart Overlay Fix Deployed to Production
-811 " 🔴 Production Patch Verified — Chart Overlay CSS and JS Both Confirmed in Place
-812 10:03a 🔵 Production Still Has Old renderPrimaryOrderFlowView — Patch Did Not Fix the Core Bug
-813 " 🔵 mt-learner Active Suggestion: Suppress balanced Strategy in low_liquidity Regime
-814 " 🔵 Diff Shows Only One Line Different Between Production and Local — Safe to rsync
-815 " 🔴 Chart Overlay Fix Fully Deployed to Production — renderPrimaryOrderFlowView Confirmed Fixed
-816 " 🔵 Live Production Browser Test Failed — Footprint Button Not Found on 207.148.66.39
-817 10:04a 🔵 Production Trade ID 2 Not Found — Production DB Has Different Trade IDs Than Local
-818 10:05a 🔵 Production Paper Trades Have IDs 700+ — Bot is Actively Trading Multiple Symbols
-819 " 🔴 Chart Overlay Fix Fully Verified on Production — Footprint and Order Flow Both Pass
-820 " ✅ HANDOFF.md Updated with 2026-06-01 Session Summary and Revised Priority Queue
-821 10:06a ✅ HANDOFF.md Paper Gate Stats Updated to Current 108-Trade Numbers
-822 " 🔵 Paper Bot Gate Evaluation: 108 Trades, W+P 47.2% — Below P12 Threshold
+822 10:06a 🔵 Paper Bot Gate Evaluation: 108 Trades, W+P 47.2% — Below P12 Threshold
 823 " 🔵 SSH Direct to Production Blocked — "Operation Not Permitted" Error
-824 " ✅ HANDOFF.md Significantly Updated with Current Project State
 827 " 🔵 paper_trades Table Missing pnl_usd Column — Schema Differs from API Output
 825 10:10a 🔵 Production VPS Missing sqlite3 CLI — DB Queries Must Use Python
 826 " 🔵 Paper Bot Configuration: paper_config.json Full State Captured
@@ -349,14 +331,26 @@ S240 Project status check — where are we at with Matrix Trader 7.0 (May 31 at 
 853 " 🔵 paper_trades Schema — Full Column List Confirmed on Production
 854 " 🔵 Post-Tightening Paper Cohort Stats — funding_arb_focus_short Showing Strong Edge
 S241 SSH check of mt-learner status and post-tightening paper cohort analysis (Jun 6 at 2:02 PM)
-**Investigated**: mt-learner service health via systemctl and log inspection; full learner.log searched for suggestion/regime/proposal job activity; paper_trades schema confirmed; post-tightening paper cohort stats queried directly from production signals.db
+### Jun 9, 2026
+855 2:28p 🔵 Paper Trader History Missing — Investigation Started
+856 2:29p 🔵 Local signals.db Has Only 2 Closed Paper Trades — Production Has 108
+857 " 🔵 Production VPS Paper Trades Also Reset — Only 5 Closed Trades Remain (IDs 1178-1195)
+858 2:30p 🔵 Production signals Table Has No created_at Column — Schema Difference from Expected
+859 " 🔵 Production paper_trades Sequence at 1200 — ~1175 Historical Rows Were Deleted
+860 " 🔵 Production VPS Running Two Services: matrix-trader and mt-learner
+861 2:31p 🔵 Root Cause Confirmed: POST /api/paper/reset Called June 8 2026 16:58:45 — Wiped All Paper Trades
+862 " 🔵 Reset Triggered by Automated Scanner/Browser Tool — Uninterpolated JS Template Literals in HTTP Requests
+863 2:32p 🔵 position_events Table Intact with 3,048 Rows Dating Back to April 25 — Survived the paper_trades Reset
+864 2:41p 🔵 Pasted Session History Reveals Paper Reset Was a Second Unintended Wipe — Post-Tightening Cohort Had 29 Trades Before June 8
+865 " 🔵 HANDOFF.md Reveals Two Cohort Resets Before June 8 — Focus-Short Cohort Started June 7, Then Wiped June 8
+867 " 🚨 Scanner IP 163.7.3.220 Identified as ByteDance/Byteplus Cloud Infrastructure in Jakarta
+866 2:43p 🔵 Full Log Context Confirms External Security Scanner — Not gstack — Triggered the Reset
+868 2:46p 🚨 APNIC RDAP Confirms Scanner IP as BYTEPLUS-SG Network — ByteDance Abuse Contact bd_abuse@bytedance.com
+869 " 🚨 MT7_API_TOKEN Auth Exists in app.py But /api/paper/reset Does NOT Use It
+### Jun 12, 2026
+870 4:48p 🔵 Matrix Trader 7.0 — Current State and Next Priorities
+871 " 🔵 Matrix Trader 7.0 — Detailed Current Task Queue and Uncommitted Changes
+872 4:49p 🟣 Paper Reset Route Hardened with ALLOW_PAPER_RESET Gate, Auth, and Auto-Backup
 
-**Learned**: mt-learner is healthy and running — job_proposal fires daily at 03:26 UTC and explicitly logs "0 new suggestions, 3 total" (confirmed June 5 and June 6). job_regime completes in 0.0s with no output. The suggestion freeze is correct behavior, not a bug. There is one unreviewed pending suggestion: regime_funding_arb_choppy_20260529_001 (suppress funding_arb in choppy regime). Post-tightening cohort (since Jun 1): funding_arb_focus_short is the only positive-EV strategy at 28 trades, W+P 50%, avg net +10.56%. mean_reversion is badly negative at -20.15% avg over 7 trades. Disabled strategies (balanced, funding_arb base, momentum_breakout) leaked a few residual trades from before the config change.
-
-**Completed**: Read-only investigation completed — no code changes. Full paper cohort analysis surfaced actionable signal: funding_arb_focus_short is approaching P12 gate criteria; mean_reversion should likely be disabled; one unreviewed learner suggestion exists.
-
-**Next Steps**: User was asked whether to: (1) investigate why disabled strategies are still leaking through into paper trades, and/or (2) review the pending choppy-regime suppression suggestion for funding_arb. Session is paused awaiting user direction.
-
-
-Access 677k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 763k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>

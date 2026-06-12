@@ -76,6 +76,8 @@ Optional:
 | `HL_WALLET_ADDRESS` | Hyperliquid read-only account status |
 | `HL_PRIVATE_KEY` | Hyperliquid execution (P11 — not yet activated) |
 | `LIVE_TRADING_ENABLED` | Master gate for live order placement — must be `true` to enable |
+| `MT7_API_TOKEN` | Optional bearer token required for mutating routes on exposed installs |
+| `ALLOW_PAPER_RESET` | Emergency maintenance gate for `/api/paper/reset`; keep `false` unless deliberately resetting with backup |
 | `MATRIX_PORT` | Override default port 8080 |
 | `SCORE_VERSION` | `v1` (step) or `v2` (saturating ramp) scoring |
 | `REPORT_NARRATIVE_MODE` | `deterministic` / `free` / `auto` for Cipher report AI polish |
@@ -85,6 +87,8 @@ AI providers fall through automatically. App runs without any AI key — AI sect
 ## Security
 
 Never commit real API keys. The repo ignores `.env`, `data/`, and Python caches. Only `.env.example` is public. If a key was ever pasted into chat or logs, rotate it immediately.
+
+If the app is reachable beyond localhost/LAN, set `MT7_API_TOKEN` so mutating routes require `Authorization: Bearer <token>`. Paper trade reset is disabled by default; only enable `ALLOW_PAPER_RESET=true` during a deliberate maintenance window, and turn it off again afterward.
 
 ## Workflow
 
