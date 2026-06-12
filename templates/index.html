@@ -5974,6 +5974,7 @@ const I = {
   hermesLoading:false,
   researchPipeline: null,
   tagAttribution: null,
+  hypotheses: null,
   edgeLab: null,
   edgeLabLoading: false,
 };
@@ -8686,12 +8687,13 @@ async function loadIntelligence() {
   const container = document.getElementById('intelligence-content');
   if (container) container.innerHTML = '<div style="color:var(--muted);padding:2rem;">Loading...</div>';
   try {
-    const [statusRes, suggestionsRes, rosterRes, hermesRes, attrRes, edgeLabRes] = await Promise.all([
+    const [statusRes, suggestionsRes, rosterRes, hermesRes, attrRes, hypRes, edgeLabRes] = await Promise.all([
       fetch('/api/intelligence/status').then(r => r.json()),
       fetch('/api/intelligence/suggestions').then(r => r.json()),
       fetch('/api/intelligence/roster').then(r => r.json()).catch(() => null),
       fetch('/api/intelligence/hermes').then(r => r.json()).catch(() => null),
       fetch('/api/intelligence/tag-attribution').then(r => r.json()).catch(() => null),
+      fetch('/api/intelligence/hypotheses').then(r => r.json()).catch(() => null),
       fetch('/api/intelligence/factor-report').then(r => r.json()).catch(() => null),
     ]);
     I.status = statusRes.success ? statusRes : null;
@@ -8702,6 +8704,7 @@ async function loadIntelligence() {
     if (rosterRes && rosterRes.success) I.roster = rosterRes;
     if (hermesRes && hermesRes.success) I.hermes = hermesRes.audit || null;
     if (attrRes && attrRes.success) I.tagAttribution = attrRes;
+    if (hypRes && hypRes.success) I.hypotheses = hypRes;
     if (edgeLabRes && edgeLabRes.success) I.edgeLab = edgeLabRes;
     renderIntelligence();
     loadStrategyOverrides();
@@ -8947,6 +8950,15 @@ journalctl -u mt-learner -f</pre>`;
       ${renderTagAttribution()}
     </div>
 
+    <!-- Parallel Hypothesis Lab -->
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+        <h3 style="margin:0;font-size:15px;">Parallel Hypothesis Lab</h3>
+        <span style="font-size:12px;color:var(--text3);">Shadow-only. No scanner, paper, or live config is changed.</span>
+      </div>
+      ${renderParallelHypotheses()}
+    </div>
+
     <!-- Active Strategy Overrides (populated by loadStrategyOverrides) -->
     <div id="active-overrides-panel" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
       <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px;">
@@ -9016,6 +9028,66 @@ function renderTagAttribution() {
       <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Agent Regimes</div>
       <table style="width:100%;border-collapse:collapse;">${tableHead}<tbody>${regimeBody}</tbody></table>
     </div>` : ''}`;
+}
+
+function renderParallelHypotheses() {
+  const d = I.hypotheses;
+  if (!d) return '<div style="color:var(--text2);font-size:13px;">Loading…</div>';
+  if (!d.success) return '<div style="color:var(--text2);font-size:13px;">Unavailable.</div>';
+  const colorMap = {green:'var(--green)', amber:'var(--amber)', red:'var(--red)', blue:'var(--blue)'};
+  const pct = v => (v === null || v === undefined) ? '—' : fmtPct(Number(v), 2);
+  const rate = v => (v === null || v === undefined) ? '—' : Number(v).toFixed(1) + '%';
+  const sourceBlock = (label, payload, target) => {
+    const a = payload.affected || {};
+    const c = payload.comparison || {};
+    const v = payload.verdict || {};
+    const progress = Math.max(0, Math.min(100, ((Number(a.count || 0) / Math.max(1, Number(target || 50))) * 100)));
+    const vc = colorMap[v.color] || 'var(--text2)';
+    return `<div style="border:1px solid #202936;border-radius:6px;padding:10px;background:#0d1117;min-width:0;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#667085;">${label}</div>
+        <div style="font-size:10px;color:${vc};font-weight:700;text-transform:uppercase;">${esc(v.label || 'Collecting')}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">
+        <div><div style="font-size:9px;color:#667085;text-transform:uppercase;">Affected</div><div style="font-family:var(--mono);font-size:13px;color:var(--text);">${Number(a.count || 0)} / ${target}</div></div>
+        <div><div style="font-size:9px;color:#667085;text-transform:uppercase;">Avg P&L</div><div style="font-family:var(--mono);font-size:13px;color:${Number(a.avg_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${pct(a.avg_pnl)}</div></div>
+        <div><div style="font-size:9px;color:#667085;text-transform:uppercase;">W+P</div><div style="font-family:var(--mono);font-size:13px;color:var(--text);">${rate(a.win_partial_rate)}</div></div>
+      </div>
+      <div style="margin-top:8px;height:3px;background:#1f2937;border-radius:2px;overflow:hidden;"><div style="width:${progress}%;height:100%;background:${vc};"></div></div>
+      <div style="font-size:10px;color:#94a3b8;margin-top:7px;">Comparison: ${Number(c.count || 0)} trades · ${pct(c.avg_pnl)} avg · ${rate(c.win_partial_rate)} W+P</div>
+      <div style="font-size:10px;color:#667085;margin-top:4px;">${esc(v.detail || '')}</div>
+    </div>`;
+  };
+  const rows = (d.hypotheses || []).map(h => {
+    const pv = h.primary_verdict || {};
+    const vc = colorMap[pv.color] || 'var(--text2)';
+    const condition = [
+      h.strategy ? `strategy=${h.strategy}` : '',
+      h.agent_regime ? `regime=${h.agent_regime}` : '',
+      h.requires_flow_confirmed === false ? 'flow_confirmed=false' : '',
+    ].filter(Boolean).join(' · ');
+    return `<div style="border:1px solid #202936;border-radius:6px;padding:12px;margin-bottom:10px;background:#10151c;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:9px;">
+        <div>
+          <div style="font-size:13px;font-weight:700;color:var(--text);">${esc(h.title || h.id)}</div>
+          <div style="font-size:11px;color:#94a3b8;margin-top:3px;">${esc(condition || h.id)}</div>
+        </div>
+        <div style="font-size:10px;border:1px solid ${vc};color:${vc};border-radius:4px;padding:3px 7px;text-transform:uppercase;font-weight:700;">${esc(pv.label || 'Collecting')}</div>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:10px;">${esc(h.rationale || '')}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;">
+        ${sourceBlock('Paper', (h.sources || {}).paper || {}, h.target || d.target || 50)}
+        ${sourceBlock('Live', (h.sources || {}).live || {}, h.target || d.target || 50)}
+      </div>
+    </div>`;
+  }).join('');
+  return `
+    <div style="font-size:12px;color:var(--text2);margin-bottom:10px;">
+      Evaluating ${Number((d.summary || {}).hypothesis_count || 0)} hypotheses in parallel. Target: ${Number(d.target || 50)} affected closed samples each.
+      <span style="color:var(--text3);">Live closed: ${Number((d.summary || {}).live_closed || 0)} · Paper closed: ${Number((d.summary || {}).paper_closed || 0)}</span>
+    </div>
+    ${rows || '<div style="color:var(--text2);font-size:13px;">No hypotheses configured.</div>'}
+  `;
 }
 
 async function loadSuggestions(rerender = true) {

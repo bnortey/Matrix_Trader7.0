@@ -275,13 +275,13 @@ Do not start a new task until the previous one works end-to-end.
 <claude-mem-context>
 # Memory Context
 
-# [Matrix_Trader_7.0] recent context, 2026-06-12 4:50pm EDT
+# [Matrix_Trader_7.0] recent context, 2026-06-12 5:22pm EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (22,467t read) | 762,615t work | 97% savings
+Stats: 50 obs (20,068t read) | 299,477t work | 93% savings
 
 ### May 30, 2026
 S234 Add evaluation progress display and fix missing Expected value for learner suggestions — design decisions finalized, awaiting go-ahead to implement (May 30 at 10:16 PM)
@@ -294,33 +294,7 @@ S237 Checking if per-strategy consecutive loss cooldown feature is already imple
 S238 Audit paper bot config panel for missing loss streak cooldown UI controls (May 31 at 12:22 AM)
 S239 User confirmed satisfaction ("great") with completed Safety Controls feature on paper config panel (May 31 at 12:28 AM)
 S240 Project status check — where are we at with Matrix Trader 7.0 (May 31 at 12:31 AM)
-### Jun 1, 2026
-822 10:06a 🔵 Paper Bot Gate Evaluation: 108 Trades, W+P 47.2% — Below P12 Threshold
-823 " 🔵 SSH Direct to Production Blocked — "Operation Not Permitted" Error
-827 " 🔵 paper_trades Table Missing pnl_usd Column — Schema Differs from API Output
-825 10:10a 🔵 Production VPS Missing sqlite3 CLI — DB Queries Must Use Python
-826 " 🔵 Paper Bot Configuration: paper_config.json Full State Captured
-828 10:14a 🔵 Full SQLite Schema for paper_trades and signals Tables Captured
-829 " 🔵 Deep Paper Bot Analysis: LONG Direction and funding_arb Strategy Are Primary Drag on W+P
-830 10:16a 🔵 Custom Strategy System Supports direction_lock and blocked_agent_regimes — Actionable Fix Path for Paper Bot
-831 " 🔵 Live Paper Bot State: 5 Open/Pending Positions, Recent 20 Trades Show ORBS_USDT Double-Loss Pattern
-832 10:17a 🔵 PATCH /api/paper/config Returns Empty Response — Strategy Disable Attempt May Have Failed
-833 " 🔵 Production Service Had 5-Second Crash on 2026-06-01 at 14:03:56 — Likely Import or Startup Error
-834 " 🔵 Paper Config Confirmed: PATCH from External IP Failed, disabled_strategies Still Only Has 2 Entries
-835 " 🔵 Effective Conviction Thresholds: funding_arb Floor at 69, Lower Than Strategy Default of 76
-836 10:18a ✅ Paper Bot Strategy Filter Tightened: funding_arb and momentum_breakout Now Disabled
-837 " ✅ HANDOFF.md Updated with Paper Gate Analysis Session Summary
-### Jun 2, 2026
-838 11:17a 🔵 Matrix Trader 7.0 Paper EV Deep Analysis — Session Initiated
-839 11:18a 🔵 Paper Bot Has ALL Strategies Disabled — EV Sample Critically Thin
-840 " 🔵 Paper Bot Architecture: Entry Touch, Exit Evaluation, Safety Controls
-841 " 🔵 Production Paper Bot Has 116 Closed Trades — Key EV Breakdown by Strategy/Direction
-842 " 🔵 Flow Score and Trend Score Are Strong Paper EV Predictors — Agent Regime Also Material
 ### Jun 4, 2026
-843 10:36a 🔵 Matrix Trader 7.0 Current Project State
-844 10:37a 🔵 MT7 Paper Bot P12 Gate Status: Below Threshold, Post-Tightening Cohort Active
-845 " 🔵 MT7 Working Tree Has Significant Uncommitted Changes Including New Edge Lab and MT-Learner Files
-846 " 🔵 Production Paper Bot Live Stats 2026-06-04: 133 Total Closed, Post-Tightening Cohort Negative EV
 847 10:38a 🔵 Production Paper Bot Has 2 Open Underwater SHORT Positions and 1 Pending (Flow Not Confirmed)
 848 " 🔵 MT-Learner Active With New Pending Suggestion: Block Choppy Agent Regime
 ### Jun 6, 2026
@@ -351,6 +325,30 @@ S241 SSH check of mt-learner status and post-tightening paper cohort analysis (J
 870 4:48p 🔵 Matrix Trader 7.0 — Current State and Next Priorities
 871 " 🔵 Matrix Trader 7.0 — Detailed Current Task Queue and Uncommitted Changes
 872 4:49p 🟣 Paper Reset Route Hardened with ALLOW_PAPER_RESET Gate, Auth, and Auto-Backup
+873 4:51p 🔵 Hermes Advisory Memo 2026-06-12 — Live Account at 63.86% Drawdown, Two Regime Suppressions Approved
+874 " 🔵 require_api_token() Called in api_paper_reset() But Function Does Not Exist in app.py
+875 " 🔴 Added Missing require_api_token() Helper to app.py
+876 " 🔵 Paper Trade History Was Wiped on June 8 by External Scanner Traffic Hitting Unprotected Reset Route
+877 4:54p 🔵 HANDOFF.md Session Summary Patch Failed — Context Mismatch After Earlier Patch
+878 4:55p 🔵 HANDOFF.md Session Summary Patch Context Bug — "---" Separator Between Anchors
+879 " ✅ HANDOFF.md 2026-06-12 Session Summary Successfully Written
+880 4:56p ✅ README.md Updated with MT7_API_TOKEN and ALLOW_PAPER_RESET Security Documentation
+881 " 🔵 Post-Hardening Verification Passed — app.py Compiles Clean, Frontend Reset Button Confirmed Removed
+882 " 🔵 Live Flask Test Confirms Paper Reset Returns 403 by Default
+883 " 🔵 Second Gate Test Confirmed — ALLOW_PAPER_RESET=true Without MT7_API_TOKEN Returns 403
+884 4:57p 🔵 Full Reset Gate Chain Verified — All Four Security Layers Confirmed Working
+885 4:58p 🔵 Full Happy-Path Reset Test Timed Out at 30s — No Result Returned
+886 5:00p 🔵 Happy-Path Reset Test Passed — Full Reset Executes Correctly With All Gates Satisfied
+887 " 🔵 Pre-Commit State — 5 Files Modified, data/backups Empty (Test Cleanup Confirmed)
+888 " ✅ HANDOFF.md Line Counts Corrected to Actual wc -l Values
+889 5:03p ✅ Second Commit Staged — HANDOFF.md Line Count Correction After Initial Push
+890 5:04p ✅ Committed "fix: harden paper reset route" — Commit 63aaf3d
+891 5:05p ✅ Hardening Changes Deployed to Production VPS 207.148.66.39
+892 5:06p ✅ matrix-trader Service Restarted on Production VPS — Hardening Live
+893 " 🔵 Production Verification Passed — Paper Reset Blocked, Fresh Cohort Has 18 Closed Trades at 66.7% W+P
+894 5:07p 🔵 Production Frontend Verification Confirmed — No Reset Button or Old Reset URL in Served HTML
+895 5:08p 🔵 Production File Integrity Verified — Hardened app.py and index.html Confirmed on VPS Disk
+896 5:09p ✅ Commit 63aaf3d Pushed to GitHub — Session Complete
 
-Access 763k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 299k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>

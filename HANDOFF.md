@@ -8,8 +8,8 @@
 
 Last updated: 2026-06-12
 Last commit: fix: harden symbol loss gate
-app.py: 13,038 lines
-index.html: 13,525 lines
+app.py: 13,252 lines
+index.html: 13,597 lines
 
 ---
 
@@ -265,6 +265,7 @@ Sentiment APIs (no key needed):
 | `/api/intelligence/hermes` | GET | Full Hermes context packet + latest memo |
 | `/api/intelligence/hermes/coach-reviews` | GET | Full coach review corpus (paginated; filterable by result/strategy) |
 | `/api/intelligence/status` | GET | Shadow validation status |
+| `/api/intelligence/hypotheses` | GET | Parallel shadow hypothesis evaluation; read-only, no config mutation |
 | `/api/intelligence/suggestions` | GET | Learner suggestions with baseline metrics |
 | `/api/intelligence/suggestions/<id>` | PATCH | Legacy apply/dismiss (backward compat) |
 | `/api/intelligence/suggestions/<id>/apply` | POST | Apply suggestion — one-at-a-time enforced |
@@ -621,6 +622,14 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 - `/api/paper/reset` should be treated as emergency maintenance only. Never expose it to the public internet without `MT7_API_TOKEN` set.
 - Hermes recommends approving two learner suppressions in shadow-only mode first: `regime_funding_arb_choppy_20260608_001` and `regime_balanced_low_liquidity_20260608_002`. Do not promote to live blocking until 50 closed affected signals validate EV improvement and trade-count impact.
 - P12 remains blocked: do not add `HL_PRIVATE_KEY`, do not scale risk, and do not blend paper/live metrics while the paper EV discrepancy is unresolved.
+
+### 2026-06-12 — Session summary (parallel hypothesis lab)
+
+- Added read-only `/api/intelligence/hypotheses` to evaluate multiple shadow hypotheses side by side without touching scanner, paper, or live config.
+- Initial tracked hypotheses: `regime_funding_arb_choppy_20260608_001`, `regime_balanced_low_liquidity_20260608_002`, `research_order_flow_confirmation`, and `research_funding_crowding_filter`.
+- Endpoint reports live and paper affected/comparison slices separately, with affected count, W+P, avg net P&L, dollar P&L when available, profit factor, deltas vs same-strategy comparison rows, and a per-source verdict.
+- Added Intelligence tab "Parallel Hypothesis Lab" panel. This is intentionally observational; the old one-at-a-time learner apply guard remains for actual config mutation.
+- Local validation passed: Python compile, frontend JS parse, API smoke test, and in-app browser render check for the Intelligence panel.
 
 ### 2026-06-07 — Session summary (project review, mean_reversion disable, GitHub push)
 

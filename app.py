@@ -8542,6 +8542,221 @@ def api_intelligence_tag_attribution():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+PARALLEL_HYPOTHESES = [
+    {
+        "id": "regime_funding_arb_choppy_20260608_001",
+        "title": "Funding Arb / Choppy",
+        "strategy": "funding_arb",
+        "agent_regime": "choppy",
+        "action": "shadow_block",
+        "rationale": "Hermes and mt-learner flagged funding_arb in choppy regimes as an EV drag.",
+    },
+    {
+        "id": "regime_balanced_low_liquidity_20260608_002",
+        "title": "Balanced / Low Liquidity",
+        "strategy": "balanced",
+        "agent_regime": "low_liquidity",
+        "action": "shadow_block",
+        "rationale": "Hermes and mt-learner flagged balanced in low_liquidity regimes as a major EV drag.",
+    },
+    {
+        "id": "research_order_flow_confirmation",
+        "title": "Momentum Needs Flow",
+        "strategy": "momentum_breakout",
+        "requires_flow_confirmed": False,
+        "action": "shadow_block",
+        "rationale": "Tests whether momentum_breakout losers cluster in entries without flow confirmation.",
+    },
+    {
+        "id": "research_funding_crowding_filter",
+        "title": "Funding Crowding Filter",
+        "strategy": "funding_arb",
+        "agent_regime": "funding_crowded",
+        "action": "shadow_watch",
+        "rationale": "Tests whether crowded funding conditions are separable from cleaner squeeze setups.",
+    },
+]
+
+
+def _hypothesis_stats(rows: list[dict]) -> dict:
+    closed = [
+        r for r in rows
+        if str(r.get("result") or "").upper() in ("WIN", "LOSS", "PARTIAL", "TP3")
+        and r.get("pnl_pct") is not None
+    ]
+    wins = [r for r in closed if str(r.get("result") or "").upper() in ("WIN", "TP3")]
+    partials = [r for r in closed if str(r.get("result") or "").upper() == "PARTIAL"]
+    pnls = [float(r.get("pnl_pct") or 0.0) for r in closed]
+    pnl_usd = []
+    for r in closed:
+        if r.get("pnl_usd") is not None:
+            try:
+                pnl_usd.append(float(r.get("pnl_usd") or 0.0))
+                continue
+            except Exception:
+                pass
+        if r.get("size_usd") is not None:
+            pnl_usd.append(float(r.get("size_usd") or 0.0) * float(r.get("pnl_pct") or 0.0) / 100.0)
+    pf_basis = pnl_usd if pnl_usd else pnls
+    gains = [x for x in pf_basis if x > 0]
+    losses = [abs(x) for x in pf_basis if x < 0]
+    return {
+        "count": len(closed),
+        "wins": len(wins),
+        "partials": len(partials),
+        "losses": len([r for r in closed if str(r.get("result") or "").upper() == "LOSS"]),
+        "win_partial_rate": round((len(wins) + len(partials)) / len(closed) * 100, 1) if closed else 0,
+        "avg_pnl": round(sum(pnls) / len(pnls), 2) if pnls else 0,
+        "total_pnl": round(sum(pnls), 2) if pnls else 0,
+        "total_pnl_usd": round(sum(pnl_usd), 2) if pnl_usd else None,
+        "profit_factor": round(sum(gains) / sum(losses), 2) if losses else (round(sum(gains), 2) if gains else 0),
+    }
+
+
+def _row_matches_hypothesis(row: dict, hypothesis: dict) -> bool:
+    strategy = hypothesis.get("strategy")
+    if strategy and str(row.get("strategy_key") or "") != strategy:
+        return False
+    regime = hypothesis.get("agent_regime")
+    if regime and str(row.get("agent_regime") or "") != regime:
+        return False
+    if "requires_flow_confirmed" in hypothesis:
+        return bool(row.get("flow_confirmed")) is bool(hypothesis.get("requires_flow_confirmed"))
+    return True
+
+
+def _hypothesis_verdict(affected: dict, unaffected: dict, target: int) -> dict:
+    n = int(affected.get("count") or 0)
+    avg = float(affected.get("avg_pnl") or 0.0)
+    wp = float(affected.get("win_partial_rate") or 0.0)
+    base_avg = float(unaffected.get("avg_pnl") or 0.0)
+    if n < target:
+        status = "collecting"
+        label = "Collecting"
+        color = "blue"
+        detail = f"{n}/{target} affected closed samples."
+    elif avg < 0 and avg < base_avg:
+        status = "promote_candidate"
+        label = "Promote Candidate"
+        color = "green"
+        detail = "Affected slice is negative EV and worse than the comparison slice."
+    elif avg < base_avg or wp < 50:
+        status = "review"
+        label = "Review"
+        color = "amber"
+        detail = "Affected slice is weaker, but not clean enough to promote automatically."
+    else:
+        status = "do_not_promote"
+        label = "Do Not Promote"
+        color = "red"
+        detail = "Affected slice is not underperforming enough to justify a block."
+    return {"status": status, "label": label, "color": color, "detail": detail}
+
+
+@app.route("/api/intelligence/hypotheses")
+def api_intelligence_hypotheses():
+    """Evaluate multiple shadow hypotheses in parallel without mutating config."""
+    try:
+        target = int(request.args.get("target") or 50)
+        since = request.args.get("since")
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        live_where = """
+            result IN ('WIN','LOSS','PARTIAL','TP3')
+            AND pnl_pct IS NOT NULL
+            AND (source IS NULL OR source != 'paper')
+        """
+        live_params = []
+        if since:
+            live_where += " AND COALESCE(result_at, entry_at, logged_at, '') >= ?"
+            live_params.append(str(since))
+        signal_cols = {r[1] for r in con.execute("PRAGMA table_info(signals)").fetchall()}
+        paper_cols = {r[1] for r in con.execute("PRAGMA table_info(paper_trades)").fetchall()}
+        live_flow_expr = "flow_confirmed" if "flow_confirmed" in signal_cols else "NULL"
+        paper_flow_expr = "pt.flow_confirmed" if "flow_confirmed" in paper_cols else "NULL"
+        paper_pnl_usd_expr = "pt.pnl_usd" if "pnl_usd" in paper_cols else "NULL"
+        paper_size_expr = "pt.size_usd" if "size_usd" in paper_cols else "NULL"
+        live_rows = [dict(r) for r in con.execute(f"""
+            SELECT id, symbol, strategy_key, direction, result, pnl_pct, tags,
+                   COALESCE(result_at, entry_at, logged_at) as ts,
+                   json_extract(signal_json, '$.agent_regime') as agent_regime,
+                   COALESCE({live_flow_expr}, CASE
+                       WHEN (',' || COALESCE(tags,'') || ',') LIKE '%,flow_confirmed,%' THEN 1
+                       ELSE 0
+                   END) as flow_confirmed
+            FROM signals
+            WHERE {live_where}
+            ORDER BY ts DESC
+            LIMIT 5000
+        """, live_params).fetchall()]
+
+        paper_where = "pt.status='closed' AND pt.pnl_pct IS NOT NULL"
+        paper_params = []
+        if since:
+            paper_where += " AND COALESCE(pt.closed_at, pt.opened_at, pt.queued_at, '') >= ?"
+            paper_params.append(str(since))
+        paper_rows = [dict(r) for r in con.execute(f"""
+            SELECT pt.id, pt.symbol, pt.strategy_key, pt.direction, pt.result,
+                   pt.pnl_pct, {paper_pnl_usd_expr} as pnl_usd, {paper_size_expr} as size_usd,
+                   {paper_flow_expr} as flow_confirmed,
+                   COALESCE(pt.closed_at, pt.opened_at, pt.queued_at) as ts,
+                   json_extract(s.signal_json, '$.agent_regime') as agent_regime
+            FROM paper_trades pt
+            LEFT JOIN signals s ON s.id = pt.signal_id
+            WHERE {paper_where}
+            ORDER BY ts DESC
+            LIMIT 5000
+        """, paper_params).fetchall()]
+        con.close()
+
+        rows_by_source = {"live": live_rows, "paper": paper_rows}
+        evaluated = []
+        for hypothesis in PARALLEL_HYPOTHESES:
+            source_payload = {}
+            for source_name, rows in rows_by_source.items():
+                affected = [r for r in rows if _row_matches_hypothesis(r, hypothesis)]
+                comparison = [
+                    r for r in rows
+                    if str(r.get("strategy_key") or "") == str(hypothesis.get("strategy") or "")
+                    and not _row_matches_hypothesis(r, hypothesis)
+                ]
+                affected_stats = _hypothesis_stats(affected)
+                comparison_stats = _hypothesis_stats(comparison)
+                source_payload[source_name] = {
+                    "affected": affected_stats,
+                    "comparison": comparison_stats,
+                    "delta": {
+                        "avg_pnl": round(affected_stats["avg_pnl"] - comparison_stats["avg_pnl"], 2),
+                        "win_partial_rate": round(affected_stats["win_partial_rate"] - comparison_stats["win_partial_rate"], 1),
+                    },
+                    "recent_affected": affected[:8],
+                    "verdict": _hypothesis_verdict(affected_stats, comparison_stats, target),
+                }
+            primary = source_payload["paper"] if source_payload["paper"]["affected"]["count"] else source_payload["live"]
+            evaluated.append({
+                **hypothesis,
+                "target": target,
+                "sources": source_payload,
+                "primary_verdict": primary["verdict"],
+            })
+
+        return jsonify({
+            "success": True,
+            "target": target,
+            "since": since,
+            "mode": "parallel_shadow",
+            "summary": {
+                "hypothesis_count": len(evaluated),
+                "live_closed": len(live_rows),
+                "paper_closed": len(paper_rows),
+            },
+            "hypotheses": evaluated,
+        })
+    except Exception as e:
+        print(f"[api/intelligence/hypotheses] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 def _apply_suggestion_config(suggestion: dict) -> tuple[bool, str | None]:
     stype = suggestion.get("type")
     payload = suggestion.get("api_payload") or {}
