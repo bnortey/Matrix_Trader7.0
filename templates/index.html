@@ -10746,6 +10746,14 @@ function renderResearchFirm() {
 
   function pctFmt(v) { return v != null ? (v * 100).toFixed(1) + '%' : '—'; }
   function pnlFmt(v) { return v != null ? (v >= 0 ? '+' : '') + v.toFixed(1) + '%' : '—'; }
+  function rateLabel(v, fallback = '—') { return v != null ? (v * 100).toFixed(1) + '%' : fallback; }
+  function researchEvidenceMetric(label, value, sub, color = '#888', title = '') {
+    return `<div title="${esc(title)}" style="background:#0d1117;border:1px solid #1e2530;border-radius:4px;padding:8px;min-width:0;">
+      <div style="font-size:10px;color:#555;margin-bottom:4px;text-transform:uppercase;">${esc(label)}</div>
+      <div style="font-size:13px;color:${color};font-weight:600;font-family:${String(value).length > 10 ? 'var(--mono)' : 'inherit'};">${value}</div>
+      <div style="font-size:11px;color:#555;margin-top:1px;">${sub || '&nbsp;'}</div>
+    </div>`;
+  }
   function deltaPp(cl, bl) {
     if (cl == null || bl == null) return null;
     return ((cl - bl) * 100).toFixed(0);
@@ -10784,8 +10792,11 @@ function renderResearchFirm() {
     const cb      = CONF_BADGE[conf] || CONF_BADGE.watching;
     const typeLbl = TYPE_BADGE[brief.type] || (brief.type || '').replace(/_/g,' ').toUpperCase();
     const n       = ev.cluster_trades || 0;
+    const isStopPressure = brief.type === 'stop_pressure_pattern';
+    const baselineResultRate = ev.baseline_win_partial_rate ?? ev.baseline_win_rate;
+    const clusterResultRate = ev.cluster_win_partial_rate ?? ev.cluster_win_rate;
 
-    const dp    = deltaPp(ev.cluster_win_rate, ev.baseline_win_rate);
+    const dp    = deltaPp(clusterResultRate, baselineResultRate);
     const dpNum = dp !== null ? parseFloat(dp) : null;
     const dpPnl = ev.cluster_avg_pnl != null && ev.baseline_avg_pnl != null
       ? (ev.cluster_avg_pnl - ev.baseline_avg_pnl) : null;
@@ -10820,7 +10831,6 @@ function renderResearchFirm() {
 
     // Accept / reject guidance for actionable stages
     // For stop_pressure_pattern, win-rate delta is unavailable — use P&L delta as the signal
-    const isStopPressure = brief.type === 'stop_pressure_pattern';
     const edgePositive = dpNum !== null
       ? dpNum > 0
       : (dpPnl !== null ? dpPnl > 0 : null);  // fall back to P&L delta
@@ -10884,6 +10894,49 @@ function renderResearchFirm() {
          </button>`
       : '';
 
+    const baselineEvidence = researchEvidenceMetric(
+      'Baseline Result Rate',
+      rateLabel(baselineResultRate),
+      `${pnlFmt(ev.baseline_avg_pnl)} avg P&L · ${ev.baseline_trades||0} trades`,
+      '#888',
+      'Win plus partial-win rate for all closed trades in this strategy. Partial wins count as positive outcomes.'
+    );
+    const standardPatternEvidence = researchEvidenceMetric(
+      'This Pattern',
+      `${rateLabel(clusterResultRate)} result rate`,
+      `${pnlFmt(ev.cluster_avg_pnl)} avg P&L · ${n} trades`,
+      dpNum>0 ? '#22c55e' : dpNum<0 ? '#ef4444' : '#888',
+      'Win plus partial-win rate for trades matching this pattern.'
+    );
+    const stopPressureEvidence = isStopPressure ? `
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:10px;">
+        ${baselineEvidence}
+        ${researchEvidenceMetric(
+          'All Matching Trades',
+          `${rateLabel(clusterResultRate)} W+P`,
+          `${pnlFmt(ev.cluster_avg_pnl)} avg P&L · ${n} trades`,
+          dpPnl != null ? (dpPnl >= 0 ? '#22c55e' : '#ef4444') : '#888',
+          'All closed trades for this strategy in the same volatility bucket, not just losses.'
+        )}
+        ${researchEvidenceMetric(
+          'Stop-Pressure Losses',
+          `${Number(ev.avg_stop_pressure || 0).toFixed(0)}% stop used`,
+          `${ev.stop_pressure_loss_count || 0} losses · ${ev.failed_fast_count || 0} failed fast`,
+          Number(ev.avg_stop_pressure || 0) >= 90 ? '#f59e0b' : '#888',
+          'Losses where adverse movement consumed most or all of the planned stop distance.'
+        )}
+        ${researchEvidenceMetric(
+          'Before Stop',
+          `${pnlFmt(ev.avg_mfe_before_stop)} MFE`,
+          'avg favorable move before stopped',
+          Number(ev.avg_mfe_before_stop || 0) >= 1 ? '#22c55e' : '#ef4444',
+          'MFE is the best favorable move before the trade stopped out. Near zero means the setup failed immediately.'
+        )}
+      </div>
+      <div style="font-size:11px;color:#777;background:#0d1117;border-left:3px solid #f59e0b;border-radius:4px;padding:8px 10px;margin-bottom:10px;line-height:1.45;">
+        Stop-pressure cards are not pure entry-edge cards. They test whether this strategy and volatility bucket needs different stop/avoid rules. Use W+P and avg P&L to judge whether the bucket is worth trading; use stop pressure, failed-fast count, and MFE to decide whether to widen stops or block the setup.
+      </div>` : '';
+
     return `<div style="border:1px solid ${conf==='ready'?'#22c55e55':conf==='proposal'?'#448aff44':'var(--border)'};border-radius:6px;padding:14px;margin-bottom:10px;background:${conf==='ready'?'rgba(0,230,118,0.03)':'transparent'}">
 
       <!-- Header row -->
@@ -10899,18 +10952,7 @@ function renderResearchFirm() {
 
       <!-- Evidence comparison -->
       <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Evidence</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
-        <div style="background:#0d1117;border:1px solid #1e2530;border-radius:4px;padding:8px;">
-          <div style="font-size:10px;color:#555;margin-bottom:4px;">YOUR BASELINE (all trades)</div>
-          <div style="font-size:13px;color:#888;font-weight:600;">${pctFmt(ev.baseline_win_rate)} win</div>
-          <div style="font-size:11px;color:#555;">${pnlFmt(ev.baseline_avg_pnl)} avg P&L · ${ev.baseline_trades||0} trades</div>
-        </div>
-        <div style="background:#0d1117;border:1px solid ${dpNum>0?'#22c55e33':dpNum<0?'#ef444433':'#1e2530'};border-radius:4px;padding:8px;">
-          <div style="font-size:10px;color:#555;margin-bottom:4px;">THIS PATTERN (cluster)</div>
-          <div style="font-size:13px;color:${dpNum>0?'#22c55e':dpNum<0?'#ef4444':'#888'};font-weight:600;">${pctFmt(ev.cluster_win_rate)} win</div>
-          <div style="font-size:11px;color:#555;">${pnlFmt(ev.cluster_avg_pnl)} avg P&L · ${n} trades</div>
-        </div>
-      </div>
+      ${isStopPressure ? stopPressureEvidence : `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">${baselineEvidence}${standardPatternEvidence}</div>`}
 
       <!-- Delta plain English -->
       ${deltaPlain ? `<div style="font-size:12px;color:#888;margin-bottom:2px;padding:8px 10px;background:#0d1117;border-radius:4px;border-left:3px solid ${dpColor};">${deltaPlain}</div>` : ''}

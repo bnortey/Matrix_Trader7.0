@@ -371,6 +371,10 @@ def run_hypothesis_discovery(db_path: str, research_dir: Path) -> None:
             SELECT strategy_key,
                    COUNT(*) as n,
                    ROUND(SUM(CASE WHEN result='WIN' THEN 1.0
+                                  ELSE 0 END) / COUNT(*), 4) as strict_win_rate,
+                   ROUND(SUM(CASE WHEN result IN ('WIN','PARTIAL') THEN 1.0
+                                  ELSE 0 END) / COUNT(*), 4) as win_partial_rate,
+                   ROUND(SUM(CASE WHEN result='WIN' THEN 1.0
                                   WHEN result='PARTIAL' THEN 0.5
                                   ELSE 0 END) / COUNT(*), 4) as win_rate,
                    ROUND(AVG(pnl_pct), 2) as avg_pnl
@@ -720,7 +724,8 @@ def run_hypothesis_discovery(db_path: str, research_dir: Path) -> None:
             GROUP BY strategy_key, volatility
             HAVING COUNT(*) >= 10
         """)
-        for row in cur.fetchall():
+        stop_rows = [dict(r) for r in cur.fetchall()]
+        for row in stop_rows:
             sk = row["strategy_key"]
             volatility = row["volatility"] or "unknown"
             avg_stop_pressure = row["avg_stop_pressure"] or 0
@@ -748,15 +753,37 @@ def run_hypothesis_discovery(db_path: str, research_dir: Path) -> None:
             )[:200]
 
             bl = baselines.get(sk, {})
+            all_vol_row = conn.execute("""
+                SELECT
+                    COUNT(*) as n,
+                    ROUND(SUM(CASE WHEN result='WIN' THEN 1.0 ELSE 0 END) / COUNT(*), 4) as strict_win_rate,
+                    ROUND(SUM(CASE WHEN result IN ('WIN','PARTIAL') THEN 1.0 ELSE 0 END) / COUNT(*), 4) as win_partial_rate,
+                    ROUND(SUM(CASE WHEN result='WIN' THEN 1.0
+                                   WHEN result='PARTIAL' THEN 0.5
+                                   ELSE 0 END) / COUNT(*), 4) as win_score,
+                    ROUND(AVG(pnl_pct), 2) as avg_pnl
+                FROM signals
+                WHERE strategy_key = ?
+                  AND COALESCE(volatility, 'unknown') = ?
+                  AND result IS NOT NULL
+                  AND pnl_pct IS NOT NULL
+            """, (sk, volatility))
+            all_vol = dict(all_vol_row.fetchone() or {})
             evidence = {
                 "baseline_win_rate": bl.get("win_rate"),
+                "baseline_strict_win_rate": bl.get("strict_win_rate"),
+                "baseline_win_partial_rate": bl.get("win_partial_rate"),
                 "baseline_avg_pnl": bl.get("avg_pnl"),
                 "baseline_trades": bl.get("n"),
-                "cluster_win_rate": None,
-                "cluster_avg_pnl": row["avg_mfe"],
-                "cluster_trades": n,
+                "cluster_win_rate": all_vol.get("win_score"),
+                "cluster_strict_win_rate": all_vol.get("strict_win_rate"),
+                "cluster_win_partial_rate": all_vol.get("win_partial_rate"),
+                "cluster_avg_pnl": all_vol.get("avg_pnl"),
+                "cluster_trades": all_vol.get("n") or n,
                 "cluster_description": cluster_desc,
+                "stop_pressure_loss_count": n,
                 "avg_stop_pressure": avg_stop_pressure,
+                "avg_mfe_before_stop": row["avg_mfe"],
                 "failed_fast_count": failed_fast,
             }
 
