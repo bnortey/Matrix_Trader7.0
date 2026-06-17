@@ -64,7 +64,7 @@ def _already_exists(suggestions, stype, strategy, value_key, value):
     for s in suggestions:
         if s.get('type') != stype or s.get('strategy') != strategy:
             continue
-        if s.get('status') in ('pending', 'pending_review', 'evaluating', 'applied'):
+        if s.get('status') in ('pending', 'pending_review', 'evaluating', 'shadow_evaluating', 'parked', 'applied'):
             return True
         if s.get('status') in ('dismissed', 'rejected') and s.get(value_key) == value:
             return True

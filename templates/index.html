@@ -5957,6 +5957,7 @@ const I = {
   loading:      false,
   status:       null,
   suggestions:  [],
+  suggestionShadowLab: null,
   suggestionBaseline: {},
   evaluationWindowTrades: 20,
   learnerRunning: false,
@@ -6083,7 +6084,7 @@ async function loadGoalBenchmark() {
     if (suggestionsResp.status === 'fulfilled') {
       try {
         const sd = await suggestionsResp.value.json();
-        pendingCount = (sd.suggestions || []).filter(s => s.status === 'pending_review' || s.status === 'evaluating').length;
+        pendingCount = (sd.suggestions || []).filter(s => ['pending_review', 'pending', 'evaluating', 'shadow_evaluating'].includes(s.status)).length;
       } catch (_) {}
     }
 
@@ -8698,6 +8699,7 @@ async function loadIntelligence() {
     ]);
     I.status = statusRes.success ? statusRes : null;
     I.suggestions = suggestionsRes.suggestions || [];
+    I.suggestionShadowLab = suggestionsRes.shadow_lab || null;
     I.suggestionBaseline = suggestionsRes.baseline || {};
     I.evaluationWindowTrades = suggestionsRes.evaluation_window_trades || 20;
     I.learnerRunning = suggestionsRes.learner_running || false;
@@ -9096,6 +9098,7 @@ async function loadSuggestions(rerender = true) {
     const data = await res.json();
     if (!data.success) throw new Error(data.error || 'suggestions unavailable');
     I.suggestions = data.suggestions || [];
+    I.suggestionShadowLab = data.shadow_lab || null;
     I.suggestionBaseline = data.baseline || {};
     I.evaluationWindowTrades = data.evaluation_window_trades || 20;
     I.learnerRunning = !!data.learner_running;
@@ -9171,8 +9174,8 @@ async function loadHermesAudit(rerender = true) {
   }
 }
 
-function suggestionMetric(label, value, color) {
-  return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px;min-width:0;">
+function suggestionMetric(label, value, color, title = '') {
+  return `<div title="${esc(title)}" style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px;min-width:0;">
     <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}</div>
     <div style="font-size:14px;font-weight:700;color:${color || 'var(--text2)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${value ?? '—'}</div>
   </div>`;
@@ -9194,6 +9197,7 @@ function suggestionStatusBadge(status) {
     pending_review: ['Pending Review', '#f59e0b', '#1a1400'],
     pending: ['Pending Review', '#f59e0b', '#1a1400'],
     evaluating: ['Evaluating', '#60a5fa', '#08111f'],
+    shadow_evaluating: ['Shadow Evaluating', '#38bdf8', '#071522'],
     rejected: ['Rejected', '#ef4444', '#190909'],
     evaluated: ['Evaluated', '#22c55e', '#07180f'],
     applied: ['Applied', '#22c55e', '#07180f'],
@@ -9207,6 +9211,8 @@ function suggestionStatusBadge(status) {
 function renderSuggestionCard(sug, active = false) {
   const baseline = sug.baseline || I.suggestionBaseline || {};
   const isEvaluating = sug.status === 'evaluating';
+  const isShadowEvaluating = sug.status === 'shadow_evaluating';
+  const isParked = sug.status === 'parked';
   const canAct = ['pending_review', 'pending'].includes(sug.status);
   const border = active ? (isEvaluating ? '#1e3a5f' : '#5b4214') : '#202936';
   const expected = sug.expected_ev_label || sug.expected_win_rate_delta || sug.expected_trade_count_delta || '—';
@@ -9222,10 +9228,10 @@ function renderSuggestionCard(sug, active = false) {
     </div>
     <div style="font-size:12px;color:var(--text2);line-height:1.5;background:#0b0f15;border-left:3px solid #263244;border-radius:4px;padding:9px;margin-bottom:10px;">${esc(sug.reasoning || '')}</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin-bottom:11px;">
-      ${suggestionMetric('Baseline EV', fmtSuggestionEv(baseline.ev_per_trade_pct), Number(baseline.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)')}
-      ${suggestionMetric('Win + Partial', fmtSuggestionRate(baseline.win_partial_rate), 'var(--text2)')}
-      ${suggestionMetric('Sample', baseline.ev_sample_n ?? sample, 'var(--text2)')}
-      ${suggestionMetric('Expected', esc(expected), 'var(--amber)')}
+      ${suggestionMetric('Baseline EV/trade', fmtSuggestionEv(baseline.ev_per_trade_pct), Number(baseline.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)', 'Current overall live-signal average net P&L per closed trade. This is the baseline before applying the suggestion.')}
+      ${suggestionMetric('Baseline W+P', fmtSuggestionRate(baseline.win_partial_rate), 'var(--text2)', 'Current overall live-signal win plus partial-win rate.')}
+      ${suggestionMetric('Baseline Sample', baseline.ev_sample_n ?? sample, 'var(--text2)', 'Closed trades included in the current baseline snapshot.')}
+      ${suggestionMetric('Learner Expected', esc(expected), 'var(--amber)', 'The learner estimate from historical analysis; shadow rows below show would-have performance.')}
     </div>
     ${isEvaluating ? (() => {
       const done = sug.trades_since_baseline ?? 0;
@@ -9242,8 +9248,15 @@ function renderSuggestionCard(sug, active = false) {
         <button onclick="parkSuggestion('${encodeURIComponent(sug.id || '')}')" style="margin-top:9px;background:#211536;color:#c4b5fd;border:1px solid #6d28d9;padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Park Evaluation</button>
       </div>`;
     })() : ''}
+    ${isShadowEvaluating ? `<div style="background:#071522;border:1px solid #164e63;border-radius:5px;padding:10px;margin-bottom:10px;">
+      <div style="font-size:11px;color:#67e8f9;line-height:1.45;">Collecting shadow evidence concurrently. This does not occupy the one-at-a-time applied config evaluation lane.</div>
+    </div>` : ''}
     ${canAct ? `<div style="display:flex;gap:8px;">
       <button onclick="applySuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#166534;color:#86efac;border:1px solid #15803d;padding:8px;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;">Apply</button>
+      <button onclick="rejectSuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#1b0808;color:#fca5a5;border:1px solid #7f1d1d;padding:8px;border-radius:5px;font-size:12px;cursor:pointer;">Reject</button>
+    </div>` : ''}
+    ${isParked ? `<div style="display:flex;gap:8px;">
+      <button onclick="resumeSuggestion('${encodeURIComponent(sug.id || '')}')" title="Resume this parked idea into concurrent shadow evaluation" style="flex:1;background:#0b2530;color:#67e8f9;border:1px solid #0891b2;padding:8px;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;">Resume Shadow</button>
       <button onclick="rejectSuggestion('${encodeURIComponent(sug.id || '')}')" style="flex:1;background:#1b0808;color:#fca5a5;border:1px solid #7f1d1d;padding:8px;border-radius:5px;font-size:12px;cursor:pointer;">Reject</button>
     </div>` : ''}
     ${sug.reject_reason ? `<div style="font-size:10px;color:#9ca3af;margin-top:8px;">Reason: ${esc(sug.reject_reason)}</div>` : ''}
@@ -9251,9 +9264,79 @@ function renderSuggestionCard(sug, active = false) {
   </div>`;
 }
 
+function renderSuggestionShadowLab() {
+  const lab = I.suggestionShadowLab || {};
+  const items = lab.items || [];
+  if (!items.length) {
+    return `<div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:12px;color:var(--muted);font-size:12px;margin-bottom:14px;">
+      No pending learner suggestions are eligible for shadow evaluation yet.
+    </div>`;
+  }
+  const colorMap = {green:'var(--green)', amber:'var(--amber)', red:'var(--red)', blue:'var(--blue)'};
+  const pct = v => (v === null || v === undefined) ? '—' : fmtPct(Number(v), 2);
+  const rate = v => (v === null || v === undefined) ? '—' : Number(v).toFixed(1) + '%';
+  const sourceChip = (label, payload, target) => {
+    const a = payload.affected || {};
+    const c = payload.comparison || {};
+    const v = payload.verdict || {};
+    const vc = colorMap[v.color] || 'var(--text2)';
+    const progress = Math.max(0, Math.min(100, Number(a.count || 0) / Math.max(1, Number(target || 50)) * 100));
+    return `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px;min-width:0;">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:6px;">
+        <span style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;">${label}</span>
+        <span style="font-size:9px;color:${vc};font-weight:800;text-transform:uppercase;">${esc(v.label || 'Collecting')}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">
+        <div title="Closed trades this suggestion would have skipped, blocked, or affected. Target is the sample size needed before trusting the shadow result.">
+          <div style="font-size:8px;color:#667085;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px;">Affected</div>
+          <div style="font-family:var(--mono);font-size:13px;color:var(--text2);">${Number(a.count || 0)}/${target}</div>
+        </div>
+        <div title="Average net P&L per affected closed trade. Negative means the suggestion is finding a weak slice.">
+          <div style="font-size:8px;color:#667085;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px;">Avg P&L/trade</div>
+          <div style="font-family:var(--mono);font-size:13px;color:${Number(a.avg_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'};">${pct(a.avg_pnl)}</div>
+        </div>
+        <div title="Win plus partial-win rate for affected closed trades.">
+          <div style="font-size:8px;color:#667085;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px;">W+P Rate</div>
+          <div style="font-family:var(--mono);font-size:13px;color:var(--text2);">${rate(a.win_partial_rate)}</div>
+        </div>
+      </div>
+      <div style="height:3px;background:#111827;border-radius:99px;overflow:hidden;margin-top:7px;"><div style="height:100%;width:${progress}%;background:${vc};"></div></div>
+      <div style="font-size:10px;color:#667085;margin-top:6px;">Comparison: ${Number(c.count || 0)} other same-strategy closed trades · avg P&L/trade ${pct(c.avg_pnl)} · W+P ${rate(c.win_partial_rate)}</div>
+    </div>`;
+  };
+  const rows = items.map(item => {
+    const pv = item.primary_verdict || {};
+    const vc = colorMap[pv.color] || 'var(--text2)';
+    return `<div style="border:1px solid #202936;border-radius:6px;background:#10151c;padding:11px;margin-bottom:9px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+        <div style="min-width:0;">
+          <div style="font-size:13px;font-weight:800;color:var(--text);line-height:1.35;">${esc(item.title || item.suggestion_id || 'Suggestion')}</div>
+          <div style="font-size:10px;color:#667085;margin-top:3px;">${esc(item.strategy || 'system')} · ${esc(item.type || 'suggestion')} · ${esc(item.status || '')}${item.expected ? ` · expected ${esc(item.expected)}` : ''}</div>
+        </div>
+        <span title="${esc(pv.detail || '')}" style="font-size:10px;border:1px solid ${vc};color:${vc};border-radius:4px;padding:3px 7px;text-transform:uppercase;font-weight:800;">${esc(pv.label || 'Collecting')}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px;">
+        ${sourceChip('Paper Shadow', (item.sources || {}).paper || {}, item.target || lab.target || 50)}
+        ${sourceChip('Live Shadow', (item.sources || {}).live || {}, item.target || lab.target || 50)}
+      </div>
+      <div style="font-size:10px;color:#667085;margin-top:7px;">${esc(pv.detail || '')}</div>
+    </div>`;
+  }).join('');
+  return `<div style="margin-bottom:14px;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px;">
+      <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;">Suggestion Shadow Lab</div>
+      <div style="font-size:10px;color:var(--text3);">Parallel, read-only · target ${Number(lab.target || 50)} affected samples</div>
+    </div>
+    <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 10px;color:var(--text3);font-size:11px;line-height:1.45;margin-bottom:9px;">
+      Affected means trades this suggestion would have skipped or blocked in shadow mode. Avg P&L/trade and W+P Rate describe that affected slice. Comparison is the other closed trades from the same strategy that the suggestion would not have touched.
+    </div>
+    ${rows}
+  </div>`;
+}
+
 function renderSuggestionsPanel() {
   const suggestions = I.suggestions || [];
-  const pending = suggestions.filter(s => ['pending_review', 'pending'].includes(s.status));
+  const pending = suggestions.filter(s => ['pending_review', 'pending', 'shadow_evaluating'].includes(s.status));
   const evaluating = suggestions.filter(s => s.status === 'evaluating');
   const history = suggestions.filter(s => ['rejected', 'evaluated', 'applied', 'dismissed', 'parked'].includes(s.status));
   const active = evaluating[0] || pending[0];
@@ -9282,6 +9365,8 @@ function renderSuggestionsPanel() {
 
     <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;margin:0 0 8px;">Active Review</div>
     ${active ? renderSuggestionCard(active, true) : `<div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:14px;color:var(--muted);font-size:12px;margin-bottom:14px;">No active suggestions. The learner will surface new candidates after its next analysis pass.</div>`}
+
+    ${renderSuggestionShadowLab()}
 
     ${queue.length ? `<div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;margin:14px 0 8px;">Queue - Locked</div>
       ${queue.map(s => renderSuggestionCard(s, false)).join('')}` : ''}
@@ -9522,10 +9607,25 @@ function renderHermesArchive(archive) {
   </div>`;
 }
 
-function openArchivedMemo(idx) {
+async function openArchivedMemo(idx) {
   const archive = (I.hermes && I.hermes.memo_archive) || [];
-  const m = archive[idx];
+  let m = archive[idx];
   if (!m) return;
+  openDrillModal('hermes-archived-memo', `
+    <div style="color:var(--blue);font-size:9px;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;">Hermes Advisory Group — Archived Memo</div>
+    <div style="font-size:19px;font-weight:800;color:var(--text);padding-right:28px;">${esc(m.title || 'Hermes Memo')}</div>
+    <div style="font-size:13px;color:var(--muted);margin-top:12px;">Loading full memo...</div>
+  `, 'var(--blue)', 820);
+  if (m.archive_id) {
+    try {
+      const res = await fetch(`/api/intelligence/hermes/memo/${encodeURIComponent(m.archive_id)}`);
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'memo unavailable');
+      m = data.memo || m;
+    } catch(e) {
+      m = { ...m, load_error: e.message || 'Could not load full memo' };
+    }
+  }
   const sections = m.sections || {};
   const sectionOrder = [
     ['executive_verdict', 'Executive Verdict'],
@@ -9541,11 +9641,12 @@ function openArchivedMemo(idx) {
     <div style="color:var(--blue);font-size:9px;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;">Hermes Advisory Group — Archived Memo</div>
     <div style="font-size:19px;font-weight:800;color:var(--text);padding-right:28px;">${esc(m.title || 'Hermes Memo')}</div>
     <div style="font-size:11px;color:#667085;margin:3px 0 14px;">Generated ${esc(m.generated_at || 'unknown')}</div>
+    ${m.load_error ? `<div style="background:#1f0a0a;border:1px solid #3a1515;border-radius:5px;padding:9px;color:var(--red);font-size:12px;margin-bottom:12px;">${esc(m.load_error)}</div>` : ''}
     ${sectionOrder.length ? sectionOrder.map(([key, label]) => `
       <div style="margin-bottom:12px;">
         <div style="font-size:10px;color:var(--blue);text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;">${label}</div>
         <div style="background:#0b0f15;border-left:3px solid var(--blue);border-radius:4px;padding:11px;font-size:13px;color:var(--text2);line-height:1.55;">${esc(sections[key])}</div>
-      </div>`).join('') : (m.body || m.body_preview) ? `<pre style="white-space:pre-wrap;background:#0b0f15;border:1px solid #1e2530;border-radius:6px;padding:12px;color:var(--text2);font-size:12px;line-height:1.45;">${esc(m.body || m.body_preview)}</pre>${!m.body ? '<div style="font-size:11px;color:var(--muted);margin-top:8px;">Preview only — full memo stored on Hermes server.</div>' : ''}` : '<div style="color:var(--muted);font-size:13px;">No content available for this memo.</div>'}
+      </div>`).join('') : (m.body || m.body_preview) ? `<pre style="white-space:pre-wrap;background:#0b0f15;border:1px solid #1e2530;border-radius:6px;padding:12px;color:var(--text2);font-size:12px;line-height:1.45;">${esc(m.body || m.body_preview)}</pre>${!m.body ? '<div style="font-size:11px;color:var(--muted);margin-top:8px;">Preview only — full memo could not be loaded.</div>' : ''}` : '<div style="color:var(--muted);font-size:13px;">No content available for this memo.</div>'}
   `;
   openDrillModal('hermes-archived-memo', html, 'var(--blue)', 820);
 }
@@ -9913,6 +10014,23 @@ async function parkSuggestion(sid) {
   }
 }
 
+async function resumeSuggestion(sid) {
+  sid = decodeURIComponent(sid || '');
+  if (!confirm('Resume this parked idea into concurrent shadow evaluation? This will not change live or paper config.')) return;
+  try {
+    const res = await fetch(`/api/intelligence/suggestions/${encodeURIComponent(sid)}/resume`, {
+      method:'POST',
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'resume failed');
+    showOverrideMsg('Parked suggestion resumed in shadow mode.');
+    await loadSuggestions(true);
+    if (typeof loadGoalBenchmark === 'function') loadGoalBenchmark();
+  } catch (e) {
+    alert('Resume failed: ' + (e.message || e));
+  }
+}
+
 async function loadEdgeLab() {
   if (I.edgeLabLoading) return;
   I.edgeLabLoading = true;
@@ -10122,7 +10240,7 @@ function renderEdgeLabPanel() {
 }
 
 function renderIntelSubTabs() {
-  const sugCount = (I.suggestions || []).filter(s => ['pending_review', 'pending', 'evaluating'].includes(s.status)).length;
+  const sugCount = (I.suggestions || []).filter(s => ['pending_review', 'pending', 'evaluating', 'shadow_evaluating'].includes(s.status)).length;
   const tabs = [
     ['overview', 'Overview'],
     ['firm', 'The Firm'],
@@ -11177,7 +11295,7 @@ async function loadPaperTrading() {
   if (!el) return;
   el.innerHTML = '<div style="color:var(--muted);padding:2rem;">Loading...</div>';
   try {
-    const [cfgR, statsR, tradesR, stratR, filterStatsR, accountR, cohortReviewR, edgeCohortR] = await Promise.all([
+    const [cfgR, statsR, tradesR, stratR, filterStatsR, accountR, cohortReviewR] = await Promise.all([
       fetch('/api/paper/config'),
       fetch('/api/paper/stats'),
       fetch('/api/paper/trades'),
@@ -11185,7 +11303,6 @@ async function loadPaperTrading() {
       fetch('/api/paper/filter-stats'),
       fetch('/api/paper/account'),
       fetch('/api/paper/cohort-review').catch(() => null),
-      fetch('/api/paper/cohort-edge').catch(() => null),
     ]);
     const cfg         = await cfgR.json();
     const stats       = await statsR.json();
@@ -11194,7 +11311,6 @@ async function loadPaperTrading() {
     const filterStats = await filterStatsR.json();
     const account     = await accountR.json();
     const cohortReview = cohortReviewR ? await cohortReviewR.json().catch(() => null) : null;
-    const edgeCohort  = edgeCohortR ? await edgeCohortR.json().catch(() => null) : null;
     if (!cfg.success) { el.innerHTML = '<div style="color:var(--red);padding:2rem;">Config unavailable</div>'; return; }
 
     // All enabled strategies from the API (built-ins + custom)
@@ -11360,7 +11476,7 @@ async function loadPaperTrading() {
       statsHtml = `
         ${renderPaperCohortStrip(s.current_cohort)}
         ${renderPaperCohortReview(cohortReview)}
-        ${renderPaperCohortEdge(edgeCohort)}
+        ${renderPaperCohortEdgeLoading()}
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-bottom:10px;">
           ${paperStat('Paper Account', fmtUsd(acct.current_value_usd), (acct.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', `Started at ${fmtUsd(acct.starting_balance_usd)}`)}
           ${paperStat('Hard P&L', fmtUsdSigned(s.all_closed.total_pnl_usd), s.all_closed.total_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Real dollar P&L accrued from paper position sizes')}
@@ -11600,6 +11716,7 @@ async function loadPaperTrading() {
     const resetHtml = '';
 
     el.innerHTML = headerHtml + explainerHtml + configHtml + statsHtml + pendingHtml + openHtml + closedHtml + rejHtml + resetHtml;
+    loadPaperCohortEdge();
 
   } catch(e) {
     if (el) el.innerHTML = `<div style="color:var(--red);padding:2rem;">Error: ${e.message}</div>`;
@@ -11706,6 +11823,7 @@ function renderPaperCohortReview(payload) {
       ? String(hermes.latest_memo_at)
       : memoDate.toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
   }
+  const nextActionHtml = renderPaperCohortNextActions(r);
   return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 11px;margin-bottom:10px;">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
       <div>
@@ -11716,6 +11834,7 @@ function renderPaperCohortReview(payload) {
     </div>
     <div style="font-size:12px;color:var(--text2);line-height:1.5;margin-bottom:8px;">${esc(r.summary || '')}</div>
     <div style="font-size:11px;color:#9ca3af;line-height:1.45;border-left:3px solid ${decisionColor};padding-left:8px;margin-bottom:9px;">${esc(r.recommendation || '')}</div>
+    ${nextActionHtml}
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:7px;margin-bottom:9px;">
       ${gateHtml}
     </div>
@@ -11744,6 +11863,67 @@ function renderPaperCohortReview(payload) {
       </div>
     </div>
   </div>`;
+}
+
+function renderPaperCohortNextActions(r) {
+  const decision = r?.decision || '';
+  if (decision === 'ready_next_test') {
+    return `<div style="background:#07180f;border:1px solid rgba(34,197,94,.35);border-radius:6px;padding:10px 11px;margin-bottom:10px;">
+      <div style="font-size:10px;color:#86efac;text-transform:uppercase;letter-spacing:.08em;font-weight:800;margin-bottom:5px;">Next Step</div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.5;margin-bottom:9px;">
+        This cohort becomes your proven baseline. Pick exactly one next paper-only experiment, apply it if needed, then start a new cohort so the next 20+ closed trades are measured cleanly.
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button onclick="openSuggestionShadowLab()" title="Review ready learner suggestions and promote or reject the next experiment" style="background:#10223a;border:1px solid #2563eb;color:#93c5fd;border-radius:5px;padding:7px 10px;font-size:12px;font-weight:800;cursor:pointer;">Choose Experiment</button>
+        <button onclick="startNextPaperCohort()" title="Reset only the cohort measurement window and label. This does not change strategy config." style="background:#12301d;border:1px solid #16a34a;color:#86efac;border-radius:5px;padding:7px 10px;font-size:12px;font-weight:800;cursor:pointer;">Start New Cohort</button>
+      </div>
+    </div>`;
+  }
+  if (decision === 'tighten_or_pause') {
+    return `<div style="background:#1f0a0a;border:1px solid rgba(239,68,68,.35);border-radius:6px;padding:10px 11px;margin-bottom:10px;">
+      <div style="font-size:10px;color:#fca5a5;text-transform:uppercase;letter-spacing:.08em;font-weight:800;margin-bottom:5px;">Next Step</div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.5;margin-bottom:9px;">Do not start another experiment yet. Inspect the weak strategy or symbol buckets, then use Suggestions only if a shadow test identifies a clean block candidate.</div>
+      <button onclick="openSuggestionShadowLab()" style="background:#10223a;border:1px solid #2563eb;color:#93c5fd;border-radius:5px;padding:7px 10px;font-size:12px;font-weight:800;cursor:pointer;">Review Suggestions</button>
+    </div>`;
+  }
+  if (decision === 'hold_review') {
+    return `<div style="background:#1f1606;border:1px solid rgba(245,158,11,.35);border-radius:6px;padding:10px 11px;margin-bottom:10px;">
+      <div style="font-size:10px;color:#fbbf24;text-transform:uppercase;letter-spacing:.08em;font-weight:800;margin-bottom:5px;">Next Step</div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.5;">Review the split and shadow suggestions before changing the paper bot. This cohort is not clean enough to promote automatically.</div>
+    </div>`;
+  }
+  return '';
+}
+
+function openSuggestionShadowLab() {
+  switchTab('intelligence');
+  I.activeSubTab = 'suggestions';
+  localStorage.setItem('mt7_intel_subtab', 'suggestions');
+  loadSuggestions(true);
+}
+
+async function startNextPaperCohort() {
+  const defaultLabel = `Paper experiment ${new Date().toISOString().slice(0, 10)}`;
+  const label = prompt('Name the next paper-only experiment cohort:', defaultLabel);
+  if (!label || !label.trim()) return;
+  const ok = confirm('Start a new cohort measurement window now? This does not change strategy settings or place trades.');
+  if (!ok) return;
+  try {
+    const r = await fetch('/api/paper/config', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        current_cohort_started_at: new Date().toISOString(),
+        current_cohort_label: label.trim(),
+      }),
+    });
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error || 'cohort update failed');
+    showOverrideMsg('New paper cohort started.');
+    await loadPaperTrading();
+  } catch(e) {
+    alert('Could not start new cohort: ' + (e.message || e));
+  }
 }
 
 function edgeStateMeaning(group, key) {
@@ -11779,6 +11959,27 @@ function edgeAlignmentText(label, bestEdge) {
   if (label === 'neutral') return `Matched Edge Lab state was close to baseline.${edge}`;
   if (label === 'unfavorable') return `Matched state has historically underperformed baseline.${edge}`;
   return 'No nearby same-symbol Edge Lab candle was available for this entry.';
+}
+
+function renderPaperCohortEdgeLoading() {
+  return `<div id="paper-cohort-edge-card" style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 11px;margin-bottom:10px;">
+    <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Edge Lab Cohort Attribution</div>
+    <div style="font-size:12px;color:#777;margin-top:6px;">Loading Edge Lab attribution...</div>
+  </div>`;
+}
+
+async function loadPaperCohortEdge() {
+  const card = $('paper-cohort-edge-card');
+  if (!card) return;
+  try {
+    const r = await fetch('/api/paper/cohort-edge');
+    const d = await r.json().catch(() => ({ success:false, error:'invalid response' }));
+    if (!card.isConnected) return;
+    card.outerHTML = renderPaperCohortEdge(d);
+  } catch(e) {
+    if (!card.isConnected) return;
+    card.outerHTML = renderPaperCohortEdge({ success:false, error:e.message || 'request failed' });
+  }
 }
 
 function renderPaperCohortEdge(data) {

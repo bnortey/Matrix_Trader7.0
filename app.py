@@ -172,6 +172,7 @@ ENRICH_WORKERS = 10         # concurrent threads for stage-2 enrichment
 DB_PATH = "data/signals.db"
 EDGE_LAB_DB_PATH = "data/edge_lab.db"
 EDGE_LAB_REPORT_PATH = "data/factor_report.json"
+_EDGE_LAB_INDEX_READY = False
 RISK_GATES_PATH = "data/risk_gates.json"
 STRATEGY_OVERRIDES_PATH = "data/strategy_overrides.json"
 EXPERIMENT_LEDGER_PATH = "data/experiment_ledger.json"
@@ -7132,6 +7133,7 @@ def _hermes_memo_archive(limit: int = 8) -> list[dict]:
             if match:
                 title = match.group(1).strip()
             memos.append({
+                "archive_id": os.path.splitext(os.path.basename(path))[0],
                 "generated_at": data.get("generated_at") or datetime.utcfromtimestamp(os.path.getmtime(path)).isoformat(),
                 "source": data.get("source"),
                 "source_path": path,
@@ -7141,6 +7143,58 @@ def _hermes_memo_archive(limit: int = 8) -> list[dict]:
     except Exception as e:
         print(f"[hermes] memo_archive: {e}", file=sys.stderr)
     return memos
+
+
+def _hermes_archived_memo(archive_id: str) -> dict | None:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", archive_id or ""):
+        return None
+    archive_dir = os.path.join(HERMES_DIR, "archive")
+    json_path = os.path.join(archive_dir, f"{archive_id}.json")
+    md_path = os.path.join(archive_dir, f"{archive_id}.md")
+    data = _hermes_read_json(json_path, None)
+    if isinstance(data, dict):
+        body = data.get("body") or ""
+        title = data.get("title") or "Hermes memo"
+        match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+        if match:
+            title = match.group(1).strip()
+        if not body and os.path.exists(md_path):
+            try:
+                with open(md_path, encoding="utf-8") as f:
+                    body = f.read()
+            except Exception as e:
+                print(f"[hermes] archived markdown {md_path}: {e}", file=sys.stderr)
+        return {
+            "archive_id": archive_id,
+            "generated_at": data.get("generated_at") or (
+                datetime.utcfromtimestamp(os.path.getmtime(json_path)).isoformat()
+                if os.path.exists(json_path) else None
+            ),
+            "source": data.get("source"),
+            "source_path": json_path,
+            "title": title,
+            "sections": data.get("sections") if isinstance(data.get("sections"), dict) else {},
+            "body": body,
+        }
+    if os.path.exists(md_path):
+        try:
+            with open(md_path, encoding="utf-8") as f:
+                body = f.read()
+            title = "Hermes memo"
+            match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+            if match:
+                title = match.group(1).strip()
+            return {
+                "archive_id": archive_id,
+                "generated_at": datetime.utcfromtimestamp(os.path.getmtime(md_path)).isoformat(),
+                "source_path": md_path,
+                "title": title,
+                "sections": {},
+                "body": body,
+            }
+        except Exception as e:
+            print(f"[hermes] archived markdown {md_path}: {e}", file=sys.stderr)
+    return None
 
 
 def _hermes_latest_report_meta() -> dict:
@@ -7951,7 +8005,7 @@ def _hermes_suggestion_audit() -> dict:
     for s in suggestions:
         status = s.get("status") or "unknown"
         counts[status] = counts.get(status, 0) + 1
-    active = [s for s in suggestions if s.get("status") in {"pending", "pending_review", "evaluating"}]
+    active = [s for s in suggestions if s.get("status") in {"pending", "pending_review", "evaluating", "shadow_evaluating"}]
     return {
         "learner_running": _learner_running(),
         "counts": counts,
@@ -8058,6 +8112,19 @@ def api_intelligence_hermes():
         return jsonify({"success": True, "audit": _build_hermes_audit()})
     except Exception as e:
         print(f"[api/intelligence/hermes] error: {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/intelligence/hermes/memo/<archive_id>')
+def api_hermes_archived_memo(archive_id: str):
+    """Return the full archived Hermes memo body for modal viewing."""
+    try:
+        memo = _hermes_archived_memo(archive_id)
+        if not memo:
+            return jsonify({"success": False, "error": "Archived memo not found"}), 404
+        return jsonify({"success": True, "memo": memo})
+    except Exception as e:
+        print(f"[api/intelligence/hermes/memo] error: {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -8653,6 +8720,191 @@ def _hypothesis_verdict(affected: dict, unaffected: dict, target: int) -> dict:
     return {"status": status, "label": label, "color": color, "detail": detail}
 
 
+def _suggestion_shadow_rows(con: sqlite3.Connection, since: str | None = None) -> dict[str, list[dict]]:
+    signal_cols = {r[1] for r in con.execute("PRAGMA table_info(signals)").fetchall()}
+    paper_cols = {r[1] for r in con.execute("PRAGMA table_info(paper_trades)").fetchall()}
+    live_flow_expr = "flow_confirmed" if "flow_confirmed" in signal_cols else "NULL"
+    paper_flow_expr = "pt.flow_confirmed" if "flow_confirmed" in paper_cols else "NULL"
+    paper_pnl_usd_expr = "pt.pnl_usd" if "pnl_usd" in paper_cols else "NULL"
+    paper_size_expr = "pt.size_usd" if "size_usd" in paper_cols else "NULL"
+    live_where = """
+        result IN ('WIN','LOSS','PARTIAL','TP3')
+        AND pnl_pct IS NOT NULL
+        AND (source IS NULL OR source != 'paper')
+    """
+    live_params = []
+    if since:
+        live_where += " AND COALESCE(result_at, entry_at, logged_at, '') >= ?"
+        live_params.append(str(since))
+    live_rows = [dict(r) for r in con.execute(f"""
+        SELECT id, symbol, strategy_key, direction, result, pnl_pct, tags,
+               conviction, COALESCE(result_at, entry_at, logged_at) as ts,
+               json_extract(signal_json, '$.agent_regime') as agent_regime,
+               json_extract(signal_json, '$.volatility_regime') as volatility_regime,
+               COALESCE({live_flow_expr}, CASE
+                   WHEN (',' || COALESCE(tags,'') || ',') LIKE '%,flow_confirmed,%' THEN 1
+                   ELSE 0
+               END) as flow_confirmed
+        FROM signals
+        WHERE {live_where}
+        ORDER BY ts DESC
+        LIMIT 5000
+    """, live_params).fetchall()]
+
+    paper_where = "pt.status='closed' AND pt.pnl_pct IS NOT NULL"
+    paper_params = []
+    if since:
+        paper_where += " AND COALESCE(pt.closed_at, pt.opened_at, pt.queued_at, '') >= ?"
+        paper_params.append(str(since))
+    paper_rows = [dict(r) for r in con.execute(f"""
+        SELECT pt.id, pt.symbol, pt.strategy_key, pt.direction, pt.result,
+               pt.pnl_pct, {paper_pnl_usd_expr} as pnl_usd, {paper_size_expr} as size_usd,
+               pt.conviction, {paper_flow_expr} as flow_confirmed,
+               COALESCE(pt.closed_at, pt.opened_at, pt.queued_at) as ts,
+               json_extract(s.signal_json, '$.agent_regime') as agent_regime,
+               json_extract(s.signal_json, '$.volatility_regime') as volatility_regime
+        FROM paper_trades pt
+        LEFT JOIN signals s ON s.id = pt.signal_id
+        WHERE {paper_where}
+        ORDER BY ts DESC
+        LIMIT 5000
+    """, paper_params).fetchall()]
+    return {"live": live_rows, "paper": paper_rows}
+
+
+def _row_matches_suggestion_shadow(row: dict, suggestion: dict) -> bool:
+    strategy = suggestion.get("strategy")
+    if strategy and str(row.get("strategy_key") or "") != str(strategy):
+        return False
+    stype = suggestion.get("type")
+    payload = suggestion.get("api_payload") or {}
+    if stype == "threshold":
+        try:
+            threshold = float(suggestion.get("suggested_value") or payload.get("min_conviction"))
+            conviction = float(row.get("conviction") or 0)
+            return conviction < threshold
+        except Exception:
+            return False
+    if stype == "regime_suppress":
+        blocked = _normalize_agent_regime_list(payload.get("blocked_agent_regimes"))
+        regime = str(suggestion.get("regime") or "").strip().lower()
+        if regime and regime not in blocked:
+            blocked.append(regime)
+        allowed = payload.get("allowed_volatility")
+        if blocked:
+            return str(row.get("agent_regime") or "").strip().lower() in blocked
+        if isinstance(allowed, list) and allowed:
+            return str(row.get("volatility_regime") or "").strip().lower() not in {
+                str(v).strip().lower() for v in allowed
+            }
+    return False
+
+
+def _suggestion_shadow_title(suggestion: dict) -> str:
+    stype = suggestion.get("type")
+    strategy = suggestion.get("strategy") or "strategy"
+    if stype == "threshold":
+        return f"{strategy}: threshold >= {suggestion.get('suggested_value') or (suggestion.get('api_payload') or {}).get('min_conviction')}"
+    if stype == "regime_suppress":
+        regime = suggestion.get("regime") or ", ".join((suggestion.get("api_payload") or {}).get("blocked_agent_regimes") or [])
+        return f"{strategy}: suppress {regime or 'weak regime'}"
+    return suggestion.get("evidence_summary") or suggestion.get("id") or "Learner suggestion"
+
+
+def _suggestion_shadow_verdict(affected: dict, comparison: dict, target: int, suggestion: dict) -> dict:
+    n = int(affected.get("count") or 0)
+    avg = float(affected.get("avg_pnl") or 0.0)
+    wp = float(affected.get("win_partial_rate") or 0.0)
+    base_avg = float(comparison.get("avg_pnl") or 0.0)
+    if n < target:
+        return {
+            "status": "collecting",
+            "label": "Collecting",
+            "color": "blue",
+            "detail": f"{n}/{target} affected closed samples.",
+        }
+    if avg < 0 and avg < base_avg:
+        return {
+            "status": "ready_to_promote",
+            "label": "Ready To Promote",
+            "color": "green",
+            "detail": "Would-have affected slice is negative EV and worse than the comparison slice.",
+        }
+    if avg < base_avg or wp < 50:
+        return {
+            "status": "review",
+            "label": "Review",
+            "color": "amber",
+            "detail": "Affected slice is weaker, but the edge is not clean enough to promote automatically.",
+        }
+    return {
+        "status": "do_not_promote",
+        "label": "Do Not Promote",
+        "color": "red",
+        "detail": "Affected slice is not underperforming enough to justify applying this suggestion.",
+    }
+
+
+def _evaluate_suggestions_shadow(suggestions: list[dict], target: int, since: str | None = None) -> dict:
+    candidates = [
+        s for s in suggestions
+        if s.get("status") in {"pending", "pending_review", "evaluating", "shadow_evaluating"}
+        and s.get("type") in {"threshold", "regime_suppress"}
+    ]
+    if not candidates:
+        return {"target": target, "items": [], "summary": {"suggestion_count": 0, "paper_closed": 0, "live_closed": 0}}
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        rows_by_source = _suggestion_shadow_rows(con, since=since)
+    finally:
+        con.close()
+    items = []
+    for suggestion in candidates:
+        source_payload = {}
+        for source_name, rows in rows_by_source.items():
+            strategy = str(suggestion.get("strategy") or "")
+            affected = [r for r in rows if _row_matches_suggestion_shadow(r, suggestion)]
+            comparison = [
+                r for r in rows
+                if (not strategy or str(r.get("strategy_key") or "") == strategy)
+                and not _row_matches_suggestion_shadow(r, suggestion)
+            ]
+            affected_stats = _hypothesis_stats(affected)
+            comparison_stats = _hypothesis_stats(comparison)
+            source_payload[source_name] = {
+                "affected": affected_stats,
+                "comparison": comparison_stats,
+                "delta": {
+                    "avg_pnl": round(affected_stats["avg_pnl"] - comparison_stats["avg_pnl"], 2),
+                    "win_partial_rate": round(affected_stats["win_partial_rate"] - comparison_stats["win_partial_rate"], 1),
+                },
+                "recent_affected": affected[:8],
+                "verdict": _suggestion_shadow_verdict(affected_stats, comparison_stats, target, suggestion),
+            }
+        primary = source_payload["paper"] if source_payload["paper"]["affected"]["count"] else source_payload["live"]
+        items.append({
+            "suggestion_id": suggestion.get("id"),
+            "title": _suggestion_shadow_title(suggestion),
+            "status": suggestion.get("status"),
+            "type": suggestion.get("type"),
+            "strategy": suggestion.get("strategy"),
+            "target": target,
+            "expected": suggestion.get("expected_ev_label") or suggestion.get("expected_net_ev_delta") or suggestion.get("expected_trade_count_delta"),
+            "sources": source_payload,
+            "primary_verdict": primary["verdict"],
+        })
+    return {
+        "target": target,
+        "items": items,
+        "summary": {
+            "suggestion_count": len(items),
+            "paper_closed": len(rows_by_source.get("paper") or []),
+            "live_closed": len(rows_by_source.get("live") or []),
+        },
+    }
+
+
 @app.route("/api/intelligence/hypotheses")
 def api_intelligence_hypotheses():
     """Evaluate multiple shadow hypotheses in parallel without mutating config."""
@@ -8891,12 +9143,15 @@ def api_intelligence_suggestions():
                 pass
         goals = _load_goals()
         evaluation_window = int(goals.get('evaluation_window_trades') or 20)
+        shadow_target = int(request.args.get("shadow_target") or 50)
+        shadow_lab = _evaluate_suggestions_shadow(suggestions, shadow_target)
         return jsonify({
             'success': True,
             'suggestions': suggestions,
             'baseline': _suggestion_baseline_snapshot(),
             'learner_running': _learner_running(),
             'evaluation_window_trades': evaluation_window,
+            'shadow_lab': shadow_lab,
         })
     except Exception as e:
         return jsonify({
@@ -9065,6 +9320,48 @@ def api_suggestion_park(suggestion_id):
         return jsonify({"success": True, "parked": suggestion_id, "parked_at": parked_at})
     except Exception as e:
         print(f"[api/suggestion/park] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/intelligence/suggestions/<suggestion_id>/resume", methods=["POST"])
+def api_suggestion_resume(suggestion_id):
+    """Resume a parked suggestion into the concurrent shadow-evaluation lane."""
+    try:
+        suggestions = _load_suggestions()
+        suggestion = next((s for s in suggestions if s.get("id") == suggestion_id), None)
+        if not suggestion:
+            return jsonify({"success": False, "error": "Suggestion not found"}), 404
+        if suggestion.get("status") != "parked":
+            return jsonify({
+                "success": False,
+                "error": f"Status is {suggestion.get('status')}, not parked",
+            }), 409
+
+        resumed_at = datetime.utcnow().isoformat()
+        baseline = _suggestion_baseline_snapshot()
+        baseline["shadow_started_at"] = resumed_at
+        extra = {
+            "shadow_baseline": baseline,
+            "shadow_started_at": resumed_at,
+            "resumed_at": resumed_at,
+            "previous_status": "parked",
+            "shadow_mode": True,
+        }
+        if not _update_suggestion_status(suggestion_id, "shadow_evaluating", extra):
+            return jsonify({"success": False, "error": "Failed to update suggestion"}), 500
+        _append_experiment_record({
+            "id": suggestion_id,
+            "type": "suggestion_shadow_resumed",
+            "strategy": suggestion.get("strategy"),
+            "suggestion_type": suggestion.get("type"),
+            "resumed_at": resumed_at,
+            "shadow_baseline": baseline,
+            "parked_at": suggestion.get("parked_at"),
+            "park_reason": suggestion.get("park_reason"),
+        })
+        return jsonify({"success": True, "resumed": suggestion_id, "status": "shadow_evaluating", "shadow_baseline": baseline})
+    except Exception as e:
+        print(f"[api/suggestion/resume] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -11558,6 +11855,23 @@ def _edge_alignment_from_matches(matches: list[dict]) -> dict:
     return {"label": label, "score": score, "best_edge_delta": round(best, 2)}
 
 
+def _ensure_edge_lab_indexes(con: sqlite3.Connection) -> None:
+    """Create the indexes needed by paper cohort attribution, lazily."""
+    global _EDGE_LAB_INDEX_READY
+    if _EDGE_LAB_INDEX_READY:
+        return
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cf_symbol_timeframe_ts
+        ON candle_features (symbol, timeframe, timestamp)
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cf_timestamp
+        ON candle_features (timestamp)
+    """)
+    con.commit()
+    _EDGE_LAB_INDEX_READY = True
+
+
 @app.route("/api/paper/cohort-edge")
 def api_paper_cohort_edge():
     """Attribute paper cohort trades to Edge Lab factor states.
@@ -11595,6 +11909,7 @@ def api_paper_cohort_edge():
 
         edge_con = sqlite3.connect(EDGE_LAB_DB_PATH)
         edge_con.row_factory = sqlite3.Row
+        _ensure_edge_lab_indexes(edge_con)
         max_ts_row = edge_con.execute("SELECT MAX(timestamp) FROM candle_features").fetchone()
         edge_max_ts = int(max_ts_row[0]) if max_ts_row and max_ts_row[0] is not None else None
 
