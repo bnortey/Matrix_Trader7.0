@@ -10551,6 +10551,36 @@ function sectionBlock(title, body) {
   </div>`;
 }
 
+function renderActionMatrix(matrix) {
+  if (!matrix) return '';
+  const posture = matrix.posture || 'selective';
+  const postureColor = posture === 'wait' ? 'var(--muted)' : posture === 'defensive' ? 'var(--amber)' : posture === 'investigate' ? 'var(--blue)' : 'var(--green)';
+  const rows = (title, items, empty, color) => `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:6px;padding:10px;min-width:0;">
+    <div style="font-size:10px;color:${color};text-transform:uppercase;letter-spacing:.08em;margin-bottom:7px;">${title}</div>
+    ${(items || []).length ? (items || []).map(x => `<div style="border-top:1px solid rgba(255,255,255,.05);padding:7px 0 0;margin-top:7px;">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;">
+        <b style="font-size:12px;color:var(--text);">${esc(x.label || 'Review')}</b>
+        <span style="font-family:var(--mono);font-size:11px;color:${color};">${esc(x.symbol || '')}</span>
+      </div>
+      <div style="font-size:11px;color:var(--text2);line-height:1.45;margin-top:3px;">${esc(x.reason || '')}</div>
+      <div style="font-size:10px;color:#667085;line-height:1.4;margin-top:4px;">Next: ${esc(x.next_step || '')}</div>
+    </div>`).join('') : `<div style="font-size:12px;color:var(--muted);">${empty}</div>`}
+  </div>`;
+  return `<div style="margin-bottom:12px;">
+    <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:6px;padding:10px;margin-bottom:8px;">
+      <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Trader Action Matrix</div>
+      <div style="font-size:18px;font-weight:800;color:${postureColor};text-transform:uppercase;">${esc(posture)}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">Advisory only. Report notes cannot create trades; only fresh MT7 signals can become candidates.</div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px;">
+      ${rows('Review / Act On', matrix.actions, 'No immediate review actions.', 'var(--green)')}
+      ${rows('Watchlist', matrix.watchlist, 'No coiling watchlist items.', 'var(--blue)')}
+      ${rows('Avoid / De-risk', matrix.avoid, 'No avoid buckets flagged.', 'var(--amber)')}
+      ${rows('Investigate', matrix.investigations, 'No investigation items.', 'var(--red)')}
+    </div>
+  </div>`;
+}
+
 function getISOWeek(date) {
   const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
   d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
@@ -10670,6 +10700,7 @@ function renderReportPanel() {
     </div>
     <div style="font-size:12px;color:var(--muted);margin-bottom:10px;">Generated ${esc(I.report.generated_at || '—')} · Narrative: ${esc(narrativeLabel)}</div>
     ${sectionBlock('Thomas Reeves — Opening Note', `<div style="font-size:13px;color:var(--text2);line-height:1.55;">${esc(n.trader_open || 'Data-only report. Narrative generated from Matrix Trader data.')}</div>`)}
+    ${renderActionMatrix(d.action_matrix)}
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">
       ${reportMetric('Signals', pulse.signals ?? 0)}
       ${reportMetric('Blocked', pulse.blocked ?? 0)}

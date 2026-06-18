@@ -9608,6 +9608,156 @@ def _report_count_funding_extremes(data: dict) -> tuple[int, int]:
     return neg, pos
 
 
+def _build_report_action_matrix(data: dict) -> dict:
+    """Convert report observations into trader-facing actions without inventing entries."""
+    pulse = data.get("market_pulse") or {}
+    paper = data.get("paper_desk") or {}
+    explosive = data.get("explosive_move") or {}
+    explosive_ctx = data.get("explosive_signal_context") or {}
+    coiling = data.get("whats_coiling") or []
+    disagreements = data.get("disagreements") or []
+    blocked = data.get("blocked") or []
+    strategy_perf = data.get("strategy_regime_perf") or []
+    neg_funding, pos_funding = _report_count_funding_extremes(data)
+
+    actions: list[dict] = []
+    watchlist: list[dict] = []
+    avoid: list[dict] = []
+    investigations: list[dict] = []
+
+    posture = "selective"
+    if not int(pulse.get("signals") or 0):
+        posture = "wait"
+    if int(pulse.get("blocked") or 0) or disagreements:
+        posture = "defensive"
+    if explosive and not explosive_ctx.get("had_signal") and not explosive_ctx.get("was_blocked"):
+        posture = "investigate"
+
+    if explosive:
+        sym = explosive.get("symbol")
+        move = _report_float(explosive.get("change_24h_pct"))
+        fr = _report_float(explosive.get("funding_rate"))
+        if explosive_ctx.get("had_signal"):
+            actions.append({
+                "label": "Review MT7 Signal",
+                "symbol": sym,
+                "priority": "high",
+                "reason": (
+                    f"Explosive mover was on the signal list as {explosive_ctx.get('signal_direction')} "
+                    f"at conviction {explosive_ctx.get('signal_conviction')}."
+                ),
+                "next_step": "Open the signal/trade detail and compare entry timing, funding, volume, and stop distance before considering any manual action.",
+            })
+        elif explosive_ctx.get("was_blocked"):
+            avoid.append({
+                "label": "Respect Risk Gate",
+                "symbol": sym,
+                "reason": f"Explosive mover was blocked by {explosive_ctx.get('block_gate')}.",
+                "next_step": "Do not override the gate from the report. Review only after the gate condition clears on a fresh scan.",
+            })
+        else:
+            investigations.append({
+                "label": "Missed Mover Review",
+                "symbol": sym,
+                "reason": f"{sym} moved {move:+.2f}% with funding {fr:.5f} but had no MT7 signal or block record.",
+                "next_step": "Check whether the move lacked structure at scan time, happened between scans, or exposed a missing feature.",
+            })
+
+    for item in coiling[:4]:
+        sym = item.get("symbol")
+        watch = item.get("watch") or "funding unwind"
+        rate = _report_float(item.get("funding_rate"))
+        watchlist.append({
+            "label": watch,
+            "symbol": sym,
+            "reason": f"Funding is extreme at {rate:.5f} while price has not fully resolved.",
+            "next_step": "Wait for a fresh MT7 signal or visible volume expansion; do not trade the funding read alone.",
+        })
+
+    if neg_funding or pos_funding:
+        actions.append({
+            "label": "Funding Crowding Scan",
+            "symbol": "market",
+            "priority": "medium",
+            "reason": f"{neg_funding} extreme negative and {pos_funding} extreme positive funding buckets are active.",
+            "next_step": "Favor setups where funding crowding aligns with price structure and order-flow confirmation.",
+        })
+
+    weak_perf = []
+    for r in strategy_perf:
+        good = int(r.get("win") or 0) + int(r.get("partial") or 0)
+        total = good + int(r.get("loss") or 0)
+        if total >= 5 and good / total < 0.45:
+            weak_perf.append({
+                "strategy": r.get("strategy"),
+                "regime": r.get("regime"),
+                "good": good,
+                "total": total,
+            })
+    for r in weak_perf[:3]:
+        avoid.append({
+            "label": "Weak Strategy/Regime Bucket",
+            "symbol": str(r.get("strategy") or "strategy"),
+            "reason": f"{r.get('strategy')} in {r.get('regime')} is {r.get('good')}/{r.get('total')} W+P in the recent report window.",
+            "next_step": "Treat matching signals as review-only unless the current setup has stronger independent confirmation.",
+        })
+
+    closed = int(paper.get("closed") or 0)
+    avg_pnl = _report_float(paper.get("avg_pnl_pct"))
+    if closed:
+        investigations.append({
+            "label": "Paper Cohort Check",
+            "symbol": "paper",
+            "reason": f"Recent paper desk has {closed} closed trades at {avg_pnl:+.2f}% average P&L.",
+            "next_step": "Use the Paper tab cohort gates, not this daily report alone, to decide promotion.",
+        })
+
+    return {
+        "posture": posture,
+        "actions": actions[:5],
+        "watchlist": watchlist[:6],
+        "avoid": avoid[:5],
+        "investigations": investigations[:5],
+        "rules": [
+            "Reports are advisory; only fresh MT7 signals can become trade candidates.",
+            "No report note may create a trade if the signal engine did not produce one.",
+            "Use paper cohort gates for promotion decisions.",
+        ],
+    }
+
+
+def _sanitize_report_narrative(narrative: dict, data: dict) -> dict:
+    """Strip action-inventing language from AI-polished report notes."""
+    clean = dict(narrative or {})
+    explosive = data.get("explosive_move") or {}
+    explosive_ctx = data.get("explosive_signal_context") or {}
+    no_signal = bool(explosive) and not explosive_ctx.get("had_signal")
+    banned = [
+        "i'm opening", "i am opening", "open a long", "open a short",
+        "i'd open", "i would open", "enter long", "enter short",
+        "go long", "go short", "shorting ", "longing ",
+    ]
+    for key, value in list(clean.items()):
+        if not isinstance(value, str):
+            continue
+        low = value.lower()
+        if any(term in low for term in banned):
+            if no_signal:
+                sym = explosive.get("symbol") or "the explosive mover"
+                clean[key] = (
+                    f"{sym} moved sharply, but MT7 did not produce a trade signal for it in this report window. "
+                    "Treat it as a missed-mover review, not an entry. Wait for a fresh signal, risk-gate context, and order-flow confirmation."
+                )
+            else:
+                clean[key] = re.sub(
+                    r"\b(?:I[' ]?m|I am|I'd|I would)?\s*(?:opening|open|enter|go)\s+(?:a\s+)?(?:long|short)\b",
+                    "reviewing the setup",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+    return clean
+
+
 def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> dict:
     """
     No-cost Cipher desk notes built directly from report data.
@@ -9847,7 +9997,7 @@ def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> d
 
         continuation_call = "Watch for volume to expand on the next hourly candle — that's continuation. If volume collapses, the move was a wick, not a trend."
         if vol_label in ("institutional-grade", "decent") and abs(exp_change) > 5:
-            continuation_call = "High-volume, large-move combination has continuation odds in its favor. Monitor for a retest of the breakout level — that's the entry I'd want, not the breakout itself."
+            continuation_call = "High-volume, large-move combination deserves follow-up, but not a chase. Monitor for a retest of the breakout level and require a fresh MT7 signal before treating it as actionable."
 
         narrative["microstructure_autopsy"] = (
             f"I care less about the candle size and more about what was behind it. "
@@ -9858,7 +10008,7 @@ def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> d
         narrative["microstructure_autopsy"] = (
             f"No single move demanded an autopsy today. "
             f"The standing rule: volume proportional to move size is continuation. Volume mismatched to move size is trap. "
-            f"If a name appears on the signal list with thin order book depth, drop size by half — the spread will eat the edge."
+            f"If a name appears on the signal list with thin order book depth, treat it as a sizing and slippage review before considering any manual action."
         )
 
     # --- Ghost: cross_venue_autopsy — venue leader, arb gap implications ---
@@ -9890,7 +10040,7 @@ def _build_deterministic_report_narrative(data: dict, weekly: bool = False) -> d
         narrative["cross_venue_autopsy"] = (
             f"{exp_sym} moved {exp_change:+.1f}%. {venue_note} "
             f"As Bybit comes back online in this stack, three-venue agreement will become the gold standard. "
-            f"Until then: two-venue confirmation is strong enough to trade; single-venue requires tighter stops."
+            f"Until then: two-venue confirmation is stronger evidence; single-venue moves should stay in review mode unless a fresh MT7 signal confirms them."
         )
     else:
         narrative["cross_venue_autopsy"] = (
@@ -9983,11 +10133,15 @@ def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool, str]:
             "disagreements": data.get("disagreements", [])[:4],
             "strategy_regime_perf": data.get("strategy_regime_perf", [])[:8],
             "paper_desk": data.get("paper_desk", {}),
+            "action_matrix": data.get("action_matrix", {}),
         }
         system = (
             f"You are the editorial desk for {FIRM_META['name']}. Return only JSON. "
             "Write concise institutional crypto research notes for retail traders. "
-            "Do not imitate copyrighted dialogue; use the broad voice traits provided."
+            "Do not imitate copyrighted dialogue; use the broad voice traits provided. "
+            "Never claim you are opening, entering, longing, shorting, buying, or selling. "
+            "Use only advisory verbs: review, watch, wait, avoid, investigate. "
+            "If the explosive mover has no MT7 signal, call it a missed-mover review, not an entry."
         )
         requested = [
             ("trader_open", AGENT_ROSTER["trader"]),
@@ -10011,7 +10165,8 @@ def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool, str]:
             "Market data:\n"
             f"{json.dumps(compact, default=str)}\n\n"
             "Write one 35-80 word first-person note for each analyst using the data above. "
-            "Reference specific numbers, symbols, or rates from the data. End each note with a forward call.\n\n"
+            "Reference specific numbers, symbols, or rates from the data. End each note with a forward call. "
+            "Do not create trade instructions; reports cannot authorize entries.\n\n"
             "Analyst voices:\n"
             f"{analyst_guide}\n\n"
             "Return only this JSON with your notes as the values (no extra text):\n"
@@ -10030,7 +10185,8 @@ def _call_report_ai(data: dict, weekly: bool = False) -> tuple[dict, bool, str]:
             clean = clean.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         parsed = json.loads(clean)
         if isinstance(parsed, dict):
-            return _merge_report_narrative(narrative, parsed), True, "ai"
+            merged = _merge_report_narrative(narrative, parsed)
+            return _sanitize_report_narrative(merged, data), True, "ai"
     except Exception as e:
         print(f"[report_ai] {e}", file=sys.stderr)
     return narrative, False, "deterministic"
@@ -10203,7 +10359,7 @@ def _build_daily_data(date_str: str, ticker_snapshot: list[dict] | None = None) 
     explosive_sym = (explosive_move or {}).get("symbol", "")
     explosive_signal_context = _report_explosive_signal_context(explosive_sym, date_str)
     coiling_base_rates = _report_coiling_base_rates(coiling, date_str)
-    return {
+    report_data = {
         "date": date_str,
         "market_pulse": {
             "signals": len(signals),
@@ -10233,6 +10389,8 @@ def _build_daily_data(date_str: str, ticker_snapshot: list[dict] | None = None) 
         "paper_desk": paper_desk,
         "learner": _report_read_learner_files(),
     }
+    report_data["action_matrix"] = _build_report_action_matrix(report_data)
+    return report_data
 
 
 def _report_read_learner_files() -> dict:
