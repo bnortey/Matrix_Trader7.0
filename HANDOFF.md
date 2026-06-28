@@ -614,6 +614,16 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 
 ## Session Notes
 
+### 2026-06-28 — Session summary (drawdown audit fix + Hermes rerun)
+
+- Audited the June 28 Hermes memo claim that paper drawdown was `129.93%`. Root cause was `_compute_goal_actuals()` using total paper P&L divided by starting balance as `drawdown_pct`; that value was actually account return.
+- Added true fixed-dollar peak-to-trough paper equity metrics: `return_pct`, `peak_value_usd`, `max_drawdown_usd`, `drawdown_peak_at`, and `drawdown_trough_at`. `/api/paper/account`, `/api/goals`, and `/api/intelligence/hermes` now report real drawdown separately from return.
+- Updated paper safety controls to use true peak-to-trough drawdown instead of total P&L vs starting balance.
+- Tightened `scale_up_ready`: EV/sample/drawdown must pass, paper cohort must have enough trades, W+P >= 55%, profit factor >= 1.25, and no active paper safety controls. The API now exposes `scale_up_blockers`, `active_safety_controls`, and paper cohort gate stats.
+- Updated the Goals dashboard drawdown tile to display drawdown as a positive risk percentage and show peak/max-loss context.
+- Deployed to production `207.148.66.39` and restarted `matrix-trader`. Production verified: `current_value_usd=459.86`, `return_pct=129.93`, `drawdown_pct=13.51`, `max_drawdown_usd=51.40`, `peak_value_usd=491.25`, `scale_up_ready=false`, blocker `active paper safety control`.
+- Triggered a fresh Hermes run. New memo generated at `2026-06-28T23:28:41Z` now says `Cautious Improvement — Drawdown Contained`, reports drawdown `13.51%`, and correctly says not to scale while the active cold-streak paper safety control is present.
+
 ### 2026-06-12 — Session summary (paper reset hardening + Hermes yellow flag review)
 
 - Reviewed the June 12 Hermes memo. Verdict is Cautious Hold / Yellow Flag: reported account growth is strong, but drawdown breach and paper/live EV divergence override scale-up optimism.

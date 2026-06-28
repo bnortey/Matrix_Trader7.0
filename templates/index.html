@@ -6078,7 +6078,8 @@ async function loadGoalBenchmark() {
 
     const dd = Number(a.drawdown_pct || 0);
     const ddLimit = Number(g.max_drawdown_pct || 40);
-    const ddColor = dd <= -ddLimit * 0.75 ? 'var(--red)' : dd <= -ddLimit * 0.4 ? 'var(--amber)' : 'var(--green)';
+    const ddColor = dd >= ddLimit * 0.75 ? 'var(--red)' : dd >= ddLimit * 0.4 ? 'var(--amber)' : 'var(--green)';
+    const ddLabel = Number.isFinite(dd) ? dd.toFixed(1) + '%' : 'No data';
 
     let pendingCount = 0;
     if (suggestionsResp.status === 'fulfilled') {
@@ -6096,11 +6097,13 @@ async function loadGoalBenchmark() {
       </div>`;
     }
     if (a.kill_switch_breached) {
-      alertHtml += `<div style="margin-top:8px;padding:8px 10px;background:#1b0808;border:1px solid #5f1b1b;border-radius:5px;font-size:11px;color:#fca5a5;">Kill zone breached. Drawdown is beyond -${ddLimit.toFixed(0)}%.</div>`;
+      alertHtml += `<div style="margin-top:8px;padding:8px 10px;background:#1b0808;border:1px solid #5f1b1b;border-radius:5px;font-size:11px;color:#fca5a5;">Kill zone breached. Drawdown is beyond ${ddLimit.toFixed(0)}%.</div>`;
     }
     if (a.scale_up_ready) {
       const trigger = g.scale_up_trigger || {};
       alertHtml += `<div style="margin-top:8px;padding:8px 10px;background:#07180f;border:1px solid #14532d;border-radius:5px;font-size:11px;color:#86efac;">Scale-up trigger reached: EV is above ${trigger.ev_threshold_pct || 8}% across ${a.ev_sample_n || 0} trades.</div>`;
+    } else if ((a.scale_up_blockers || []).length) {
+      alertHtml += `<div style="margin-top:8px;padding:8px 10px;background:#14100a;border:1px solid #4a3518;border-radius:5px;font-size:11px;color:#f6c453;">Scale-up blocked: ${esc((a.scale_up_blockers || []).slice(0, 2).join('; '))}.</div>`;
     }
 
     el.innerHTML = `<div style="margin:12px 0 14px;">
@@ -6113,7 +6116,7 @@ async function loadGoalBenchmark() {
         ${gbTile('Monthly Return', gbSigned(monthly), `Goal ${monthlyTarget.toFixed(0)}%`, monthlyColor, gbProgress(Math.max(0, monthly), monthlyTarget), `${gbFmtMoney(a.month_pnl_usd || 0)} this month`)}
         ${gbTile('EV / Trade', gbSigned(ev), evSub, evColor, ev == null ? 0 : gbProgress(Math.abs(ev), evTarget), `Target +${evTarget.toFixed(1)}%`)}
         ${gbTile('Win + Partial', wrPct, wr == null ? '' : `${a.win_partial_sample_n || 0} closed`, wrColor, wr == null ? 0 : wr * 100, `Floor ${(wrFloor * 100).toFixed(0)}%`)}
-        ${gbTile('Drawdown', gbSigned(dd), `Kill zone -${ddLimit.toFixed(0)}%`, ddColor, gbProgress(Math.abs(dd), ddLimit), `Limit ${gbFmtMoney(starting * ddLimit / 100)}`)}
+        ${gbTile('Drawdown', ddLabel, `Kill zone ${ddLimit.toFixed(0)}%`, ddColor, gbProgress(dd, ddLimit), `Peak ${gbFmtMoney(a.peak_value_usd || current)} / max loss ${gbFmtMoney(a.max_drawdown_usd || 0)}`)}
       </div>
       ${alertHtml}
     </div>`;

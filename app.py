@@ -301,6 +301,82 @@ def _save_goals(goals: dict) -> None:
     os.replace(tmp, GOALS_PATH)
 
 
+def _paper_equity_metrics(rows, starting_balance: float) -> dict:
+    """Return fixed-dollar paper equity and peak-to-trough drawdown metrics."""
+    balance = float(starting_balance or 0.0)
+    peak = balance
+    max_drawdown_pct = 0.0
+    max_drawdown_usd = 0.0
+    peak_at = None
+    trough_at = None
+    current_peak_at = None
+
+    for row in rows:
+        size_usd = float(row[0] or 0.0)
+        pnl_pct = float(row[1] or 0.0)
+        closed_at = row[2] if len(row) > 2 else None
+        balance += size_usd * pnl_pct / 100.0
+
+        if balance > peak:
+            peak = balance
+            current_peak_at = closed_at
+
+        drawdown_usd = max(0.0, peak - balance)
+        drawdown_pct = (drawdown_usd / peak * 100.0) if peak > 0 else 0.0
+        if drawdown_pct > max_drawdown_pct:
+            max_drawdown_pct = drawdown_pct
+            max_drawdown_usd = drawdown_usd
+            peak_at = current_peak_at
+            trough_at = closed_at
+
+    total_pnl_usd = balance - float(starting_balance or 0.0)
+    return {
+        "current_value_usd": round(balance, 2),
+        "total_pnl_usd": round(total_pnl_usd, 2),
+        "return_pct": round((total_pnl_usd / starting_balance) * 100.0, 2) if starting_balance else 0.0,
+        "peak_value_usd": round(peak, 2),
+        "max_drawdown_usd": round(max_drawdown_usd, 2),
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "drawdown_peak_at": peak_at,
+        "drawdown_trough_at": trough_at,
+    }
+
+
+def _paper_scale_stats(rows) -> dict:
+    """Return paper cohort stats used as hard gates for scale-up readiness."""
+    count = len(rows)
+    wins = 0
+    partials = 0
+    gains_usd = 0.0
+    losses_usd = 0.0
+
+    for row in rows:
+        result = str(row[0] or "").upper()
+        size_usd = float(row[1] or 0.0)
+        pnl_pct = float(row[2] or 0.0)
+        pnl_usd = size_usd * pnl_pct / 100.0
+        if result in {"WIN", "TP3"}:
+            wins += 1
+        elif result == "PARTIAL":
+            partials += 1
+        if pnl_usd > 0:
+            gains_usd += pnl_usd
+        elif pnl_usd < 0:
+            losses_usd += abs(pnl_usd)
+
+    profit_factor = None
+    if losses_usd > 0:
+        profit_factor = gains_usd / losses_usd
+    elif gains_usd > 0:
+        profit_factor = 999.0
+
+    return {
+        "count": count,
+        "win_partial_rate": round((wins + partials) / count, 4) if count else None,
+        "profit_factor": round(profit_factor, 2) if profit_factor is not None else None,
+    }
+
+
 def _load_suggestions_data() -> dict:
     try:
         with open(LEARNER_PENDING_PATH, encoding="utf-8") as f:
@@ -392,11 +468,15 @@ def _compute_goal_actuals(goals: dict) -> dict:
         con = sqlite3.connect(DB_PATH)
 
         rows = con.execute(
-            "SELECT size_usd, pnl_pct FROM paper_trades WHERE status='closed' AND pnl_pct IS NOT NULL"
+            "SELECT size_usd, pnl_pct, closed_at FROM paper_trades "
+            "WHERE status='closed' AND pnl_pct IS NOT NULL "
+            "ORDER BY closed_at ASC, id ASC"
         ).fetchall()
-        total_pnl_usd = sum((r[0] or 0) * (r[1] or 0) / 100 for r in rows)
-        current_value = round(account_balance + total_pnl_usd, 2)
-        drawdown_pct = round((total_pnl_usd / account_balance) * 100, 2) if account_balance else 0
+        equity = _paper_equity_metrics(rows, account_balance)
+        total_pnl_usd = float(equity.get("total_pnl_usd") or 0.0)
+        current_value = float(equity.get("current_value_usd") or account_balance)
+        return_pct = float(equity.get("return_pct") or 0.0)
+        drawdown_pct = float(equity.get("max_drawdown_pct") or 0.0)
 
         month_rows = con.execute(
             "SELECT size_usd, pnl_pct FROM paper_trades "
@@ -446,17 +526,56 @@ def _compute_goal_actuals(goals: dict) -> dict:
             else:
                 break
 
-        scale_trigger = goals.get("scale_up_trigger", {})
-        scale_ready = (
-            ev_per_trade is not None
-            and ev_per_trade >= float(scale_trigger.get("ev_threshold_pct", 8.0))
-            and ev_sample_n >= int(scale_trigger.get("min_trades", 50))
-        )
+        cfg = _load_paper_config()
+        cohort_started_at = cfg.get("current_cohort_started_at")
+        if cohort_started_at:
+            cohort_rows = con.execute(
+                "SELECT result, size_usd, pnl_pct FROM paper_trades "
+                "WHERE status='closed' AND result IS NOT NULL AND pnl_pct IS NOT NULL "
+                "AND closed_at >= ?",
+                (str(cohort_started_at),),
+            ).fetchall()
+        else:
+            cohort_rows = con.execute(
+                "SELECT result, size_usd, pnl_pct FROM paper_trades "
+                "WHERE status='closed' AND result IS NOT NULL AND pnl_pct IS NOT NULL"
+            ).fetchall()
+        paper_scale = _paper_scale_stats(cohort_rows)
 
         con.close()
+
+        safety = _paper_safety_controls(cfg)
+        active_safety_controls = list(safety.get("reasons") or [])
+
+        scale_trigger = goals.get("scale_up_trigger", {})
+        max_drawdown_pct = abs(float(goals.get("max_drawdown_pct", 40.0)))
+        ev_threshold = float(scale_trigger.get("ev_threshold_pct", 8.0))
+        min_trades = int(scale_trigger.get("min_trades", 50))
+        cohort_min_trades = int(goals.get("evaluation_window_trades", 20))
+        cohort_wp_floor = 0.55
+        cohort_pf_floor = 1.25
+        scale_blockers = []
+
+        if ev_per_trade is None or ev_per_trade < ev_threshold:
+            scale_blockers.append(f"live EV below {ev_threshold:.1f}%")
+        if ev_sample_n < min_trades:
+            scale_blockers.append(f"live EV sample below {min_trades} trades")
+        if drawdown_pct >= max_drawdown_pct:
+            scale_blockers.append(f"drawdown {drawdown_pct:.1f}% >= {max_drawdown_pct:.1f}% limit")
+        if active_safety_controls:
+            scale_blockers.append("active paper safety control")
+        if paper_scale["count"] < cohort_min_trades:
+            scale_blockers.append(f"paper cohort below {cohort_min_trades} trades")
+        if paper_scale["win_partial_rate"] is None or paper_scale["win_partial_rate"] < cohort_wp_floor:
+            scale_blockers.append(f"paper cohort W+P below {cohort_wp_floor * 100:.0f}%")
+        if paper_scale["profit_factor"] is None or paper_scale["profit_factor"] < cohort_pf_floor:
+            scale_blockers.append(f"paper cohort PF below {cohort_pf_floor:.2f}")
+
+        scale_ready = not scale_blockers
         return {
             "current_value_usd":    current_value,
             "total_pnl_usd":        round(total_pnl_usd, 2),
+            "return_pct":           return_pct,
             "monthly_return_pct":   monthly_return_pct,
             "month_pnl_usd":        round(month_pnl_usd, 2),
             "ev_per_trade_pct":     ev_per_trade,
@@ -466,9 +585,19 @@ def _compute_goal_actuals(goals: dict) -> dict:
             "win_partial_rate":     win_partial_rate,
             "win_partial_sample_n": len(wr_results),
             "drawdown_pct":         drawdown_pct,
+            "max_drawdown_pct":     drawdown_pct,
+            "max_drawdown_usd":     equity.get("max_drawdown_usd"),
+            "peak_value_usd":       equity.get("peak_value_usd"),
+            "drawdown_peak_at":     equity.get("drawdown_peak_at"),
+            "drawdown_trough_at":   equity.get("drawdown_trough_at"),
             "consecutive_losses":   streak,
             "scale_up_ready":       scale_ready,
-            "kill_switch_breached": drawdown_pct <= -abs(float(goals.get("max_drawdown_pct", 40.0))),
+            "scale_up_blockers":     scale_blockers,
+            "active_safety_controls": active_safety_controls,
+            "paper_cohort_sample_n": paper_scale["count"],
+            "paper_cohort_win_partial_rate": paper_scale["win_partial_rate"],
+            "paper_cohort_profit_factor": paper_scale["profit_factor"],
+            "kill_switch_breached": drawdown_pct >= max_drawdown_pct,
         }
     except Exception as e:
         print(f"[goals] compute error: {e}", file=sys.stderr)
@@ -11342,16 +11471,15 @@ def _paper_safety_controls(cfg: dict) -> dict:
 
         # 2. Drawdown risk reduction
         pnl_rows = con.execute(
-            "SELECT size_usd, pnl_pct FROM paper_trades "
-            "WHERE status='closed' AND pnl_pct IS NOT NULL"
+            "SELECT size_usd, pnl_pct, closed_at FROM paper_trades "
+            "WHERE status='closed' AND pnl_pct IS NOT NULL "
+            "ORDER BY closed_at ASC, id ASC"
         ).fetchall()
-        total_pnl_usd = sum(float(r[0]) * float(r[1]) / 100.0 for r in pnl_rows)
-        if total_pnl_usd < 0 and account_balance > 0:
-            drawdown_pct = abs(total_pnl_usd) / account_balance * 100.0
-            if drawdown_pct >= drawdown_thresh:
-                overage = drawdown_pct - drawdown_thresh
-                risk_multiplier = max(0.4, 1.0 - overage / 100.0)
-                reasons.append(f"drawdown {drawdown_pct:.1f}% → risk ×{risk_multiplier:.2f}")
+        drawdown_pct = float(_paper_equity_metrics(pnl_rows, account_balance).get("max_drawdown_pct") or 0.0)
+        if drawdown_pct >= drawdown_thresh:
+            overage = drawdown_pct - drawdown_thresh
+            risk_multiplier = max(0.4, 1.0 - overage / 100.0)
+            reasons.append(f"drawdown {drawdown_pct:.1f}% → risk ×{risk_multiplier:.2f}")
 
         # 3. Cold streak → elevated flow score
         recent_results = con.execute(
@@ -12414,9 +12542,14 @@ def api_paper_account():
                 "starting_balance_usd": goals.get("account_balance_usd"),
                 "current_value_usd":    actuals.get("current_value_usd"),
                 "total_pnl_usd":        actuals.get("total_pnl_usd"),
+                "return_pct":           actuals.get("return_pct"),
                 "monthly_return_pct":   actuals.get("monthly_return_pct"),
                 "month_pnl_usd":        actuals.get("month_pnl_usd"),
                 "drawdown_pct":         actuals.get("drawdown_pct"),
+                "max_drawdown_usd":     actuals.get("max_drawdown_usd"),
+                "peak_value_usd":       actuals.get("peak_value_usd"),
+                "drawdown_peak_at":     actuals.get("drawdown_peak_at"),
+                "drawdown_trough_at":   actuals.get("drawdown_trough_at"),
                 "kill_switch_breached": actuals.get("kill_switch_breached"),
             },
             "actuals": actuals,
