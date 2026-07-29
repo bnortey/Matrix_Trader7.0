@@ -10176,6 +10176,408 @@ def api_signals_history():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+COACH_REVIEW_VERSION = "coach-v2-evidence"
+
+
+def _sanitize_coach_review_text(value: str | None) -> tuple[str, dict]:
+    """Remove provider reasoning/preambles without rewriting the review."""
+    original = str(value or "").strip()
+    if not original:
+        return "", {
+            "reasoning_removed": False,
+            "preamble_removed": False,
+            "original_chars": 0,
+            "clean_chars": 0,
+        }
+
+    cleaned = re.sub(
+        r"<think\b[^>]*>.*?</think\s*>",
+        "",
+        original,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    reasoning_removed = cleaned != original
+    # Some providers were interrupted before emitting </think>. Never expose
+    # an unterminated reasoning block; the evidence packet supplies a safe
+    # deterministic narrative when no final answer remains.
+    open_reasoning = re.search(r"<think\b[^>]*>", cleaned, flags=re.IGNORECASE)
+    if open_reasoning:
+        cleaned = cleaned[:open_reasoning.start()].strip()
+        reasoning_removed = True
+    cleaned = re.sub(r"</?think\s*>", "", cleaned, flags=re.IGNORECASE).strip()
+    if cleaned.startswith("```") and cleaned.endswith("```"):
+        cleaned = re.sub(r"^```(?:text|markdown)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    preamble_removed = False
+    preamble = re.compile(
+        r"^(?:okay|alright|sure|let(?:'|’)s|let me|here(?:'|’)s|here is|"
+        r"i(?:'|’)ll|i will|to begin|starting with|the user)\b",
+        re.IGNORECASE,
+    )
+    lines = cleaned.splitlines()
+    while lines and preamble.search(lines[0].strip()):
+        lines.pop(0)
+        preamble_removed = True
+    cleaned = "\n".join(lines).strip()
+    return cleaned, {
+        "reasoning_removed": reasoning_removed,
+        "preamble_removed": preamble_removed,
+        "original_chars": len(original),
+        "clean_chars": len(cleaned),
+    }
+
+
+def _coach_journey_from_signal_json(sig_json_obj: dict) -> dict:
+    available = bool(sig_json_obj.get("journey_available"))
+    if not available and not any(
+        key in sig_json_obj
+        for key in (
+            "journey_mae_pct",
+            "journey_mfe_pct",
+            "journey_path_label",
+        )
+    ):
+        return {"available": False, "reason": "stored journey metrics unavailable"}
+    target_hits = {}
+    for target in ("tp1", "tp2", "tp3"):
+        if sig_json_obj.get(f"journey_{target}_hit"):
+            target_hits[target] = "recorded"
+    return {
+        "available": available,
+        "mae_pct": sig_json_obj.get("journey_mae_pct"),
+        "mfe_pct": sig_json_obj.get("journey_mfe_pct"),
+        "capture_ratio_pct": sig_json_obj.get("journey_capture_ratio"),
+        "stop_pressure_pct": sig_json_obj.get("journey_stop_pressure"),
+        "path_label": sig_json_obj.get("journey_path_label") or "path_unclassified",
+        "entry_delay_minutes": sig_json_obj.get("journey_entry_delay_min"),
+        "entry_to_close_minutes": sig_json_obj.get("journey_entry_to_close_min"),
+        "target_hits": target_hits,
+    }
+
+
+def _coach_funding_read(sig: dict) -> dict:
+    direction = str(sig.get("direction") or "").upper()
+    try:
+        rate = float(sig.get("funding_rate") or 0.0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    annualized = abs(rate) * 3 * 365 * 100
+    if abs(rate) <= 0.0003:
+        label = "neutral"
+        explanation = "Funding did not provide a material directional carry edge."
+    elif (rate < 0 and direction == "LONG") or (rate > 0 and direction == "SHORT"):
+        label = "aligned"
+        explanation = "Funding crowding supported the trade direction, but was not an entry signal."
+    else:
+        label = "misaligned"
+        explanation = "Carry was positioned against the trade direction and required stronger independent confirmation."
+    return {
+        "label": label,
+        "rate": round(rate, 8),
+        "annualized_abs_pct": round(annualized, 1),
+        "explanation": explanation,
+    }
+
+
+def _coach_primary_issue(sig: dict, journey: dict, funding: dict) -> str:
+    result = str(sig.get("result") or "").upper()
+    if not journey.get("available"):
+        return "insufficient_path_data"
+    path = str(journey.get("path_label") or "")
+    stop_pressure = _report_float(journey.get("stop_pressure_pct"))
+    capture = journey.get("capture_ratio_pct")
+    capture = _report_float(capture) if capture is not None else None
+    mfe = _report_float(journey.get("mfe_pct"))
+    if result == "LOSS":
+        if funding.get("label") == "misaligned":
+            return "funding_misaligned"
+        if stop_pressure >= 80:
+            return "stop_pressure"
+        if path == "reversed_after_progress" or (mfe >= 1 and (capture is None or capture < 25)):
+            return "reversal_after_progress"
+        if path == "failed_fast":
+            return "setup_failure"
+        return "adverse_follow_through"
+    if result == "PARTIAL":
+        if capture is not None and capture < 35:
+            return "poor_capture"
+        return "partial_follow_through"
+    if stop_pressure >= 80:
+        return "near_stop_survival"
+    if capture is not None and capture < 35:
+        return "poor_capture"
+    if _report_float(journey.get("entry_delay_minutes")) >= 60:
+        return "late_entry"
+    return "clean_follow_through"
+
+
+def _coach_lesson(
+    sig: dict,
+    journey: dict,
+    funding: dict,
+    primary_issue: str,
+) -> dict:
+    strategy = str(sig.get("strategy_key") or sig.get("strategy") or "this strategy")
+    issue_rules = {
+        "funding_misaligned": (
+            "For the next comparable setup, require a fresh MT7 signal plus price structure "
+            "and flow aligned with the direction; do not override those gates because of funding alone."
+        ),
+        "stop_pressure": (
+            "Do not widen the stop or raise leverage. For the next comparable setup, require "
+            "cleaner entry location and confirmed flow before acting."
+        ),
+        "reversal_after_progress": (
+            "For the next comparable setup, record which planned target was reached before "
+            "the reversal and follow the declared exit plan; test any change only across a cohort."
+        ),
+        "setup_failure": (
+            "For the next comparable setup, require directional flow confirmation and a visible "
+            "reclaim or rejection before entry; one loss cannot justify changing the strategy."
+        ),
+        "adverse_follow_through": (
+            "For the next comparable setup, require the original structure and flow thesis to "
+            "remain valid at entry; aggregate comparable outcomes before proposing a filter."
+        ),
+        "poor_capture": (
+            "For the next comparable setup, follow the predeclared target and exit plan and record "
+            "where favorable excursion was surrendered; evaluate changes at cohort level."
+        ),
+        "near_stop_survival": (
+            "Treat this as evidence of fragile entry quality, not permission to widen stops; require "
+            "the same risk limit and cleaner confirmation on the next comparable setup."
+        ),
+        "late_entry": (
+            "For the next comparable setup, distinguish a late confirmation from a stale signal and "
+            "do not enter if the original structure or five-minute freshness gate has expired."
+        ),
+        "partial_follow_through": (
+            "For the next comparable setup, retain the declared partial-profit and invalidation plan; "
+            "compare capture across the next cohort before changing exits."
+        ),
+        "clean_follow_through": (
+            "For the next comparable setup, require the same independent structure and flow evidence; "
+            "do not increase leverage or size from this outcome."
+        ),
+        "insufficient_path_data": (
+            "Do not infer an execution lesson without the candle path. Use the outcome only as a "
+            f"{strategy} cohort observation until MAE, MFE, and stop-pressure evidence is available."
+        ),
+    }
+    worked = []
+    failed = []
+    result = str(sig.get("result") or "").upper()
+    if result in {"WIN", "PARTIAL"}:
+        worked.append("The signal produced a positive or partially positive resolved outcome.")
+    else:
+        failed.append("The resolved outcome was negative.")
+    if funding.get("label") == "aligned":
+        worked.append("Funding crowding was directionally aligned.")
+    elif funding.get("label") == "misaligned":
+        failed.append("Funding carry was positioned against the trade.")
+    if journey.get("available"):
+        if _report_float(journey.get("stop_pressure_pct")) >= 80:
+            failed.append("The path consumed at least 80% of the planned stop distance.")
+        capture = journey.get("capture_ratio_pct")
+        if capture is not None and _report_float(capture) >= 60:
+            worked.append("The exit retained at least 60% of measured favorable excursion.")
+        elif capture is not None and _report_float(capture) < 35:
+            failed.append("The exit retained less than 35% of measured favorable excursion.")
+    return {
+        "what_worked": worked[:3],
+        "what_failed": failed[:3],
+        "next_trade_rule": issue_rules[primary_issue],
+        "cohort_rule": (
+            "This review is one observation. Any scoring, filter, stop, leverage, or sizing change "
+            "requires a predeclared cohort experiment and explicit user approval where exposure rises."
+        ),
+    }
+
+
+def _coach_fallback_narrative(sig: dict, packet: dict) -> str:
+    path = packet.get("path") or {}
+    funding = packet.get("funding") or {}
+    lesson = packet.get("lesson") or {}
+    result = str(sig.get("result") or "resolved").upper()
+    pnl = sig.get("pnl_pct")
+    pnl_text = f"{float(pnl):+.2f}%" if pnl is not None else "unavailable"
+    if path.get("available"):
+        first = (
+            f"{sig.get('symbol') or 'The trade'} resolved {result} at {pnl_text}. "
+            f"The measured path recorded {float(path.get('mae_pct') or 0):.2f}% MAE and "
+            f"{float(path.get('mfe_pct') or 0):.2f}% MFE, with "
+            f"{float(path.get('stop_pressure_pct') or 0):.1f}% stop pressure"
+            + (
+                f" and {float(path.get('capture_ratio_pct')):.1f}% capture."
+                if path.get("capture_ratio_pct") is not None else "."
+            )
+        )
+    else:
+        first = (
+            f"{sig.get('symbol') or 'The trade'} resolved {result} at {pnl_text}, but the retained "
+            "candle path is unavailable, so MAE, MFE, capture, and stop-pressure claims are withheld."
+        )
+    second = (
+        f"Funding was {funding.get('label', 'unknown')} at "
+        f"{float(funding.get('rate') or 0):.5f}. {lesson.get('next_trade_rule')} "
+        f"{lesson.get('cohort_rule')}"
+    )
+    return first + "\n\n" + second
+
+
+def _build_coach_review_packet(
+    sig: dict,
+    sig_json_obj: dict,
+    journey: dict | None,
+    narrative: str | None,
+    duration_minutes: int | None,
+) -> dict:
+    clean, sanitation = _sanitize_coach_review_text(narrative)
+    journey = journey or _coach_journey_from_signal_json(sig_json_obj)
+    funding = _coach_funding_read(sig)
+    primary_issue = _coach_primary_issue(sig, journey, funding)
+    lesson = _coach_lesson(sig, journey, funding, primary_issue)
+    evidence = [
+        {"field": "result", "value": sig.get("result"), "source": "signals"},
+        {"field": "pnl_pct", "value": sig.get("pnl_pct"), "source": "signals"},
+        {"field": "funding_rate", "value": funding.get("rate"), "source": "signal_at_scan"},
+        {"field": "path_label", "value": journey.get("path_label"), "source": "retained_min15_path"},
+        {"field": "mae_pct", "value": journey.get("mae_pct"), "source": "retained_min15_path"},
+        {"field": "mfe_pct", "value": journey.get("mfe_pct"), "source": "retained_min15_path"},
+        {"field": "capture_ratio_pct", "value": journey.get("capture_ratio_pct"), "source": "retained_min15_path"},
+        {"field": "stop_pressure_pct", "value": journey.get("stop_pressure_pct"), "source": "retained_min15_path"},
+    ]
+    return {
+        "version": COACH_REVIEW_VERSION,
+        "narrative": clean,
+        "trade": {
+            "symbol": sig.get("symbol"),
+            "direction": sig.get("direction"),
+            "strategy": sig.get("strategy_key") or sig.get("strategy"),
+            "conviction": sig.get("conviction"),
+            "result": sig.get("result"),
+            "pnl_pct": sig.get("pnl_pct"),
+            "duration_minutes": duration_minutes or journey.get("entry_to_close_minutes"),
+        },
+        "verdict": {
+            "primary_issue": primary_issue,
+            "label": primary_issue.replace("_", " ").title(),
+            "outcome": str(sig.get("result") or "resolved").upper(),
+        },
+        "path": {
+            "available": bool(journey.get("available")),
+            "label": journey.get("path_label"),
+            "mae_pct": journey.get("mae_pct"),
+            "mfe_pct": journey.get("mfe_pct"),
+            "capture_ratio_pct": journey.get("capture_ratio_pct"),
+            "stop_pressure_pct": journey.get("stop_pressure_pct"),
+            "entry_delay_minutes": journey.get("entry_delay_minutes"),
+            "target_hits": sorted((journey.get("target_hits") or {}).keys()),
+        },
+        "funding": funding,
+        "lesson": lesson,
+        "evidence": evidence,
+        "quality": {
+            **sanitation,
+            "paragraphs": len([p for p in clean.split("\n\n") if p.strip()]),
+            "has_actionable_rule": bool(lesson.get("next_trade_rule")),
+            "structured_evidence_fields": sum(item.get("value") is not None for item in evidence),
+        },
+        "limits": [
+            "A single trade cannot prove a strategy change.",
+            "The review does not observe private exchange execution beyond retained MT7 records.",
+            "The review cannot raise leverage, position size, or risk and cannot create an order.",
+        ],
+        "authority": "advisory_only",
+    }
+
+
+def _persist_coach_review_packet(
+    signal_id: int,
+    sig_json_obj: dict,
+    packet: dict,
+    reviewed_at: str | None = None,
+) -> None:
+    sig_json_obj["coach_review"] = packet.get("narrative") or ""
+    sig_json_obj["coach_review_at"] = reviewed_at or datetime.utcnow().isoformat()
+    sig_json_obj["coach_review_version"] = COACH_REVIEW_VERSION
+    sig_json_obj["coach_review_packet"] = packet
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE signals SET signal_json=? WHERE id=?",
+        (json.dumps(sig_json_obj, default=str), signal_id),
+    )
+    con.commit()
+    con.close()
+
+
+def _upgrade_coach_review_contract(limit: int | None = None) -> dict:
+    """Pure local migration: sanitize and structure stored reviews; no AI/network."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    sql = """
+        SELECT * FROM signals
+        WHERE json_valid(signal_json)
+          AND json_extract(signal_json, '$.coach_review') IS NOT NULL
+          AND (
+              json_extract(signal_json, '$.coach_review_version') IS NULL
+              OR json_extract(signal_json, '$.coach_review_version') != ?
+              OR lower(json_extract(signal_json, '$.coach_review')) LIKE '%<think%'
+          )
+        ORDER BY id ASC
+    """
+    params: list = [COACH_REVIEW_VERSION]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(max(0, int(limit)))
+    rows = con.execute(sql, params).fetchall()
+    upgraded = 0
+    reasoning_removed = 0
+    empty_after_cleanup = 0
+    for row in rows:
+        sig = dict(row)
+        try:
+            sig_json_obj = json.loads(sig.get("signal_json") or "{}")
+        except Exception:
+            continue
+        original = sig_json_obj.get("coach_review") or ""
+        journey = _coach_journey_from_signal_json(sig_json_obj)
+        packet = _build_coach_review_packet(
+            sig,
+            sig_json_obj,
+            journey,
+            original,
+            journey.get("entry_to_close_minutes"),
+        )
+        if packet.get("quality", {}).get("reasoning_removed"):
+            reasoning_removed += 1
+        if not packet.get("narrative"):
+            empty_after_cleanup += 1
+            packet["narrative"] = _coach_fallback_narrative(sig, packet)
+            packet["quality"]["clean_chars"] = len(packet["narrative"])
+            packet["quality"]["paragraphs"] = 2
+            packet["quality"]["narrative_source"] = "deterministic_repair"
+        sig_json_obj["coach_review"] = packet["narrative"]
+        sig_json_obj["coach_review_version"] = COACH_REVIEW_VERSION
+        sig_json_obj["coach_review_packet"] = packet
+        sig_json_obj.setdefault("coach_review_at", datetime.utcnow().isoformat())
+        con.execute(
+            "UPDATE signals SET signal_json=? WHERE id=?",
+            (json.dumps(sig_json_obj, default=str), sig["id"]),
+        )
+        upgraded += 1
+    con.commit()
+    con.close()
+    return {
+        "contract_version": COACH_REVIEW_VERSION,
+        "eligible": len(rows),
+        "upgraded": upgraded,
+        "reasoning_removed": reasoning_removed,
+        "empty_after_cleanup": empty_after_cleanup,
+    }
+
+
 def _generate_coach_review(
     sig: dict,
     signal_id: int,
@@ -10195,7 +10597,33 @@ def _generate_coach_review(
     """
     cached = sig_json_obj.get("coach_review")
     if cached:
-        return cached
+        packet = _build_coach_review_packet(
+            sig,
+            sig_json_obj,
+            journey,
+            cached,
+            duration_minutes,
+        )
+        if not packet.get("narrative"):
+            packet["narrative"] = _coach_fallback_narrative(sig, packet)
+            packet["quality"]["clean_chars"] = len(packet["narrative"])
+            packet["quality"]["paragraphs"] = 2
+            packet["quality"]["narrative_source"] = "deterministic_repair"
+        if (
+            sig_json_obj.get("coach_review_version") != COACH_REVIEW_VERSION
+            or packet.get("narrative") != cached
+            or not sig_json_obj.get("coach_review_packet")
+        ):
+            try:
+                _persist_coach_review_packet(
+                    signal_id,
+                    sig_json_obj,
+                    packet,
+                    sig_json_obj.get("coach_review_at"),
+                )
+            except Exception as exc:
+                print(f"[coach_review upgrade] {exc}", file=sys.stderr)
+        return packet.get("narrative") or None
 
     direction = sig.get("direction", "")
 
@@ -10337,28 +10765,25 @@ def _generate_coach_review(
         feature="coach_review",
     )
 
-    if review:
-        # Strip preamble lines that start with reasoning/meta phrases regardless of provider
-        _preamble_triggers = (
-            "okay", "let's", "let me", "sure", "here is", "here's", "i'll", "i will",
-            "alright", "right,", "starting with", "to begin", "first,", "the user",
-        )
-        lines = review.strip().splitlines()
-        while lines and lines[0].strip().lower().startswith(_preamble_triggers):
-            lines.pop(0)
-        review = "\n".join(lines).strip() or review.strip()
-        try:
-            sig_json_obj["coach_review"]    = review
-            sig_json_obj["coach_review_at"] = datetime.utcnow().isoformat()
-            _con = sqlite3.connect(DB_PATH)
-            _con.execute("UPDATE signals SET signal_json=? WHERE id=?",
-                         (json.dumps(sig_json_obj, default=str), signal_id))
-            _con.commit()
-            _con.close()
-        except Exception as _e:
-            print(f"[coach_review persist] {_e}", file=sys.stderr)
-
-    return review
+    packet = _build_coach_review_packet(
+        sig,
+        sig_json_obj,
+        journey,
+        review,
+        duration_minutes,
+    )
+    if not packet.get("narrative"):
+        packet["narrative"] = _coach_fallback_narrative(sig, packet)
+        packet["quality"]["clean_chars"] = len(packet["narrative"])
+        packet["quality"]["paragraphs"] = 2
+        packet["quality"]["narrative_source"] = "deterministic_fallback"
+    else:
+        packet["quality"]["narrative_source"] = "ai"
+    try:
+        _persist_coach_review_packet(signal_id, sig_json_obj, packet)
+    except Exception as _e:
+        print(f"[coach_review persist] {_e}", file=sys.stderr)
+    return packet.get("narrative")
 
 
 @app.route("/api/signal/detail/<int:signal_id>")
@@ -10443,6 +10868,15 @@ def api_signal_detail(signal_id: int):
             pass
         ai_analysis = _generate_coach_review(sig, signal_id, sig_json_obj, journey, journey_prompt,
                                               tags_raw, entry1, exit_price, duration_minutes)
+        coach_review = sig_json_obj.get("coach_review_packet")
+        if not coach_review:
+            coach_review = _build_coach_review_packet(
+                sig,
+                sig_json_obj,
+                journey,
+                ai_analysis,
+                duration_minutes,
+            )
 
         return jsonify({
             "success":          True,
@@ -10468,6 +10902,7 @@ def api_signal_detail(signal_id: int):
             "volatility":       sig.get("volatility"),
             "journey":          journey,
             "ai_analysis":      ai_analysis,
+            "coach_review":     coach_review,
             "liquidation":      sig.get("liquidation"),
             "liquidation_price": sig.get("liquidation_price"),
             "liquidation_distance_pct": sig.get("liquidation_distance_pct"),
@@ -10492,6 +10927,8 @@ def api_signal_regenerate_review(signal_id: int):
             sj = {}
         sj.pop("coach_review", None)
         sj.pop("coach_review_at", None)
+        sj.pop("coach_review_version", None)
+        sj.pop("coach_review_packet", None)
         con.execute("UPDATE signals SET signal_json=? WHERE id=?",
                     (json.dumps(sj, default=str), signal_id))
         con.commit()
@@ -18565,25 +19002,24 @@ def _hermes_signal_audit(con: sqlite3.Connection) -> dict:
     shadow_lane = _lane(shadow_source_filter, "disabled_shadow")
     source_filter = live_source_filter
 
-    # ── Coach reviews: tier-1 summary (always included) + recent 20 full text ──
-    COACH_THEMES = {
-        "stop_pressure":      ["stop pressure", "stop was hit", "stop hit", "touched the stop"],
-        "funding_misaligned": ["funding misalign", "carry was fighting", "misaligned", "carry fighting"],
-        "entry_timing":       ["entry too early", "entry too late", "early entry", "late entry", "entered too"],
-        "regime_mismatch":    ["choppy", "no trend", "range-bound", "sideways", "regime"],
-        "conviction_issue":   ["overconfident", "low conviction", "weak setup"],
-        "size_management":    ["sizing", "position size", "oversize", "too large"],
-        "poor_capture":       ["capture ratio", "gave back", "profit given back", "didn't hold"],
-        "exit_timing":        ["held too long", "exited too early", "exit timing"],
-        "liquidity":          ["liquidity", "thin market", "spread", "slippage"],
-        "agent_disagreement": ["desk was split", "elevated disagreement", "disagreement score"],
+    # ── Coach intelligence: structured contract + recent evidence ──
+    coach_summary = {
+        "contract_version": COACH_REVIEW_VERSION,
+        "total_reviews": 0,
+        "structured_reviews": 0,
+        "legacy_reviews": 0,
+        "by_result": {},
+        "loss_themes": [],
+        "recurring_patterns": [],
+        "strategy_patterns": [],
+        "quality": {},
+        "note": "Use /api/intelligence/hermes/coach-reviews for the paginated evidence corpus.",
     }
-
-    coach_summary = {"total_reviews": 0, "by_result": {}, "loss_themes": [], "note": "Use /api/intelligence/hermes/coach-reviews for full corpus."}
     recent_reviews = []
     try:
         all_review_rows = con.execute(f"""
-            SELECT symbol, direction, strategy_key, result, pnl_pct, signal_json
+            SELECT id, symbol, direction, strategy_key, result, pnl_pct,
+                   logged_at, signal_json
             FROM signals
             WHERE result IS NOT NULL
               AND result NOT IN ('EXPIRED', 'SKIPPED')
@@ -18592,45 +19028,173 @@ def _hermes_signal_audit(con: sqlite3.Connection) -> dict:
             ORDER BY logged_at DESC
         """).fetchall()
 
-        theme_counts = {t: {"total": 0, "LOSS": 0, "WIN": 0, "PARTIAL": 0} for t in COACH_THEMES}
+        issue_counts: dict[str, dict] = {}
+        strategy_counts: dict[tuple[str, str], dict] = {}
         by_result: dict = {}
+        structured_reviews = 0
+        reasoning_removed = 0
+        path_available = 0
+        actionable = 0
+        sentence_counts: dict[str, int] = {}
+        sentence_total = 0
 
         for i, row in enumerate(all_review_rows):
             try:
                 sj = json.loads(row["signal_json"] or "{}")
-                review_text = sj.get("coach_review") or ""
+                raw_review = sj.get("coach_review") or ""
+                review_text, sanitation = _sanitize_coach_review_text(raw_review)
                 if not review_text:
                     continue
                 result = row["result"]
                 by_result[result] = by_result.get(result, 0) + 1
-                text_lower = review_text.lower()
-                for theme, phrases in COACH_THEMES.items():
-                    if any(p in text_lower for p in phrases):
-                        theme_counts[theme]["total"] += 1
-                        if result in theme_counts[theme]:
-                            theme_counts[theme][result] += 1
+                packet = sj.get("coach_review_packet")
+                if not isinstance(packet, dict) or packet.get("version") != COACH_REVIEW_VERSION:
+                    packet = _build_coach_review_packet(
+                        dict(row),
+                        sj,
+                        _coach_journey_from_signal_json(sj),
+                        review_text,
+                        None,
+                    )
+                else:
+                    structured_reviews += 1
+                quality = packet.get("quality") or {}
+                reasoning_removed += int(bool(
+                    sanitation.get("reasoning_removed")
+                    or quality.get("reasoning_removed")
+                ))
+                path_available += int(bool((packet.get("path") or {}).get("available")))
+                actionable += int(bool((packet.get("lesson") or {}).get("next_trade_rule")))
+                for sentence in re.split(r"(?<=[.!?])\s+", review_text.replace("\n", " ")):
+                    normalized = re.sub(
+                        r"[^a-z0-9% ]+",
+                        " ",
+                        sentence.lower(),
+                    )
+                    normalized = re.sub(r"\s+", " ", normalized).strip()
+                    if len(normalized.split()) < 7:
+                        continue
+                    sentence_counts[normalized] = sentence_counts.get(normalized, 0) + 1
+                    sentence_total += 1
+                issue = str(
+                    (packet.get("verdict") or {}).get("primary_issue")
+                    or "unclassified"
+                )
+                issue_bucket = issue_counts.setdefault(
+                    issue,
+                    {"total": 0, "LOSS": 0, "WIN": 0, "PARTIAL": 0, "pnl_sum": 0.0},
+                )
+                issue_bucket["total"] += 1
+                if result in issue_bucket:
+                    issue_bucket[result] += 1
+                issue_bucket["pnl_sum"] += _report_float(row["pnl_pct"])
+                strategy_key = str(row["strategy_key"] or "unknown")
+                strategy_bucket = strategy_counts.setdefault(
+                    (strategy_key, issue),
+                    {"count": 0, "losses": 0, "wins_partials": 0, "pnl_sum": 0.0},
+                )
+                strategy_bucket["count"] += 1
+                strategy_bucket["losses"] += int(result == "LOSS")
+                strategy_bucket["wins_partials"] += int(result in {"WIN", "PARTIAL"})
+                strategy_bucket["pnl_sum"] += _report_float(row["pnl_pct"])
                 if i < 20:
                     recent_reviews.append({
+                        "signal_id": row["id"],
                         "symbol":    row["symbol"],
                         "direction": row["direction"],
                         "strategy":  row["strategy_key"],
                         "result":    result,
                         "pnl_pct":   row["pnl_pct"],
                         "review":    review_text,
+                        "packet":    packet,
                     })
             except Exception:
                 pass
 
         loss_themes = sorted(
-            [{"theme": t, "loss_count": c["LOSS"], "win_count": c["WIN"], "total_count": c["total"]}
-             for t, c in theme_counts.items() if c["total"] > 0],
+            [
+                {
+                    "theme": issue,
+                    "loss_count": counts["LOSS"],
+                    "win_count": counts["WIN"],
+                    "partial_count": counts["PARTIAL"],
+                    "total_count": counts["total"],
+                }
+                for issue, counts in issue_counts.items()
+                if counts["total"] > 0
+            ],
             key=lambda x: x["loss_count"], reverse=True,
         )
+        recurring_patterns = sorted(
+            [
+                {
+                    "issue": issue,
+                    "label": issue.replace("_", " ").title(),
+                    "sample": counts["total"],
+                    "losses": counts["LOSS"],
+                    "wins_partials": counts["WIN"] + counts["PARTIAL"],
+                    "avg_pnl_pct": round(counts["pnl_sum"] / counts["total"], 2),
+                    "descriptive_only": True,
+                }
+                for issue, counts in issue_counts.items()
+            ],
+            key=lambda item: (item["sample"], item["losses"]),
+            reverse=True,
+        )
+        strategy_patterns = sorted(
+            [
+                {
+                    "strategy": strategy,
+                    "issue": issue,
+                    "sample": counts["count"],
+                    "losses": counts["losses"],
+                    "wins_partials": counts["wins_partials"],
+                    "avg_pnl_pct": round(counts["pnl_sum"] / counts["count"], 2),
+                }
+                for (strategy, issue), counts in strategy_counts.items()
+                if counts["count"] >= 5
+            ],
+            key=lambda item: (item["losses"], item["sample"]),
+            reverse=True,
+        )[:12]
+        total_reviews = len(all_review_rows)
+        repeated_counts = [
+            count for count in sentence_counts.values()
+            if count >= 5
+        ]
+        repeated_occurrences = sum(repeated_counts)
+        repeated_occurrence_pct = (
+            round(repeated_occurrences / sentence_total * 100, 1)
+            if sentence_total else 0.0
+        )
         coach_summary = {
-            "total_reviews": len(all_review_rows),
+            "contract_version": COACH_REVIEW_VERSION,
+            "total_reviews": total_reviews,
+            "structured_reviews": structured_reviews,
+            "legacy_reviews": max(0, total_reviews - structured_reviews),
             "by_result": by_result,
             "loss_themes": loss_themes,
-            "note": "Use /api/intelligence/hermes/coach-reviews for full corpus.",
+            "recurring_patterns": recurring_patterns,
+            "strategy_patterns": strategy_patterns,
+            "quality": {
+                "structured_coverage_pct": round(
+                    structured_reviews / total_reviews * 100, 1
+                ) if total_reviews else 0.0,
+                "path_evidence_coverage_pct": round(
+                    path_available / total_reviews * 100, 1
+                ) if total_reviews else 0.0,
+                "actionable_rule_coverage_pct": round(
+                    actionable / total_reviews * 100, 1
+                ) if total_reviews else 0.0,
+                "reasoning_contamination_hidden": reasoning_removed,
+                "exact_sentences_repeated_5plus": len(repeated_counts),
+                "repeated_sentence_occurrence_pct": repeated_occurrence_pct,
+                "narrative_repetition_status": (
+                    "needs_review" if repeated_occurrence_pct >= 15 else "acceptable"
+                ),
+            },
+            "authority": "descriptive_only",
+            "note": "Use /api/intelligence/hermes/coach-reviews for the paginated evidence corpus.",
         }
     except Exception:
         pass
@@ -19065,7 +19629,7 @@ def _build_hermes_audit() -> dict:
     packet: dict = {
         "generated_at": datetime.utcnow().isoformat(),
         "mode": "mt7_context_packet",
-        "data_contract_version": "hermes_metrics_v2",
+        "data_contract_version": "hermes_metrics_v3_coach_intelligence",
         "consultancy": _hermes_consultancy_profile(),
         "latest_memo": _hermes_latest_memo(),
         "memo_archive": _hermes_memo_archive(),
@@ -19196,11 +19760,46 @@ def _build_hermes_audit() -> dict:
     return packet
 
 
+_hermes_audit_cache_lock = threading.Lock()
+_hermes_audit_cache: dict = {"built_at": 0.0, "packet": None}
+HERMES_AUDIT_CACHE_SECONDS = 60
+
+
+def _invalidate_hermes_audit_cache() -> None:
+    with _hermes_audit_cache_lock:
+        _hermes_audit_cache.update({"built_at": 0.0, "packet": None})
+
+
+def _load_hermes_audit_cached(force: bool = False) -> dict:
+    now = time.time()
+    with _hermes_audit_cache_lock:
+        packet = _hermes_audit_cache.get("packet")
+        age = max(0.0, now - float(_hermes_audit_cache.get("built_at") or 0.0))
+        if not force and packet is not None and age < HERMES_AUDIT_CACHE_SECONDS:
+            cached = copy.deepcopy(packet)
+            cached["cache"] = {
+                "status": "hit",
+                "age_seconds": round(age, 1),
+                "ttl_seconds": HERMES_AUDIT_CACHE_SECONDS,
+            }
+            return cached
+        packet = _build_hermes_audit()
+        _hermes_audit_cache.update({"built_at": time.time(), "packet": packet})
+        built = copy.deepcopy(packet)
+        built["cache"] = {
+            "status": "rebuilt",
+            "age_seconds": 0.0,
+            "ttl_seconds": HERMES_AUDIT_CACHE_SECONDS,
+        }
+        return built
+
+
 @app.route('/api/intelligence/hermes')
 def api_intelligence_hermes():
     """Read-only Hermes context packet plus latest external Hermes memo, when present."""
     try:
-        return jsonify({"success": True, "audit": _build_hermes_audit()})
+        force = str(request.args.get("refresh") or "").lower() in {"1", "true", "yes"}
+        return jsonify({"success": True, "audit": _load_hermes_audit_cached(force=force)})
     except Exception as e:
         print(f"[api/intelligence/hermes] error: {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -19222,12 +19821,15 @@ def api_hermes_archived_memo(archive_id: str):
 @app.route('/api/intelligence/hermes/coach-reviews')
 def api_hermes_coach_reviews():
     """Full coach review corpus for Hermes deep-dive sessions.
-    Query params: result (WIN|LOSS|PARTIAL), strategy, limit (default 200), offset (default 0).
+    Query params: result (WIN|LOSS|PARTIAL), strategy, issue,
+    limit/per_page (default 100), offset (default 0).
     """
     try:
         result_filter = request.args.get("result", "").strip().upper()
         strategy_filter = request.args.get("strategy", "").strip().lower()
-        limit  = min(int(request.args.get("limit",  200)), 500)
+        issue_filter = request.args.get("issue", "").strip().lower()
+        requested_limit = request.args.get("limit", request.args.get("per_page", 100))
+        limit  = max(1, min(int(requested_limit), 500))
         offset = max(int(request.args.get("offset", 0)),   0)
 
         con = sqlite3.connect(DB_PATH)
@@ -19247,12 +19849,18 @@ def api_hermes_coach_reviews():
         if strategy_filter:
             clauses.append("strategy_key = ?")
             params.append(strategy_filter)
+        if issue_filter:
+            clauses.append(
+                "json_extract(signal_json, '$.coach_review_packet.verdict.primary_issue') = ?"
+            )
+            params.append(issue_filter)
 
         where = " AND ".join(clauses) + " " + source_filter
 
         total_count = con.execute(f"SELECT COUNT(*) FROM signals WHERE {where}", params).fetchone()[0]
         rows = con.execute(
-            f"""SELECT symbol, direction, strategy_key, result, pnl_pct, logged_at, signal_json
+            f"""SELECT id, symbol, direction, strategy, strategy_key, conviction,
+                       result, pnl_pct, funding_rate, logged_at, signal_json
                 FROM signals WHERE {where}
                 ORDER BY logged_at DESC LIMIT ? OFFSET ?""",
             params + [limit, offset],
@@ -19263,9 +19871,19 @@ def api_hermes_coach_reviews():
         for row in rows:
             try:
                 sj = json.loads(row["signal_json"] or "{}")
-                review_text = sj.get("coach_review") or ""
+                review_text, _ = _sanitize_coach_review_text(sj.get("coach_review") or "")
                 if review_text:
+                    packet = sj.get("coach_review_packet")
+                    if not isinstance(packet, dict):
+                        packet = _build_coach_review_packet(
+                            dict(row),
+                            sj,
+                            _coach_journey_from_signal_json(sj),
+                            review_text,
+                            None,
+                        )
                     reviews.append({
+                        "signal_id": row["id"],
                         "symbol":    row["symbol"],
                         "direction": row["direction"],
                         "strategy":  row["strategy_key"],
@@ -19273,6 +19891,7 @@ def api_hermes_coach_reviews():
                         "pnl_pct":   row["pnl_pct"],
                         "logged_at": row["logged_at"],
                         "review":    review_text,
+                        "packet":    packet,
                     })
             except Exception:
                 pass
@@ -19282,6 +19901,7 @@ def api_hermes_coach_reviews():
             "total":   total_count,
             "limit":   limit,
             "offset":  offset,
+            "contract_version": COACH_REVIEW_VERSION,
             "reviews": reviews,
         })
     except Exception as e:
@@ -19311,6 +19931,7 @@ def _hermes_run_script():
         with _hermes_run_lock:
             if result.returncode == 0:
                 _hermes_run_state.update(status="done", error=None, finished_at=datetime.utcnow().isoformat())
+                _invalidate_hermes_audit_cache()
             else:
                 combined = (result.stderr or result.stdout or "").strip()
                 last_lines = "\n".join(combined.splitlines()[-6:]) if combined else ""
@@ -21900,7 +22521,7 @@ def api_research_weekly_memo():
 
 
 REPORTS_DIR = "data/reports"
-REPORT_SCHEMA_VERSION = "cipher-v9-accountable-intelligence"
+REPORT_SCHEMA_VERSION = "cipher-v10-decision-intelligence"
 
 
 def _report_classify_session(utc_iso: str) -> str:
@@ -25213,7 +25834,8 @@ def _report_desk_verdict(data: dict, weekly: bool = False) -> dict:
     pulse = data.get("market_pulse") or {}
     breadth = data.get("market_breadth") or {}
     action = data.get("action_matrix") or {}
-    regime = str(pulse.get("dominant_regime") or "unknown").replace("_", " ")
+    regime_key = str(pulse.get("dominant_regime") or "unknown")
+    regime = regime_key.replace("_", " ")
     signals = int(pulse.get("signals") or 0)
     blocked = int(pulse.get("blocked") or 0)
     disagreements = len(data.get("disagreements") or [])
@@ -25229,6 +25851,43 @@ def _report_desk_verdict(data: dict, weekly: bool = False) -> dict:
         )
     if disagreements:
         evidence.append(f"{disagreements} material analyst disagreements")
+    regime_rows = [
+        row for row in (data.get("strategy_regime_perf") or [])
+        if regime_key != "unknown"
+        and str(row.get("regime") or "") == regime_key
+        and int(row.get("sample") or 0) > 0
+        and row.get("avg_pnl_pct") is not None
+    ]
+    ranked_regime_rows = sorted(
+        regime_rows,
+        key=lambda row: (
+            _report_float(row.get("avg_pnl_pct")),
+            int(row.get("sample") or 0),
+        ),
+        reverse=True,
+    )
+    best_fit = ranked_regime_rows[0] if ranked_regime_rows else None
+    weakest_fit = ranked_regime_rows[-1] if len(ranked_regime_rows) > 1 else None
+    strategy_fit = {
+        "regime": regime_key,
+        "available": bool(best_fit),
+        "best_observed": best_fit,
+        "weakest_observed": weakest_fit,
+        "minimum_decision_sample": 20,
+        "decision_ready": bool(best_fit and int(best_fit.get("sample") or 0) >= 20),
+        "note": (
+            "Observed resolved outcomes in the current regime. Samples below 20 are descriptive "
+            "and cannot promote, disable, resize, or re-leverage a strategy."
+            if best_fit else
+            "No resolved strategy outcomes match the current regime."
+        ),
+    }
+    if best_fit:
+        evidence.append(
+            f"Current-regime fit: {best_fit.get('strategy')} "
+            f"{_report_float(best_fit.get('avg_pnl_pct')):+.2f}% average "
+            f"across N={int(best_fit.get('sample') or 0)}"
+        )
 
     if not signals or regime == "unknown":
         posture = "wait"
@@ -25252,6 +25911,7 @@ def _report_desk_verdict(data: dict, weekly: bool = False) -> dict:
         "verdict": verdict,
         "evidence": evidence[:4],
         "invalidation": invalidation,
+        "strategy_fit": strategy_fit,
         "risk_disclosure": (
             "No leverage or position-size increase is implied. Any proposal that raises exposure "
             "must show old vs proposed size, leverage, liquidation distance, and drawdown impact "
@@ -26051,6 +26711,113 @@ def _report_cross_desk_synthesis(data: dict) -> dict:
     }
 
 
+def _report_desk_debate(data: dict) -> dict:
+    """Opposing measured cases with an explicit resolution and no trade authority."""
+    pulse = data.get("market_pulse") or {}
+    breadth = data.get("market_breadth") or {}
+    paper = data.get("paper_desk") or {}
+    specialist = data.get("specialist_evidence") or {}
+    cross = specialist.get("cross_venue") or {}
+    catalysts = specialist.get("catalysts") or {}
+    tokenomics = specialist.get("tokenomics") or {}
+    advancers = int(breadth.get("advancers") or 0)
+    decliners = int(breadth.get("decliners") or 0)
+    total = int(breadth.get("total") or 0)
+    neg, pos = _report_count_funding_extremes(data)
+    disagreements = len(data.get("disagreements") or [])
+    upside = []
+    downside = []
+
+    if total:
+        if advancers > decliners:
+            upside.append(
+                f"Breadth favors upside: {advancers} advancers versus {decliners} decliners."
+            )
+        elif decliners > advancers:
+            downside.append(
+                f"Breadth favors downside: {decliners} decliners versus {advancers} advancers."
+            )
+        else:
+            upside.append(f"Breadth is balanced at {advancers}/{decliners}; no directional edge.")
+            downside.append(f"Breadth is balanced at {advancers}/{decliners}; no directional edge.")
+    if neg:
+        upside.append(
+            f"{neg} extreme-negative funding names create conditional short-squeeze fuel."
+        )
+    if pos:
+        downside.append(
+            f"{pos} extreme-positive funding names create conditional long-unwind risk."
+        )
+    paper_ev = paper.get("avg_pnl_pct")
+    if paper_ev is not None:
+        target = upside if _report_float(paper_ev) > 0 else downside
+        target.append(
+            f"Recent Paper expectancy is {_report_float(paper_ev):+.2f}% across "
+            f"{int(paper.get('closed') or 0)} closed trades."
+        )
+    if cross.get("available"):
+        aligned = sum(
+            1 for row in (cross.get("price_dislocations") or [])
+            if row.get("direction_aligned") is True
+        )
+        if aligned:
+            upside.append(
+                f"{aligned} cached cross-venue dislocations show aligned direction; current books still require recheck."
+            )
+        else:
+            downside.append("Cached venue evidence does not show a clearly aligned leadership set.")
+    else:
+        downside.append("Cross-venue confirmation is unavailable in this report window.")
+    if disagreements:
+        downside.append(f"{disagreements} material desk disagreements reduce directional confidence.")
+    if not catalysts.get("available"):
+        downside.append("No time-matched primary-source catalyst explains the current leadership.")
+    if not tokenomics.get("available"):
+        downside.append("Supply and unlock coverage is unavailable for the focus assets.")
+
+    directional_up = int(advancers > decliners) + int(neg > pos)
+    directional_down = int(decliners > advancers) + int(pos > neg) + int(disagreements > 0)
+    if not total or str(pulse.get("dominant_regime") or "unknown") == "unknown":
+        resolution = "Evidence is incomplete; the desk abstains from a directional resolution."
+        lean = "abstain"
+        confidence = "low"
+    elif abs(directional_up - directional_down) < 2:
+        resolution = (
+            "The measured cases remain mixed. Review only fresh MT7 signals with independent "
+            "structure, flow, and risk confirmation."
+        )
+        lean = "mixed"
+        confidence = "low"
+    elif directional_up > directional_down:
+        resolution = (
+            "The balance of evidence conditionally favors upside follow-through, but only a fresh "
+            "MT7 signal with aligned structure and flow can become a candidate."
+        )
+        lean = "conditional_upside"
+        confidence = "medium"
+    else:
+        resolution = (
+            "The balance of evidence conditionally favors defensive/downside posture; avoid treating "
+            "crowded funding or a large move as a standalone short."
+        )
+        lean = "conditional_downside"
+        confidence = "medium"
+    return {
+        "upside_case": upside[:6],
+        "downside_case": downside[:6],
+        "resolution": resolution,
+        "lean": lean,
+        "confidence": confidence,
+        "confirmation": (
+            "Consecutive fresh scans retain the regime while breadth and cross-venue direction agree."
+        ),
+        "invalidation": (
+            "Breadth leadership reverses, the regime changes, or fresh flow disagrees with the resolved lean."
+        ),
+        "authority": "advisory_only",
+    }
+
+
 def _report_agent_spotlight(data: dict) -> dict:
     key = str(data.get("spotlight_key") or "funding")
     briefs = data.get("analyst_briefs") or {}
@@ -26082,6 +26849,7 @@ def _enrich_report_intelligence(data: dict, weekly: bool = False) -> dict:
     data["horizon_outlook"] = _report_horizon_outlook(data)
     data["scenario_matrix"] = _report_scenario_matrix(data)
     data["cross_desk_synthesis"] = _report_cross_desk_synthesis(data)
+    data["desk_debate"] = _report_desk_debate(data)
     data["analyst_briefs"] = _report_analyst_briefs(data, weekly=weekly)
     data["desk_verdict"] = _report_desk_verdict(data, weekly=weekly)
     if weekly:
@@ -34042,6 +34810,11 @@ def _coach_review_loop():
     """
     import time as _time
     _time.sleep(300)  # wait 5 minutes after startup
+    try:
+        migration = _upgrade_coach_review_contract()
+        print(f"[coach_review_loop] contract migration={migration}", file=sys.stderr)
+    except Exception as _migration_error:
+        print(f"[coach_review_loop] contract migration error: {_migration_error}", file=sys.stderr)
     while True:
         try:
             try:

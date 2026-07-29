@@ -8090,9 +8090,7 @@ async function showClosedDetail(id) {
       ? (d.duration_minutes < 60 ? `${Math.round(d.duration_minutes)}m` : `${Math.round(d.duration_minutes/60)}h`)
       : '—';
 
-    const aiHtml = d.ai_analysis
-      ? `<div style="font-size:13px;line-height:1.6;color:var(--text2);white-space:pre-wrap">${d.ai_analysis}</div>`
-      : `<div style="color:var(--text3);font-size:12px">Analysis unavailable.</div>`;
+    const aiHtml = renderCoachReviewPacket(d.coach_review, d.ai_analysis);
     const journeyHtml = renderTradeJourney(d.journey);
 
     $('panel-body').innerHTML = `
@@ -8215,6 +8213,48 @@ function renderTradeJourney(j) {
       <div class="journey-card"><div class="journey-val">${j.worst_price != null ? fmtPrice(j.worst_price) : '—'}</div><div class="journey-lbl">Worst price</div></div>
     </div>
     <div class="journey-targets">${targetHtml}</div>
+  </div>`;
+}
+
+function renderCoachReviewPacket(packet, narrative) {
+  const p = packet || {};
+  const verdict = p.verdict || {};
+  const path = p.path || {};
+  const funding = p.funding || {};
+  const lesson = p.lesson || {};
+  const quality = p.quality || {};
+  const issue = verdict.label || String(verdict.primary_issue || 'Review').replaceAll('_', ' ');
+  const result = verdict.outcome || (p.trade || {}).result || 'RESOLVED';
+  const resultColor = result === 'WIN' ? 'var(--green)' : result === 'LOSS' ? 'var(--red)' : 'var(--amber)';
+  const worked = (lesson.what_worked || []).map(x => `<li style="margin-bottom:4px;">${esc(x)}</li>`).join('');
+  const failed = (lesson.what_failed || []).map(x => `<li style="margin-bottom:4px;">${esc(x)}</li>`).join('');
+  const pathMetrics = [
+    ['MAE', path.mae_pct == null ? '—' : Number(path.mae_pct).toFixed(2) + '%'],
+    ['MFE', path.mfe_pct == null ? '—' : Number(path.mfe_pct).toFixed(2) + '%'],
+    ['Capture', path.capture_ratio_pct == null ? '—' : Number(path.capture_ratio_pct).toFixed(1) + '%'],
+    ['Stop pressure', path.stop_pressure_pct == null ? '—' : Number(path.stop_pressure_pct).toFixed(1) + '%'],
+  ];
+  const text = narrative || p.narrative || '';
+  return `<div>
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+      <span style="font-size:9px;color:${resultColor};border:1px solid ${resultColor};border-radius:10px;padding:2px 7px;">${esc(result)}</span>
+      <span style="font-size:9px;color:var(--blue);border:1px solid var(--blue);border-radius:10px;padding:2px 7px;">${esc(issue)}</span>
+      <span title="Structured evidence contract; advisory only." style="font-size:9px;color:var(--muted);">${esc(p.version || 'legacy review')}</span>
+    </div>
+    ${text ? `<div style="font-size:13px;line-height:1.65;color:var(--text2);white-space:pre-wrap">${esc(text)}</div>` : '<div style="color:var(--text3);font-size:12px">Narrative unavailable.</div>'}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:7px;margin-top:12px;">
+      ${pathMetrics.map(([label,value]) => `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px;"><div style="font-size:9px;color:#667085;text-transform:uppercase;">${label}</div><div style="font-size:13px;color:var(--text);margin-top:3px;">${value}</div></div>`).join('')}
+      <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px;"><div style="font-size:9px;color:#667085;text-transform:uppercase;">Funding</div><div style="font-size:13px;color:var(--text);margin-top:3px;">${esc(funding.label || 'unknown')}</div><div style="font-size:9px;color:var(--muted);">${Number(funding.rate || 0).toFixed(5)}</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px;margin-top:10px;">
+      <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px;"><div style="font-size:9px;color:var(--green);text-transform:uppercase;margin-bottom:5px;">What held up</div>${worked ? `<ul style="padding-left:16px;margin:0;font-size:11px;color:var(--text2);line-height:1.45;">${worked}</ul>` : '<div style="font-size:11px;color:var(--muted);">No positive claim is supported.</div>'}</div>
+      <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px;"><div style="font-size:9px;color:var(--red);text-transform:uppercase;margin-bottom:5px;">What failed / stayed fragile</div>${failed ? `<ul style="padding-left:16px;margin:0;font-size:11px;color:var(--text2);line-height:1.45;">${failed}</ul>` : '<div style="font-size:11px;color:var(--muted);">No failure claim is supported.</div>'}</div>
+    </div>
+    <div style="background:rgba(68,138,255,.06);border-left:3px solid var(--blue);border-radius:4px;padding:10px;margin-top:10px;">
+      <div style="font-size:9px;color:var(--blue);text-transform:uppercase;margin-bottom:4px;">Specific next-trade rule</div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.5;">${esc(lesson.next_trade_rule || 'No evidence-backed next-trade rule is available.')}</div>
+    </div>
+    <div style="font-size:10px;color:var(--muted);line-height:1.45;margin-top:8px;">${esc(lesson.cohort_rule || 'One review is descriptive only.')} ${quality.reasoning_removed ? 'Hidden provider reasoning was removed from this stored review.' : ''}</div>
   </div>`;
 }
 
@@ -9673,7 +9713,7 @@ async function triggerHermesRun() {
           if (statusEl) statusEl.textContent = 'Done — refreshing…';
           if (btn) { btn.disabled = false; btn.textContent = 'Run Now'; }
           _hermesRunActive = false;
-          await loadHermesAudit(true);
+          await loadHermesAudit(true, true);
           if (statusEl) statusEl.textContent = 'Updated';
           setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 4000);
         } else {
@@ -9694,10 +9734,10 @@ async function triggerHermesRun() {
   }
 }
 
-async function loadHermesAudit(rerender = true) {
+async function loadHermesAudit(rerender = true, force = false) {
   I.hermesLoading = true;
   try {
-    const res = await fetch('/api/intelligence/hermes');
+    const res = await fetch('/api/intelligence/hermes' + (force ? '?refresh=1' : ''));
     const data = await res.json();
     if (!data.success) throw new Error(data.error || 'Hermes audit unavailable');
     I.hermes = data.audit || null;
@@ -10321,6 +10361,54 @@ function hermesMiniTable(rows, cols, empty) {
       return `<td style="padding:6px;border-bottom:1px solid #161b22;color:var(--text2);">${esc(val ?? '—')}</td>`;
     }).join('')}</tr>`).join('')}</tbody>
   </table></div>`;
+}
+
+function renderHermesCoachIntelligence(signals) {
+  const c = (signals || {}).coach_reviews || {};
+  const q = c.quality || {};
+  const patterns = (c.recurring_patterns || []).slice(0, 8);
+  const strategyPatterns = (c.strategy_patterns || []).slice(0, 8);
+  const recent = ((signals || {}).coach_reviews_recent_20 || []).slice(0, 4);
+  const patternTable = hermesMiniTable(patterns, [
+    {key:'label',label:'Observed pattern'},
+    {key:'sample',label:'N'},
+    {key:'losses',label:'Loss'},
+    {key:'wins_partials',label:'W+P'},
+    {key:'avg_pnl_pct',label:'Avg P&L',format:v=>hermesPct(v)},
+  ], 'No structured coach patterns are available.');
+  const strategyTable = hermesMiniTable(strategyPatterns, [
+    {key:'strategy',label:'Strategy'},
+    {key:'issue',label:'Issue',format:v=>String(v || '').replaceAll('_',' ')},
+    {key:'sample',label:'N'},
+    {key:'losses',label:'Loss'},
+    {key:'avg_pnl_pct',label:'Avg P&L',format:v=>hermesPct(v)},
+  ], 'No strategy-pattern bucket has at least five reviews.');
+  return `<div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:15px;margin-bottom:14px;">
+    <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px;">
+      <div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;">Coach Intelligence Audit</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.5;margin-top:4px;">Hermes groups structured trade reviews by measured path failure—not loose keyword matches. Patterns remain descriptive until a predeclared cohort experiment validates them.</div>
+      </div>
+      <span style="font-size:9px;color:var(--blue);border:1px solid var(--blue);border-radius:10px;padding:3px 8px;">${esc(c.contract_version || 'legacy')}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px;margin-bottom:12px;">
+      ${hermesMetric('Reviews', c.total_reviews || 0, 'var(--text2)', 'Resolved signal reviews available to Hermes.')}
+      ${hermesMetric('Structured', (q.structured_coverage_pct == null ? '—' : Number(q.structured_coverage_pct).toFixed(1)+'%'), Number(q.structured_coverage_pct) >= 95 ? 'var(--green)' : 'var(--amber)', 'Reviews upgraded to the evidence-backed coach contract.')}
+      ${hermesMetric('Path Evidence', (q.path_evidence_coverage_pct == null ? '—' : Number(q.path_evidence_coverage_pct).toFixed(1)+'%'), 'var(--text2)', 'Reviews with retained MAE/MFE/capture/stop-pressure evidence.')}
+      ${hermesMetric('Action Rules', (q.actionable_rule_coverage_pct == null ? '—' : Number(q.actionable_rule_coverage_pct).toFixed(1)+'%'), 'var(--text2)', 'Reviews with a specific next-comparable-trade rule.')}
+      ${hermesMetric('Reasoning Hidden', q.reasoning_contamination_hidden || 0, Number(q.reasoning_contamination_hidden) ? 'var(--amber)' : 'var(--green)', 'Historical provider reasoning removed from trader-visible review text.')}
+      ${hermesMetric('Repeated Sentences', q.exact_sentences_repeated_5plus || 0, q.narrative_repetition_status === 'needs_review' ? 'var(--amber)' : 'var(--green)', 'Unique exact sentences that recur in at least five reviews; structured diagnoses remain independent of this prose repetition.')}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;">
+      <div><div style="font-size:10px;color:#667085;text-transform:uppercase;margin-bottom:7px;">Recurring path diagnoses</div>${patternTable}</div>
+      <div><div style="font-size:10px;color:#667085;text-transform:uppercase;margin-bottom:7px;">Strategy × diagnosis concentrations</div>${strategyTable}</div>
+    </div>
+    ${recent.length ? `<details style="margin-top:12px;"><summary style="cursor:pointer;color:var(--blue);font-size:11px;">Recent evidence-backed reviews</summary><div style="display:grid;gap:8px;margin-top:8px;">${recent.map(row => {
+      const issue = ((row.packet || {}).verdict || {}).label || 'Review';
+      return `<button onclick="loadDetail(${Number(row.signal_id || 0)})" style="text-align:left;background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px;color:var(--text2);cursor:pointer;"><b style="color:var(--text);">${esc(row.symbol || 'Signal')}</b> · ${esc(row.result || '')} · ${esc(issue)}<br><span style="font-size:10px;color:var(--muted);">${esc(String(row.review || '').slice(0,180))}${String(row.review || '').length > 180 ? '…' : ''}</span></button>`;
+    }).join('')}</div></details>` : ''}
+    <div style="font-size:10px;color:var(--muted);line-height:1.45;margin-top:10px;">Coach findings cannot directly change scoring, filters, stops, leverage, sizing, or execution. Exposure increases always require an explicit old-versus-proposed risk comparison and user approval.</div>
+  </div>`;
 }
 
 const HERMES_SECTION_LABELS = {
@@ -11651,7 +11739,7 @@ function renderHermesPanel() {
       <div style="display:flex;gap:8px;align-items:center;">
         <span id="hermes-run-status" style="font-size:11px;color:var(--text2);"></span>
         <button onclick="triggerHermesRun()" id="btn-hermes-run" style="background:#1a2535;border:1px solid #2a4060;color:#7eb8f7;padding:7px 12px;border-radius:5px;font-size:12px;cursor:pointer;">Run Now</button>
-        <button onclick="loadHermesAudit(true)" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Refresh</button>
+        <button onclick="loadHermesAudit(true, true)" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Refresh</button>
       </div>
     </div>
 
@@ -11717,6 +11805,8 @@ function renderHermesPanel() {
         ], 'No closed paper trades yet.')}
       </div>
     </div>
+
+    ${renderHermesCoachIntelligence(h.signals || {})}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;">
       <div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:15px;">
@@ -13942,6 +14032,9 @@ function renderReportNarrative(key, text, fallback = 'No qualified narrative is 
 
 function renderDeskVerdict(verdict) {
   const v = verdict || {};
+  const fit = v.strategy_fit || {};
+  const best = fit.best_observed || {};
+  const weak = fit.weakest_observed || {};
   const colors = {wait:'var(--muted)', defensive:'var(--amber)', investigate:'var(--red)', selective:'var(--green)'};
   const col = colors[v.posture] || 'var(--text2)';
   const evidence = (v.evidence || []).map(x => `<li style="margin-bottom:4px;">${esc(x)}</li>`).join('');
@@ -13952,8 +14045,32 @@ function renderDeskVerdict(verdict) {
     </div>
     <div style="font-size:14px;line-height:1.55;color:var(--text);">${esc(v.verdict || 'No qualified desk verdict is available.')}</div>
     ${evidence ? `<ul style="margin:9px 0 0;padding-left:18px;font-size:11px;color:var(--text2);line-height:1.45;">${evidence}</ul>` : ''}
+    ${fit.available ? `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:7px;margin-top:9px;">
+      <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px;"><div style="font-size:9px;color:var(--green);text-transform:uppercase;">Best observed fit · ${esc(fit.regime || 'unknown')}</div><div style="font-size:12px;color:var(--text2);margin-top:4px;">${esc(best.strategy || '—')} · ${best.avg_pnl_pct == null ? '—' : Number(best.avg_pnl_pct).toFixed(2)+'% avg'} · N=${Number(best.sample || 0)}</div></div>
+      ${weak.strategy && weak.strategy !== best.strategy ? `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px;"><div style="font-size:9px;color:var(--red);text-transform:uppercase;">Weakest observed fit</div><div style="font-size:12px;color:var(--text2);margin-top:4px;">${esc(weak.strategy)} · ${weak.avg_pnl_pct == null ? '—' : Number(weak.avg_pnl_pct).toFixed(2)+'% avg'} · N=${Number(weak.sample || 0)}</div></div>` : ''}
+    </div><div style="font-size:9px;color:${fit.decision_ready ? 'var(--text3)' : 'var(--amber)'};margin-top:5px;">${esc(fit.note || '')}</div>` : ''}
     <div style="font-size:10px;color:var(--amber);margin-top:9px;line-height:1.45;"><b>Invalidation:</b> ${esc(v.invalidation || 'New measured evidence is required.')}</div>
     <div style="font-size:10px;color:var(--muted);margin-top:6px;line-height:1.45;">${esc(v.risk_disclosure || '')}</div>
+  </div>`;
+}
+
+function renderDeskDebate(debate) {
+  const d = debate || {};
+  const caseBlock = (title, rows, color, empty) => `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:6px;padding:10px;">
+    <div style="font-size:9px;color:${color};text-transform:uppercase;margin-bottom:6px;">${title}</div>
+    ${(rows || []).length ? `<ul style="padding-left:17px;margin:0;font-size:11px;color:var(--text2);line-height:1.5;">${rows.map(x=>`<li style="margin-bottom:5px;">${esc(x)}</li>`).join('')}</ul>` : `<div style="font-size:11px;color:var(--muted);">${empty}</div>`}
+  </div>`;
+  return `<div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:9px;">
+      ${caseBlock('Conditional upside case', d.upside_case, 'var(--green)', 'No supported upside case.')}
+      ${caseBlock('Conditional downside / risk case', d.downside_case, 'var(--red)', 'No supported downside case.')}
+    </div>
+    <div style="background:rgba(68,138,255,.06);border-left:3px solid var(--blue);border-radius:4px;padding:10px;margin-top:9px;">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><span style="font-size:9px;color:var(--blue);text-transform:uppercase;">Resolution · ${esc(d.lean || 'unresolved')}</span><span style="font-size:9px;color:var(--muted);">${esc(d.confidence || 'low')} confidence · ${esc(d.authority || 'advisory only')}</span></div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.5;margin-top:5px;">${esc(d.resolution || 'The desk abstains.')}</div>
+      <div style="font-size:10px;color:var(--green);margin-top:6px;"><b>Confirm:</b> ${esc(d.confirmation || 'New evidence required.')}</div>
+      <div style="font-size:10px;color:var(--amber);margin-top:3px;"><b>Invalidate:</b> ${esc(d.invalidation || 'New evidence required.')}</div>
+    </div>
   </div>`;
 }
 
@@ -14048,6 +14165,7 @@ function renderReportPanel() {
     ${sectionBlock('Time-Horizon Regime Outlook', renderHorizonOutlook(d.horizon_outlook), 'Separates immediate trading conditions from tactical strategy preference and longer-term research posture. Every outlook is conditional and includes the evidence that would confirm or invalidate it.')}
     ${sectionBlock('Conditional Scenario Matrix', renderScenarioMatrix(d.scenario_matrix), 'Shows plausible ways the current regime could evolve and the observable trigger for each. These are scenarios—not guaranteed forecasts or price targets.')}
     ${sectionBlock('Cross-Desk Synthesis', renderCrossDeskSynthesis(d.cross_desk_synthesis), 'Makes consensus, unresolved disagreements, and missing data visible so a confident narrative cannot hide weak coverage.')}
+    ${sectionBlock('Cross-Desk Debate', renderDeskDebate(d.desk_debate), 'Presents the strongest measured upside and downside cases side by side, then resolves the disagreement conditionally. It cannot create a trade or increase exposure.')}
     ${sectionBlock('Social Attention & Credibility', `${n.social_watch ? `<div style="margin-bottom:10px;">${renderReportNarrative('social_watch', n.social_watch)}</div>` : ''}${renderSocialEvidence(d.specialist_evidence)}`, 'Shows direct public-discussion activity, author diversity, concentration, duplicate language, and change versus MT7’s trailing baseline. It is attention evidence—not truth, directional sentiment, or an entry signal.')}
     ${sectionBlock('Primary-Source Catalyst Radar', `${n.catalyst_watch ? `<div style="margin-bottom:10px;">${renderReportNarrative('catalyst_watch', n.catalyst_watch)}</div>` : ''}${renderCatalystEvidence(d.specialist_evidence)}`, 'Shows timestamped official exchange, protocol/governance, U.S. regulator, and Federal Reserve events. Publication and effective times are separated so traders can define a reaction window without assuming direction.')}
     ${sectionBlock('Tokenomics & Supply Risk', `${n.tokenomics_watch ? `<div style="margin-bottom:10px;">${renderReportNarrative('tokenomics_watch', n.tokenomics_watch)}</div>` : ''}${renderTokenomicsEvidence(d.specialist_evidence)}`, 'Shows measured circulating supply and FDV, attributed next-unlock schedules, and treasury composition. These qualify risk and dilution pressure; they do not predict direction, prove wallet behavior, or authorize more leverage or size.')}
@@ -17251,8 +17369,8 @@ function renderPairWorkspaceTab() {
       ${pairMetric('Result', pairWorkspaceDetail.result || t.result || 'Open', pairWorkspaceDetail.result === 'WIN' ? 'var(--green)' : pairWorkspaceDetail.result === 'LOSS' ? 'var(--red)' : 'var(--amber)')}
       ${pairMetric('P&L', pairWorkspaceDetail.pnl_pct != null ? fmtPct(pairWorkspaceDetail.pnl_pct) : '—', pairWorkspaceDetail.pnl_pct == null ? 'var(--text3)' : pairWorkspaceDetail.pnl_pct >= 0 ? 'var(--green)' : 'var(--red)')}
     </div>`);
-    if (pairWorkspaceDetail.ai_analysis) {
-      bits.push(`<div style="white-space:pre-wrap;color:var(--text2);line-height:1.65">${esc(pairWorkspaceDetail.ai_analysis)}</div>`);
+    if (pairWorkspaceDetail.ai_analysis || pairWorkspaceDetail.coach_review) {
+      bits.push(renderCoachReviewPacket(pairWorkspaceDetail.coach_review, pairWorkspaceDetail.ai_analysis));
     } else {
       bits.push('<span style="color:var(--text3)">Coach review unavailable yet.</span>');
     }
@@ -17839,7 +17957,7 @@ async function showPaperClosedDetail(id) {
       ${renderTradeJourney(data.journey)}
       <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px;">
         <div class="d-lbl">Coach Review</div>
-        <div style="font-size:13px;line-height:1.6;color:var(--text2);white-space:pre-wrap">${esc(data.ai_analysis || 'Analysis unavailable.')}</div>
+        ${renderCoachReviewPacket(data.coach_review, data.ai_analysis)}
       </div>`;
   } catch (e) {
     const linked = $('paper-linked-signal-detail');

@@ -986,6 +986,61 @@ class CipherReportDepthTests(unittest.TestCase):
         self.assertEqual(polished["trader_open"]["class"], "ai_polished")
         self.assertIn("signals", deterministic["trader_open"]["evidence"])
 
+    def test_desk_verdict_surfaces_current_regime_strategy_fit_with_sample_gate(self):
+        data = {
+            "market_pulse": {
+                "signals": 12,
+                "blocked": 0,
+                "dominant_regime": "funding_crowded",
+                "desk_agreement": "high",
+            },
+            "market_breadth": {"total": 100, "advancers": 60, "decliners": 35},
+            "action_matrix": {"posture": "selective"},
+            "strategy_regime_perf": [
+                {
+                    "strategy": "balanced",
+                    "regime": "funding_crowded",
+                    "sample": 8,
+                    "avg_pnl_pct": 2.5,
+                },
+                {
+                    "strategy": "funding_arb",
+                    "regime": "funding_crowded",
+                    "sample": 24,
+                    "avg_pnl_pct": 1.2,
+                },
+            ],
+        }
+        verdict = mt7._report_desk_verdict(data)
+        fit = verdict["strategy_fit"]
+        self.assertTrue(fit["available"])
+        self.assertEqual(fit["best_observed"]["strategy"], "balanced")
+        self.assertFalse(fit["decision_ready"])
+        self.assertIn("N=8", verdict["evidence"][-1])
+        self.assertIn("descriptive", fit["note"])
+
+    def test_cross_desk_debate_keeps_opposing_cases_and_advisory_resolution(self):
+        debate = mt7._report_desk_debate({
+            "market_pulse": {"dominant_regime": "funding_crowded"},
+            "market_breadth": {"total": 100, "advancers": 65, "decliners": 30},
+            "funding_heatmap": {
+                "extreme_negative": [{"symbol": "A_USDT"}],
+                "extreme_positive": [{"symbol": "B_USDT"}],
+            },
+            "paper_desk": {"avg_pnl_pct": 1.5, "closed": 30},
+            "disagreements": [{"symbol": "A_USDT"}],
+            "specialist_evidence": {
+                "cross_venue": {"available": False},
+                "catalysts": {"available": False},
+                "tokenomics": {"available": False},
+            },
+        })
+        self.assertTrue(debate["upside_case"])
+        self.assertTrue(debate["downside_case"])
+        self.assertIn(debate["lean"], {"mixed", "conditional_upside", "conditional_downside"})
+        self.assertEqual(debate["authority"], "advisory_only")
+        self.assertNotIn("enter", debate["resolution"].lower())
+
     def test_current_daily_cache_expires_without_invoking_ai(self):
         today = mt7.datetime.utcnow().strftime("%Y-%m-%d")
         Path(mt7.REPORTS_DIR).mkdir(parents=True, exist_ok=True)
