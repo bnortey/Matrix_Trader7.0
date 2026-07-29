@@ -7,7 +7,7 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-29
-Last commit: c6c5846 fix: correct paper drawdown metrics
+Latest implementation commit: beda80f feat: complete intelligence and Edge Lab upgrades
 app.py: 33,194 lines
 index.html: 18,989 lines
 
