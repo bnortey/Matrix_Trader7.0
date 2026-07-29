@@ -73,6 +73,9 @@ index.html: 18,989 lines
     `main` ref matched the local backup commit. The temporary verification
     clone was then removed; the GitHub copy and server-local rollback snapshot
     remain.
+  - The duplicate `github-upload` staging repository was removed after remote
+    verification, reclaiming `2.5 GB`; the retained server rollback directory
+    is `1.6 GB`.
 - The first bounded rebuild migrated five symbols and 42,125 closed v2 paths
   in 87.52 seconds with zero failures.
 - A production profiler pass found and fixed three migration/report
