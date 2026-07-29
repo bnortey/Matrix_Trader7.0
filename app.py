@@ -19762,7 +19762,10 @@ def _build_hermes_audit() -> dict:
 
 _hermes_audit_cache_lock = threading.Lock()
 _hermes_audit_cache: dict = {"built_at": 0.0, "packet": None}
-HERMES_AUDIT_CACHE_SECONDS = 60
+# Hermes reads several thousand resolved reviews and multiple advisory feeds.
+# Data-changing routes explicitly invalidate this cache, while the UI exposes a
+# forced refresh. Keep routine navigation cheap without hiding fresh mutations.
+HERMES_AUDIT_CACHE_SECONDS = 300
 
 
 def _invalidate_hermes_audit_cache() -> None:

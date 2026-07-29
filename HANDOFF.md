@@ -7,9 +7,103 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-29
-Latest implementation commit: b40b739 feat: add causal learning intelligence
-app.py: 34,248 lines
-index.html: 19,054 lines
+Latest implementation commit: 2a988fe feat: complete report intelligence closeout
+app.py: 35,021 lines
+index.html: 19,172 lines
+
+---
+
+## 2026-07-29 — Report intelligence closeout
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Upgraded Cipher daily and weekly reports to
+  `cipher-v10-decision-intelligence`.
+  - The Desk Verdict now includes current-regime strategy fit when the
+    evidence passes its sample gate; unknown regimes do not manufacture a
+    regime-specific fit claim.
+  - Added a true Cross-Desk Debate with conditional upside and downside cases,
+    a resolution, confirmation evidence, invalidation evidence, and an
+    advisory-only safety statement.
+  - The existing accountability, evidence freshness, data-limit, and
+    exposure-change disclosures remain visible.
+- Upgraded trade coaching to `coach-v2-evidence`.
+  - Every eligible resolved review now has a structured packet containing the
+    trade snapshot, verdict, primary path diagnosis, MAE/MFE/capture/stop
+    pressure, funding alignment, what held up, what failed, a specific
+    next-trade rule, evidence, quality metadata, limitations, and explicit
+    advisory-only authority.
+  - Provider reasoning such as `<think>...</think>` is sanitized before it can
+    reach the trader. AI failure falls back to a deterministic evidence-based
+    review instead of leaving an empty or vague result.
+  - Legacy reviews migrate locally without paid-provider calls. Regeneration
+    clears the old packet and version so the complete contract is rebuilt.
+- Upgraded Hermes to `hermes_metrics_v3_coach_intelligence`.
+  - Coach themes now use structured path diagnoses instead of loose keyword
+    matching.
+  - Hermes reports diagnosis recurrence, strategy × diagnosis
+    concentrations, structured/path/action-rule coverage, hidden historical
+    reasoning contamination, and exact repeated-sentence counts.
+  - Added a Coach Intelligence Audit panel plus recent evidence-backed review
+    drill-down.
+  - Added a five-minute audit cache so repeated daily, weekly, and Hermes views
+    do not repeatedly rescan the full review corpus. Explicit refreshes and
+    data-changing actions still rebuild or invalidate it.
+- Upgraded the learner coach analyst to
+  `coach-pattern-v2-structured`. Its nine eligible production briefs now use
+  structured diagnoses and path evidence with a 20% recurrence floor.
+  Suggestions remain shadow-only and have no leverage, sizing, risk, scoring,
+  filter, or execution authority.
+- Upgraded the History and pair-workspace review views to render the
+  structured evidence packet instead of presenting only a prose block.
+
+**Production migration and evidence quality:**
+
+- Migrated `3,633/3,633` eligible production reviews to
+  `coach-v2-evidence`.
+- Removed reasoning artifacts from `1,242` historical outputs; 52
+  reasoning-only outputs were replaced with deterministic evidence-based
+  reviews.
+- Visible production review state after migration:
+  - `0` residual `<think>` blocks,
+  - `0` empty reviews,
+  - `100.0%` structured coverage,
+  - `100.0%` actionable-rule coverage,
+  - `97.1%` path-evidence coverage,
+  - seven exact repeated sentences, representing `1.0%` recurrence and an
+    acceptable quality status.
+- Rebuilt all nine eligible coach-pattern research briefs deterministically;
+  all nine use the v2 contract and all nine retain `risk_authority=none`.
+
+**Safety, performance, and verification:**
+
+- Reports, reviews, and pattern briefs remain advisory. No report can create a
+  trade or directly change scoring, filters, stops, leverage, position size,
+  account exposure, or execution.
+- Any exposure-increasing idea must show the old and proposed size, leverage,
+  liquidation distance, and drawdown impact and still requires explicit user
+  approval.
+- Full local suite: `94/94` tests passed. Python compile, inline JavaScript
+  parse, and `git diff --check` also passed.
+- The full Hermes audit rebuild measured `10.47s`; a warm cached request
+  measured `0.24s`. The five-minute invalidation-aware cache keeps that heavy
+  reconstruction off the normal navigation path.
+- Desktop and 390 × 844 mobile browser acceptance passed for Cipher, Hermes,
+  and the structured History coach-review view. There was no document-level
+  horizontal overflow and no browser warning or error.
+- Production migration preserved trading state exactly: `3,947` signals and
+  `2,714` Paper rows (`304 closed`, `30 entry_expired`, `2 expired`,
+  `2,377 flow_rejected`, `1 pending`). SQLite integrity is `ok`; both
+  `matrix-trader` and `mt-learner` are active.
+- Server rollback snapshot:
+  `/opt/matrix-trader/backups/20260729T205700Z-report-closeout`.
+  It contains the pre-deploy application files, consistent `signals.db`,
+  verified compressed database, pre-deploy statistics and hashes, plus the
+  pre-refresh coach brief corpus.
+- Private GitHub backup commit:
+  `e19f179ba83656ab071c396f52ab86e95251df3b`. A clean VPS restore
+  verification matched the remote ref, passed all SHA-256 checks, and passed
+  `zstd -t` for the database and reporting-code archives.
 
 ---
 
