@@ -6,16 +6,476 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-06-12
-Last commit: fix: harden symbol loss gate
-app.py: 13,252 lines
-index.html: 13,597 lines
+Last updated: 2026-07-29
+Last commit: c6c5846 fix: correct paper drawdown metrics
+app.py: 33,194 lines
+index.html: 18,989 lines
+
+---
+
+## 2026-07-29 — Edge Lab v2 production migration and performance hardening
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Completed the Edge Lab roadmap across path truth, factor credibility,
+  strategy conditioning, challenger modeling, UI, bounded migration, and
+  storage safety.
+- Path labels are versioned as `edge_path_v2` and now retain actual exit type,
+  exit timing, exit-bounded MFE/MAE, gross realized path return, 24-hour
+  horizon return, and explicit ambiguity bounds.
+- Factor analysis is version-gated and now uses:
+  - current-run dynamic baselines,
+  - fee/slippage-adjusted net expectancy without inventing historical funding,
+  - symbol-day effective sample size,
+  - discovery/confirmation time splits,
+  - Benjamini-Hochberg multiple-testing control,
+  - ambiguity and symbol-concentration warnings,
+  - paired v2 migration coverage,
+  - an explicit 24-hour Edge vs 84-hour MT7 outcome-window warning.
+- Added strategy-conditioned Paper validation and rejected-candidate
+  counterfactuals for every instrumented strategy gate. Edge Lab is no longer
+  funding-arbitrage-specific.
+- Added filter-only suggestion drafts. Every draft states that leverage,
+  position size, and account exposure remain unchanged; registration is
+  measurement-only and never mutates scoring or strategy configuration.
+- Added the grouped-hour, leverage-normalized net-utility v2 meta-labeler
+  challenger while leaving the frozen v1 contract untouched. The first
+  production challenger run used 158 exact Paper snapshots, completed three
+  grouped walk-forward folds, and passed 6/7 research checks. It failed to
+  beat the temporal RMSE baseline, so `authority_eligible=false` remains
+  correct.
+- Added `edge_lab_upgrade.py`, which rebuilds five stale symbols per scheduled
+  run instead of rewriting the 20 GB research database in one blocking job.
+- Added `edge_lab_maintenance.py`; it is dry-run by default, requires
+  `--backup-confirmed` to prune, and only removes source JSON when the matching
+  v2 projection is verified.
+
+**Production migration and observed performance:**
+
+- Pre-deploy rollback snapshot:
+  `/opt/matrix-trader/backups/20260729T183804Z-edge-lab-v2`.
+  - Full compressed Edge DB: `1.2 GB`.
+  - Consistent compressed `signals.db`: `66 MB`.
+  - Uncompressed consistent `signals.db` retained server-side.
+  - All compressed assets passed `zstd -t`; all 40 snapshot files passed
+    SHA-256 verification.
+- Off-server disaster recovery is now live in the separate private repository
+  `https://github.com/bnortey/mt7-production-backups`.
+  - Sanitized backup commit:
+    `f14f23f026c0fc6f05a259eed6a9ce19a1c39b9c`.
+  - Git LFS stores `edge_lab.db.zst` (`1.2 GB`), `signals.db.zst`
+    (`66 MB`), and `rollback-metadata.tar.zst`; `.env`, exchange/AI
+    credentials, wallet keys, and all SSH private keys are excluded.
+  - A repository-scoped VPS deploy key has read/write access only to this
+    private backup repository.
+  - Verification used a clean clone back onto the VPS. All three files passed
+    the committed SHA-256 manifest, `git lfs fsck` passed, and the remote
+    `main` ref matched the local backup commit. The temporary verification
+    clone was then removed; the GitHub copy and server-local rollback snapshot
+    remain.
+- The first bounded rebuild migrated five symbols and 42,125 closed v2 paths
+  in 87.52 seconds with zero failures.
+- A production profiler pass found and fixed three migration/report
+  performance faults before leaving the sprint:
+  1. The v2 materializer would have rewritten all 4.36 million legacy rows.
+     It now projects only paired current-version rows.
+  2. Version predicates used `COALESCE`, preventing the new composite source
+     index from being used. Direct predicates and
+     `idx_candle_labels_versions_id` reduce no-op materialization to 3.53
+     seconds.
+  3. Concentration, coverage, symbol-count, and fingerprint bookkeeping
+     scanned the legacy population. They now use the paired-v2 boundary and
+     indexed counts.
+- Production factor generation fell from roughly 90 seconds wall time during
+  the first v2 run to 17.97 seconds; measured analysis fell from 101.0 to 12.4
+  seconds and concentration from 73.81 to 1.81 seconds.
+- Current factor scope is intentionally only five symbols / 42,125 paired-v2
+  rows (about 1.6% coverage). Every generic factor remains `research_only`
+  during migration regardless of apparent edge.
+- After the remote restore test passed, audited maintenance removed `39,260`
+  old `candle_labels` source rows whose current v2 projections were verified.
+  The source-label population moved from `4,362,764` to `4,323,504`; a
+  follow-up dry run found zero eligible rows. No feature projections, Paper
+  trades, signals, configs, or live behavior were removed.
+- No `VACUUM` was run. SQLite retained `326,684,672` bytes of internal reusable
+  pages, avoiding a blocking 20 GB database rewrite while allowing later
+  writes to reuse the space.
+- The post-maintenance factor report rebuilt successfully with 42,125
+  paired-v2 rows in 12.18 seconds. The v2 challenger still passes 6/7 checks
+  but fails temporal-baseline RMSE, so it remains shadow-only.
+- Edge Lab daily and weekly timers are active again. The daily run is scheduled
+  for `2026-07-30 03:45 UTC`; the weekly run for `2026-08-02 03:29 UTC`.
+
+**Safety and acceptance:**
+
+- Paper data survived the restart exactly: 2,714 rows before and after
+  deployment (`304 closed`, `30 entry_expired`, `2 expired`,
+  `2,377 flow_rejected`, `1 pending`); signal count remained `3,947`.
+- Paper data also survived offsite backup and retention maintenance unchanged:
+  `304 closed`, `30 entry_expired`, `2 expired`, `2,377 flow_rejected`,
+  `1 pending`, `0 open`, and `$741.31` recorded closed P&L.
+- `matrix-trader` and `mt-learner` are active; production logs contain no new
+  traceback, exception, or application error.
+- Production APIs report `edge_factor_v2`, 42,125 eligible rows, five eligible
+  symbols, one review-only draft, and both strategy validation and v2
+  meta-labeling with `authority_eligible=false`.
+- Browser acceptance passed on desktop and `390×844` mobile with no document
+  overflow and no console warnings/errors.
+- Final local regression: 80/80 tests passed, plus Python compile, shell syntax,
+  and `git diff --check`.
+- `git-lfs` was installed on the VPS solely so the private backup can be pushed
+  directly from the server without using Mac storage. The sanitized upload
+  staging directory excludes `.env`, exchange/AI credentials, wallet keys, and
+  SSH private keys.
+
+**Ongoing guardrails:**
+
+- Keep `bnortey/mt7-production-backups` private. Never put `signals.db`,
+  `edge_lab.db`, their compressed copies, credentials, or keys in the public
+  `bnortey/Matrix_Trader7.0` repository.
+- Do not run `VACUUM` on the 20 GB Edge Lab database during active service
+  without a new verified backup, a maintenance window, and sufficient
+  temporary disk space.
+- Generic factor states remain `research_only` during bounded v2 migration.
+  No suggestion, factor, or meta-label output may raise leverage, position
+  size, or account exposure automatically.
+
+---
+
+## 2026-07-29 — Cipher accountable report-intelligence sprint
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Upgraded the report contract to `cipher-v9-accountable-intelligence`; v8 report caches rebuild from persisted evidence.
+- Completed the seven-part report-intelligence roadmap:
+  1. Added a bounded exact-sentence repetition baseline against up to 15 prior reports, with a visible 30% review threshold.
+  2. Split weekly reporting into a genuinely weekly synthesis contract. It now analyzes daily progression, active coverage days, regime persistence/rotation, weekly gating, measured breadth/context coverage, next-week confirmation tests, and scheduled-event risk instead of reusing daily prose.
+  3. Added specialty-aware focus selection. Funding chooses the largest unresolved carry imbalance, microstructure chooses the strongest retained flow/book divergence, cross-venue chooses the largest identity-safe liquidity-qualified dislocation, technicals prefer liquid movers, and catalyst/tokenomics/social leads use their own quality contracts.
+  4. Added a compact `Desk Verdict` with posture, evidence, invalidation, authority, and an explicit exposure-risk disclosure.
+  5. Replaced false-neutral fallbacks with evidence-aware abstention. Missing data no longer prints fabricated `0.00%` movers, a one-checkpoint BTC return, or asks traders to confirm that an `unknown` regime remains dominant.
+  6. Added a structured forward report-claims ledger. Claims are written before their observation window, the first claim is immutable across report regeneration, mature claims are resolved by the existing 15-minute outcome loop, unscorable claims stay visible, and the ledger is permanently `descriptive_only`.
+  7. Added paragraph-level trust labels distinguishing deterministic interpretation from AI-polished evidence-grounded language, with the measured evidence families listed beside each narrative.
+- Added `GET /api/intelligence/report-claims`; it is read-only and has no scoring, strategy, risk, sizing, leverage, or execution authority.
+- Agent profile reports now show why each specialty focus was selected, the focus symbol when applicable, evidence quality, trader use, invalidation, and coverage limits.
+- Added a mobile-safe `Report Accountability` section showing repetition status, pending/resolved/unscorable claim totals, open forward claims by daily/weekly scope, and per-analyst resolved accuracy.
+- All new calculations use persisted/cached data. Report generation still performs no request-time exchange, social, catalyst, tokenomics, or hosted-AI fetch unless the user explicitly presses Regenerate for editorial polish.
+
+**Verification:**
+
+- `tests.test_cipher_report_depth`: `21/21` passing, including weekly/daily distinctness, role-aware focus, abstention behavior, immutable forward claims, and trust labels.
+- Full discovery: `71/72` passing. The only failure remains the pre-existing duplicate suggestion-ID sequencing test (`test_duplicate_suggestion_ids_are_repaired_and_future_ids_do_not_collide`), outside this sprint.
+- Python compile, inline JavaScript parse, and `git diff --check` passed.
+- Local deterministic generation measured about `74ms` daily and `105ms` weekly.
+- Production uncached generation measured `1.680s` daily and `1.700s` weekly. Current production exact-sentence overlap is `20.0%` versus prior daily reports and `0.0%` between the current weekly synthesis and paired daily.
+- Production file hashes match local. `matrix-trader` is active, the report-claims API returns `descriptive_only`, and post-restart service logs contain no application errors.
+- Browser acceptance passed on production:
+  - daily and weekly show schema v9, Desk Verdict, trust labels, and Report Accountability,
+  - weekly unknown-regime coverage correctly withholds regime-specific preference,
+  - Priya’s profile selects HYPE from measured float/FDV risk and displays distinct evidence/trader-use/invalidation text,
+  - desktop and `390×844` mobile have no document-level horizontal overflow,
+  - browser console contains no warnings or errors.
+- Production rollback bundle: `/opt/matrix-trader/backups/20260729T053656Z-report-intelligence-v9` (prior app, dashboard, and full SQLite database).
+
+**Sprint status:** complete. Reports are richer and more accountable without adding latency to scans or granting narrative/claim accuracy any authority over entries, conviction, exposure, or execution.
+
+---
+
+## 2026-07-29 — Cipher report-enrichment sprint completion
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Upgraded the report contract to `cipher-v8-evidence-audit`.
+- Completed Hari Stern’s direct social-intelligence phase with an asynchronous 30-minute collector:
+  - uses Bluesky’s public AppView search contract with a bounded non-authenticated host fallback,
+  - samples no more than eight reviewed market/asset topics and 50 recent English posts per topic,
+  - persists aggregate activity rather than full profiles,
+  - measures post rate, unique authors, top-author concentration, duplicate-language share, engagement per post, and change versus MT7’s own trailing seven-day median,
+  - labels thin, concentrated, baseline-collecting, and single-source samples explicitly,
+  - never converts engagement or activity into bullish/bearish sentiment, conviction, leverage, position size, or execution.
+- Replaced Hari’s funding-only proxy report with a distinct evidence-led brief and a full `Social Attention & Credibility` daily/weekly section. It states what was sampled, the evidence-quality flags, the trader use, the invalidation test, and the Bluesky-only limitation.
+- Added `GET /api/intelligence/social-evidence`; it is read-only and never performs request-time social calls.
+- Expanded the existing asynchronous official catalyst collector with:
+  - crypto-filtered U.S. SEC and CFTC press-release feeds,
+  - Ethereum Foundation protocol/security publications,
+  - reviewed Aave, Arbitrum, and Optimism governance forums,
+  - Solana’s official protocol status feed.
+- Every new catalyst retains an authority scope and symbol-resolution contract. Governance discussion is not described as passage or implementation; regulator items remain market-wide unless the source proves an asset mapping.
+- Added a structured on-chain capability boundary to Priya’s tokenomics packet:
+  - direct holder concentration and labeled flows remain unavailable,
+  - MT7 now exposes the exact prerequisites for safe coverage: reviewed chain contracts, exclusions for vesting/treasury/bridge/burn/exchange addresses, historical snapshots, label provenance, and bridge/internal-transfer de-duplication,
+  - same-symbol and top-wallet queries are explicitly rejected as cross-chain identity evidence.
+- Added a forward-only `Report Evidence Outcome Audit`:
+  - evidence must exist before a signal timestamp,
+  - resolved cohorts compare social, official-catalyst, and tokenomics-risk context with their no-evidence controls,
+  - retained daily ≥8% movers show evidence coverage, signal coverage, and missed-mover counts,
+  - the audit is observational, always returns `scoring_eligible: false`, and cannot mutate signals, sizing, leverage, or execution,
+  - the cohort join runs in the background after the social cycle and is stored as a compact snapshot; reports and the API only read that cache,
+  - exposed at `GET /api/intelligence/report-evidence-evaluation`.
+- Added compact, mobile-safe report UI for social examples/quality, outcome cohorts, catalyst authority labels, and the on-chain capability boundary. All network collectors remain asynchronous, cached, bounded, and outside scan/report request paths.
+- Added environment-template controls for social/catalyst/tokenomics cadence and retention.
+- Fixed a production acceptance defect in the legacy Intelligence workspace: the broad status and suggestion summaries can take more than eight seconds while SQLite is serving the other panels. Their bounded client deadline is now 20 seconds, so that work no longer collapses the entire tab into a generic load failure.
+
+**Local verification before deployment:**
+
+- Live governed catalyst collection stored `128` retained events across exchange, macro, protocol, governance, regulator, and status source families. Local Bybit announcement access returned a region/WAF `403`; the collector recorded the source error and completed without blocking other feeds.
+- Live social collection completed in `900ms`, stored five topic snapshots from `181` recent posts, and returned zero source errors.
+- Cached endpoint latency:
+  - social evidence `4.7ms`,
+  - catalyst evidence `3.9ms`,
+  - report-evidence evaluation `4.0ms` from the background snapshot cache.
+- Uncached local current daily report built in `86.7ms` after evidence collection.
+- Python compile and inline JavaScript parse passed.
+- `tests.test_cipher_report_depth`: `16/16` passing.
+- Full discovery: `66/67` passing. The only failure remains the pre-existing duplicate suggestion-ID sequencing test (`test_duplicate_suggestion_ids_are_repaired_and_future_ids_do_not_collide`), which is outside this report-enrichment sprint.
+
+**Production verification:**
+
+- The governed catalyst refresh retained `178` events (`92` new) with zero source errors in `5.017s`. Reviewed raw source counts were MEXC `4`, Bybit `50`, Hyperliquid `60`, Federal Reserve monetary releases `15`, FOMC dates `25`, Ethereum Foundation `18`, Aave governance `30`, Arbitrum governance `30`, Optimism governance `30`, and Solana status `30`. The currently fetched SEC/CFTC crypto-filtered sets contained zero qualifying releases and were reported as empty—not as collector failures.
+- The direct social refresh stored five topic snapshots from `181` posts with zero source errors in `1.876s`.
+- The background evidence cohort calculation completed in `2.502s`; its cached API returned in `14.4ms`.
+- Current daily report latency was `1.165s` uncached and `39.5ms` cached. The rendered report identifies schema `cipher-v8-evidence-audit`, Hari as `direct_activity_cached`, the social sample as `usable_single_source`, and the outcome audit as `descriptive_only / background_snapshot / scoring false`.
+- Browser acceptance passed on the deployed UI:
+  - daily and weekly reports render the enriched written outlook, scenarios, social evidence, official catalysts, tokenomics boundary, and forward outcome audit,
+  - Hari, Priya, and Daria expose distinct specialty reads, evidence used, trader use, invalidation, and limitations,
+  - desktop and `390×844` mobile have no document-level horizontal overflow; wide evidence tables scroll inside their cards,
+  - the browser console contains no warnings or errors.
+- Python compile, inline JavaScript parse, service health, cached-endpoint checks, and source collection checks passed.
+- Production backup: `/opt/matrix-trader/backups/20260729T035533Z-cipher-evidence-audit`.
+
+**Sprint status:** all five outstanding report-roadmap items are implemented. Direct cross-chain holder/wallet flows are resolved as an explicit capability boundary—not silently treated as delivered—and report evidence remains descriptive until future forward samples justify a separate scoring experiment.
+
+---
+
+## 2026-07-29 — Cipher tokenomics and supply-risk evidence phase
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Upgraded the report contract to `cipher-v7-tokenomics-evidence`; earlier report caches rebuild from persisted evidence.
+- Added a low-frequency asynchronous tokenomics collector (six-hour cadence, staggered startup). Scan, report, and agent-profile requests never wait on these networks.
+- Added free, explicitly attributed evidence:
+  - CoinGecko market snapshots for current price, market cap, FDV, circulating/total/max supply, float percentage, volume, and source timestamp.
+  - DefiLlama public-page observations for next disclosed unlock groups and treasury composition.
+- Added bounded SQLite stores:
+  - `tokenomics_asset_snapshots` retains 180 days of reviewed supply/valuation observations,
+  - `token_unlock_events` stores deduplicated next-event schedules,
+  - `token_treasury_snapshots` stores one observation per project/day,
+  - `tokenomics_collection_runs` retains 30 days of source counts, errors, latency, and coverage.
+- Token identity is conservative:
+  - CoinGecko evidence can attach to an MT7 pair only through a reviewed ID map.
+  - Same-symbol aggregator matches are not assumed to identify the MEXC contract.
+  - Unverified unlock/treasury rows remain stored for audit but cannot become focus-asset conclusions.
+- Linear emissions are labeled as rate changes. MT7 does not convert them into fake one-time token amounts, percent-of-float cliffs, or dollar unlocks.
+- Added `GET /api/intelligence/tokenomics-evidence`, a read-only cached endpoint with no request-time source fetch.
+- Priya now writes an evidence-led specialty brief containing:
+  - reported circulating float and FDV/market-cap pressure,
+  - mapped next-cliff timing, percent of circulating supply, cached value, and category when available,
+  - mapped treasury value/composition when available,
+  - trader use, invalidation, source freshness, mapping quality, and explicit coverage limits.
+- Daily and weekly deterministic reports now include an 80+ word `Tokenomics & Supply Risk` note plus compact supply, unlock, and treasury tables.
+- The action matrix can flag focus-asset low-float/FDV or near-term cliff risk. Any resulting exposure recommendation is limited to review, tighter admission, or an explicit reduction; tokenomics evidence can never justify higher leverage or a larger position.
+- Direct holder concentration, labeled wallet transfers, treasury transfers, and exchange-flow data remain explicitly unavailable. Market data and treasury composition are not described as whale activity or sale intent.
+- Fixed Priya’s profile modal on mobile: its report/evidence grid now collapses to one readable column instead of compressing the written analysis.
+- No tokenomics observation can create a signal, alter conviction, change sizing/leverage automatically, or execute a trade.
+
+**Production verification:**
+
+- Live source collection completed in `1.552s` with zero source errors:
+  - `26` reviewed CoinGecko asset snapshots,
+  - `356` raw DefiLlama unlock projects yielding `255` deduplicated next-event records,
+  - `408` treasury observations.
+- Current reviewed schedule coverage includes six upcoming events in the report look-ahead. Example: ARB’s cached Aug. 15 cliff is labeled `1.36%` of circulating float and `watch`, while SOL’s linear row is shown as `rate change / not a cliff`.
+- HYPE currently demonstrates the supply-risk contract: `22.2%` reported circulating float, `4.49×` FDV/market cap, `high` float-risk label.
+- Cached tokenomics endpoint latency: `47ms`.
+- Uncached current daily report latency: `1.377s`; cached daily latency: `54ms`; uncached weekly: `1.625s`.
+- Current reports expose `aggregated_cached` Priya coverage, source errors, feed age, reviewed mapping status, and direct on-chain blind spots.
+- Browser validation passed on the live production UI:
+  - the report section renders the tokenomics narrative, coverage metrics, supply table, reviewed unlock table, and explicit missing-data labels,
+  - desktop and `390×844` mobile viewports have no document-level horizontal overflow,
+  - wide evidence tables scroll only inside their own containers,
+  - Priya’s mobile modal is readable in one column and contains her measured read, evidence, trader use, invalidation, and limitations,
+  - browser console has no warnings or errors.
+- Python compile, inline JavaScript parse, collector/parser/report endpoint tests, file-hash verification, and service health passed.
+- `tests.test_cipher_report_depth`: `13/13` passing.
+- Full discovery: `63/64` passing. The only failure is the pre-existing duplicate suggestion-ID sequencing test (`test_duplicate_suggestion_ids_are_repaired_and_future_ids_do_not_collide`).
+- Production backup: `/opt/matrix-trader/backups/20260729T033200Z-tokenomics-evidence`.
+
+**Next report roadmap phase:**
+
+1. Add direct social activity and source-credibility evidence for Hari without treating engagement volume as an entry signal.
+2. Add protocol governance/security and selected regulator sources only after defining the same source-quality, timestamp, and symbol-resolution contracts.
+3. Evaluate optional chain-specific holder and labeled-flow providers; do not claim cross-chain coverage until it is reliable, affordable, and identity-safe.
+4. Measure whether tokenomics qualifiers improve missed-mover diagnosis and forward paper outcomes before any scoring experiment.
+5. Keep all collectors asynchronous, cached, bounded, source-labeled, and outside scan/report execution paths.
+
+---
+
+## 2026-07-29 — Cipher primary-source catalyst intelligence phase
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Upgraded the report contract to `cipher-v6-primary-catalysts`; prior report caches rebuild from persisted evidence rather than being relabeled.
+- Added an asynchronous official-source collector that runs every 15 minutes, staggered after the existing snapshot workers. Report and scan requests never wait on these networks.
+- Source families:
+  - official MEXC Announcement Center,
+  - official Bybit V5 Announcements API,
+  - Hyperliquid Statuspage incidents and scheduled maintenance,
+  - Federal Reserve monetary-policy RSS,
+  - official FOMC meeting calendar.
+- Added bounded SQLite stores:
+  - `catalyst_events` retains 90 days plus future scheduled events,
+  - `catalyst_collection_runs` retains 30 days of source counts, errors, latency, and new/stored totals.
+- Every event stores its canonical primary-source URL, publication time, event/effective time, source-time quality, status, severity, deterministic event class, affected assets/venues, and a content hash. Publication and effective time are not conflated.
+- Deterministic classes include listing, delisting, leverage/funding change, maintenance, venue incident, security, and monetary policy. They do not infer bullish/bearish direction.
+- MEXC token extraction is constrained by the current MT7 symbol universe to avoid turning prose acronyms into fake asset matches.
+- Added `GET /api/intelligence/catalyst-evidence`, a read-only cache endpoint with no request-time source fetch.
+- Yasmin now reports the highest-priority official item, source, timing, event class, severity, affected assets, market-reaction test, trader use, and invalidation.
+- Daria now separates the event the source proves from the market story/causality it does not prove, then requires breadth/flow/structure agreement.
+- Daily and weekly deterministic narratives now include a 90+ word catalyst watch; the weekly report uses actual cached event evidence instead of learner briefs as its upcoming-event source.
+- Added a restrained `Primary-Source Catalyst Radar` with source links, publication/effective timestamps, compact source-health metrics, and contextual help.
+- Cross-desk blind spots now describe the bounded official source set accurately instead of claiming there is no primary catalyst coverage.
+- AI report polish can edit the catalyst note, but the detailed deterministic version remains the free, fast baseline and cannot be collapsed into generic copy.
+- Fixed a separate Intelligence-tab sluggishness defect discovered during browser validation: the optional missed-mover endpoint could hang indefinitely and block the entire workspace. Optional Intelligence requests now abort after five seconds and degrade gracefully; core status/suggestion requests have an eight-second ceiling.
+- No catalyst item can create a signal, alter conviction, change sizing/leverage, or execute a trade.
+
+**Production verification:**
+
+- First official-source batch stored `86` retained events with no source errors:
+  - MEXC `4` current announcement cards,
+  - Bybit `50`,
+  - Hyperliquid status/maintenance `60` raw items before retention filtering,
+  - Federal Reserve monetary releases `15`,
+  - FOMC meetings `25` parsed across bounded calendar years.
+- First collection latency was `1.342s`; the autonomous follow-up completed in `3.031s` with zero errors and zero duplicate inserts.
+- Cached catalyst endpoint latency: `14ms`.
+- Uncached production report latency: daily `1.102s`, weekly `1.506s`; cached daily latency: `35ms`.
+- Current daily report exposes three time-matched official source families, zero source errors, a 91-word catalyst watch, and `primary_source_cached` Yasmin/Daria coverage.
+- Browser validation passed on the live production UI:
+  - the Intelligence workspace no longer remains frozen on `Loading…` when missed-mover analysis stalls,
+  - the radar renders official source links and separates publication/effective times,
+  - Yasmin and Daria profile modals show the new evidence-rich specialty briefs,
+  - a `390×844` viewport has no document-level horizontal overflow and the event cards stack cleanly.
+- Python compile, inline JavaScript parse, all parser/collector/report endpoint tests, service health, and source-health checks passed.
+- `tests.test_cipher_report_depth`: `12/12` passing.
+- Full discovery: `62/63` passing. The only failure is the pre-existing duplicate suggestion-ID sequencing test (`test_duplicate_suggestion_ids_are_repaired_and_future_ids_do_not_collide`).
+- Production backup: `/opt/matrix-trader/backups/20260729T025500Z-primary-catalysts`.
+
+**Next report roadmap phase:**
+
+1. Add supply, unlock, and treasury evidence for Priya using authoritative or clearly attributed sources. **Completed in `cipher-v7-tokenomics-evidence`; direct holder/wallet-flow coverage remains a deliberate gap.**
+2. Add direct social activity plus source-credibility evidence for Hari without making engagement volume a trading signal.
+3. Extend official catalyst coverage to protocol governance/security and selected regulators only after defining source-quality and symbol-resolution contracts.
+4. Measure whether catalyst alignment improves missed-mover diagnosis and forward paper outcomes before allowing any scoring experiment.
+5. Keep every collector asynchronous, cached, bounded, source-labeled, and outside scan/report execution paths.
+
+---
+
+## 2026-07-29 — Cipher synchronized cross-venue evidence phase
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Upgraded report schema to `cipher-v5-cross-venue`, invalidating older cached report payloads.
+- Added a background collector that fetches the complete public MEXC, Hyperliquid, and Bybit ticker universes concurrently every 15 minutes. It is independent of scans and report requests.
+- Added bounded SQLite evidence tables:
+  - `cross_venue_snapshots` retains seven days of synchronized normalized observations,
+  - `cross_venue_collection_runs` retains health, latency, venue counts, match counts, and errors for 30 days.
+- Exact-base matching remains anchored to MEXC. Bybit is context-only and was not added to the signal scanner or execution routes.
+- Normalized comparable fields include price, mark/index, MEXC/Bybit top spread, USD turnover, venue-supported USD OI, 24h change, and funding converted to an 8-hour equivalent.
+- Data-quality controls prevent false precision:
+  - MEXC funding interval is labeled assumed,
+  - MEXC ticker OI remains labeled native contract units and is never compared as USD,
+  - Hyperliquid is labeled USDC/mark-price context,
+  - exact-base matches wider than 500 bps are quarantined as token-identity/staleness conflicts,
+  - an 8 bps USDC quote buffer is shown separately from every raw venue gap,
+  - thin-liquidity comparisons are labeled.
+- Ghost, Eric, and Kenny now receive measured venue coverage, price dispersion, normalized funding divergence, direction agreement, venue leadership (only after two observations), and supported USD OI movement.
+- Deterministic Ghost narratives no longer claim that arbitrary venue gaps forecast the next move. Venue evidence is explicitly confirmation context, not an entry or arbitrage instruction.
+- Added a compact cross-venue table to `Measured Market Evolution` and a read-only cached health/evidence endpoint: `GET /api/intelligence/cross-venue-evidence`.
+- Current-day report caches now expire after 15 minutes and current-week caches after one hour. Historical reports remain immutable. Automatic refresh stays deterministic and does not invoke AI.
+
+**Production verification:**
+
+- Initial batch completed in `272ms` with no venue errors:
+  - MEXC `913`,
+  - Hyperliquid `177`,
+  - Bybit USDT perpetuals `663`,
+  - `524` MEXC-anchored assets on two or more venues,
+  - `161` assets on all three venues,
+  - `1,209` normalized rows stored.
+- The production batch exposed `ON_USDT` as an implausible exact-symbol collision; the new identity guard correctly quarantines it rather than showing a false ~20,000 bps opportunity.
+- Uncached daily report latency with two retained venue batches: `1.214s`; cached latency: `0.037s`.
+- The report request path makes zero venue calls and zero AI calls on first paint.
+- Python compile, inline JavaScript parse, read-only endpoint, production report schema, and service health passed.
+- Production browser smoke test passed: the report renders the new coverage metrics and venue table, console has no warnings/errors, and a 390×844 viewport has no document-level horizontal overflow (wide tables remain locally scrollable).
+- `tests.test_cipher_report_depth`: `9/9` passing, including normalization, persistence, quote buffering, identity quarantine, cache expiry, and cached endpoint coverage.
+- Full discovery: `58/59` passing. The only failure is the pre-existing duplicate suggestion-ID sequencing test (`test_duplicate_suggestion_ids_are_repaired_and_future_ids_do_not_collide`).
+- Production backup: `/opt/matrix-trader/backups/20260729T022015Z-cross-venue`.
+
+**Next report roadmap phase:**
+
+1. Add timestamped primary-source news, official announcements, listing/governance/security events, and macro-calendar evidence for Yasmin and Daria.
+2. Add supply, unlock, treasury, holder-concentration, and on-chain flow evidence for Priya.
+3. Add direct social activity plus source-credibility evidence for Hari.
+4. Add synchronized depth only for a small priority/watchlist set if measured trader value justifies its API and storage cost.
+5. Keep every new collector asynchronous, cached, rate-limited, evidence-labeled, and outside scan/report paths.
+
+---
+
+## 2026-07-29 — Cipher evidence layer + report performance phase
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Upgraded report schema to `cipher-v4-evidence`.
+- Daily and weekly Cipher reports now consume bounded evidence packets from MT7's persisted:
+  - hourly all-market ticker history,
+  - BTC/ETH market-context history,
+  - MEXC recorded trade tape,
+  - MEXC order-book depth history,
+  - paper outcomes and execution costs.
+- Added measured breadth evolution, price/OI rotation, funding change, BTC return/RSI/trend transitions, aggressive-flow delta, book imbalance, and spread evidence.
+- Enriched Thomas, Harper, Daria, Rishi, Eric, Niobe, Kenny, and Nadia briefs with those measured inputs. Missing tokenomics, social, news, and cross-venue sources remain explicitly unclaimed.
+- Paper report evidence now includes W+P rate, net expectancy, profit factor, realized dollar P&L, maximum drawdown, fee/slippage drag, and compounding-trade count.
+- Strategy/regime tables now include sample size and average realized P&L.
+- Added a compact `Measured Market Evolution` report section instead of another large dashboard surface.
+
+**Efficiency and robustness work:**
+
+- Weekly reports no longer rebuild the full daily report eight times. Seven daily rollups use one bounded DB pass; the full payload is built once.
+- Added indexed timestamp queries for signals, filtered candidates, and paper trades. Removed `date(column)` wrappers from report reads so SQLite can use those indexes.
+- Normal report navigation never blocks on a live exchange call or AI provider:
+  - market evidence comes from the snapshot worker,
+  - first paint uses deterministic cached narrative,
+  - explicit `Regenerate` may apply optional AI polish.
+- Added a 90-day `ticker_daily_snapshots` table. Hourly history remains bounded to seven days; the daily table preserves longer-horizon breadth/rotation evidence at roughly 1/24 the storage cost.
+- Existing hourly history is backfilled into daily snapshots once at startup.
+- AI polish cannot replace a detailed deterministic note with materially shorter generic copy.
+- Snapshot source and age are displayed on the report.
+
+**Production verification:**
+
+- `matrix-trader` restarted successfully and is active.
+- New timestamp indexes are present.
+- Daily history backfilled to `8,256` daily-symbol rows across `8` days immediately after deploy.
+- Uncached production report latency: daily `1.06s`, weekly `1.25s`.
+- Cached production report latency: daily `0.04s`, weekly `0.04s`.
+- Daily production evidence: `2,072` hourly market rows; paper cohort `53` closed, `56.6%` W+P, `+4.26%` expectancy, `1.55` profit factor, `+$112.78` realized, `$38.53` max drawdown.
+- Frontend marker, report APIs, Python compile, inline-JS parse, and service health passed.
+- `tests.test_cipher_report_depth`: `7/7` passing.
+- Full test discovery has one unrelated existing failure in duplicate suggestion-ID sequencing (`test_duplicate_suggestion_ids_are_repaired_and_future_ids_do_not_collide`).
+- Production backup: `/opt/matrix-trader/backups/20260729T020643Z-cipher-v4`.
+
+**Next report roadmap phase:**
+
+1. ~~Add synchronized MEXC/Hyperliquid/Bybit evidence for Ghost and Eric.~~ Completed in `cipher-v5-cross-venue`.
+2. Add timestamped primary-source news, official announcements, and macro-event evidence for Yasmin and Daria.
+3. Add supply/unlock/on-chain evidence for Priya.
+4. Add direct social activity/credibility evidence for Hari.
+5. Keep every new collector asynchronous, cached, rate-limited, and outside scan/report request paths.
 
 ---
 
 ## What This Project Is
 
-Matrix Trader 7.0 is a local web application for high-leverage crypto trading on MEXC and Hyperliquid perpetual swap markets. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders derived from ATR, views a 4-section AI trade brief, and executes trades manually. Signal history is auto-logged to SQLite. A paper bot runs automated simulated trades. An external mt-learner service analyzes outcomes and generates improvement suggestions. It is not a price forecasting engine and not a SaaS product.
+Matrix Trader 7.0 is a local web application for high-leverage crypto trading on MEXC and Hyperliquid perpetual swap markets. A Python Flask backend serves a single-file dark-theme dashboard. The user scans 800+ MEXC perp tickers, receives ranked LONG/SHORT signals with entry/TP/SL ladders derived from ATR, views a 4-section AI trade brief, and executes trades manually. Signal history is auto-logged to SQLite. A paper bot runs automated simulated trades. An external mt-learner service analyzes outcomes and generates improvement suggestions. Probabilistic AI forecasting exists only as a forward-tested shadow research lane with zero authority over conviction, risk, paper trading, leverage, or execution. MT7 is not a SaaS product.
 
 ---
 
@@ -24,7 +484,7 @@ Matrix Trader 7.0 is a local web application for high-leverage crypto trading on
 | MT6 Mistake | MT7 Rule |
 |---|---|
 | Matrix chat bot as delivery mechanism | Web app only |
-| ARIMA price forecasting | No forecasting. Signals only. |
+| ARIMA price forecasting | No unvalidated forecasting authority. Forward forecasts stay probabilistic, capped, and shadow-only until independently proven. |
 | Two competing TUI implementations | One interface: the web dashboard |
 | Coinglass API key committed in plaintext | All keys in `.env`, never committed |
 | 17 planning markdown files instead of code | Ship before you plan |
@@ -162,7 +622,7 @@ eth-account>=0.8.0
 msgpack>=1.0.0
 ```
 
-SQLite3 is stdlib. AI fallback chain: Claude → Gemini → DeepSeek → Groq. Always use `call_ai()` from `lib/ai_client.py` — never import providers directly. `call_ai()` accepts optional `provider` and `model` kwargs to pin a specific model for a feature (e.g. coach reviews).
+SQLite3 is stdlib. AI routing supports Claude, OpenAI, Gemini, DeepSeek, Kimi, Z.ai, Groq, Ollama, and one configurable OpenAI-compatible endpoint. Always use `call_ai()` from `lib/ai_client.py`—never import providers directly. `call_ai()` accepts a `feature` key plus optional explicit `provider` and `model` pins. Per-call routing health is recorded in `ai_call_events` without prompts, responses, or secrets.
 
 ---
 
@@ -170,9 +630,14 @@ SQLite3 is stdlib. AI fallback chain: Claude → Gemini → DeepSeek → Groq. A
 
 ```bash
 ANTHROPIC_API_KEY=        # AI trade briefs, coach reviews, reports
-GEMINI_API_KEY=           # fallback AI provider
-GROQ_API_KEY=             # fallback AI provider (Qwen3/Llama)
-DEEPSEEK_API_KEY=         # fallback AI provider
+OPENAI_API_KEY=           # GPT-5.6 family
+GEMINI_API_KEY=           # Gemini hosted/free-tier models
+GROQ_API_KEY=             # Groq hosted free-tier models
+DEEPSEEK_API_KEY=         # DeepSeek V4
+KIMI_API_KEY=             # Kimi K2.6/K3
+ZAI_API_KEY=              # Z.ai GLM
+OLLAMA_BASE_URL=          # optional local Ollama endpoint
+CUSTOM_AI_API_KEY=        # optional custom OpenAI-compatible endpoint key
 MATRIX_PORT=8080          # optional — defaults to 8080
 MEXC_API_KEY=             # optional — private account endpoints
 MEXC_API_SECRET=          # optional
@@ -273,6 +738,8 @@ Sentiment APIs (no key needed):
 | `/api/intelligence/suggestions/<id>/park` | POST | Park stale evaluating suggestion without rejecting or reverting overlay |
 | `/api/intelligence/research` | GET | Strategy hypothesis briefs |
 | `/api/intelligence/roster` | GET | Cipher Research Group analyst roster |
+| `/api/intelligence/cross-venue/<symbol>` | GET | On-demand read-only chart/structure comparison for one symbol |
+| `/api/intelligence/cross-venue-evidence` | GET | Latest cached synchronized MEXC/Hyperliquid/Bybit report evidence and collector health |
 | `/api/intelligence/reports/daily` | GET | Daily Cipher report (cached); rejects future dates |
 | `/api/intelligence/reports/weekly` | GET | Weekly Cipher report (cached) |
 | `/api/intelligence/reports/regenerate` | POST | Force regenerate a cached report |
@@ -280,6 +747,11 @@ Sentiment APIs (no key needed):
 | `/api/execution/place` | POST | Place limit order (gated by LIVE_TRADING_ENABLED) |
 | `/api/execution/kill-switch` | POST | Cancel all orders + close all positions |
 | `/api/ai/health` | GET | AI provider health check |
+| `/api/ai/circuits/reset` | POST | Reset one or all AI provider cooldowns |
+| `/api/ai/benchmarks` | GET/POST | Read benchmark history or start an explicit shadow model benchmark |
+| `/api/ai/benchmarks/<run_id>/promote` | POST | Manually route an eligible benchmark model to its tested workflow |
+| `/api/ai/forecasting` | GET | Forward shadow configuration, candidates, calibration/return scoreboard, regimes, and safety flags |
+| `/api/ai/forecasting/run` | POST | Start one bounded collect/evaluate cycle (`all`, `collect`, or `evaluate`) |
 | `/api/settings/ai` | GET | Current AI model settings (global + per-feature) |
 | `/api/settings/ai` | PATCH | Update global or coach_review model |
 | `/api/paper/trades` | GET | Paper trade history |
@@ -497,12 +969,15 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | P9 | Trade Readiness Panel — pre-flight checklist, position sizing recommendation | ✅ Done |
 | P10 | Paper bot — live on VPS, 50 closed trades, dynamic position sizing | ✅ Done (running) |
 | Self-improving loop A+B | Goals file, apply/reject API, benchmark strip, Suggestions sub-tab | ✅ Done |
-| AI model selector | Per-feature model pinning: global + coach_review_model in Tools tab | ✅ Done |
+| Super User AI Control Center | Global + five task routes, free-first preset, 9 providers/custom endpoint, health-aware fallbacks, persistent circuit breakers, connection test, redacted call telemetry | ✅ Deployed 2026-07-27 |
+| Model Benchmark Lab | Five workflow suites, score-only persistence, champion/challenger gates, explicit audited workflow promotion | ✅ Deployed 2026-07-27 |
+| Forward AI Shadow Validation | 15m/1h/4h probabilistic ledger, calibration and net-after-cost scoring, no-change/MT7 baselines, champion/challenger and regime scoreboard | ✅ Deployed 2026-07-27 — no trading authority |
 | Hermes Advisory Group | External consultancy bridge: context packet API, Hermes sub-tab, memo display, weekly timer | ✅ Done |
 | Hermes coach reviews | Two-tier system: compact theme summary in packet + full corpus endpoint | ✅ Done |
 | Paper/live data isolation | source field in dedup guard; paper bot only links/updates source='paper' signals | ✅ Done |
 | P11 | Execution layer built (Hyperliquid kill switch, order placement, confirmation modal) | ✅ Built — NOT activated. Waiting on paper bot validation. |
 | Paper bot realism | Pending entry1 wait, max-hold expiry, net fee/slippage P&L, chunked Min1 evaluator parity, UI stats | ✅ Done |
+| Paper equity compounding | User-selectable Fixed Base / Compound Realized Equity sizing, caps/floor/drawdown fallback, per-trade audit snapshot | ✅ Deployed — Fixed Base remains active until explicitly changed |
 | mt-learner net objective | Threshold/regime suggestions optimize actual net `pnl_pct`, W+P, loss streak | ✅ Done/deployed |
 | Liquidation price engine | `lib/risk_liquidation.py` — exchange-aware liq price on signals, paper trades, UI | ✅ Done |
 | Paper hard-dollar P&L | `pnl_usd`, `gross_pnl_usd`, `cost_usd` on paper trades; dollar stats in Paper tab | ✅ Done |
@@ -513,9 +988,11 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 | Strategy Context card | Pair workspace sidebar: recent 20/10 perf, symbol fit, direction fit, cold streak warnings | ✅ Done |
 | Hermes on-demand run | `POST /api/intelligence/hermes/run` + Run Now button with async status polling | ✅ Done |
 | Market fullscreen chart | `.panel-fullscreen .chart-panel` expands to 58vh; chart reloads on toggle | ✅ Done |
-| Edge Lab pipeline | `edge_lab/` package + weekly Lite timer + daily incremental refresh — candle fetch, path labeling, materializer, factor analysis → `edge_lab.db` + `factor_report.json` | ✅ Deployed/running |
-| Edge Lab cohort attribution | `/api/paper/cohort-edge` + Paper tab panel attribute current paper cohort trades to Edge Lab factor states | ✅ Done/deployed |
-| P12 | Micro-live automation — one proven strategy, automated, exposure caps | ⏳ Pending — gated on paper bot proving edge (50%+ W+P, positive EV after fees, 50+ trades) |
+| Edge Lab pipeline | V2 versioned research pipeline: exit-aware path economics, rolling dynamic baselines, cost adjustment, symbol-day effective n, discovery/confirmation, FDR, ambiguity and concentration, generalized strategy/counterfactual validation, gated measurement-only drafts → `edge_lab.db` + `factor_report.json` | ✅ Implemented locally; production migration/deploy pending |
+| Edge Lab cohort attribution | `/api/paper/cohort-edge` + Paper tab panel attribute trades to fully closed Min15 factor states, with explicit coverage reasons and feature/outcome freshness | ✅ Repaired/deployed — historical coverage 96.8%, current cohort 100% |
+| Statistical meta-labeler | Frozen v1 remains untouched; v2 challenger predicts leverage-normalized net Paper utility with grouped hourly walk-forward splits and zero authority | ✅ V2 challenger implemented locally; v1 evidence remains 2/10 and untouched |
+| Robust paper/P12 evidence gate | 50-trade isolated minimum, net %/$ EV, W+P, dollar PF, rolling 20/50 stability, 10% trimmed EV, leave-best-out P&L, cohort drawdown, safety controls | ✅ Deployed — current cohort 3/50, live locked |
+| P12 | Micro-live automation — one proven strategy, automated, exposure caps | ⏳ Pending — gated on robust paper evidence (55%+ W+P, PF >=1.25, positive robust EV, controlled drawdown, 50+ trades) |
 
 ---
 
@@ -523,16 +1000,25 @@ No glassmorphism, no gradients, no drop shadows. Flat dark UI only.
 
 **Next in priority order:**
 
-1. **Finish post-reset hardening/deploy verification**: June 8 external scanner traffic called `POST /api/paper/reset` and wiped paper history. Local code now disables reset by default, removes the dashboard reset button, and requires `ALLOW_PAPER_RESET=true`, `MT7_API_TOKEN`, typed confirmation, and an automatic DB backup before reset can run. Verify this on production before trusting new paper stats.
-2. **Rebuild the paper gate from a fresh cohort**: The prior paper history is not a reliable active table after the wipe. Track the clean post-hardening focus-short cohort separately; do not mix pre-reset evidence into P12 readiness.
-3. **Review/apply learner regime suppressions as shadow-first controls**: Hermes 2026-06-12 recommends approving `regime_funding_arb_choppy_20260608_001` and `regime_balanced_low_liquidity_20260608_002` in shadow-only mode first. Collect 50 closed affected signals, compare EV and trade-count impact, then decide whether to promote.
-4. **Use Edge Lab attribution panel**: `/api/paper/cohort-edge` + Paper tab panel attributes cohort trades to Edge Lab factor states. Use this to validate whether winning trades align with strong Edge Lab states.
-5. **If focus-short cohort proves edge** (50+ clean trades, 50%+ W+P, EV > 0 after fees, no drawdown breach): prepare P12 micro-live design. Do not activate yet.
+1. **Operate, do not tune, the completed Edge Lab v2 migration**: the daily low-priority runner upgrades five stale symbols per run and every factor remains `research_only` until the rolling 90-day window reaches 95% v2 label and feature coverage. Keep meta-labeler v1 frozen (`2/10` gates) and collect untouched forward evidence. V2 is a separate grouped-time net-utility challenger with no authority; do not tune it against the same validation outcomes.
+2. **Keep forecasting forward-only in parallel**: collect at least 50 valid outcomes per model/horizon and compare Brier skill, net-after-cost return, abstention, and regime stability against MT7 and no-change baselines. Do not backfill stale signals or grant forecasts trading authority.
+3. **Collect the clean paper cohort under the frozen robust gate**: P12 now requires 50 isolated closes even when the experiment progress target is 20. Do not change the current policy while the cohort is only `3/50`. At 50, require net %/$ EV > 0, W+P >=55%, dollar PF >=1.25, positive/stable recent 20 and 50 windows, positive 10% trimmed EV, positive P&L after removing the best winner, cohort drawdown <=20%, and no active safety control.
+4. **Prepare P12 only after the preceding gates pass**. P11 remains built but inactive; do not add live credentials, raise risk, or automate execution yet.
+
+**Implemented Paper feature — optional realized-equity compounding:**
+
+- `paper_sizing_mode` supports `fixed` and `compound_realized`. Fixed remains the backward-compatible default; changing modes never changes leverage, risk percentage, maximum positions, stop behavior, or margin mode.
+- Compound mode uses configured starting balance plus P&L from closed Paper trades only. Open/unrealized P&L is excluded.
+- Guardrails: configurable compound cap, operating equity floor that blocks new entries, and current-drawdown fallback that limits sizing to no more than the fixed base.
+- Enabling compound mode requires an explicit risk acknowledgement, is blocked while Paper positions are pending/open, and automatically starts a new validation cohort. Returning to Fixed Base is always available once the active-position gate clears.
+- The Paper UI shows realized equity, effective sizing base, risk target dollars, maximum single/concurrent notional, and current drawdown. New trades persist their sizing mode/base/equity/risk policy for audit.
+- This feature is Paper-only. It grants no Live authority and must be compared with the fixed-base cohort before any Live design review.
 
 **Do NOT do yet:**
 - Add `HL_PRIVATE_KEY` to VPS — paper bot has not proven edge
-- Build P12 automation — gated on P11 validation
+- Activate P12 automation — gated on robust paper validation and the immutable execution checks
 - Raise risk or scale account size while Hermes drawdown status is yellow/red
+- Enable compounded sizing for Live — Paper forward validation and the independent Live gates must pass first
 - Let Hermes directly mutate configs, trade, or read private exchange keys — Hermes is advisory only
 
 **Production server:** Vultr Singapore `207.148.66.39` — SSH key-auth only.
@@ -613,6 +1099,175 @@ Read CLAUDE.md and HANDOFF.md before touching anything.
 ---
 
 ## Session Notes
+
+### 2026-07-28 — Session summary (Paper realized-equity compounding, deployed)
+
+- Added `Fixed Base` and `Compound Realized Equity` Paper sizing modes. Existing/legacy configs default to Fixed Base, so deployment did not change position size, leverage, risk percentage, or active strategy settings.
+- Compound mode calculates eligible equity as configured starting balance plus dollar P&L from closed Paper trades only. Pending/open positions and unrealized P&L are excluded.
+- Added configurable `$1,000` compound sizing cap, `$50` operating equity floor, and `20%` current-drawdown fallback defaults. The floor blocks new entries without inventing capital; the fallback limits sizing to no more than the fixed base.
+- Both risk-derived sizing and the Paper position cap receive the same effective sizing base. Leverage, risk percentage, max positions, stop behavior, and isolated-margin/liquidation calculations remain independent.
+- Added per-trade audit columns: `sizing_mode`, `sizing_base_usd`, `realized_equity_usd`, `sizing_risk_pct`, and `sizing_policy_json`.
+- Enabling Compound requires explicit acknowledgement, is rejected while any Paper position is pending/open, and automatically starts a new isolated cohort. Switching modes never resets historical trades.
+- Paper API/dashboard now expose realized equity, effective sizing base, dollar risk target, maximum single and concurrent notional, cap/floor state, and current drawdown. Closed trade detail records the sizing policy used at entry.
+- Production remains in Fixed Base because one Paper entry is pending. Live verification: realized equity `$941.00`, sizing base `$200.00`, 5% risk target `$10.00`, maximum single position `$50.00`, maximum concurrent notional `$250.00`, current drawdown `1.20%`. The explicit enablement preview shows proposed base `$941.00`, risk target `$47.05`, maximum single notional `$235.25`, and maximum concurrent notional `$1,176.25`. A Compound enable request returned HTTP 409 and stored mode remained Fixed.
+- Verification: 51 targeted tests passed (8 new compounding tests), Python/JavaScript syntax checks passed, SQL insert columns/placeholders match, SQLite migration completed, both APIs return the sizing policy, and desktop plus 390×844 mobile browser checks passed.
+- Rollback: `/opt/matrix-trader/backups/20260728-paper-compounding/` contains the prior app, dashboard, Paper config, and full 349 MB SQLite database.
+
+### 2026-07-28 — Session summary (universal learner suggestion contract, deployed)
+
+- Generalized the learner improvement path across every strategy key instead of special-casing Funding Arb. `mt-learner/analyzer.py` now reads the active runtime threshold for standard and custom strategies from `/api/strategies?include_disabled=1`; historical implied thresholds remain evidence only.
+- Threshold generation now fails closed when runtime authority is unavailable. Read-only proposals with a changed or unverified baseline are automatically superseded; applied/evaluating controls are never rewritten by this cleanup.
+- Added the universal `mt7_suggestion_v1` explainability contract to all suggestion API records: exact current→proposed changes, evidence source/sample/confidence, forward-test state, expected benefit, downside, rollback, scope, runtime authority, completeness, and audit fingerprint.
+- Every suggestion is manual-review-only (`auto_apply_allowed=false`). Application requires an acknowledged contract version and matching baseline fingerprint. Stale, incomplete, or unsupported changes are blocked.
+- Leverage, risk, position-size, maximum-position, margin-mode, and execution-related suggestions are classified as restricted. They must show dollar risk targets, notional/margin/concurrent-exposure estimates and loss/liquidation semantics, then require the exact phrase `APPROVE <suggestion_id>`. This does not weaken the immutable no-automatic-leverage-escalation rule.
+- Dashboard Suggestions cards now render the contract explicitly. Pending controls show `Review & Apply`; restricted controls render a red capital-at-risk disclosure. Mobile browser verification at 390×844 confirmed the contract remains readable.
+- Repaired a production queue collision by assigning the second duplicate record `thresh_balanced_focus_short_20260728_001_r2`; future IDs use a collision-free allocator. Production queue has 10 records and 10 unique IDs.
+- Current production pending reviews are runtime-authoritative and remain unapplied: Funding Arb `69→81` (`strategy_override`) and Balanced Focus Short `65→67` (`strategy_config`). The previous Funding Arb `60→81` and unverified Balanced Focus Short proposal were superseded.
+- Production safety verification: an apply call without contract acknowledgement returned HTTP 409 and left the suggestion `pending_review`; both `matrix-trader` and `mt-learner` are active. No strategy configuration was applied.
+- Tests: 43 targeted unit tests passed, including universal-strategy runtime authority, stale/unverified supersession, restricted capital disclosure/confirmation, application gates, and duplicate-ID repair.
+- Deployment backups: `/opt/matrix-trader/backups/20260728-suggestion-contract/` and `/opt/mt-learner/backups/20260728-suggestion-contract/`.
+
+### 2026-07-28 — Session summary (Hermes metric contract + fail-closed report publishing, deployed)
+
+- Re-audited the latest Hermes memo against production code and data. The material Hermes concerns are real but remain evidence/measurement issues, not reasons to relax MT7 safety: keep the isolated current Paper policy unchanged until 50 closed trades, do not scale risk or enable assisted live, and recompute the stale Funding Arb threshold proposal before review.
+- Added the `hermes_metrics_v2` contract to the MT7 packet. Source-live signal-evaluator outcomes, disabled-strategy counterfactual shadow outcomes, and simulated Paper trades now have separate lanes, windows, units, and execution semantics. Signal totals use percentage points; Paper dollar fields use `size_usd * pnl_pct / 100`.
+- Hermes now receives the authoritative current Paper policy, fixed `$200` sizing base, maximum `5` open positions, capability inventory, readiness blockers, and explicit risk semantics. `risk_pct_per_trade` is a sizing input, not a guaranteed realized-loss cap.
+- Learner audit now exposes proposal baseline versus runtime truth. `thresh_funding_arb_20260717_001` is explicitly conflicted: proposal baseline `60`, runtime actual `69`, suggested `81`. It must not be applied; recompute from `69` and collect fresh forward evidence.
+- Corrected the old-VPS Hermes wrapper on `62.238.15.113`. It no longer feeds prior memo prose back as evidence, includes the new authority/capability contracts, and reduces duplicated research context from a 164 KB prompt to about 62 KB of decision-relevant summaries.
+- Added fail-closed memo publication. A generated memo is rejected before replacing `latest_memo` if it mislabels the all-time Paper count, conflates the 30-day linked-signal sample, omits the 4/50 cohort gate, misses the stale threshold conflict/do-not-apply instruction, invents non-overlapping rolling-window requirements, couples every shadow experiment, or describes signal-selection gates as capital-loss protection.
+- Promoted a semantically validated memo and synced it into production MT7. Production reports `301` all-time simulated Paper trades, current cohort `4/50`, `$741.00` all-time simulated Paper P&L, live 30-day signal-evaluator `n=40`, and disabled shadow `n=1,575`; the memo correctly keeps these datasets separate.
+- Verification: `app.py` compiles; all `34` focused tests pass, including the 3 new Hermes metric-contract regressions; `/api/intelligence/hermes` returns `success=true`, `hermes_metrics_v2`, and the validated memo; `matrix-trader` is active.
+- Rollbacks: production app backup `/opt/matrix-trader/backups/app.py.pre-hermes-v2-20260728T1936Z`; report-runner backup `/opt/mt7-hermes/run_consultancy.sh.pre-metrics-v2-20260728`; replaced production memo backup `/opt/matrix-trader/backups/hermes-20260728T201234Z/`.
+
+### 2026-07-28 — Session summary (robust paper/P12 evidence gate, deployed)
+
+- Replaced the lenient paper-promotion decision with a conservative P12 evidence policy. The configured 20-trade experiment target remains a progress marker, but P12/assisted-review readiness now has an immutable minimum of 50 isolated closed trades.
+- Added net evidence in both percentage and actual position-size dollars, W+P >=55%, dollar profit factor >=1.25, recent 20/50 stability, a 10% symmetric trimmed mean, P&L after removing the single best dollar winner, top-winner concentration, and cohort-only peak-to-trough drawdown.
+- Recent-window stability requires both 20- and 50-trade windows to have positive net %/$ EV, PF >=1.0, and W+P >=50%. Outlier resilience requires both trimmed EV and leave-best-out dollar P&L to stay positive. Cohort drawdown is capped at the tighter of the configured account limit and 20%.
+- Fixed the readiness unit bug where a stored `0.667` fraction was rendered and compared as `0.7%`. Production now correctly reports the current cohort W+P as `66.7%`.
+- The older mixed-policy sample is now explicitly non-blocking context. It can explain improvement or regression but cannot authorize the current policy.
+- `/api/paper/cohort-review`, `/api/paper/account`, and `/api/live/readiness` expose the same robust evidence. The Live route still hard-codes `can_auto_trade=false`; no paper config, execution setting, leverage, position size, or live credential changed.
+- Current production truth: cohort `recovery_trial_balanced_focus_short_2026-07-28` is `3/50`, net average `+18.58% / +$9.29`, W+P `66.7%`, PF `5.38`, trimmed EV `+18.58%`, P&L excluding the best winner `+$6.92`, top-winner share `61.2%`, and cohort drawdown `3.18%`. Every performance gate remains `wait` until the sample reaches 50, and an active strategy cooldown independently keeps Live locked.
+- Added `tests/test_paper_readiness.py`. The suite proves that one-winner outlier profit is rejected, recent decay is detected despite positive full-sample averages, and broad 60-trade evidence can clear every blocking robust gate. All `31` tests pass.
+- Deployed a production-specific app/dashboard patch. `matrix-trader`, `mt-learner`, and both Edge Lab timers are active; all three readiness APIs return HTTP 200. Desktop and 390×844 browser checks show no overflow or console errors. Rollback bundle: `/opt/matrix-trader/backups/20260728-robust-paper-gate`.
+
+### 2026-07-28 — Session summary (statistical meta-labeler Phase 1, deployed)
+
+- Added `edge_lab/meta_labeler.py` and `edge_lab_meta.py`: a deterministic NumPy logistic meta-labeler with temporal calibration and expanding walk-forward evaluation. It reads paper outcomes from `signals.db`, joins only fully closed pre-entry Min15 states from Edge Lab, and writes research artifacts only to `edge_lab.db`.
+- Feature joins enforce `feature_timestamp + 15m <= trade_timestamp` and a maximum 30-minute feature age. The outcome target is positive net `pnl_pct`, so fees/slippage already included by the paper evaluator remain part of the label.
+- Every walk-forward fold uses only earlier trades for base-model fitting and an inner chronological calibration holdout. Evaluation includes Brier score, log loss, calibration error, accuracy, no-filter and strategy baselines, fold stability, decision-bucket EV/PF/drawdown, and feature PSI drift.
+- Added ten predeclared evidence gates: >=95% coverage, held-out sample, Brier wins over both baselines, ECE <=0.10, a useful >=20-trade shadow-allow slice with positive/incremental EV, acceptable drift, and majority fold wins. Even if all gates pass, `authority_eligible` remains hard-coded `false`.
+- Added `meta_label_runs` and `meta_label_predictions` audit tables inside `edge_lab.db`. Production verification confirms there are no meta-labeler tables or writes in `signals.db`; the API safety contract reports no conviction, config, sizing, order, or execution authority.
+- The active-score ledger is forward-only and immutable: it stores only the first score made before an outcome exists, updates that row when the trade closes, and excludes the trade from all later active rescoring. Historical closed trades are never backfilled as forward evidence.
+- Added `GET /api/intelligence/meta-labeler`; `/api/intelligence/factor-report` includes the latest overview. The Edge Lab Intelligence tab now shows coverage, held-out sample, Brier, ECE, forward outcomes toward the 50-trade target, shadow-allow evidence, every gate, version, and an explicit no-authority badge.
+- The initial frozen production run used entries from `2026-07-08T16:41:37.802459`: `147/152` joined (`96.71%`), `74` walk-forward test trades, model Brier `0.268597` versus no-filter `0.247214` and strategy `0.245439`, accuracy `48.65%`, ECE `0.189055`, and no trades above the strict 0.60 shadow-allow threshold.
+- Initial evidence is negative: only coverage and test-sample gates pass (`2/10`). Brier skill is negative versus both baselines, and max feature PSI is `1.489738`, dominated by the shift between `funding_arb` and `funding_arb_focus_short`. Three current open/pending scores were stored as `shadow_block`; none affected the paper bot.
+- Production run 2 verified the forward ledger migration: all three original unresolved scores remain single immutable records, none have closed, and the forward cohort therefore correctly reports `0/50`. No active trade was duplicated or retrospectively labeled.
+- Do not tune v1 against these same held-out trades. The next valid challenger is predeclared: after >=50 closed trades in the new July 28 cohort, evaluate a funding-arb-specific challenger trained only on the prior window and compare it against frozen v1 and both baselines.
+- Scheduled the shadow run after every daily/weekly Edge Lab refresh. Routine output is compact; model weights and row features are not exposed through the API.
+- Added `tests/test_meta_labeler.py` for chronological fold boundaries, closed-candle cutoff, end-to-end calibration/persistence, immutable forward-score evaluation, duplicate prevention, and the signals-DB/authority boundary. All `27` focused tests pass; Python, shell, JavaScript, API, checksum, desktop, and 390×844 browser verification pass with no console errors.
+- Production services and both Edge Lab timers are active. Rollback bundle: `/opt/matrix-trader/backups/20260728-meta-labeler`.
+
+### 2026-07-28 — Session summary (Edge Lab coverage repair, deployed)
+
+- Diagnosed the July 8 validation cohort before changing code: only `45/154` trades matched fresh Edge Lab rows (`29.2%`); `63` were on symbols never ingested, `36` had stale features, and `10` were still inside the old 24-hour outcome-maturity window.
+- Removed the structural coupling between features and future outcomes. `candle_feature_snapshots` now stores every feature-complete Min15 state immediately, while `candle_labels` continues to require its full 96-candle/24-hour forward path. No outcomes, paper trades, scoring, or execution settings are written into the snapshot table.
+- Attribution is leakage-safe: a Min15 row is eligible only after its candle has fully closed before the trade. The API retains a labeled-feature fallback for older historical rows while the new independent snapshot history accumulates.
+- Raised the cohort ingestion limit from `60` to `200`; the daily refresh now explicitly ingests all active-cohort symbols before the top-volume universe. Routine builders use `--skip-smoke` to avoid an optional full JSON scan across the 19 GB label table.
+- Added per-trade `coverage_reason`, `feature_source`, snapshot/outcome max timestamps, aggregate reason counts, and unmatched-symbol diagnostics to `/api/paper/cohort-edge` and the operations watchdog.
+- Backfilled the July 8–28 validation universe: production now holds `235,070` snapshots across `71` symbols. Historical coverage is `150/155` (`96.8%`), up from about `30%`; current reset-cohort coverage is `1/1` (`100%`) and the Edge Lab watchdog passes.
+- All five historical misses are explained: two `AERGO_USDT` trades have no current contract history, two `BUILDONBOB_USDT` trades only have stale pre-delisting history, and one `AEHRSTOCK_USDT` trade has no kline history available from MEXC. Both USDC equity-perp cohort symbols returned usable history and were ingested.
+- Added `tests/test_edge_lab_coverage.py` for feature/outcome separation, fully closed-candle matching, staleness, and missing-symbol classification. All `24` focused tests pass; Python and shell validation pass.
+- Deployed a production-specific `app.py` patch plus Edge Lab builder/storage/scheduler changes. `matrix-trader`, `mt-learner`, and both Edge Lab timers are active. Rollback bundle: `/opt/matrix-trader/backups/20260728-edge-coverage`.
+
+### 2026-07-28 — Session summary (learner authority semantics, deployed)
+
+- Established an explicit authority contract: `pending`/`pending_review`, `shadow_evaluating`, and `parked` are read-only; `evaluating` is an applied config trial; `applied` owns active scan authority; `superseded` and `rejected` own none.
+- Added built-in control introspection for learner thresholds, blocked agent regimes, and volatility allowlists. `/api/intelligence/suggestions` now reports each suggestion's `control_authority`, any state conflict, the authority contract, and conflict counts.
+- Active Strategy Overrides now reports field-level provenance. Production shows Balanced conviction and low-liquidity suppression as learner-applied, Funding Arb choppy suppression as learner-applied, and Funding Arb conviction `69` as manual/legacy.
+- Applying/promoting an exact control that is already active is rejected instead of creating a duplicate trial. Resuming a parked item into shadow is rejected if matching authority remains active. Rejecting an authority-owning item requires it to be parked/rolled back first.
+- Parking an applied trial now removes only that suggestion's exact override and preserves unrelated fields. The UI labels this action `Park & Roll Back`; shadow cards explicitly say read-only, applied cards show active authority, and conflicting states render a red warning.
+- Migrated legacy production labels while `mt-learner` was stopped: `regime_balanced_low_liquidity_20260524_001` and `regime_funding_arb_choppy_20260529_001` became `applied`; duplicate `regime_balanced_low_liquidity_20260608_002` became `superseded`. The override SHA-256 was identical before/after, so scan behavior did not change. The migration is recorded in `experiment_ledger.json`.
+- Production now reports `2` read-only shadows, `0` applied trials, and `0` authority conflicts. The learner queue watchdog passes.
+- Added `tests/test_learner_authority.py` for deterministic ownership migration, exact-field rollback, audit recording, and active-control shadow rejection. All `22` focused AI/learner tests pass.
+- Deployed production-specific `app.py` and dashboard builds. Rollback bundle: `/opt/matrix-trader/backups/20260728-learner-authority`. Both services are active with no warning logs.
+- Browser verification passed on desktop and `390×844`: Applied Control, Read-only Shadow, Superseded, provenance, and zero-conflict states all render; no horizontal overflow or console errors.
+
+### 2026-07-28 — Session summary (roadmap audit + AI admission control, deployed)
+
+- Audited the clean paper cohort `recovery_trial_custom_balanced_no_extreme_vol_2026-07-08`: `147` closed, W+P `51.0%`, average net `+1.48%`, hard P&L `+$108.77`, PF `1.16`, and max drawdown `$109`. It trails the comparable baseline by `6.64` average-P&L points and remains `hold_review`.
+- Robustness is weak: removing the best three trades reduces cohort PF to `1.009`; removing the best five produces PF `0.928` and `-$50.27`. The recent 50 recovered to PF `1.714`, but the newest 25 softened to PF `0.87`. Median trade P&L is `-7.42%`.
+- Strategy/regime splits are actionable research hypotheses, not promotion evidence: `funding_arb|SHORT` was strongest (`33` trades, PF `2.19`), while `funding_arb_focus_short` was weak (`12`, PF `0.455`). High volatility, choppy, news-catalyst, and compression slices underperformed; `volatile_squeeze` performed strongly. Positive/negative agent deltas did not cleanly separate outcomes.
+- Edge Lab matched only `45/147` cohort trades (`30.2%`). Its “favorable” matches averaged `-3.11%`, while unmatched trades averaged `+2.46%`; current factor attribution therefore does not validate the edge.
+- Found learner state drift: two overrides are displayed as `shadow_evaluating` while scan admission actively applies their blocked regimes. State semantics must be repaired before adding another learning layer.
+- Forward AI forecasting has one evaluated observation at 15m/1h and is statistically non-informative. It remains capped, forward-only, and zero-authority.
+- AI telemetry exposed a reliability failure: since July 27 there were `1,735` provider attempts and only `384` successes. One signal scan generated `1,540` agent attempts; hundreds hit unfunded DeepSeek/Gemini models concurrently before their first failure could persist a circuit, then Groq hit its free rate limit.
+- Fixed `_circuit_allows()` so a provider with no circuit record atomically acquires one cross-process `half_open` initial-probe lease. Concurrent requests now skip that provider until the probe succeeds or opens the shared breaker. Healthy providers remain concurrent; explicit Super User tests can still bypass a circuit.
+- Added a 20-thread regression test proving exactly one request reaches an initially untested failing provider. All `19` AI router/benchmark/forecast tests pass.
+- Deployed `lib/ai_client.py` to production with rollback copy `/opt/matrix-trader/backups/20260728-ai-admission/ai_client.py`. Both `matrix-trader` and `mt-learner` restarted active; production checksum matches local, AI/paper APIs respond, and neither service logged warnings after restart.
+
+### 2026-07-27 — Session summary (Forward AI shadow validation, deployed)
+
+- Added `lib/ai_forecasting.py`, an isolated forward-outcome ledger for structured UP/FLAT/DOWN probabilities at 15m, 1h, and 4h. One model call produces all three horizons; prompts and raw responses are never stored.
+- Collection is bounded to fresh (`<=5m`), current-quality live signals at or above the configured conviction floor. Production is set to conviction `70`, a hard `12` model-call UTC daily cap, and an evidence target of `50` evaluated forecasts per model/horizon.
+- Added deterministic realized-outcome evaluation from the first available Min1 close at each horizon. The scoreboard reports multiclass Brier score, skill versus a no-change baseline and the MT7 signal-direction baseline, direction accuracy, abstention quality, unleveraged net-after-`0.12%` research return, profit factor, shadow drawdown, and volatility-regime splits.
+- Evidence readiness requires the target sample plus a Brier win over MT7, positive net return, direction accuracy >=50%, and >=95% valid-call rate. Readiness is descriptive only; there is no automatic promotion.
+- Added the Forward AI Scoreboard to the Super User AI Control Center plus `GET /api/ai/forecasting` and authenticated `POST /api/ai/forecasting/run`. The dashboard can select one champion and one optional challenger, enable/disable collection, set the conviction floor/cap/target, run a bounded cycle, and inspect the evidence.
+- Safety boundary is explicit in code and API: forecasts cannot change conviction, risk gates, paper trades, orders, leverage, or execution. Returns are unleveraged research metrics. Provider circuits and the hard daily cap are enforced before calls.
+- Deployed the production-specific app/dashboard patch, `lib/ai_client.py`, and the new forecasting module to Vultr `207.148.66.39`. Rollback files are in `/opt/matrix-trader/backups/20260727-ai-forward`.
+- Production champion is Groq Qwen 3.6 27B (free), based on its qualified 94/100 `signal_agents` benchmark. Challenger remains empty: Llama 3.1 8B scored 81.5 but missed correctness (`27.5/40`), while Llama 3.3 70B scored 60.3 with correctness `7.5/40`; neither passed the `35/40` correctness gate.
+- The first bounded cycle made zero calls and created zero rows because the newest qualifying live signal was from July 22. This is intentional: no stale backfill. Collection begins after the next genuine live scan creates a qualifying signal.
+- Verification passed: 18 focused router/benchmark/forecast tests, Python compilation, staged JavaScript parsing, production service/API/schema checks, explicit zero-authority safety flags, a real four-call free-model challenger benchmark, and responsive desktop/390px browser checks with no horizontal overflow or console errors.
+
+### 2026-07-27 — Session summary (Model Benchmark Lab, deployed)
+
+- Added `lib/ai_benchmark.py`, a shadow-only evaluator with two fixed synthetic MT7 cases for each of the five routed workflows: signal analysts, coach review, strategy analysis, Cipher report polish, and learner coach-pattern synthesis.
+- Every response is scored deterministically out of 100: format 20, correctness 40, risk discipline 30, and calibration 10. Latency only breaks close recommendation ties and cannot rescue an unsafe result.
+- Promotion gates require every case to complete, quality >= 70, format >= 18, correctness >= 35, and risk >= 24. The harness never changes routes automatically; an eligible result exposes an explicit `Use for workflow` action and records the old/new route in `ai_benchmark_promotions`.
+- Added `ai_benchmark_runs`, `ai_benchmark_results`, and `ai_benchmark_promotions`. Prompts and model responses are never persisted; results store provider/model provenance, component scores, latency, verdict, and a redacted failure only.
+- Candidate selection is capped at eight. Unconfigured providers and providers with open circuits cannot start a run. The UI confirms the exact number of external calls before starting.
+- Versioned the clarified benchmark contract as `mt7_static_v1`; the initial pre-vocabulary run is retained as `mt7_static_v0` for auditability.
+- Deployed a production-specific app/dashboard patch and the new evaluator to Vultr `207.148.66.39`. Rollback files are in `/opt/matrix-trader/backups/20260727-ai-benchmark`.
+- Production free-tier signal-analysis canary: Groq Qwen 3.6 27B scored 94/100 (risk 30/30, correctness 40/40, format 20/20, median 706 ms) and became the first qualified champion. Groq GPT-OSS 120B returned no usable response in either v1 case and remains `needs_work`.
+- No model was auto-promoted. The `signal_agents` route still inherits the Super User active route and the promotion ledger remains empty.
+- Verification passed: 14 focused tests, Python compilation, JavaScript parsing, Flask API contract checks, production schema/API checks, real background benchmark execution, responsive desktop/390px UI, champion table rendering, and zero browser console errors.
+
+### 2026-07-27 — Session summary (AI circuit breakers + health-aware routing, deployed)
+
+- Added a persistent `ai_provider_circuits` ledger shared by `matrix-trader` and `mt-learner`. Billing/authentication failures open for one hour, exhausted rate limits for ten minutes, configuration failures for five minutes, and transient outages after two consecutive strikes for two minutes.
+- Open circuits permit only one cross-process half-open probe after cooldown. A successful response closes and clears the breaker; a failed probe reopens it.
+- Added health-aware fallback ordering based on bounded recent success history, median latency, and model cost tier. The explicit Super User model remains first while its circuit is closed; only fallback candidates are reordered.
+- Explicit model tests bypass the current circuit and test only the selected model. The Tools panel shows open cooldowns and includes a `Reset provider cooldowns` control for deliberate re-probing after keys, balances, or quotas change.
+- Added `routing_strategy` (`health_aware` or fixed `ordered`) to AI settings plus `POST /api/ai/circuits/reset`.
+- Deployed a production-specific app/dashboard patch plus the shared router to Vultr `207.148.66.39`. Rollback files are in `/opt/matrix-trader/backups/20260727-ai-circuit`.
+- Production verification: one DeepSeek V4 Flash test returned its existing 402 and opened the billing circuit; the next normal `coach_pattern` call skipped DeepSeek and completed through Groq Qwen 3.6 27B in one actual attempt. Both services remain active.
+- Verification passed: 9 router tests, Python compilation, JavaScript parsing, Flask API smoke tests, production API/schema checks, real provider failover, no browser console errors, and no horizontal overflow at desktop or 390px mobile width.
+
+### 2026-07-27 — Session summary (AI provider/routing foundation, deployed)
+
+- Expanded the shared `lib/ai_client.py` router to Claude, OpenAI GPT-5.6, Gemini, DeepSeek V4, Kimi K2.6/K3, Z.ai GLM, current Groq free-tier models, Ollama, and one user-configured OpenAI-compatible endpoint.
+- Added task routes for signal analysts, coach reviews, strategy analysis, Cipher report polish, and learner coach-pattern synthesis. Explicit model pins still win; otherwise each task inherits its route or the active global model.
+- Replaced the two-model Tools card with the Super User AI Control Center. It includes unrestricted catalog selection, task routing, a free-first shortcut with a hard free-tier/local fallback boundary, custom endpoint configuration, explicit connection testing, and recent inference health.
+- Added `ai_call_events` telemetry. It records provider, model, task, success, latency, fallback use, attempt number, and a redacted error only—never prompts, responses, or API keys.
+- Migrates retired `deepseek-chat` / `deepseek-reasoner` selections to `deepseek-v4-flash` at load time and migrates the legacy coach override into `feature_routes`.
+- Forecasting remains deliberately outside this batch and has no authority over signal conviction, risk gates, or execution.
+- Switched Gemini integration from the retired `google-generativeai` client to the current `google-genai` SDK.
+- Deployed a production-specific bundle to Vultr `207.148.66.39` without copying unrelated local `app.py` / dashboard work. Rollback files are in `/opt/matrix-trader/backups/20260727-ai-router`.
+- Restarted `matrix-trader` and `mt-learner`; both are active. Production exposes 24 models, 5 feature routes, and the `ai_call_events` ledger.
+- Production provider state after deploy: Claude, Gemini, DeepSeek, and Groq keys are configured; Gemini credits are depleted, DeepSeek balance is insufficient, and Groq successfully completed the fallback calls.
+- Verification passed: 5 AI router unit tests, Python compilation, frontend JavaScript parse, Flask settings/health smoke tests, production API checks, service logs, and live browser checks at desktop and 390px mobile width.
+
+### 2026-07-01 — Session summary (profitability meta-analysis — no code changes)
+
+- Deep meta-analysis of strategies/profitability written to `MT7_META_ANALYSIS_2026-07-01.md` (repo root). Analysis-only session; no app code, config, or DB writes.
+- Data: local `signals.db` (production snapshot to 2026-05-08, 750 closed live signals, leveraged gross pnl_pct) **plus live production API queries** (GET-only) against `207.148.66.39:8080` on 2026-07-01.
+- **⚠ Production build regression found:** `/api/paper/account` returns the pre-June-28 schema — `drawdown_pct=129.93` (return-as-drawdown bug back), no `return_pct`/`max_drawdown_usd`/`scale_up_blockers`, and `scale_up_ready=true` from the old lenient logic. Local `app.py` has the fix; production does not. Redeploy + restart + re-verify before trusting any drawdown or scale-up output.
+- **Focus-short cohort update (live):** 104 closed since June 9 — W+P 60.6%, strict 34.6%, avg net +7.05%, PF 1.87, hard P&L +$366.63, worst trade -$17.11. Passes the documented P12 gate on its face; blocked only on the redeploy/drawdown verification above.
+- Hypothesis lab live verdicts: `regime_balanced_low_liquidity` = promote candidate (96 affected, avg -6.49, PF 0.83 vs 1.23); `momentum needs flow` promote candidate but comparison n=3; `funding_crowded` collecting/early-positive; `funding_arb/choppy` review.
+- **Intelligence-layer audit (queried live):** mt-learner is DOWN (`learner_running=false`, baseline stale 2026-06-06) and the suggestion queue regressed to pre-June-7 state (both regime suggestions un-parked → one-experiment guard deadlocked; no suggestion can apply). Production Hermes `latest_memo` is the pre-fix June 28 05:58Z "Critical — 129.93% drawdown" memo (built on the buggy metric) and its body contains leaked LLM preamble — Hermes memos lack the coach-review cache guard. Agent shadow validation (905 signals): 83% neutral deltas, win/loss delta separation <1 conviction point — LLM delta channel economically irrelevant; regime classifier is the valuable output. Edge Lab cohort attribution coverage only 5.6% (6/104; cohort symbols are tokenized-stock perps outside the Edge Lab universe) and its 6 "favorable" trades avg -11.82. Full assessment + self-monitoring recommendations in `MT7_META_ANALYSIS_2026-07-01.md` §6.
+- Headline findings: baseline PF 1.04 (0.98 trimmed) — no base edge; SHORT PF 1.65 vs LONG PF 0.50; LONG+funding≤-0.1% ("squeeze longs") n=251 PF 0.37 is the single biggest leak; LONG RSI≥70 PF 0.24; `bid_heavy`/`discount` LONG boosts anti-predict while their SHORT mirrors work; KAT_USDT alone -2,091 total.
+- Stacked filter (no squeeze-longs, no high/extreme-vol LONGs, ATR≤5, conviction≥65) kept 119/750 trades at PF 2.73 (trim-6 PF 3.02) — proposed as next paper cohort alongside `paper_stop_mode: tp_ladder_lock`.
+- Top recommendations (shadow-first): market-regime LONG gate using stored btc_context; squeeze-LONG hard gate; overbought LONG hard block; fee-aware net EV for live signals; short-only `momentum_breakdown` strategy; per-symbol frequency cap. Full ranking and sequencing in the report.
 
 ### 2026-06-28 — Session summary (drawdown audit fix + Hermes rerun)
 

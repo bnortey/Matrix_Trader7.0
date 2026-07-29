@@ -1,11 +1,9 @@
-"""
-Materializer for Edge Lab candle_features table.
+"""Resumable, version-aware Edge Lab feature materializer.
 
-Reads candle_labels (with JSON blobs) and writes flat columns to
-candle_features so factor queries run in <5s instead of 270-360s.
-
-Do NOT import app.py or backtest.py. Do NOT write to signals.db.
-Pure Python + sqlite3 only. No pandas.
+The canonical JSON labels remain in candle_labels. This module maintains the
+flat candle_features projection used by factor analysis. Existing rows are
+updated whenever their source label changes; feature-engine upgrades therefore
+cannot silently leave stale flat rows behind.
 """
 from __future__ import annotations
 
@@ -15,150 +13,142 @@ import sys
 import time
 from pathlib import Path
 
-# Template → short column prefix
+from edge_lab.feature_engine import FEATURE_VERSION
+from edge_lab.path_labeler import PATH_LABEL_VERSION
+
+MATERIALIZER_VERSION = "edge_materializer_v2"
+
 _TEMPLATE_PREFIX = {
-    "TP0_5_SL0_5":  "t05",
-    "TP1_0_SL0_5":  "t10",
+    "TP0_5_SL0_5": "t05",
+    "TP1_0_SL0_5": "t10",
     "TP1_5_SL0_75": "t15",
-    "TP2_0_SL1_0":  "t20",
+    "TP2_0_SL1_0": "t20",
 }
 _TEMPLATES = list(_TEMPLATE_PREFIX)
 _SIDES = ["long", "short"]
 _SIDE_COL = {"long": "l", "short": "s"}
 
-_TAG_COLS = {
-    "compressed":    "tag_compressed",
-    "expanded":      "tag_expanded",
-    "bullish_trend": "tag_bullish_trend",
-    "bearish_trend": "tag_bearish_trend",
-    "extreme_vol":   "tag_extreme_vol",
-    "low_vol":       "tag_low_vol",
-}
+_BASE_COLUMNS = [
+    "candle_id", "symbol", "timeframe", "timestamp",
+    "volatility_regime", "trend_state", "compression_state",
+    "rsi_decile", "volume_decile", "atr_decile", "stddev_decile",
+    "tag_compressed", "tag_expanded", "tag_bullish_trend",
+    "tag_bearish_trend", "tag_extreme_vol", "tag_low_vol",
+    "source_generated_at", "feature_version", "label_version",
+    "materializer_version",
+]
+_OUTCOME_SUFFIXES = [
+    "tp", "sl", "neither", "ambig", "mfe", "mae", "ttp", "tsl", "texit",
+    "gross", "hret", "amb_low", "amb_high",
+]
+_OUTCOME_COLUMNS = [
+    f"{prefix}_{_SIDE_COL[side]}_{suffix}"
+    for prefix in _TEMPLATE_PREFIX.values()
+    for side in _SIDES
+    for suffix in _OUTCOME_SUFFIXES
+]
+_ALL_COLUMNS = _BASE_COLUMNS + _OUTCOME_COLUMNS
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS candle_features (
-    candle_id    INTEGER PRIMARY KEY,
-    symbol       TEXT,
-    timeframe    TEXT,
-    timestamp    INTEGER,
-
-    volatility_regime  TEXT,
-    trend_state        TEXT,
-    compression_state  TEXT,
-    rsi_decile         INTEGER,
-    volume_decile      INTEGER,
-    atr_decile         INTEGER,
-    stddev_decile      INTEGER,
-
-    tag_compressed    INTEGER,
-    tag_expanded      INTEGER,
+    candle_id INTEGER PRIMARY KEY,
+    symbol TEXT,
+    timeframe TEXT,
+    timestamp INTEGER,
+    volatility_regime TEXT,
+    trend_state TEXT,
+    compression_state TEXT,
+    rsi_decile INTEGER,
+    volume_decile INTEGER,
+    atr_decile INTEGER,
+    stddev_decile INTEGER,
+    tag_compressed INTEGER,
+    tag_expanded INTEGER,
     tag_bullish_trend INTEGER,
     tag_bearish_trend INTEGER,
-    tag_extreme_vol   INTEGER,
-    tag_low_vol       INTEGER,
-
-    -- TP0_5_SL0_5
-    t05_l_tp INTEGER, t05_l_sl INTEGER, t05_l_mfe REAL, t05_l_mae REAL, t05_l_ttp REAL,
-    t05_s_tp INTEGER, t05_s_sl INTEGER, t05_s_mfe REAL, t05_s_mae REAL, t05_s_ttp REAL,
-
-    -- TP1_0_SL0_5
-    t10_l_tp INTEGER, t10_l_sl INTEGER, t10_l_mfe REAL, t10_l_mae REAL, t10_l_ttp REAL,
-    t10_s_tp INTEGER, t10_s_sl INTEGER, t10_s_mfe REAL, t10_s_mae REAL, t10_s_ttp REAL,
-
-    -- TP1_5_SL0_75
-    t15_l_tp INTEGER, t15_l_sl INTEGER, t15_l_mfe REAL, t15_l_mae REAL, t15_l_ttp REAL,
-    t15_s_tp INTEGER, t15_s_sl INTEGER, t15_s_mfe REAL, t15_s_mae REAL, t15_s_ttp REAL,
-
-    -- TP2_0_SL1_0
-    t20_l_tp INTEGER, t20_l_sl INTEGER, t20_l_mfe REAL, t20_l_mae REAL, t20_l_ttp REAL,
-    t20_s_tp INTEGER, t20_s_sl INTEGER, t20_s_mfe REAL, t20_s_mae REAL, t20_s_ttp REAL
-)
-"""
-
-_INSERT_SQL = """
-INSERT OR IGNORE INTO candle_features VALUES (
-    ?,?,?,?,
-    ?,?,?,?,?,?,?,
-    ?,?,?,?,?,?,
-    ?,?,?,?,?,
-    ?,?,?,?,?,
-    ?,?,?,?,?,
-    ?,?,?,?,?,
-    ?,?,?,?,?,
-    ?,?,?,?,?,
-    ?,?,?,?,?,
-    ?,?,?,?,?
+    tag_extreme_vol INTEGER,
+    tag_low_vol INTEGER
 )
 """
 
 _INDEXES = [
-    ("idx_cf_vol_regime",  "CREATE INDEX IF NOT EXISTS idx_cf_vol_regime ON candle_features(volatility_regime)"),
-    ("idx_cf_trend",       "CREATE INDEX IF NOT EXISTS idx_cf_trend ON candle_features(trend_state)"),
+    ("idx_cf_vol_regime", "CREATE INDEX IF NOT EXISTS idx_cf_vol_regime ON candle_features(volatility_regime)"),
+    ("idx_cf_trend", "CREATE INDEX IF NOT EXISTS idx_cf_trend ON candle_features(trend_state)"),
     ("idx_cf_compression", "CREATE INDEX IF NOT EXISTS idx_cf_compression ON candle_features(compression_state)"),
-    ("idx_cf_rsi",         "CREATE INDEX IF NOT EXISTS idx_cf_rsi ON candle_features(rsi_decile)"),
-    ("idx_cf_volume",      "CREATE INDEX IF NOT EXISTS idx_cf_volume ON candle_features(volume_decile)"),
-    ("idx_cf_atr",         "CREATE INDEX IF NOT EXISTS idx_cf_atr ON candle_features(atr_decile)"),
-    ("idx_cf_regime_trend","CREATE INDEX IF NOT EXISTS idx_cf_regime_trend ON candle_features(volatility_regime, trend_state)"),
-    ("idx_cf_tags",        "CREATE INDEX IF NOT EXISTS idx_cf_tags ON candle_features(tag_compressed, tag_expanded, tag_bullish_trend, tag_bearish_trend, tag_extreme_vol, tag_low_vol)"),
+    ("idx_cf_rsi", "CREATE INDEX IF NOT EXISTS idx_cf_rsi ON candle_features(rsi_decile)"),
+    ("idx_cf_volume", "CREATE INDEX IF NOT EXISTS idx_cf_volume ON candle_features(volume_decile)"),
+    ("idx_cf_atr", "CREATE INDEX IF NOT EXISTS idx_cf_atr ON candle_features(atr_decile)"),
+    ("idx_cf_regime_trend", "CREATE INDEX IF NOT EXISTS idx_cf_regime_trend ON candle_features(volatility_regime, trend_state)"),
+    ("idx_cf_symbol_ts", "CREATE INDEX IF NOT EXISTS idx_cf_symbol_ts ON candle_features(symbol, timeframe, timestamp)"),
+    ("idx_cf_versions_ts", "CREATE INDEX IF NOT EXISTS idx_cf_versions_ts ON candle_features(label_version, feature_version, timestamp)"),
 ]
 
-_PROGRESS_INTERVAL = 500_000
 
-
-def _parse_json(s: str | None) -> dict:
-    if not s:
-        return {}
+def _parse_json(value: str | None) -> dict:
     try:
-        return json.loads(s)
+        return json.loads(value or "{}")
     except Exception:
         return {}
 
 
-def _bool_to_int(v) -> int | None:
-    if v is True:
-        return 1
-    if v is False:
-        return 0
-    return None
+def _bool_to_int(value) -> int | None:
+    return 1 if value is True else 0 if value is False else None
 
 
-def _int_or_none(v) -> int | None:
-    if v is None:
-        return None
+def _int_or_none(value) -> int | None:
     try:
-        return int(v)
+        return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
 
 
-def _float_or_none(v) -> float | None:
-    if v is None:
-        return None
+def _float_or_none(value) -> float | None:
     try:
-        return float(v)
+        return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _ensure_schema(con: sqlite3.Connection) -> None:
+    con.execute(_CREATE_TABLE)
+    label_columns = {
+        row[1] for row in con.execute("PRAGMA table_info(candle_labels)")
+    }
+    for column in ("feature_version", "label_version"):
+        if column not in label_columns:
+            con.execute(f"ALTER TABLE candle_labels ADD COLUMN {column} TEXT")
+    current = {row[1] for row in con.execute("PRAGMA table_info(candle_features)")}
+    declarations = {
+        "source_generated_at": "TEXT",
+        "feature_version": "TEXT",
+        "label_version": "TEXT",
+        "materializer_version": "TEXT",
+    }
+    for column in _OUTCOME_COLUMNS:
+        declarations[column] = "INTEGER" if column.endswith(
+            ("_tp", "_sl", "_neither", "_ambig")
+        ) else "REAL"
+    for column, declaration in declarations.items():
+        if column not in current:
+            con.execute(f"ALTER TABLE candle_features ADD COLUMN {column} {declaration}")
+    con.commit()
 
 
 def _extract_row(row: tuple) -> tuple:
-    """Convert one candle_labels row into a candle_features INSERT tuple."""
-    candle_id, symbol, timeframe, timestamp, features_str, paths_str = row
-
+    (
+        candle_id, symbol, timeframe, timestamp, features_str, paths_str,
+        source_generated_at, source_feature_version, source_label_version,
+    ) = row
     features = _parse_json(features_str)
-    paths    = _parse_json(paths_str)
-
-    # Tags are stored as a JSON array string inside features_json
+    paths = _parse_json(paths_str)
     tags_raw = features.get("tags") or []
     if isinstance(tags_raw, str):
         tags_raw = _parse_json(tags_raw)
     tags = set(tags_raw) if isinstance(tags_raw, list) else set()
+    first_path = next(iter(paths.values()), {})
 
     values = [
-        candle_id,
-        symbol,
-        timeframe,
-        timestamp,
-        # Feature columns
+        candle_id, symbol, timeframe, timestamp,
         features.get("volatility_regime"),
         features.get("trend_state"),
         features.get("compression_state"),
@@ -166,35 +156,59 @@ def _extract_row(row: tuple) -> tuple:
         _int_or_none(features.get("volume_decile")),
         _int_or_none(features.get("atr_pct_15m_decile")),
         _int_or_none(features.get("stddev_decile")),
-        # Tag flag columns
-        1 if "compressed"    in tags else 0,
-        1 if "expanded"      in tags else 0,
-        1 if "bullish_trend" in tags else 0,
-        1 if "bearish_trend" in tags else 0,
-        1 if "extreme_vol"   in tags else 0,
-        1 if "low_vol"       in tags else 0,
+        int("compressed" in tags),
+        int("expanded" in tags),
+        int("bullish_trend" in tags),
+        int("bearish_trend" in tags),
+        int("extreme_vol" in tags),
+        int("low_vol" in tags),
+        source_generated_at,
+        source_feature_version or features.get("feature_version"),
+        source_label_version or first_path.get("label_version"),
+        MATERIALIZER_VERSION,
     ]
 
-    # Path outcome columns — 4 templates × 2 sides × 5 fields = 40
-    for tmpl in _TEMPLATES:
-        tmpl_paths = paths.get(tmpl) or {}
+    for template in _TEMPLATES:
+        payload = paths.get(template) or {}
         for side in _SIDES:
-            values += [
-                _bool_to_int(tmpl_paths.get(f"{side}_tp_hit_first")),
-                _bool_to_int(tmpl_paths.get(f"{side}_sl_hit_first")),
-                _float_or_none(tmpl_paths.get(f"{side}_mfe_pct")),
-                _float_or_none(tmpl_paths.get(f"{side}_mae_pct")),
-                _float_or_none(tmpl_paths.get(f"{side}_time_to_tp_minutes")),
-            ]
-
+            values.extend([
+                _bool_to_int(payload.get(f"{side}_tp_hit_first")),
+                _bool_to_int(payload.get(f"{side}_sl_hit_first")),
+                _bool_to_int(payload.get(f"{side}_neither_hit")),
+                _bool_to_int(payload.get(f"{side}_ambiguous_hit")),
+                _float_or_none(payload.get(f"{side}_mfe_pct")),
+                _float_or_none(payload.get(f"{side}_mae_pct")),
+                _float_or_none(payload.get(f"{side}_time_to_tp_minutes")),
+                _float_or_none(payload.get(f"{side}_time_to_sl_minutes")),
+                _float_or_none(payload.get(f"{side}_time_to_exit_minutes")),
+                _float_or_none(payload.get(f"{side}_gross_pnl_pct")),
+                _float_or_none(payload.get(f"{side}_horizon_return_pct")),
+                _float_or_none(payload.get(f"{side}_ambiguity_pnl_low_pct")),
+                _float_or_none(payload.get(f"{side}_ambiguity_pnl_high_pct")),
+            ])
     return tuple(values)
 
 
+def _upsert_sql() -> str:
+    quoted = ", ".join(_ALL_COLUMNS)
+    placeholders = ", ".join("?" for _ in _ALL_COLUMNS)
+    updates = ", ".join(
+        f"{column}=excluded.{column}" for column in _ALL_COLUMNS if column != "candle_id"
+    )
+    return (
+        f"INSERT INTO candle_features ({quoted}) VALUES ({placeholders}) "
+        f"ON CONFLICT(candle_id) DO UPDATE SET {updates}"
+    )
+
+
 def materialize(db_path: Path, batch_size: int = 10_000) -> dict:
-    """
-    Read candle_labels in batches, write flat columns to candle_features.
-    INSERT OR IGNORE — idempotent, safe to resume.
-    Returns summary dict.
+    """Project current-version JSON labels into ``candle_features``.
+
+    Legacy source rows remain available for audit and gradual rebuilds, but
+    rewriting their stale projections during the v2 migration would create
+    millions of unusable rows and a large WAL. The factor engine only accepts
+    current feature/label versions, so materialization follows the same
+    boundary.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -203,92 +217,102 @@ def materialize(db_path: Path, batch_size: int = 10_000) -> dict:
     con = sqlite3.connect(str(db_path))
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
-    con.execute("PRAGMA cache_size=-64000")  # 64 MB page cache
-
-    # Create table
-    con.execute(_CREATE_TABLE)
-    con.commit()
+    con.execute("PRAGMA cache_size=-64000")
+    _ensure_schema(con)
 
     total_source = con.execute("SELECT COUNT(*) FROM candle_labels").fetchone()[0]
-
-    # Resume: start after highest already-materialized candle_id
-    resume_row = con.execute("SELECT MAX(candle_id) FROM candle_features").fetchone()
-    last_id = resume_row[0] if resume_row[0] is not None else -1
-    already_done = con.execute(
-        "SELECT COUNT(*) FROM candle_features WHERE candle_id <= ?", (last_id,)
-    ).fetchone()[0] if last_id >= 0 else 0
+    eligible_source = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM candle_labels
+        WHERE feature_version = ?
+          AND label_version = ?
+        """,
+        (FEATURE_VERSION, PATH_LABEL_VERSION),
+    ).fetchone()[0]
+    t_start = time.time()
+    cursor_id = -1
+    rows_read = 0
+    rows_upserted = 0
+    rows_skipped = 0
+    upsert_sql = _upsert_sql()
 
     print(f"[materializer] DB: {db_path}", file=sys.stderr)
-    print(f"[materializer] candle_labels rows: {total_source:,}", file=sys.stderr)
-    if last_id >= 0:
-        print(f"[materializer] Resuming after candle_id={last_id} ({already_done:,} already done)", file=sys.stderr)
-
-    t_start = time.time()
-    rows_read = 0
-    rows_inserted = 0
-    rows_skipped = 0
-    last_progress_print = 0
-
+    print(f"[materializer] source rows: {total_source:,}", file=sys.stderr)
     while True:
-        batch = con.execute(
-            "SELECT id, symbol, timeframe, timestamp, features_json, paths_json "
-            "FROM candle_labels WHERE id > ? ORDER BY id ASC LIMIT ?",
-            (last_id, batch_size),
-        ).fetchall()
-
+        batch = con.execute("""
+            SELECT l.id, l.symbol, l.timeframe, l.timestamp,
+                   l.features_json, l.paths_json, l.generated_at,
+                   l.feature_version, l.label_version
+            FROM candle_labels AS l
+            LEFT JOIN candle_features AS f ON f.candle_id=l.id
+            WHERE l.id > ?
+              AND l.feature_version = ?
+              AND l.label_version = ?
+              AND (
+                    f.candle_id IS NULL
+                 OR COALESCE(f.source_generated_at, '') <> COALESCE(l.generated_at, '')
+                 OR COALESCE(f.materializer_version, '') <> ?
+              )
+            ORDER BY l.id
+            LIMIT ?
+        """, (
+            cursor_id,
+            FEATURE_VERSION,
+            PATH_LABEL_VERSION,
+            MATERIALIZER_VERSION,
+            batch_size,
+        )).fetchall()
         if not batch:
             break
 
-        insert_batch = []
+        payload = []
         for raw_row in batch:
+            cursor_id = int(raw_row[0])
+            rows_read += 1
             try:
-                insert_batch.append(_extract_row(raw_row))
-            except Exception as e:
-                print(f"[materializer] WARN: skipping candle_id={raw_row[0]}: {e}", file=sys.stderr)
+                payload.append(_extract_row(raw_row))
+            except Exception as exc:
                 rows_skipped += 1
-
-        if insert_batch:
-            con.executemany(_INSERT_SQL, insert_batch)
+                print(
+                    f"[materializer] WARN candle_id={raw_row[0]}: {exc}",
+                    file=sys.stderr,
+                )
+        if payload:
+            con.executemany(upsert_sql, payload)
             con.commit()
-            rows_inserted += len(insert_batch)
-
-        rows_read += len(batch)
-        last_id = batch[-1][0]
-
-        # Progress report every 500k rows
-        milestone = (rows_read // _PROGRESS_INTERVAL) * _PROGRESS_INTERVAL
-        if milestone > last_progress_print and rows_read >= _PROGRESS_INTERVAL:
-            pct = rows_read / total_source * 100 if total_source else 0
-            elapsed = time.time() - t_start
-            rate = rows_read / elapsed if elapsed > 0 else 0
+            rows_upserted += len(payload)
+        if rows_read and rows_read % 500_000 < batch_size:
+            elapsed = max(0.001, time.time() - t_start)
             print(
-                f"[materializer] {rows_read:>9,} / {total_source:,} rows "
-                f"({pct:.1f}%)  {rate:,.0f} rows/s",
+                f"[materializer] {rows_read:,} changed rows "
+                f"({rows_read / elapsed:,.0f}/s)",
                 file=sys.stderr,
             )
-            last_progress_print = milestone
 
-    # Build indexes
-    print(f"[materializer] Building {len(_INDEXES)} indexes ...", file=sys.stderr)
+    print(f"[materializer] ensuring {len(_INDEXES)} indexes", file=sys.stderr)
     for name, ddl in _INDEXES:
-        t0 = time.time()
+        started = time.time()
         con.execute(ddl)
         con.commit()
-        print(f"[materializer]   {name}: {time.time()-t0:.1f}s", file=sys.stderr)
+        print(f"[materializer] {name}: {time.time() - started:.1f}s", file=sys.stderr)
 
     con.close()
-    runtime = round(time.time() - t_start, 1)
-
+    runtime = round(time.time() - t_start, 2)
     summary = {
-        "db_path":         str(db_path),
-        "rows_read":       rows_read,
-        "rows_inserted":   rows_inserted,
-        "rows_skipped":    rows_skipped,
+        "db_path": str(db_path),
+        "materializer_version": MATERIALIZER_VERSION,
+        "source_rows": total_source,
+        "eligible_source_rows": eligible_source,
+        "rows_read": rows_read,
+        "rows_upserted": rows_upserted,
+        "rows_inserted": rows_upserted,
+        "rows_skipped": rows_skipped,
         "runtime_seconds": runtime,
     }
     print(
-        f"[materializer] Done: {rows_inserted:,} inserted, "
-        f"{rows_skipped} skipped, {runtime}s",
+        f"[materializer] done: {rows_upserted:,} upserted, "
+        f"{rows_skipped:,} skipped, {runtime}s",
         file=sys.stderr,
     )
     return summary

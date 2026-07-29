@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from edge_lab.factor_engine import TEMPLATES
 from edge_lab.factor_report import run_factor_analysis
+from edge_lab.strategy_evaluator import evaluate_strategy_economics
 
 
 def _fmt_row(row: dict) -> str:
@@ -117,6 +118,12 @@ def main() -> None:
         action="store_true",
         help="Suppress per-group progress output",
     )
+    parser.add_argument(
+        "--signals-db",
+        type=Path,
+        default=Path("data/signals.db"),
+        help="Read-only Paper evidence used for strategy-conditioned validation.",
+    )
     args = parser.parse_args()
 
     try:
@@ -125,6 +132,10 @@ def main() -> None:
             top_n=args.top_n,
             templates=args.templates or None,
             verbose=not args.quiet,
+        )
+        report["strategy_validation"] = evaluate_strategy_economics(
+            args.signals_db,
+            edge_db=args.db,
         )
     except FileNotFoundError as e:
         print(f"ERROR: {e}", file=sys.stderr)

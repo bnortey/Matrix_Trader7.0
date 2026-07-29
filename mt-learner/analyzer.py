@@ -2,12 +2,15 @@ import sqlite3
 import json
 import os
 import logging
+import time
+import urllib.request
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
 MIN_THRESHOLD_SAMPLE = 30
+MT7_INTERNAL_URL = (os.getenv("MT7_INTERNAL_URL") or "http://127.0.0.1:8080").rstrip("/")
 
 FEATURES = [
     'conviction', 'rsi_1h', 'trend_score', 'atr_pct',
@@ -35,6 +38,45 @@ def _write_json(filename, data):
     with open(tmp, 'w') as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
+
+
+def _load_runtime_strategy_controls():
+    """Read effective strategy settings from MT7 instead of inferring config from history."""
+    last_error = None
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(
+                f"{MT7_INTERNAL_URL}/api/strategies?include_disabled=1",
+                timeout=5,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            controls = {}
+            for strategy in payload.get("strategies") or []:
+                if not isinstance(strategy, dict) or not strategy.get("key"):
+                    continue
+                effective = strategy.get("conviction_override")
+                authority = "strategy_override"
+                if effective is None:
+                    effective = strategy.get("min_conviction")
+                    authority = "strategy_config"
+                try:
+                    effective = int(effective)
+                except (TypeError, ValueError):
+                    effective = None
+                    authority = "unavailable"
+                controls[str(strategy["key"])] = {
+                    "min_conviction": effective,
+                    "min_conviction_authority": authority,
+                    "enabled": bool(strategy.get("enabled", True)),
+                    "is_custom": bool(strategy.get("is_custom", False)),
+                }
+            return controls
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4:
+                time.sleep(1)
+    logger.warning("runtime strategy control lookup failed after retries: %s", last_error)
+    return {}
 
 
 def _closed_pnl_rows(cur, strategy_key, threshold):
@@ -176,7 +218,7 @@ def run_feature_analysis(db_path):
         raise
 
 
-def run_threshold_analysis(db_path):
+def run_threshold_analysis(db_path, runtime_controls=None):
     logger.info('run_threshold_analysis: starting')
     t0 = datetime.now(timezone.utc)
     try:
@@ -187,19 +229,35 @@ def run_threshold_analysis(db_path):
         strategies = [r[0] for r in cur.fetchall()]
 
         out = {}
+        runtime_controls = (
+            runtime_controls
+            if isinstance(runtime_controls, dict)
+            else _load_runtime_strategy_controls()
+        )
+        runtime_snapshot_at = datetime.now(timezone.utc).isoformat()
         for strat in strategies:
             cur.execute("""
                 SELECT MIN(conviction) FROM signals
                 WHERE strategy_key = ? AND result IS NOT NULL AND conviction IS NOT NULL
             """, (strat,))
             row = cur.fetchone()
-            implied_min = int(row[0]) if row and row[0] is not None else 55
+            historical_implied_min = int(row[0]) if row and row[0] is not None else 55
+            runtime_control = runtime_controls.get(strat) or {}
+            runtime_min = runtime_control.get("min_conviction")
+            try:
+                current_threshold = int(runtime_min)
+                current_source = runtime_control.get("min_conviction_authority") or "runtime"
+            except (TypeError, ValueError):
+                current_threshold = historical_implied_min
+                current_source = "historical_implied_fallback"
 
-            best_thresh = implied_min
+            best_thresh = current_threshold
             best_metrics = None
             best_score = None
             best_count = 0
-            current_metrics = _threshold_metrics(_closed_pnl_rows(cur, strat, implied_min))
+            current_metrics = _threshold_metrics(
+                _closed_pnl_rows(cur, strat, current_threshold)
+            )
 
             for t in range(55, 91):
                 metrics = _threshold_metrics(_closed_pnl_rows(cur, strat, t))
@@ -216,7 +274,12 @@ def run_threshold_analysis(db_path):
             current_ne = current_metrics['net_expectancy'] if current_metrics else None
             best_ne = best_metrics['net_expectancy'] if best_metrics else None
             out[strat] = {
-                'current_implied_threshold': implied_min,
+                'current_implied_threshold': historical_implied_min,
+                'runtime_threshold': current_threshold,
+                'runtime_threshold_source': current_source,
+                'runtime_snapshot_at': runtime_snapshot_at,
+                'strategy_enabled': runtime_control.get("enabled"),
+                'strategy_is_custom': runtime_control.get("is_custom"),
                 'optimal_threshold': best_thresh,
                 'current_net_expectancy': round(current_ne, 4) if current_ne is not None else None,
                 'optimal_net_expectancy': round(best_ne, 4) if best_ne is not None else None,
@@ -228,10 +291,13 @@ def run_threshold_analysis(db_path):
                 'current_max_loss_streak': current_metrics['max_loss_streak'] if current_metrics else None,
                 'optimal_max_loss_streak': best_metrics['max_loss_streak'] if best_metrics else None,
                 'optimal_sample_size': best_count,
-                'delta_from_current': best_thresh - implied_min,
+                'delta_from_current': best_thresh - current_threshold,
                 'confidence': confidence,
                 'objective': 'net_ev_primary_wp_and_loss_streak_tiebreak',
-                'note': f'{best_count} net-P&L trades at threshold {best_thresh}',
+                'note': (
+                    f'{best_count} net-P&L trades at threshold {best_thresh}; '
+                    f'baseline {current_threshold} from {current_source}'
+                ),
             }
 
         conn.close()

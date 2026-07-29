@@ -9,6 +9,8 @@ from edge_lab.normalization import rolling_decile
 # remove or replace this import to preserve Edge Lab isolation.
 from lib.indicators import atr, ema, rsi, volatility_regime
 
+FEATURE_VERSION = "edge_features_v2"
+
 
 def compute_features(
     candles: pd.DataFrame,
@@ -57,6 +59,8 @@ def compute_features(
     df["trend_state"] = df.apply(trend_state, axis=1)
     df["compression_state"] = df.apply(compression_state, axis=1)
     df["funding_state"] = "unknown"
+    df["feature_version"] = FEATURE_VERSION
+    df["funding_available"] = False
     df["tags"] = df.apply(_tags_for_row, axis=1)
     return df
 
@@ -83,7 +87,7 @@ def features_json_for_row(row) -> dict:
         "rsi_15m", "rsi_15m_decile", "atr_pct_15m", "atr_pct_15m_decile",
         "volume_decile", "stddev_pct", "stddev_decile", "volatility_regime",
         "ema20", "ema50", "trend_state", "compression_state", "funding_state",
-        "tags",
+        "funding_available", "feature_version", "tags",
     ]
     out = {}
     for key in keys:

@@ -24,10 +24,6 @@ MAX_REVIEWS_BATCH = 18   # cap to stay within fallback model token limits
 REVIEW_EXCERPT_CHARS = 650
 PROMPT_CHAR_LIMIT = 18000
 REFRESH_DELTA     = 10   # re-synthesize when review count grows by this much
-DEFAULT_PROVIDER  = 'claude'
-DEFAULT_MODEL     = 'claude-sonnet-4-6'
-
-
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -61,8 +57,13 @@ def _call_ai_fallback(prompt: str, max_tokens: int = 700) -> str | None:
                 sys.path.insert(0, path)
         from lib.ai_client import call_ai
 
-        provider = os.environ.get('COACH_ANALYST_PROVIDER', DEFAULT_PROVIDER)
-        model = os.environ.get('COACH_ANALYST_MODEL', DEFAULT_MODEL)
+        # The shared feature route owns the default. These env vars remain an
+        # explicit operational override only when both are set.
+        provider = (os.environ.get('COACH_ANALYST_PROVIDER') or '').strip() or None
+        model = (os.environ.get('COACH_ANALYST_MODEL') or '').strip() or None
+        if not (provider and model):
+            provider = None
+            model = None
         result = call_ai(
             system=(
                 'You are a quantitative trading researcher analyzing coach reviews. '
@@ -73,9 +74,11 @@ def _call_ai_fallback(prompt: str, max_tokens: int = 700) -> str | None:
             max_tokens=max_tokens,
             provider=provider,
             model=model,
+            feature='coach_pattern',
         )
         if result:
-            print(f'[coach_analyst] AI synthesis completed via fallback chain starting at {provider}/{model}')
+            route_note = f'{provider}/{model}' if provider and model else 'shared coach_pattern route'
+            print(f'[coach_analyst] AI synthesis completed via {route_note}')
         return result
     except Exception as e:
         print(f'[coach_analyst] AI fallback error: {e}')

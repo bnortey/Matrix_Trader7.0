@@ -4,12 +4,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from edge_lab.feature_engine import compute_features, features_json_for_row, has_required_features
+from edge_lab.feature_engine import (
+    FEATURE_VERSION,
+    compute_features,
+    features_json_for_row,
+    has_required_features,
+)
 from edge_lab.mexc_data import fetch_klines, fetch_tickers
-from edge_lab.path_labeler import PATH_TEMPLATES, label_paths_from_arrays
+from edge_lab.path_labeler import PATH_LABEL_VERSION, PATH_TEMPLATES, label_paths_from_arrays
 from edge_lab.storage import (
     DB_PATH,
     connect,
+    get_last_feature_timestamp,
     get_last_labeled_timestamp,
     get_status_counts,
     init_storage,
@@ -18,6 +24,8 @@ from edge_lab.storage import (
     mark_failed,
     mark_running,
     mark_skipped,
+    record_build_run,
+    upsert_feature_snapshots,
     upsert_pending,
     utc_now,
 )
@@ -61,6 +69,7 @@ def build_dataset(config: EdgeLabConfig) -> dict:
         "candles_fetched": 0,
         "rows_labeled": 0,
         "rows_inserted_updated": 0,
+        "feature_rows_upserted": 0,
         "rows_skipped_warmup": 0,
         "rows_skipped_no_future": 0,
         "partial_history_warnings": [],
@@ -69,6 +78,8 @@ def build_dataset(config: EdgeLabConfig) -> dict:
         "stopped_because": "complete",
         "db_path": str(DB_PATH),
         "generated_at": None,
+        "feature_version": FEATURE_VERSION,
+        "label_version": PATH_LABEL_VERSION,
         "path_templates": list(PATH_TEMPLATES.keys()),
     }
 
@@ -132,7 +143,9 @@ def _select_symbols(tickers: list[dict], config: EdgeLabConfig) -> list[str]:
         if not symbol.endswith("_USDT") or symbol in exclude:
             continue
         last = _as_float(t.get("lastPrice") or t.get("last") or t.get("fairPrice"))
-        volume = _as_float(t.get("volume24") or t.get("amount24") or t.get("holdVol") or 0)
+        # Prefer quote/notional turnover when available. Base-unit volume is
+        # not comparable across symbols and must not drive cross-symbol rank.
+        volume = _as_float(t.get("amount24") or t.get("volume24") or t.get("holdVol") or 0)
         if last is None or last <= 0:
             continue
         if volume is None or volume < config.min_volume_24h:
@@ -163,7 +176,12 @@ def _process_symbol(con, symbol: str, config: EdgeLabConfig, summary: dict) -> N
 
     start_ts = None
     if config.mode == "incremental":
-        last = get_last_labeled_timestamp(con, symbol, config.timeframe)
+        last_labeled = get_last_labeled_timestamp(con, symbol, config.timeframe)
+        last_feature = get_last_feature_timestamp(con, symbol, config.timeframe)
+        progress_timestamps = [
+            value for value in (last_labeled, last_feature) if value is not None
+        ]
+        last = max(progress_timestamps) if progress_timestamps else None
         if last:
             start_ts = max(0, last - (config.rolling_window + config.forward_horizon_candles) * 15 * 60)
 
@@ -173,7 +191,9 @@ def _process_symbol(con, symbol: str, config: EdgeLabConfig, summary: dict) -> N
     if meta.get("partial_history"):
         summary["partial_history_warnings"].append({"symbol": symbol, "candles": candles_fetched})
 
-    min_needed = config.min_periods + config.forward_horizon_candles + 1
+    # Current feature snapshots do not need a future outcome window. Path
+    # labels remain subject to forward_horizon_candles below.
+    min_needed = config.min_periods + 1
     if candles_fetched < min_needed:
         mark_skipped(con, symbol, config.timeframe, "insufficient_history", candles_fetched)
         summary["symbols_skipped"] += 1
@@ -181,20 +201,30 @@ def _process_symbol(con, symbol: str, config: EdgeLabConfig, summary: dict) -> N
 
     features = compute_features(candles, config.rolling_window, config.min_periods)
     labels: list[dict] = []
+    feature_snapshots: list[dict] = []
     rows_skipped_warmup = 0
     rows_skipped_no_future = 0
-    last_labeled_ts = None
+    last_labeled_ts = get_last_labeled_timestamp(con, symbol, config.timeframe)
     incremental_floor = get_last_labeled_timestamp(con, symbol, config.timeframe) if config.mode == "incremental" else None
+    feature_floor = get_last_feature_timestamp(con, symbol, config.timeframe) if config.mode == "incremental" else None
     highs = features["high"].to_numpy(dtype=float)
     lows = features["low"].to_numpy(dtype=float)
     closes = features["close"].to_numpy(dtype=float)
 
     for idx, row in features.iterrows():
         ts = int(row["timestamp"])
-        if incremental_floor is not None and ts <= incremental_floor:
-            continue
         if not has_required_features(row):
             rows_skipped_warmup += 1
+            continue
+        feature_payload = features_json_for_row(row)
+        if feature_floor is None or ts > feature_floor:
+            feature_snapshots.append({
+                "symbol": symbol,
+                "timeframe": config.timeframe,
+                "timestamp": ts,
+                "features": feature_payload,
+            })
+        if incremental_floor is not None and ts <= incremental_floor:
             continue
         paths = label_paths_from_arrays(highs, lows, closes, idx, config.forward_horizon_candles)
         if paths is None:
@@ -204,20 +234,32 @@ def _process_symbol(con, symbol: str, config: EdgeLabConfig, summary: dict) -> N
             "symbol": symbol,
             "timeframe": config.timeframe,
             "timestamp": ts,
-            "features": features_json_for_row(row),
+            "features": feature_payload,
             "paths": paths,
         })
         last_labeled_ts = ts
 
+    feature_upserted = 0
+    for i in range(0, len(feature_snapshots), config.batch_size):
+        feature_upserted += upsert_feature_snapshots(con, feature_snapshots[i:i + config.batch_size])
+
     inserted = 0
     for i in range(0, len(labels), config.batch_size):
         inserted += insert_labels(con, labels[i:i + config.batch_size])
+
+    if not feature_snapshots and get_last_feature_timestamp(con, symbol, config.timeframe) is None:
+        mark_skipped(con, symbol, config.timeframe, "insufficient_feature_history", candles_fetched)
+        summary["symbols_skipped"] += 1
+        summary["rows_skipped_warmup"] += rows_skipped_warmup
+        summary["rows_skipped_no_future"] += rows_skipped_no_future
+        return
 
     mark_complete(con, symbol, config.timeframe, candles_fetched, len(labels), last_labeled_ts)
     summary["rows_skipped_warmup"] += rows_skipped_warmup
     summary["rows_skipped_no_future"] += rows_skipped_no_future
     summary["rows_labeled"] += len(labels)
     summary["rows_inserted_updated"] += inserted
+    summary["feature_rows_upserted"] += feature_upserted
 
 
 def _should_skip_for_resume(con, symbol: str, timeframe: str, mode: str) -> bool:
@@ -245,6 +287,8 @@ def _finish_summary(con, summary: dict, started: float, config: EdgeLabConfig) -
     summary["symbols_failed"] = counts.get("failed", summary["symbols_failed"])
     summary["runtime_seconds"] = round(time.monotonic() - started, 2)
     summary["generated_at"] = utc_now()
+    record_build_run(con, summary)
+    con.commit()
     return summary
 
 

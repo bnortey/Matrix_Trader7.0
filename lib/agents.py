@@ -216,6 +216,88 @@ AGENT_ROSTER = {
     },
 }
 
+# Report contracts keep the firm's public intelligence output aligned with each
+# analyst's actual mandate.  They are metadata only: they do not change signal
+# scoring or execution authority.
+AGENT_REPORT_CONTRACTS = {
+    "trader": {
+        "mandate": "Turn the desk's evidence into a prioritized, risk-aware market posture.",
+        "decision_questions": ["What matters now?", "What changes the posture?", "What should remain untraded?"],
+        "required_evidence": ["desk consensus", "regime", "risk gates", "paper outcomes"],
+        "coverage_limits": ["Cannot authorize a trade without a fresh MT7 signal."],
+    },
+    "risk_manager": {
+        "mandate": "Identify invalid setups, capital hazards, and conditions that require smaller exposure or no trade.",
+        "decision_questions": ["What can cause permanent loss?", "Which gates are active?", "What invalidates the setup?"],
+        "required_evidence": ["blocked candidates", "analyst disagreement", "drawdown", "liquidation and sizing context"],
+        "coverage_limits": ["Never recommends automatic leverage or position-size escalation."],
+    },
+    "narrative_debate": {
+        "mandate": "Separate durable market narratives from stories that are not confirmed by structure.",
+        "decision_questions": ["What story is the market pricing?", "Which desks confirm it?", "What evidence would break it?"],
+        "required_evidence": ["macro and catalyst coverage", "sentiment coverage", "structural confirmation", "desk disagreement"],
+        "coverage_limits": ["Must label missing macro, news, or sentiment feeds instead of inferring them from price alone."],
+    },
+    "tokenomics": {
+        "mandate": "Assess supply expansion, circulating-float fragility, unlock pressure, treasury activity, and on-chain flows.",
+        "decision_questions": ["Is supply changing?", "Who can sell?", "Does on-chain flow confirm the market move?"],
+        "required_evidence": ["unlock schedule", "emissions", "circulating float", "treasury or whale flows", "market proxies"],
+        "coverage_limits": ["Price, volume, and funding are proxies—not proof of unlocks, emissions, or wallet activity."],
+    },
+    "sentiment": {
+        "mandate": "Judge crowd positioning, social acceleration, credibility, and reflexive attention risk.",
+        "decision_questions": ["Is attention accelerating?", "Is the crowd one-sided?", "Does sentiment confirm or chase price?"],
+        "required_evidence": ["social activity", "sentiment quality", "funding crowding", "price-attention divergence"],
+        "coverage_limits": ["Must disclose when no live social or sentiment feed is connected."],
+    },
+    "news": {
+        "mandate": "Map scheduled and unscheduled catalysts to affected assets, time windows, and regime risk.",
+        "decision_questions": ["What event can move the tape?", "When is it?", "What confirms the market reaction?"],
+        "required_evidence": ["catalyst source", "event time", "affected assets", "reaction and invalidation"],
+        "coverage_limits": ["Must not invent catalysts when the news calendar is unavailable."],
+    },
+    "technical": {
+        "mandate": "Evaluate trend structure, momentum maturity, key levels, and multi-timeframe alignment.",
+        "decision_questions": ["Where is structure intact?", "Is the move early or late?", "Which level invalidates it?"],
+        "required_evidence": ["trend and momentum", "volume", "volatility", "support and resistance", "timeframe alignment"],
+        "coverage_limits": ["A 24-hour move alone is not a technical setup."],
+    },
+    "structural_debate": {
+        "mandate": "Synthesize order flow, positioning, venue behavior, and regime into a structural verdict.",
+        "decision_questions": ["Do market mechanics support direction?", "Where do structural desks disagree?", "What would resolve it?"],
+        "required_evidence": ["order flow", "funding", "cross-venue confirmation", "regime", "liquidity"],
+        "coverage_limits": ["Must distinguish measured venue data from unavailable venue coverage."],
+    },
+    "microstructure": {
+        "mandate": "Assess executable liquidity, spread pressure, book imbalance, aggressive flow, and trap risk.",
+        "decision_questions": ["Can the move be entered cleanly?", "Is flow persistent?", "Is displayed liquidity trustworthy?"],
+        "required_evidence": ["depth", "spread", "trade delta", "volume participation", "slippage context"],
+        "coverage_limits": ["Ticker volume is not a substitute for a fresh order-book or trade-flow snapshot."],
+    },
+    "funding": {
+        "mandate": "Interpret carry, crowded positioning, open-interest pressure, and squeeze or flush risk.",
+        "decision_questions": ["Who is paying to hold?", "Is price confirming the crowd?", "What would force an unwind?"],
+        "required_evidence": ["funding rate", "funding direction", "open interest", "price response", "liquidation context"],
+        "coverage_limits": ["Extreme funding is a condition, not a standalone entry signal."],
+    },
+    "cross_venue": {
+        "mandate": "Detect venue leadership, basis divergence, confirmation, and venue-specific distortions.",
+        "decision_questions": ["Which venue leads?", "Do venues confirm?", "Is the move local or market-wide?"],
+        "required_evidence": ["matched venue prices", "basis", "funding by venue", "liquidity by venue"],
+        "coverage_limits": ["Must state when only one venue supplied a comparable observation."],
+    },
+    "regime": {
+        "mandate": "Classify the volatility and trend environment and identify transition conditions across horizons.",
+        "decision_questions": ["What regime is active?", "How stable is it?", "What marks a transition?"],
+        "required_evidence": ["regime breadth", "volatility", "trend persistence", "funding pressure", "historical regime mix"],
+        "coverage_limits": ["Scenario analysis is conditional; it is not a guaranteed price forecast."],
+    },
+}
+
+for _agent_key, _contract in AGENT_REPORT_CONTRACTS.items():
+    if _agent_key in AGENT_ROSTER:
+        AGENT_ROSTER[_agent_key]["report_contract"] = _contract
+
 FIRM_META = {
     "name": "Cipher Research Group",
     "tagline": "We read the market's structure. Not its noise.",
@@ -272,7 +354,12 @@ def _analyst_call(system_msg: str, data_subset: dict, output_schema: dict) -> di
         "- reasoning fields: max 120 chars, plain English\n"
         "- If data is missing, use the default value shown"
     )
-    raw = call_ai(system=system_msg, user=prompt, max_tokens=400)
+    raw = call_ai(
+        system=system_msg,
+        user=prompt,
+        max_tokens=400,
+        feature="signal_agents",
+    )
     if not raw:
         return {"_llm_ok": False}
     try:

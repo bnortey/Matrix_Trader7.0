@@ -20,6 +20,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-volume-24h", type=float, default=0.0)
     parser.add_argument("--symbols", help="Comma-separated symbols, e.g. BTC_USDT,ETH_USDT")
     parser.add_argument("--top-n", type=int)
+    parser.add_argument(
+        "--skip-smoke",
+        action="store_true",
+        help="Skip the whole-dataset path smoke scan after building.",
+    )
     return parser.parse_args()
 
 
@@ -38,7 +43,8 @@ def main() -> int:
     )
     summary = build_dataset(config)
     print_summary(summary)
-    print_smoke_summary()
+    if not args.skip_smoke:
+        print_smoke_summary()
     return 0
 
 
@@ -58,6 +64,7 @@ def print_summary(summary: dict) -> None:
         ("Candles fetched", "candles_fetched"),
         ("Rows labeled", "rows_labeled"),
         ("Rows inserted/updated", "rows_inserted_updated"),
+        ("Feature snapshots upserted", "feature_rows_upserted"),
         ("Rows skipped warmup", "rows_skipped_warmup"),
         ("Rows skipped no future", "rows_skipped_no_future"),
         ("Runtime seconds", "runtime_seconds"),
@@ -114,4 +121,3 @@ def _pct(value) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

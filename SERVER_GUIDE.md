@@ -29,6 +29,8 @@ ssh root@207.148.66.39
 http://207.148.66.39:8080
 ```
 
+**Claude Cowork access key:** `.claude-vps-key` / `.claude-vps-key.pub` in the repo root (gitignored, rsync-excluded). Dedicated ed25519 key used by Claude sessions: `ssh -i .claude-vps-key root@207.148.66.39`. Authorized on both the Vultr production box and the Hermes host. Revoke by removing the `claude-cowork-mt7` line from `/root/.ssh/authorized_keys` on each server.
+
 ---
 
 ## Deploy Updates From Your Mac
@@ -57,6 +59,7 @@ rsync -avz \
   --exclude='.git' \
   --exclude='*.pyc' \
   --exclude='.superpowers/' \
+  --exclude='.claude-vps-key*' \
   ./ root@207.148.66.39:/opt/matrix-trader/
 ```
 

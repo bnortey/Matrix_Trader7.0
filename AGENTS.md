@@ -12,7 +12,7 @@ It is a **local web application**: a Python Flask backend that serves a dark-the
 
 **It is not:**
 - An execution bot yet — order placement is a staged future capability (P8–P12), currently disabled.
-- A prediction engine (no ARIMA, no price forecasting)
+- An autonomous prediction engine (no ARIMA or forecast-driven execution; probabilistic forecasts are forward-tested in a zero-authority shadow lane)
 - A SaaS product (local only for now)
 - A blind multi-exchange aggregator (MEXC is primary; Hyperliquid is integrated through explicit exchange routing)
 
@@ -33,7 +33,7 @@ This is the 7th iteration. Versions 2–6 all failed. The MT6 codebase (`Matrix_
 | MT6 Mistake | MT7 Rule |
 |---|---|
 | Matrix chat bot as delivery mechanism | Web app only |
-| ARIMA price forecasting | No forecasting. Signals only. |
+| ARIMA price forecasting | No unvalidated forecasting authority. Probabilistic forecasts remain capped, forward-only, and shadow-only until independently proven. |
 | Two competing TUI implementations | One interface: the web dashboard |
 | Coinglass API key committed in plaintext | All keys in `.env`, never committed |
 | 17 planning markdown files instead of code | Ship before you plan |
@@ -275,7 +275,7 @@ Do not start a new task until the previous one works end-to-end.
 <claude-mem-context>
 # Memory Context
 
-# [Matrix_Trader_7.0] recent context, 2026-06-12 5:22pm EDT
+# [Matrix_Trader_7.0] recent context, 2026-07-29 3:39pm EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE

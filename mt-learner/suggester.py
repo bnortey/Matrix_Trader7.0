@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import hashlib
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,66 @@ REGIME_MIN_OTHER_AVG_PNL = 0.0
 NEW_STRAT_MIN_SAMPLE = 100
 NEW_STRAT_MIN_WIN_RATE = 0.55
 NEW_STRAT_MIN_AVG_PNL = -2.0  # after assumed costs
+SUGGESTION_CONTRACT_VERSION = "mt7_suggestion_v1"
+
+
+def _baseline_fingerprint(strategy, change_set):
+    canonical = json.dumps(
+        {"strategy": strategy, "change_set": change_set},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _suggestion_contract(
+    *,
+    strategy,
+    change_set,
+    sample_size,
+    confidence,
+    source,
+    expected_benefit,
+    downside,
+    rollback_condition,
+    baseline_source,
+    baseline_snapshot_at,
+):
+    """Attach the same human-readable, reversible contract to every learner idea."""
+    return {
+        "suggestion_contract_version": SUGGESTION_CONTRACT_VERSION,
+        "scope": {
+            "strategy": strategy,
+            "target_mode": "paper_trial_after_review",
+            "exchange": "all_configured",
+        },
+        "change_set": change_set,
+        "evidence": {
+            "source": source,
+            "sample_size": sample_size,
+            "confidence": confidence,
+            "forward_tested": False,
+        },
+        "expected_impact": {
+            "benefit": expected_benefit,
+            "uncertainty": "Historical estimate; forward shadow evidence is required.",
+        },
+        "downside": downside,
+        "rollback_plan": {
+            "condition": rollback_condition,
+            "action": "Restore the exact pre-trial strategy field values and park the suggestion.",
+        },
+        "approval_policy": {
+            "auto_apply_allowed": False,
+            "explicit_user_approval_required": True,
+            "application_lane": "serial_paper_config_trial",
+        },
+        "baseline_snapshot": {
+            "source": baseline_source,
+            "captured_at": baseline_snapshot_at,
+            "fingerprint": _baseline_fingerprint(strategy, change_set),
+        },
+    }
 
 
 def _read_json(filename):
@@ -71,6 +132,96 @@ def _already_exists(suggestions, stype, strategy, value_key, value):
     return False
 
 
+def _repair_duplicate_suggestion_ids(suggestions):
+    """Give every queue record a stable unique ID before actions can target it."""
+    seen = set()
+    repaired = []
+    now = datetime.now(timezone.utc).isoformat()
+    for suggestion in suggestions:
+        original = str(suggestion.get("id") or "suggestion")
+        if original not in seen:
+            seen.add(original)
+            continue
+        suffix = 2
+        candidate = f"{original}_r{suffix}"
+        while candidate in seen:
+            suffix += 1
+            candidate = f"{original}_r{suffix}"
+        suggestion["legacy_duplicate_id"] = original
+        suggestion["id"] = candidate
+        suggestion["id_repaired_at"] = now
+        seen.add(candidate)
+        repaired.append({"old_id": original, "new_id": candidate})
+    return repaired
+
+
+def _next_suggestion_id(prefix, existing, new_suggestions):
+    date_label = datetime.now(timezone.utc).strftime("%Y%m%d")
+    base = f"{prefix}_{date_label}"
+    used = {
+        str(item.get("id") or "")
+        for item in list(existing) + list(new_suggestions)
+        if isinstance(item, dict)
+    }
+    ordinal = 1
+    while f"{base}_{ordinal:03d}" in used:
+        ordinal += 1
+    return f"{base}_{ordinal:03d}"
+
+
+def _supersede_stale_threshold_proposals(suggestions, thresholds):
+    """Retire read-only threshold ideas whose recorded baseline is no longer runtime truth."""
+    now = datetime.now(timezone.utc).isoformat()
+    changed = []
+    read_only_statuses = {
+        "pending",
+        "pending_review",
+        "shadow_evaluating",
+        "parked",
+    }
+    strategies = (thresholds or {}).get("strategies") or {}
+    for suggestion in suggestions:
+        if (
+            suggestion.get("type") != "threshold"
+            or suggestion.get("status") not in read_only_statuses
+        ):
+            continue
+        info = strategies.get(suggestion.get("strategy")) or {}
+        runtime = info.get("runtime_threshold")
+        recorded = suggestion.get("current_value")
+        if runtime is None or recorded is None:
+            continue
+        baseline_source = str(
+            (suggestion.get("baseline_snapshot") or {}).get("source") or ""
+        )
+        unverified_baseline = baseline_source in {
+            "historical_implied_fallback",
+            "unavailable",
+        }
+        try:
+            stale = int(runtime) != int(recorded) or unverified_baseline
+        except (TypeError, ValueError):
+            stale = runtime != recorded or unverified_baseline
+        if not stale:
+            continue
+        previous = suggestion.get("status")
+        suggestion.update({
+            "status": "superseded",
+            "previous_status": previous,
+            "superseded_at": now,
+            "superseded_reason": (
+                "runtime_baseline_unverified"
+                if unverified_baseline
+                else "runtime_baseline_changed"
+            ),
+            "runtime_actual_at_supersession": runtime,
+            "proposal_baseline_at_supersession": recorded,
+            "can_apply": False,
+        })
+        changed.append(suggestion.get("id"))
+    return changed
+
+
 def run_strategy_proposal_check(db_path=None):
     logger.info('run_strategy_proposal_check: starting')
     thresholds = _read_json('conviction_thresholds.json')
@@ -78,6 +229,11 @@ def run_strategy_proposal_check(db_path=None):
 
     pending = _load_pending()
     existing = pending.get('suggestions', [])
+    repaired_duplicate_ids = _repair_duplicate_suggestion_ids(existing)
+    superseded_stale_ids = _supersede_stale_threshold_proposals(
+        existing,
+        thresholds,
+    )
     rejected = _load_rejected()
     rejected_keys = {
         (r.get('strategy'), r.get('type'), str(r.get('suggested_value', '')))
@@ -88,8 +244,20 @@ def run_strategy_proposal_check(db_path=None):
     # --- Threshold suggestions ---
     if thresholds:
         for strat, info in thresholds.get('strategies', {}).items():
+            if info.get("runtime_threshold_source") not in {
+                "strategy_override",
+                "strategy_config",
+                "runtime",
+            }:
+                logger.warning(
+                    "skipping threshold suggestion for %s: runtime authority unavailable",
+                    strat,
+                )
+                continue
             optimal = info.get('optimal_threshold')
-            current = info.get('current_implied_threshold')
+            current = info.get('runtime_threshold')
+            if current is None:
+                current = info.get('current_implied_threshold')
             sample = info.get('optimal_sample_size', 0)
             ne = info.get('optimal_net_expectancy')
             current_ne = info.get('current_net_expectancy')
@@ -116,7 +284,11 @@ def run_strategy_proposal_check(db_path=None):
 
             # estimate trade count delta
             trade_pct_drop = round((delta / max(optimal, 1)) * 100)
-            sid = f'thresh_{strat}_{datetime.now(timezone.utc).strftime("%Y%m%d")}_{len(new_suggestions)+1:03d}'
+            sid = _next_suggestion_id(
+                f"thresh_{strat}",
+                existing,
+                new_suggestions,
+            )
             sug = {
                 'id': sid,
                 'type': 'threshold',
@@ -148,6 +320,28 @@ def run_strategy_proposal_check(db_path=None):
                 'expected_trade_count_delta': f'-{trade_pct_drop}% fewer trades',
                 'objective': info.get('objective', 'net_ev_primary'),
                 'api_payload': {'min_conviction': optimal},
+                **_suggestion_contract(
+                    strategy=strat,
+                    change_set=[{
+                        "field": "min_conviction",
+                        "label": "Minimum conviction",
+                        "current": current,
+                        "proposed": optimal,
+                        "unit": "score_points",
+                        "direction": "increase",
+                    }],
+                    sample_size=sample,
+                    confidence=info.get('confidence', 'low'),
+                    source="conviction_thresholds.json",
+                    expected_benefit=f"+{round(ne_delta, 2)} percentage points net EV/trade",
+                    downside=f"Approximately {trade_pct_drop}% fewer qualifying trades.",
+                    rollback_condition=(
+                        "Roll back if the forward Paper trial underperforms its pre-trial "
+                        "baseline, produces negative EV, or breaches its declared drawdown gate."
+                    ),
+                    baseline_source=info.get("runtime_threshold_source") or "historical_implied_fallback",
+                    baseline_snapshot_at=info.get("runtime_snapshot_at"),
+                ),
             }
             new_suggestions.append(sug)
 
@@ -186,7 +380,11 @@ def run_strategy_proposal_check(db_path=None):
                     + ', EV ' + str(round(d.get('avg_pnl') or 0, 2)) + '%'
                     for r, d in others.items()
                 )
-                sid = f'regime_{strat}_{regime}_{datetime.now(timezone.utc).strftime("%Y%m%d")}_{len(new_suggestions)+1:03d}'
+                sid = _next_suggestion_id(
+                    f"regime_{strat}_{regime}",
+                    existing,
+                    new_suggestions,
+                )
                 sug = {
                     'id': sid,
                     'type': 'regime_suppress',
@@ -222,6 +420,33 @@ def run_strategy_proposal_check(db_path=None):
                     },
                     'expected_ev_label': f'Regime EV: {round(avg_pnl, 2)}%/trade (drag removed if suppressed)',
                     'api_payload': {'blocked_agent_regimes': [regime]},
+                    **_suggestion_contract(
+                        strategy=strat,
+                        change_set=[{
+                            "field": "blocked_agent_regimes",
+                            "label": "Blocked agent regimes",
+                            "current": "allowed",
+                            "proposed": f"block {regime}",
+                            "unit": "regime_labels",
+                            "direction": "restrict",
+                        }],
+                        sample_size=count,
+                        confidence='medium' if count < 80 else 'high',
+                        source="regime_performance.json",
+                        expected_benefit=(
+                            f"Remove a {round(avg_pnl, 2)}% net-EV/trade regime drag."
+                        ),
+                        downside=(
+                            "Fewer qualifying trades and possible under-participation if "
+                            "the market regime changes."
+                        ),
+                        rollback_condition=(
+                            "Roll back if the excluded regime becomes positive EV in the "
+                            "forward comparison or the retained cohort deteriorates."
+                        ),
+                        baseline_source="runtime strategy admission policy",
+                        baseline_snapshot_at=datetime.now(timezone.utc).isoformat(),
+                    ),
                 }
                 new_suggestions.append(sug)
 
@@ -241,6 +466,8 @@ def run_strategy_proposal_check(db_path=None):
         'learner_version': 'v1',
         'db_signals_analyzed': total_analyzed,
         'shadow_mode': False,
+        'repaired_duplicate_ids': repaired_duplicate_ids,
+        'superseded_stale_ids': superseded_stale_ids,
         'suggestions': merged,
     }
     _write_pending(result)
