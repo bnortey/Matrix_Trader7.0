@@ -7,7 +7,7 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-29
-Latest implementation commit: pending — learning-intelligence sprint
+Latest implementation commit: b40b739 feat: add causal learning intelligence
 app.py: 34,248 lines
 index.html: 19,054 lines
 
