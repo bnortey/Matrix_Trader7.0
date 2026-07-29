@@ -207,8 +207,9 @@ class SuggestionContractTests(unittest.TestCase):
         )
 
         self.assertFalse(without_phrase[0])
-        self.assertIn("exact confirmation phrase", without_phrase[1])
-        self.assertTrue(with_phrase[0])
+        self.assertIn("strategy factory", without_phrase[1])
+        self.assertFalse(with_phrase[0])
+        self.assertIn("restricted strategy field", with_phrase[1])
 
     def test_analyzer_uses_runtime_threshold_for_any_strategy(self):
         db_path = self.root / "learner.db"

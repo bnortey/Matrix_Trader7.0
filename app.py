@@ -73,6 +73,16 @@ from lib.hyperliquid_client import (
 )
 from lib.bybit_client import fetch_bybit_candles, fetch_bybit_tickers, bybit_symbol_to_raw
 from lib.risk_liquidation import estimate_liquidation_price
+from lib.learning_intelligence import (
+    ACTIVE_EXPERIMENT_STATUSES,
+    LEARNING_CONTRACT_VERSION,
+    default_evidence_rules as _learning_default_evidence_rules,
+    evaluate_experiment as _evaluate_learning_experiment,
+    event_hash as _learning_event_hash,
+    maturity_score as _learning_maturity_score,
+    stable_fingerprint as _learning_fingerprint,
+    validate_strategy_factory_contract as _validate_strategy_factory_contract,
+)
 
 load_dotenv()
 
@@ -2141,6 +2151,9 @@ def init_db() -> None:
         ("realized_equity_usd", "REAL"),
         ("sizing_risk_pct", "REAL"),
         ("sizing_policy_json", "TEXT"),
+        ("learning_experiment_id", "TEXT"),
+        ("learning_policy_fingerprint", "TEXT"),
+        ("learning_policy_json", "TEXT"),
     ]:
         try:
             con.execute(f"ALTER TABLE paper_trades ADD COLUMN {_col} {_type}")
@@ -2151,6 +2164,63 @@ def init_db() -> None:
     con.execute("UPDATE paper_trades SET gross_pnl_pct=pnl_pct WHERE gross_pnl_pct IS NULL AND pnl_pct IS NOT NULL")
     con.execute("UPDATE paper_trades SET fee_cost_pct=0 WHERE fee_cost_pct IS NULL AND pnl_pct IS NOT NULL")
     con.execute("UPDATE paper_trades SET slippage_cost_pct=0 WHERE slippage_cost_pct IS NULL AND pnl_pct IS NOT NULL")
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_paper_learning_experiment
+        ON paper_trades (learning_experiment_id, learning_policy_fingerprint, status, closed_at)
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS learning_experiments (
+            experiment_id          TEXT PRIMARY KEY,
+            contract_version       TEXT NOT NULL,
+            source_type            TEXT NOT NULL,
+            source_id              TEXT,
+            family                 TEXT NOT NULL,
+            strategy_key           TEXT NOT NULL,
+            status                 TEXT NOT NULL,
+            hypothesis             TEXT NOT NULL,
+            mechanism              TEXT NOT NULL,
+            scope_json             TEXT NOT NULL,
+            change_set_json        TEXT NOT NULL,
+            baseline_json          TEXT NOT NULL,
+            evidence_rules_json    TEXT NOT NULL,
+            rollback_json          TEXT NOT NULL,
+            policy_json            TEXT NOT NULL,
+            policy_fingerprint     TEXT NOT NULL,
+            authority_mode         TEXT NOT NULL DEFAULT 'paper_only',
+            user_approved          INTEGER NOT NULL DEFAULT 0,
+            capital_change         INTEGER NOT NULL DEFAULT 0,
+            execution_change       INTEGER NOT NULL DEFAULT 0,
+            activated_at           TEXT NOT NULL,
+            created_at             TEXT NOT NULL,
+            updated_at             TEXT NOT NULL,
+            evaluated_at           TEXT,
+            result_json            TEXT,
+            rollback_required      INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(source_type, source_id, policy_fingerprint)
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_learning_experiments_active
+        ON learning_experiments (status, strategy_key, activated_at)
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS learning_experiment_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id  TEXT NOT NULL,
+            sequence       INTEGER NOT NULL,
+            event_type     TEXT NOT NULL,
+            event_at       TEXT NOT NULL,
+            payload_json   TEXT NOT NULL,
+            previous_hash  TEXT,
+            event_hash     TEXT NOT NULL,
+            UNIQUE(experiment_id, sequence),
+            UNIQUE(event_hash)
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_learning_experiment_events
+        ON learning_experiment_events (experiment_id, sequence)
+    """)
     con.commit()
     con.execute("""
         CREATE TABLE IF NOT EXISTS order_flow_trades (
@@ -2185,6 +2255,10 @@ def init_db() -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_of_depth_sym_ts ON order_flow_depth_snapshots (exchange, symbol, ts)")
     con.commit()
     con.close()
+    try:
+        _learning_bootstrap_applied_suggestions()
+    except Exception as e:
+        print(f"[learning] bootstrap error: {e}", file=sys.stderr)
 
 
 def _snapshot_tickers() -> int:
@@ -4921,6 +4995,20 @@ def _suggestion_explainability_contract(
         )
     if not changes:
         missing.append("explicit change set")
+    strategy_factory = None
+    if suggestion.get("type") == "new_strategy":
+        strategy_factory = _validate_strategy_factory_contract({
+            **suggestion,
+            **(suggestion.get("strategy_factory_contract") or {}),
+        })
+        missing.extend(
+            f"strategy factory: {field}"
+            for field in strategy_factory.get("missing", [])
+        )
+        missing.extend(
+            f"restricted strategy field: {field}"
+            for field in strategy_factory.get("restricted_fields", [])
+        )
 
     evidence = dict(suggestion.get("evidence") or {})
     evidence.setdefault("source", suggestion.get("objective") or suggestion.get("type"))
@@ -5022,6 +5110,7 @@ def _suggestion_explainability_contract(
         },
         "application_policy": application_policy,
         "rollback_plan": rollback,
+        "strategy_factory": strategy_factory,
         "audit": {
             "baseline_fingerprint": fingerprint,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -5278,6 +5367,683 @@ def _append_experiment_record_once(record: dict, key: str = "id") -> bool:
         json.dump(ledger, f, indent=2, sort_keys=True)
     os.replace(tmp, EXPERIMENT_LEDGER_PATH)
     return True
+
+
+def _learning_json(raw, default):
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        value = json.loads(raw or "")
+        return value if isinstance(value, type(default)) else default
+    except Exception:
+        return default
+
+
+def _learning_policy_snapshot(strategy_key: str, paper_cfg: dict | None = None) -> dict:
+    """Capture the effective Paper policy whose outcomes must stay attributable."""
+    paper_cfg = paper_cfg or _load_paper_config()
+    try:
+        strategy = get_strategy_config(strategy_key, include_disabled=True)
+    except Exception:
+        strategy = {"key": strategy_key, "unavailable": True}
+    paper_fields = (
+        "min_conviction",
+        "flow_required",
+        "min_flow_score",
+        "max_atr_pct",
+        "max_trend_score_abs",
+        "max_open_positions",
+        "max_holding_hours",
+        "paper_maker_fee_bps",
+        "paper_taker_fee_bps",
+        "paper_slippage_bps",
+        "paper_stop_mode",
+        "paper_breakeven_buffer_bps",
+        "paper_trailing_atr_mult",
+        "paper_margin_mode",
+        "paper_sizing_mode",
+        "risk_pct_per_trade",
+        "disabled_strategies",
+    )
+    return {
+        "contract_version": LEARNING_CONTRACT_VERSION,
+        "strategy_key": strategy_key,
+        "strategy": strategy,
+        "strategy_overrides": _load_strategy_overrides().get(strategy_key, {}),
+        "paper": {key: paper_cfg.get(key) for key in paper_fields},
+        "research_paper_rules": _research_rule_controls_by_tag(),
+        "scoring_version": SCORE_VERSION,
+        "evaluation_version": "paper_min1_chunked_v1",
+    }
+
+
+def _learning_append_event(
+    con: sqlite3.Connection,
+    experiment_id: str,
+    event_type: str,
+    payload: dict,
+    event_at: str | None = None,
+) -> dict:
+    """Append one hash-chained event inside the caller's transaction."""
+    previous = con.execute(
+        """SELECT sequence, event_hash
+           FROM learning_experiment_events
+           WHERE experiment_id=?
+           ORDER BY sequence DESC LIMIT 1""",
+        (experiment_id,),
+    ).fetchone()
+    sequence = int(previous[0]) + 1 if previous else 1
+    previous_hash = previous[1] if previous else None
+    event_at = event_at or datetime.now(timezone.utc).isoformat()
+    digest = _learning_event_hash(
+        experiment_id,
+        sequence,
+        event_type,
+        event_at,
+        payload,
+        previous_hash,
+    )
+    con.execute(
+        """INSERT INTO learning_experiment_events
+           (experiment_id, sequence, event_type, event_at, payload_json,
+            previous_hash, event_hash)
+           VALUES (?,?,?,?,?,?,?)""",
+        (
+            experiment_id,
+            sequence,
+            event_type,
+            event_at,
+            json.dumps(payload, sort_keys=True, default=str),
+            previous_hash,
+            digest,
+        ),
+    )
+    return {
+        "sequence": sequence,
+        "event_hash": digest,
+        "previous_hash": previous_hash,
+    }
+
+
+def _learning_verify_event_chain(
+    con: sqlite3.Connection,
+    experiment_id: str,
+) -> dict:
+    rows = con.execute(
+        """SELECT sequence, event_type, event_at, payload_json,
+                  previous_hash, event_hash
+           FROM learning_experiment_events
+           WHERE experiment_id=?
+           ORDER BY sequence ASC""",
+        (experiment_id,),
+    ).fetchall()
+    expected_previous = None
+    problems: list[str] = []
+    for expected_sequence, row in enumerate(rows, 1):
+        sequence, event_type, event_at, payload_json, previous_hash, digest = row
+        payload = _learning_json(payload_json, {})
+        expected = _learning_event_hash(
+            experiment_id,
+            sequence,
+            event_type,
+            event_at,
+            payload,
+            previous_hash,
+        )
+        if sequence != expected_sequence:
+            problems.append(f"sequence {sequence} expected {expected_sequence}")
+        if previous_hash != expected_previous:
+            problems.append(f"sequence {sequence} previous hash mismatch")
+        if digest != expected:
+            problems.append(f"sequence {sequence} event hash mismatch")
+        expected_previous = digest
+    return {
+        "valid": not problems and bool(rows),
+        "event_count": len(rows),
+        "problems": problems,
+        "head_hash": expected_previous,
+    }
+
+
+def _learning_register_suggestion_experiment(
+    suggestion: dict,
+    contract: dict,
+    baseline: dict,
+    activated_at: str,
+) -> dict:
+    """Register one immutable, forward-only Paper experiment."""
+    strategy_key = str(suggestion.get("strategy") or "").strip()
+    if not strategy_key:
+        raise ValueError("learning experiment requires a strategy")
+    policy = _learning_policy_snapshot(strategy_key)
+    policy_fingerprint = _learning_fingerprint(policy)
+    source_id = str(suggestion.get("id") or "").strip()
+    experiment_id = (
+        f"suggestion:{source_id}:"
+        f"{hashlib.sha256((activated_at + policy_fingerprint).encode()).hexdigest()[:12]}"
+    )
+    scope = contract.get("scope") or {
+        "strategy": strategy_key,
+        "target_mode": "paper_trial_after_review",
+    }
+    change_set = contract.get("change_set") or []
+    evidence_rules = (
+        suggestion.get("evidence_rules")
+        or suggestion.get("evaluation_contract")
+        or _learning_default_evidence_rules()
+    )
+    rollback = contract.get("rollback_plan") or {}
+    hypothesis = str(
+        suggestion.get("hypothesis")
+        or suggestion.get("reasoning")
+        or suggestion.get("evidence_summary")
+        or "Applied strategy change should improve risk-adjusted Paper outcomes."
+    ).strip()
+    mechanism = str(
+        suggestion.get("mechanism")
+        or contract.get("plain_language", {}).get("why")
+        or "The declared control change should remove or isolate a historically weaker cohort."
+    ).strip()
+    restricted = bool(contract.get("application_policy", {}).get("restricted"))
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS learning_experiments (
+                experiment_id TEXT PRIMARY KEY, contract_version TEXT NOT NULL,
+                source_type TEXT NOT NULL, source_id TEXT, family TEXT NOT NULL,
+                strategy_key TEXT NOT NULL, status TEXT NOT NULL,
+                hypothesis TEXT NOT NULL, mechanism TEXT NOT NULL,
+                scope_json TEXT NOT NULL, change_set_json TEXT NOT NULL,
+                baseline_json TEXT NOT NULL, evidence_rules_json TEXT NOT NULL,
+                rollback_json TEXT NOT NULL, policy_json TEXT NOT NULL,
+                policy_fingerprint TEXT NOT NULL, authority_mode TEXT NOT NULL,
+                user_approved INTEGER NOT NULL, capital_change INTEGER NOT NULL,
+                execution_change INTEGER NOT NULL, activated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                evaluated_at TEXT, result_json TEXT,
+                rollback_required INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(source_type, source_id, policy_fingerprint)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS learning_experiment_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                event_type TEXT NOT NULL, event_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL, previous_hash TEXT,
+                event_hash TEXT NOT NULL,
+                UNIQUE(experiment_id, sequence), UNIQUE(event_hash)
+            )
+        """)
+        conflict = con.execute(
+            """SELECT experiment_id
+               FROM learning_experiments
+               WHERE strategy_key=?
+                 AND status IN ('active','collecting','review')
+               LIMIT 1""",
+            (strategy_key,),
+        ).fetchone()
+        if conflict:
+            raise ValueError(
+                f"strategy already has an active learning experiment: {conflict[0]}"
+            )
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            """INSERT INTO learning_experiments
+               (experiment_id, contract_version, source_type, source_id, family,
+                strategy_key, status, hypothesis, mechanism, scope_json,
+                change_set_json, baseline_json, evidence_rules_json,
+                rollback_json, policy_json, policy_fingerprint, authority_mode,
+                user_approved, capital_change, execution_change, activated_at,
+                created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                experiment_id,
+                LEARNING_CONTRACT_VERSION,
+                "learner_suggestion",
+                source_id,
+                str(suggestion.get("type") or "strategy_change"),
+                strategy_key,
+                "collecting",
+                hypothesis,
+                mechanism,
+                json.dumps(scope, sort_keys=True, default=str),
+                json.dumps(change_set, sort_keys=True, default=str),
+                json.dumps(baseline, sort_keys=True, default=str),
+                json.dumps(evidence_rules, sort_keys=True, default=str),
+                json.dumps(rollback, sort_keys=True, default=str),
+                json.dumps(policy, sort_keys=True, default=str),
+                policy_fingerprint,
+                "paper_only",
+                1,
+                1 if restricted else 0,
+                0,
+                activated_at,
+                activated_at,
+                activated_at,
+            ),
+        )
+        _learning_append_event(
+            con,
+            experiment_id,
+            "activated",
+            {
+                "source_id": source_id,
+                "strategy_key": strategy_key,
+                "policy_fingerprint": policy_fingerprint,
+                "authority_mode": "paper_only",
+                "user_approved": True,
+                "auto_apply_allowed": False,
+                "live_behavior_change_allowed": False,
+            },
+            activated_at,
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return {
+        "experiment_id": experiment_id,
+        "policy_fingerprint": policy_fingerprint,
+        "status": "collecting",
+    }
+
+
+def _learning_bootstrap_applied_suggestions() -> list[dict]:
+    """Start forward attribution for previously approved active controls.
+
+    Historical outcomes remain excluded.  This only establishes a new
+    deployment-time boundary around a control that is already active.
+    """
+    registered: list[dict] = []
+    for suggestion in _annotate_suggestion_authority(_load_suggestions()):
+        if suggestion.get("status") != "evaluating":
+            continue
+        if suggestion.get("learning_experiment_id"):
+            continue
+        control = suggestion.get("control_authority") or {}
+        if not control.get("active"):
+            continue
+        source_id = str(suggestion.get("id") or "")
+        con = sqlite3.connect(DB_PATH)
+        existing = con.execute(
+            """SELECT experiment_id
+               FROM learning_experiments
+               WHERE source_type='learner_suggestion' AND source_id=?
+                 AND status IN ('active','collecting','review')
+               LIMIT 1""",
+            (source_id,),
+        ).fetchone()
+        con.close()
+        if existing:
+            continue
+        activated_at = datetime.now(timezone.utc).isoformat()
+        baseline = _suggestion_baseline_snapshot()
+        baseline.update({
+            "applied_at": activated_at,
+            "forward_boundary_reason": (
+                "Existing approved control adopted into the exact-policy ledger; "
+                "all earlier rows remain legacy-unattributed."
+            ),
+            "legacy_rows_excluded": True,
+        })
+        contract = suggestion.get("explainability") or _suggestion_explainability_contract(
+            suggestion
+        )
+        experiment = _learning_register_suggestion_experiment(
+            suggestion,
+            contract,
+            baseline,
+            activated_at,
+        )
+        _update_suggestion_status(
+            source_id,
+            "evaluating",
+            {
+                "learning_experiment_id": experiment["experiment_id"],
+                "learning_policy_fingerprint": experiment["policy_fingerprint"],
+                "learning_contract_version": LEARNING_CONTRACT_VERSION,
+                "learning_forward_boundary_at": activated_at,
+                "learning_legacy_rows_excluded": True,
+            },
+        )
+        con = sqlite3.connect(DB_PATH)
+        _learning_append_event(
+            con,
+            experiment["experiment_id"],
+            "legacy_authority_reconciled",
+            {
+                "scan_behavior_changed": False,
+                "historical_rows_attributed": False,
+                "forward_boundary_at": activated_at,
+            },
+            activated_at,
+        )
+        con.commit()
+        con.close()
+        registered.append(experiment)
+    return registered
+
+
+def _learning_attribution_for_trade(
+    strategy_key: str,
+    paper_cfg: dict,
+) -> dict:
+    """Return the experiment and exact effective policy for a new Paper trade."""
+    policy = _learning_policy_snapshot(strategy_key, paper_cfg)
+    fingerprint = _learning_fingerprint(policy)
+    experiment_id = None
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            """SELECT experiment_id, policy_fingerprint
+               FROM learning_experiments
+               WHERE strategy_key=?
+                 AND status IN ('active','collecting','review')
+               ORDER BY activated_at DESC LIMIT 1""",
+            (strategy_key,),
+        ).fetchone()
+        con.close()
+        if row and row[1] == fingerprint:
+            experiment_id = row[0]
+    except Exception as e:
+        print(f"[learning] attribution lookup error: {e}", file=sys.stderr)
+    return {
+        "experiment_id": experiment_id,
+        "policy_fingerprint": fingerprint,
+        "policy": policy,
+    }
+
+
+def _learning_experiment_rows(
+    con: sqlite3.Connection,
+    experiment: dict,
+) -> tuple[list[dict], list[dict]]:
+    treatment = [
+        dict(row) for row in con.execute(
+            """SELECT result, pnl_pct, size_usd, closed_at
+               FROM paper_trades
+               WHERE learning_experiment_id=?
+                 AND learning_policy_fingerprint=?
+                 AND status='closed'
+                 AND result IN ('WIN','LOSS','PARTIAL')
+                 AND pnl_pct IS NOT NULL
+               ORDER BY closed_at ASC, id ASC""",
+            (
+                experiment["experiment_id"],
+                experiment["policy_fingerprint"],
+            ),
+        ).fetchall()
+    ]
+    rules = _learning_json(experiment.get("evidence_rules_json"), {})
+    control_n = max(
+        int(rules.get("minimum_closed_trades") or 50),
+        len(treatment),
+    )
+    control = [
+        dict(row) for row in con.execute(
+            """SELECT result, pnl_pct, size_usd, closed_at
+               FROM paper_trades
+               WHERE strategy_key=?
+                 AND status='closed'
+                 AND result IN ('WIN','LOSS','PARTIAL')
+                 AND pnl_pct IS NOT NULL
+                 AND closed_at < ?
+               ORDER BY closed_at DESC, id DESC
+               LIMIT ?""",
+            (
+                experiment["strategy_key"],
+                experiment["activated_at"],
+                min(control_n, 250),
+            ),
+        ).fetchall()
+    ]
+    control.reverse()
+    return treatment, control
+
+
+def _learning_evaluate_active_experiments() -> list[dict]:
+    """Update evidence verdicts only; never mutate strategy or execution config."""
+    results: list[dict] = []
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        experiments = [
+            dict(row) for row in con.execute(
+                """SELECT * FROM learning_experiments
+                   WHERE status IN ('active','collecting','review')
+                   ORDER BY activated_at ASC"""
+            ).fetchall()
+        ]
+        for experiment in experiments:
+            treatment, control = _learning_experiment_rows(con, experiment)
+            evaluation = _evaluate_learning_experiment(
+                treatment,
+                control,
+                experiment["activated_at"],
+                rules=_learning_json(experiment.get("evidence_rules_json"), {}),
+            )
+            previous_status = experiment["status"]
+            next_status = evaluation["verdict"]
+            result_json = json.dumps(evaluation, sort_keys=True, default=str)
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute(
+                """UPDATE learning_experiments
+                   SET status=?, result_json=?, evaluated_at=?, updated_at=?,
+                       rollback_required=?
+                   WHERE experiment_id=?""",
+                (
+                    next_status,
+                    result_json,
+                    now,
+                    now,
+                    1 if next_status == "falsified" else 0,
+                    experiment["experiment_id"],
+                ),
+            )
+            if next_status != previous_status:
+                _learning_append_event(
+                    con,
+                    experiment["experiment_id"],
+                    "verdict_changed",
+                    {
+                        "from": previous_status,
+                        "to": next_status,
+                        "evaluation": evaluation,
+                        "automatic_config_change": False,
+                    },
+                    now,
+                )
+            results.append({
+                "experiment_id": experiment["experiment_id"],
+                "strategy_key": experiment["strategy_key"],
+                **evaluation,
+            })
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return results
+
+
+def _learning_strategy_factory_candidates() -> list[dict]:
+    paths = (
+        "/opt/mt-learner/research/briefs.json",
+        os.path.join(os.getcwd(), "mt-learner", "research", "briefs.json"),
+    )
+    data = {}
+    for path in paths:
+        if os.path.exists(path):
+            data = _hermes_read_json(path, {}) or {}
+            break
+    candidates: list[dict] = []
+    for brief in data.get("briefs", []):
+        proposed = brief.get("proposed_strategy")
+        if not proposed:
+            continue
+        payload = proposed.get("api_payload") or {}
+        if not (
+            proposed.get("base_key")
+            or payload.get("base_key")
+        ):
+            # Entry/risk filter proposals belong in research governance, not
+            # the new-strategy factory.
+            continue
+        candidate = {
+            **proposed,
+            "hypothesis": brief.get("thesis"),
+            "novelty_claim": brief.get("what_is_novel"),
+            "source_brief_id": brief.get("id"),
+        }
+        candidates.append({
+            "source_brief_id": brief.get("id"),
+            "title": brief.get("title"),
+            "confidence": brief.get("confidence"),
+            "validation": _validate_strategy_factory_contract(candidate),
+        })
+    return candidates
+
+
+def _learning_effectiveness_snapshot(update_evaluations: bool = False) -> dict:
+    if update_evaluations:
+        _learning_evaluate_active_experiments()
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        experiments = [
+            dict(row) for row in con.execute(
+                "SELECT * FROM learning_experiments ORDER BY activated_at DESC LIMIT 100"
+            ).fetchall()
+        ]
+        total_paper, attributed_paper = con.execute(
+            """SELECT COUNT(*),
+                      SUM(CASE WHEN learning_policy_fingerprint IS NOT NULL THEN 1 ELSE 0 END)
+               FROM paper_trades"""
+        ).fetchone()
+        chains = {
+            item["experiment_id"]: _learning_verify_event_chain(
+                con, item["experiment_id"]
+            )
+            for item in experiments
+        }
+        experiment_cards = []
+        for item in experiments:
+            result = _learning_json(item.get("result_json"), {})
+            experiment_cards.append({
+                "experiment_id": item["experiment_id"],
+                "source_id": item.get("source_id"),
+                "family": item["family"],
+                "strategy_key": item["strategy_key"],
+                "status": item["status"],
+                "hypothesis": item["hypothesis"],
+                "mechanism": item["mechanism"],
+                "activated_at": item["activated_at"],
+                "policy_fingerprint": item["policy_fingerprint"],
+                "rollback_required": bool(item["rollback_required"]),
+                "evaluation": result,
+                "integrity": chains[item["experiment_id"]],
+                "authority": {
+                    "mode": item["authority_mode"],
+                    "user_approved": bool(item["user_approved"]),
+                    "auto_apply_allowed": False,
+                    "live_behavior_change_allowed": False,
+                },
+            })
+    finally:
+        con.close()
+    factory = _learning_strategy_factory_candidates()
+    status_counts: dict[str, int] = defaultdict(int)
+    for item in experiments:
+        status_counts[item["status"]] += 1
+    attribution_rate = (
+        float(attributed_paper or 0) / float(total_paper or 1)
+        if total_paper else 0.0
+    )
+    mature = sum(
+        status_counts.get(status, 0)
+        for status in ("review", "falsified", "promotion_candidate", "completed")
+    )
+    valid_factory = sum(item["validation"]["valid"] for item in factory)
+    scores = _learning_maturity_score(
+        exact_attribution_rate=attribution_rate,
+        experiment_integrity_ok=all(
+            chain["valid"] for chain in chains.values()
+        ) if chains else True,
+        active_experiments=sum(
+            status_counts.get(status, 0)
+            for status in ACTIVE_EXPERIMENT_STATUSES
+        ),
+        mature_experiments=mature,
+        promoted_experiments=status_counts.get("promotion_candidate", 0)
+        + status_counts.get("completed", 0),
+        falsified_experiments=status_counts.get("falsified", 0),
+        strategy_candidates_valid=valid_factory,
+        strategy_candidates_total=len(factory),
+    )
+    bottlenecks = []
+    if attribution_rate < 0.95:
+        bottlenecks.append(
+            "Legacy Paper rows lack exact policy attribution; only newly created "
+            "trades count as causal evidence."
+        )
+    if mature == 0:
+        bottlenecks.append(
+            "No exact-policy forward experiment has reached its minimum sample and duration."
+        )
+    if factory and valid_factory < len(factory):
+        bottlenecks.append(
+            "Existing research strategy ideas are variants with incomplete entry, "
+            "exit, cost, control, or falsification contracts."
+        )
+    return {
+        "success": True,
+        "contract_version": LEARNING_CONTRACT_VERSION,
+        "scores": scores,
+        "attribution": {
+            "paper_rows": int(total_paper or 0),
+            "exact_policy_rows": int(attributed_paper or 0),
+            "exact_policy_rate": round(attribution_rate, 4),
+            "legacy_rows_are_causal_evidence": False,
+        },
+        "experiments": {
+            "total": len(experiments),
+            "status_counts": dict(status_counts),
+            "active_count": sum(
+                status_counts.get(status, 0)
+                for status in ACTIVE_EXPERIMENT_STATUSES
+            ),
+            "integrity_ok": all(
+                chain["valid"] for chain in chains.values()
+            ) if chains else True,
+            "items": experiment_cards[:20],
+        },
+        "strategy_factory": {
+            "candidate_count": len(factory),
+            "valid_count": valid_factory,
+            "authority": "shadow_only",
+            "items": factory[:20],
+        },
+        "adaptive_loop_registry": {
+            "serial_applied_strategy_experiments": True,
+            "parallel_read_only_research": True,
+            "overlapping_policy_windows_allowed": False,
+            "legacy_unattributed_rows_excluded": True,
+        },
+        "safety": {
+            "auto_apply_suggestions": False,
+            "auto_promote_strategies": False,
+            "auto_raise_leverage": False,
+            "auto_raise_position_size": False,
+            "live_behavior_change": False,
+            "falsification_changes_config": False,
+        },
+        "bottlenecks": bottlenecks,
+    }
 
 
 def _get_custom_strategy_keys() -> set:
@@ -19588,6 +20354,120 @@ def _apply_suggestion_config(suggestion: dict) -> tuple[bool, str | None]:
         return False, str(e)
 
 
+def _activate_suggestion_learning_trial(
+    suggestion: dict,
+    contract: dict,
+    activated_at: str,
+    baseline: dict,
+    status_extra: dict | None = None,
+) -> tuple[bool, str | None, dict | None]:
+    """Bind an applied suggestion to an immutable forward experiment."""
+    try:
+        experiment = _learning_register_suggestion_experiment(
+            suggestion,
+            contract,
+            baseline,
+            activated_at,
+        )
+    except Exception as e:
+        rollback_ok, rollback_error, _ = _revert_suggestion_config(suggestion)
+        detail = f"learning experiment registration failed: {e}"
+        if not rollback_ok:
+            detail += f"; config rollback also failed: {rollback_error}"
+        return False, detail, None
+
+    extra = {
+        "baseline": baseline,
+        "applied_at": activated_at,
+        "learning_experiment_id": experiment["experiment_id"],
+        "learning_policy_fingerprint": experiment["policy_fingerprint"],
+        "learning_contract_version": LEARNING_CONTRACT_VERSION,
+        **(status_extra or {}),
+    }
+    if _update_suggestion_status(suggestion.get("id"), "evaluating", extra):
+        return True, None, experiment
+
+    rollback_ok, rollback_error, _ = _revert_suggestion_config(suggestion)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        con.execute(
+            """UPDATE learning_experiments
+               SET status='cancelled', updated_at=?, result_json=?
+               WHERE experiment_id=?""",
+            (
+                now,
+                json.dumps({
+                    "reason": "suggestion status update failed",
+                    "config_rollback_ok": rollback_ok,
+                    "config_rollback_error": rollback_error,
+                }),
+                experiment["experiment_id"],
+            ),
+        )
+        _learning_append_event(
+            con,
+            experiment["experiment_id"],
+            "cancelled",
+            {
+                "reason": "suggestion status update failed",
+                "config_rollback_ok": rollback_ok,
+                "config_rollback_error": rollback_error,
+            },
+            now,
+        )
+        con.commit()
+    finally:
+        con.close()
+    return False, "failed to update suggestion after experiment registration", experiment
+
+
+def _learning_close_suggestion_experiments(
+    suggestion_id: str,
+    status: str,
+    payload: dict | None = None,
+) -> list[str]:
+    """Close registered experiments without changing strategy authority."""
+    if status not in {"rolled_back", "cancelled", "completed"}:
+        raise ValueError("invalid terminal learning experiment status")
+    con = sqlite3.connect(DB_PATH)
+    closed: list[str] = []
+    try:
+        rows = con.execute(
+            """SELECT experiment_id
+               FROM learning_experiments
+               WHERE source_type='learner_suggestion' AND source_id=?
+                 AND status IN ('active','collecting','review','falsified',
+                                'promotion_candidate')""",
+            (suggestion_id,),
+        ).fetchall()
+        now = datetime.now(timezone.utc).isoformat()
+        for (experiment_id,) in rows:
+            con.execute(
+                """UPDATE learning_experiments
+                   SET status=?, updated_at=?, rollback_required=0
+                   WHERE experiment_id=?""",
+                (status, now, experiment_id),
+            )
+            _learning_append_event(
+                con,
+                experiment_id,
+                status,
+                {
+                    **(payload or {}),
+                    "automatic_config_change": False,
+                },
+                now,
+            )
+            closed.append(experiment_id)
+        con.commit()
+    except sqlite3.OperationalError:
+        con.rollback()
+    finally:
+        con.close()
+    return closed
+
+
 @app.route('/api/intelligence/suggestions')
 def api_intelligence_suggestions():
     """Read learner suggestions and annotate with current performance baseline."""
@@ -19715,13 +20595,22 @@ def api_intelligence_suggestion_action(suggestion_id):
     applied_at = datetime.utcnow().isoformat()
     baseline = _suggestion_baseline_snapshot()
     baseline["applied_at"] = applied_at
-    if not _update_suggestion_status(suggestion_id, "evaluating", {
-        "baseline": baseline,
-        "applied_at": applied_at,
-    }):
-        return jsonify({'success': False, 'error': 'failed to update suggestion'}), 500
+    activated, activation_error, experiment = _activate_suggestion_learning_trial(
+        suggestion,
+        contract,
+        applied_at,
+        baseline,
+    )
+    if not activated:
+        return jsonify({'success': False, 'error': activation_error}), 500
 
-    return jsonify({'success': True, 'applied': True, 'suggestion_id': suggestion_id, 'baseline': baseline})
+    return jsonify({
+        'success': True,
+        'applied': True,
+        'suggestion_id': suggestion_id,
+        'baseline': baseline,
+        'learning_experiment': experiment,
+    })
 
 
 @app.route("/api/intelligence/suggestions/<suggestion_id>/apply", methods=["POST"])
@@ -19760,12 +20649,20 @@ def api_suggestion_apply(suggestion_id):
         applied_at = datetime.utcnow().isoformat()
         baseline = _suggestion_baseline_snapshot()
         baseline["applied_at"] = applied_at
-        if not _update_suggestion_status(suggestion_id, "evaluating", {
+        activated, activation_error, experiment = _activate_suggestion_learning_trial(
+            suggestion,
+            contract,
+            applied_at,
+            baseline,
+        )
+        if not activated:
+            return jsonify({"success": False, "error": activation_error}), 500
+        return jsonify({
+            "success": True,
+            "applied": suggestion_id,
             "baseline": baseline,
-            "applied_at": applied_at,
-        }):
-            return jsonify({"success": False, "error": "Failed to update suggestion"}), 500
-        return jsonify({"success": True, "applied": suggestion_id, "baseline": baseline})
+            "learning_experiment": experiment,
+        })
     except Exception as e:
         print(f"[api/suggestion/apply] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -19814,14 +20711,19 @@ def api_suggestion_promote(suggestion_id):
         baseline = _suggestion_baseline_snapshot()
         baseline["applied_at"] = promoted_at
         baseline["promoted_from_status"] = suggestion.get("status")
-        if not _update_suggestion_status(suggestion_id, "evaluating", {
-            "baseline": baseline,
-            "applied_at": promoted_at,
-            "promoted_at": promoted_at,
-            "promote_reason": reason,
-            "previous_status": suggestion.get("status"),
-        }):
-            return jsonify({"success": False, "error": "Failed to update suggestion"}), 500
+        activated, activation_error, experiment = _activate_suggestion_learning_trial(
+            suggestion,
+            contract,
+            promoted_at,
+            baseline,
+            {
+                "promoted_at": promoted_at,
+                "promote_reason": reason,
+                "previous_status": suggestion.get("status"),
+            },
+        )
+        if not activated:
+            return jsonify({"success": False, "error": activation_error}), 500
         _append_experiment_record({
             "id": suggestion_id,
             "type": "suggestion_promoted",
@@ -19832,7 +20734,12 @@ def api_suggestion_promote(suggestion_id):
             "reason": reason,
             "baseline": baseline,
         })
-        return jsonify({"success": True, "promoted": suggestion_id, "baseline": baseline})
+        return jsonify({
+            "success": True,
+            "promoted": suggestion_id,
+            "baseline": baseline,
+            "learning_experiment": experiment,
+        })
     except Exception as e:
         print(f"[api/suggestion/promote] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -19920,6 +20827,14 @@ def api_suggestion_park(suggestion_id):
         }
         if not _update_suggestion_status(suggestion_id, "parked", extra):
             return jsonify({"success": False, "error": "Failed to update suggestion"}), 500
+        learning_closed = _learning_close_suggestion_experiments(
+            suggestion_id,
+            "rolled_back" if rollback.get("changed") else "cancelled",
+            {
+                "reason": reason,
+                "control_rollback": rollback,
+            },
+        )
         _append_experiment_record({
             "id": suggestion_id,
             "type": "suggestion_parked",
@@ -19930,12 +20845,14 @@ def api_suggestion_park(suggestion_id):
             "baseline": suggestion.get("baseline"),
             "trades_since_baseline": suggestion.get("trades_since_baseline"),
             "control_rollback": rollback,
+            "learning_experiments_closed": learning_closed,
         })
         return jsonify({
             "success": True,
             "parked": suggestion_id,
             "parked_at": parked_at,
             "control_rollback": rollback,
+            "learning_experiments_closed": learning_closed,
         })
     except Exception as e:
         print(f"[api/suggestion/park] {e}", file=sys.stderr)
@@ -19993,6 +20910,126 @@ def api_suggestion_resume(suggestion_id):
     except Exception as e:
         print(f"[api/suggestion/resume] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/intelligence/learning-effectiveness")
+def api_learning_effectiveness():
+    """Return causal-learning maturity without mutating experiments or config."""
+    try:
+        return jsonify(_learning_effectiveness_snapshot(update_evaluations=False))
+    except Exception as e:
+        print(f"[api/learning-effectiveness] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/intelligence/learning/evaluate", methods=["POST"])
+def api_learning_evaluate():
+    """Recalculate forward experiment verdicts; never change strategy authority."""
+    try:
+        evaluations = _learning_evaluate_active_experiments()
+        return jsonify({
+            "success": True,
+            "evaluations": evaluations,
+            "automatic_config_change": False,
+            "snapshot": _learning_effectiveness_snapshot(update_evaluations=False),
+        })
+    except Exception as e:
+        print(f"[api/learning/evaluate] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route(
+    "/api/intelligence/learning/experiments/<path:experiment_id>/rollback",
+    methods=["POST"],
+)
+def api_learning_experiment_rollback(experiment_id: str):
+    """Explicitly roll back a falsified suggestion experiment."""
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = str(body.get("reason") or "").strip()
+        if len(reason) < 8:
+            return jsonify({
+                "success": False,
+                "error": "A clear rollback reason of at least 8 characters is required.",
+            }), 400
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT * FROM learning_experiments WHERE experiment_id=?",
+            (experiment_id,),
+        ).fetchone()
+        con.close()
+        if not row:
+            return jsonify({"success": False, "error": "experiment not found"}), 404
+        experiment = dict(row)
+        if experiment["status"] != "falsified":
+            return jsonify({
+                "success": False,
+                "error": "Only a falsified experiment can use this rollback path.",
+            }), 409
+        suggestion = next(
+            (
+                item for item in _load_suggestions()
+                if str(item.get("id")) == str(experiment.get("source_id"))
+            ),
+            None,
+        )
+        if not suggestion:
+            return jsonify({
+                "success": False,
+                "error": "source suggestion is unavailable; no config was changed",
+            }), 409
+        ok, error, rollback = _revert_suggestion_config(suggestion)
+        if not ok:
+            return jsonify({
+                "success": False,
+                "error": error,
+                "config_changed": False,
+            }), 409
+        rolled_back_at = datetime.now(timezone.utc).isoformat()
+        _learning_close_suggestion_experiments(
+            str(experiment.get("source_id")),
+            "rolled_back",
+            {
+                "reason": reason,
+                "control_rollback": rollback,
+                "explicit_user_action": True,
+            },
+        )
+        _update_suggestion_status(
+            str(experiment.get("source_id")),
+            "parked",
+            {
+                "parked_at": rolled_back_at,
+                "park_reason": reason,
+                "previous_status": suggestion.get("status"),
+                "control_rolled_back": bool(rollback.get("changed")),
+                "learning_experiment_id": experiment_id,
+            },
+        )
+        return jsonify({
+            "success": True,
+            "experiment_id": experiment_id,
+            "status": "rolled_back",
+            "control_rollback": rollback,
+            "automatic": False,
+        })
+    except Exception as e:
+        print(f"[api/learning/rollback] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/intelligence/learning/strategy-factory/validate", methods=["POST"])
+def api_learning_strategy_factory_validate():
+    """Validate a research strategy contract without creating a strategy."""
+    candidate = request.get_json(silent=True) or {}
+    validation = _validate_strategy_factory_contract(candidate)
+    return jsonify({
+        "success": True,
+        "validation": validation,
+        "created": False,
+        "authority": "shadow_only",
+    })
 
 
 @app.route('/api/intelligence/research')
@@ -28484,6 +29521,11 @@ def _paper_check_exits(cfg: dict | None = None) -> int:
             )
     except Exception as e:
         print(f"[paper_bot] _paper_check_exits error: {e}", file=sys.stderr)
+    if closed:
+        try:
+            _learning_evaluate_active_experiments()
+        except Exception as e:
+            print(f"[learning] post-close evaluation error: {e}", file=sys.stderr)
     return closed
 
 
@@ -28898,11 +29940,19 @@ def _paper_bot_scan(cfg: dict) -> dict:
 
             status = "pending" if confirmed else "flow_rejected"
             flow_reasons_str = json.dumps(flow_reasons)
+            strategy_key = sig.get("_strategy_key", "balanced")
+            learning_attribution = _learning_attribution_for_trade(
+                strategy_key,
+                cfg,
+            )
+            sig["learning_experiment_id"] = learning_attribution["experiment_id"]
+            sig["learning_policy_fingerprint"] = learning_attribution["policy_fingerprint"]
+            sig["learning_contract_version"] = LEARNING_CONTRACT_VERSION
 
             # Log confirmed entries to signals table so they appear in History tab
             signal_id = sig.get("signal_id")
             if confirmed:
-                sig["strategy_key"]   = sig.get("_strategy_key", "balanced")
+                sig["strategy_key"]   = strategy_key
                 sig["flow_score"]     = flow_score
                 sig["flow_confirmed"] = True
                 inserted_ids = log_signals([sig], source="paper", allow_duplicate_open=True)
@@ -28921,8 +29971,9 @@ def _paper_bot_scan(cfg: dict) -> dict:
                     raw_size_usd, notional_cap_usd, notional_cap_reason,
                     liquidity_tier, liquidity_risk_score, symbol_history_count,
                     sizing_mode, sizing_base_usd, realized_equity_usd,
-                    sizing_risk_pct, sizing_policy_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    sizing_risk_pct, sizing_policy_json, learning_experiment_id,
+                    learning_policy_fingerprint, learning_policy_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     now,
                     sig["symbol"],
@@ -28964,6 +30015,9 @@ def _paper_bot_scan(cfg: dict) -> dict:
                     sizing_policy["realized_equity_usd"],
                     risk_pct,
                     json.dumps(sizing_policy, default=str),
+                    learning_attribution["experiment_id"],
+                    learning_attribution["policy_fingerprint"],
+                    json.dumps(learning_attribution["policy"], sort_keys=True, default=str),
                 ),
             )
             con.commit()

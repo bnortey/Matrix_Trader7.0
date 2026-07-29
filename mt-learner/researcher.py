@@ -155,6 +155,75 @@ def _check_strategy_already_exists(conn, base_key: str, api_payload: dict) -> st
 # Proposed strategy builders
 # ---------------------------------------------------------------------------
 
+def _strategy_factory_contract(
+    *,
+    name: str,
+    base_key: str,
+    description: str,
+    payload: dict,
+    mechanism: str,
+    failure_regimes: list[str],
+) -> dict:
+    """Return a complete shadow-only strategy-variant experiment contract."""
+    entry_filters = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"name", "base_key"} and value not in (None, [], {})
+    }
+    return {
+        "name": name,
+        "base_key": base_key,
+        "description": description,
+        "hypothesis": description,
+        "mechanism": mechanism,
+        "entry_rules": {
+            "inherit_base_signal": base_key,
+            "additional_filters": entry_filters,
+            "no_entry_without_fresh_mt7_signal": True,
+        },
+        "exit_rules": {
+            "inherit_base_ladder_and_stop": True,
+            "no_averaging_down": True,
+            "max_holding_policy": "paper_config",
+        },
+        "failure_regimes": failure_regimes or ["unknown", "regime_shift"],
+        "data_requirements": [
+            "fresh normalized exchange ticker",
+            "closed net-P&L Paper outcomes",
+            "exact strategy-policy fingerprint",
+            "fees and slippage assumptions",
+        ],
+        "cost_assumptions": {
+            "source": "paper_config",
+            "net_metrics_required": True,
+            "zero_cost_backtest_forbidden": True,
+        },
+        "control_strategy": base_key,
+        "novelty_claim": (
+            "This is a constrained strategy variant, not a novel algorithm; "
+            "the declared entry filter is the only causal treatment."
+        ),
+        "falsification_criteria": {
+            "minimum_closed_trades": 50,
+            "minimum_elapsed_days": 7,
+            "max_avg_pnl_delta_pct": -0.25,
+            "max_profit_factor": 0.80,
+            "max_drawdown_increase_pct": 5.0,
+        },
+        "promotion_criteria": {
+            "minimum_closed_trades": 50,
+            "minimum_elapsed_days": 7,
+            "min_profit_factor": 1.15,
+            "positive_leave_best_out_ev": True,
+            "max_drawdown_increase_pct": 2.0,
+        },
+        "authority": "shadow_only",
+        "auto_apply_allowed": False,
+        "live_behavior_change_allowed": False,
+        "api_payload": payload,
+    }
+
+
 def _proposed_strategy_type1(strategy_key: str, display_name: str, regime: str,
                               baseline_mc: int, direction: str) -> dict | None:
     if direction == "suppression":
@@ -181,12 +250,17 @@ def _proposed_strategy_type1(strategy_key: str, display_name: str, regime: str,
         "direction_lock": None,
         "min_conviction": min_mc,
     }
-    return {
-        "name": payload["name"],
-        "base_key": strategy_key,
-        "description": f"Focused on {regime} regime where this strategy outperforms baseline.",
-        "api_payload": payload,
-    }
+    return _strategy_factory_contract(
+        name=payload["name"],
+        base_key=strategy_key,
+        description=f"Focused on {regime} regime where this strategy outperforms baseline.",
+        payload=payload,
+        mechanism=(
+            f"Conditioning {strategy_key} entries on {regime} should isolate the "
+            "historically stronger regime cohort."
+        ),
+        failure_regimes=["regime_shift", "unknown", f"{regime}_edge_decay"],
+    )
 
 
 def _proposed_strategy_type2(strategy_key: str, display_name: str,
@@ -199,12 +273,17 @@ def _proposed_strategy_type2(strategy_key: str, display_name: str,
         "direction_lock": None,
         "min_conviction": conv_lower,
     }
-    return {
-        "name": payload["name"],
-        "base_key": strategy_key,
-        "description": f"Targets {volatility} volatility with conviction {conv_band} sweet spot.",
-        "api_payload": payload,
-    }
+    return _strategy_factory_contract(
+        name=payload["name"],
+        base_key=strategy_key,
+        description=f"Targets {volatility} volatility with conviction {conv_band} sweet spot.",
+        payload=payload,
+        mechanism=(
+            "The volatility and conviction intersection should remove lower-quality "
+            "signals while preserving the identified positive-EV cluster."
+        ),
+        failure_regimes=["volatility_transition", "conviction_calibration_drift"],
+    )
 
 
 def _proposed_strategy_type3(strategy_key: str, display_name: str) -> dict:
@@ -215,12 +294,17 @@ def _proposed_strategy_type3(strategy_key: str, display_name: str) -> dict:
         "direction_lock": None,
         "min_conviction": 75,
     }
-    return {
-        "name": payload["name"],
-        "base_key": strategy_key,
-        "description": "Focuses on low trend_score + low atr_pct setups where win rates are higher.",
-        "api_payload": payload,
-    }
+    return _strategy_factory_contract(
+        name=payload["name"],
+        base_key=strategy_key,
+        description="Focuses on low trend_score + low atr_pct setups where win rates are higher.",
+        payload=payload,
+        mechanism=(
+            "A higher admission threshold approximates the observed clean-setup "
+            "cluster until explicit trend and ATR filters are implemented."
+        ),
+        failure_regimes=["high_volatility", "strong_trend", "threshold_proxy_failure"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,15 +332,21 @@ def _proposed_strategy_stop_pressure(strategy_key: str, display_name: str, volat
         "allowed_volatility": allowed,
         "direction_lock": None,
     }
-    return {
-        "name": payload["name"],
-        "base_key": strategy_key,
-        "description": (
-            f"Excludes {volatility} volatility where ATR stops are hit by noise "
-            f"before real adverse moves ({volatility} vol stop pressure pattern)."
+    description = (
+        f"Excludes {volatility} volatility where ATR stops are hit by noise "
+        f"before real adverse moves ({volatility} vol stop pressure pattern)."
+    )
+    return _strategy_factory_contract(
+        name=payload["name"],
+        base_key=strategy_key,
+        description=description,
+        payload=payload,
+        mechanism=(
+            f"Removing {volatility} volatility should reduce premature stop-outs "
+            "without changing the base strategy's scoring or exits."
         ),
-        "api_payload": payload,
-    }
+        failure_regimes=["volatility_reclassification", "opportunity_cost"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1059,8 +1149,10 @@ def run_brief_reeval(db_path: str, research_dir: Path) -> None:
                             brief["evidence"] = old_ev
                             conf = _confidence_from_journey_trades(row["n"])
                             brief["confidence"] = conf
-                            # Regenerate proposed_strategy if missing and confidence warrants it
-                            if conf in ("proposal", "ready") and not brief.get("proposed_strategy"):
+                            # Regenerate the full experiment contract. Legacy
+                            # proposed_strategy payloads were only renamed
+                            # config clones and are not valid factory inputs.
+                            if conf in ("proposal", "ready"):
                                 try:
                                     cdesc = brief.get("evidence", {}).get("cluster_description", "")
                                     prefix = f"stop_pressure:{sk}x"
@@ -1069,7 +1161,15 @@ def run_brief_reeval(db_path: str, research_dir: Path) -> None:
                                         display_name = _strategy_display_name(conn, sk)
                                         proposed = _proposed_strategy_stop_pressure(sk, display_name, volatility)
                                         dup_key = _check_strategy_already_exists(conn, sk, proposed["api_payload"]) if proposed else None
-                                        if proposed and not dup_key:
+                                        if dup_key:
+                                            brief["proposed_strategy"] = None
+                                            brief["status"] = "retired"
+                                            brief["confidence"] = "retired"
+                                            brief["retirement_reason"] = (
+                                                f"strategy already exists as: {dup_key}"
+                                            )
+                                            retired_count += 1
+                                        elif proposed:
                                             brief["proposed_strategy"] = proposed
                                 except Exception:
                                     pass

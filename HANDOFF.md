@@ -7,9 +7,109 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-29
-Latest implementation commit: beda80f feat: complete intelligence and Edge Lab upgrades
-app.py: 33,194 lines
-index.html: 18,989 lines
+Latest implementation commit: pending — learning-intelligence sprint
+app.py: 34,248 lines
+index.html: 19,054 lines
+
+---
+
+## 2026-07-29 — Causal learning and strategy-factory sprint
+
+**Built and deployed to production `207.148.66.39`:**
+
+- Added the `mt7_learning_v1` causal-learning contract. MT7 now separates
+  pattern discovery from causal forward evidence instead of treating mixed
+  historical policies as proof that a suggestion worked.
+- Every newly created Paper row records:
+  - the full effective strategy/Paper/research policy snapshot,
+  - a canonical SHA-256 policy fingerprint,
+  - the learning experiment ID when the row belongs to an active applied
+    trial.
+- Added `learning_experiments` and `learning_experiment_events`. Experiment
+  events are append-only and SHA-256 hash-chained, so mutation, sequence gaps,
+  and broken ancestry can be detected.
+- Applied learner suggestions now register an immutable, forward-only Paper
+  experiment after explicit approval. The experiment predeclares its
+  hypothesis, mechanism, scope, exact change set, baseline, minimum sample,
+  minimum duration, promotion gates, falsification gates, and rollback plan.
+- Active applied experiments are serial per strategy. Parallel research and
+  suggestion shadow studies remain read-only; overlapping causal policy
+  windows are rejected.
+- Mature experiments are evaluated using net P&L, win+partial rate, profit
+  factor, trimmed expectancy, leave-best-out expectancy, dollar P&L, and
+  drawdown relative to the immediately preceding same-strategy control
+  window.
+- The evaluator automatically classifies evidence as `collecting`, `review`,
+  `falsified`, or `promotion_candidate`. It does **not** change strategy
+  configuration. A falsified trial exposes an explicit rollback route that
+  requires a user reason and only reverts the suggestion's exact owned
+  control.
+- Added the controlled strategy-factory contract. A strategy idea must now
+  declare entry rules, exit rules, mechanism, failure regimes, data
+  requirements, cost assumptions, control strategy, novelty claim,
+  falsification criteria, and promotion criteria. Leverage, risk, sizing,
+  execution, and live fields are rejected from factory payloads.
+- Upgraded the deterministic mt-learner research builders and re-evaluation
+  path. Production now reports `21/21` current strategy candidates with valid
+  shadow-only experiment contracts. The former order-flow filter proposal is
+  correctly excluded from the strategy factory and remains in research
+  governance.
+- Added:
+  - `GET /api/intelligence/learning-effectiveness`
+  - `POST /api/intelligence/learning/evaluate`
+  - `POST /api/intelligence/learning/experiments/<id>/rollback`
+  - `POST /api/intelligence/learning/strategy-factory/validate`
+- Added a compact Causal Learning Ledger to Intelligence → Suggestions. It
+  shows architecture maturity separately from empirical proof, exact-policy
+  attribution, experiment state, factory-contract coverage, integrity, active
+  bottlenecks, and immutable safety posture.
+
+**Current honest maturity:**
+
+- Architecture: `10.0/10`.
+- Empirical forward proof: `0.0/10`.
+- Evidence-weighted overall: `3.5/10`.
+- This low evidence score is intentional and correct. All 2,714 existing Paper
+  rows predate exact policy attribution and remain useful for discovery but
+  are excluded from causal claims. The next explicitly approved applied
+  suggestion starts exact-policy collection automatically; default maturity
+  requires at least 50 closed trades and seven elapsed days.
+
+**Safety:**
+
+- Auto-apply: off.
+- Auto-promotion: off.
+- Automatic leverage increase: off.
+- Automatic position-size increase: off.
+- Research-to-live behavior changes: off.
+- Falsification-to-config mutation: off; rollback remains explicit.
+- Security/operational hardening is the next sprint, intentionally sequenced
+  after this learning sprint per user direction.
+
+**Verification and backups:**
+
+- Full local discovery: `87/87` tests passed.
+- Python compile, inline JavaScript parse, SQL placeholder/column parity, and
+  `git diff --check` passed.
+- Local browser acceptance passed with the complete learning panel and no UI
+  collapse. Production browser acceptance shows architecture `10.0/10`,
+  factory contracts `21/21`, learner online, no authority conflicts, and the
+  two honest evidence bottlenecks.
+- Production hashes match local. `matrix-trader` and `mt-learner` are active,
+  post-deploy logs contain no traceback/exception/error, and SQLite integrity
+  is `ok`.
+- Paper state survived exactly: 2,714 rows (`304 closed`, `30 entry_expired`,
+  `2 expired`, `2,377 flow_rejected`, `1 pending`), 3,947 signals, and
+  `$741.32` recorded closed Paper P&L.
+- Server rollback snapshot:
+  `/opt/matrix-trader/backups/20260729T202152Z-learning-intelligence`
+  (application files plus consistent pre-migration `signals.db` and verified
+  compressed copy).
+- Private GitHub backup commit:
+  `8afe8e1966ea8e4b993fc970aaadf52ef3d95e8a`. A clean VPS clone downloaded
+  only the new LFS object and matched SHA-256
+  `dbef59b562910110373060d10bfbfcece8e36a2d9b9da93d51408520be1fe98d`.
+  Temporary clone/staging directories were removed after verification.
 
 ---
 
