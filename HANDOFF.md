@@ -7,9 +7,91 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-29
-Latest implementation commit: c989b84 fix: restore MT7 dashboard reliability
-app.py: 35,384 lines
-index.html: 19,252 lines
+Latest implementation commit: 9f1584c feat: make MT7 evidence trader-readable
+app.py: 35,415 lines
+index.html: 19,461 lines
+
+---
+
+## 2026-07-29 — Trader-comprehension and evidence-state sprint
+
+**Built, tested, and deployed to production `207.148.66.39`:**
+
+- Added one reusable, tap-friendly explanation system for MT7 metrics and
+  research concepts. Help disclosures now explain:
+  - what the item means,
+  - why a trader should care,
+  - how to read the value,
+  - and what the value cannot prove.
+- Reworked primary language across Signals, Market, Tools, Strategies,
+  History, Intelligence, Research, Paper, and Assisted Live.
+  - Internal shorthand is no longer the primary label for key decisions:
+    `W+P`, `EV`, `PF`, `P12`, `shadow`, `gate`, and `cohort` are translated
+    into phrases such as profitable-or-partial rate, average result after
+    costs, profit factor, research-only, readiness requirement, and current
+    Paper trial.
+  - Technical identifiers remain visible only where they are useful for
+    super-user auditing.
+- Standardized evidence states so MT7 visibly distinguishes:
+  - measured values,
+  - collecting/waiting samples,
+  - unavailable data,
+  - stale data,
+  - review items,
+  - blocked items,
+  - and safety locks.
+  Zero is no longer used as a substitute for “no sample.”
+- Clarified the purpose and limits of the densest workspaces:
+  - Hermes is an independent system audit, not a signal generator.
+  - Edge Lab is historical/research evidence with no trading authority.
+  - Research sources must move through review, research-only measurement,
+    Paper validation, and explicit approval.
+  - Assisted Live is a readiness checklist, not an order screen or a
+    recommendation to trade.
+- Rebuilt Paper’s current-trial review into trader-facing evidence:
+  closed trades collected, profitable-or-partial rate, average result after
+  costs, recent-window consistency, outlier dependence, drawdown, and the
+  change from earlier trades.
+- Fixed the Edge Lab coverage ambiguity end to end.
+  - Watchdog and Paper now use the same denominator: closed trades in the
+    current Paper trial.
+  - `0/0` is `Collecting`, not `0%` quality.
+  - Open and pending Paper trades cannot dilute the displayed coverage rate.
+  - Production currently reports `100.0% · 1/1` closed current-trial trades
+    matched to a usable pre-entry Edge state.
+- Preserved super-user model choice and all existing execution controls. No
+  strategy rule, conviction formula, leverage, position size, account
+  exposure, live setting, or order authority changed in this sprint.
+
+**Verification and preservation:**
+
+- Full local suite: `102/102` tests passed. Python compile, inline JavaScript
+  parse, and `git diff --check` passed.
+- Desktop and `390×844` browser acceptance passed across all primary tabs,
+  including Research, Hermes, Edge Lab, Paper, and Assisted Live.
+  - Document width matched viewport width on every tested screen.
+  - Tap-to-open metric explanations worked on mobile.
+  - Production browser console returned zero errors.
+- Production Watchdog is `review · 0 fail / 1 warn`; the only warning is
+  Assisted-Live readiness, which correctly remains blocked by current-trial
+  evidence.
+- Both `matrix-trader` and `mt-learner` are active. Production file hashes
+  match the tested local files.
+- Production SQLite integrity is `ok`: `3,983` signals and `2,721` Paper rows
+  (`305 closed`, `30 entry_expired`, `2 expired`, `2,382 flow_rejected`,
+  `1 open`, `1 pending`). Counts were identical before and after restart.
+- Server rollback snapshot:
+  `/opt/matrix-trader/backups/20260730T034110Z-trader-comprehension`.
+  It is `401 MB` and contains the prior application, dashboard, a consistent
+  full SQLite backup, pre-deploy statistics, and SHA-256 hashes.
+- The recent full off-server disaster-recovery copy remains in the private
+  `bnortey/mt7-production-backups` repository. This sprint did not rewrite the
+  database or Edge Lab store, so no additional multi-gigabyte Git LFS upload
+  was necessary.
+
+**Sprint status:** complete. MT7 now exposes advanced evidence without forcing
+the trader to decode implementation vocabulary or mistake missing data for a
+measured zero.
 
 ---
 
