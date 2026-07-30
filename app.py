@@ -94,6 +94,7 @@ from lib.research_orchestrator import (
     normalize_idea_type as _research_normalize_idea_type,
     permutation_delta_test as _research_permutation_delta_test,
     scheduler_plan as _research_scheduler_plan,
+    trader_experiment_brief as _research_trader_experiment_brief,
     transition_allowed as _research_transition_allowed,
     validate_contract as _research_validate_contract,
 )
@@ -5776,6 +5777,76 @@ def _research_experiment_conflicts(
     return conflicts
 
 
+def _research_context_snapshot(item: dict) -> dict:
+    """Persist trader-facing provenance without granting it policy authority."""
+    keys = (
+        "title",
+        "thesis",
+        "expected_edge",
+        "strategy_shape",
+        "entry_filter_rule",
+        "reject_filter_rule",
+        "cohort_definition",
+        "expected_failure_mode",
+        "known_caveats",
+        "gate_impact",
+        "overfitting_risk",
+        "next_action",
+        "promotion_criteria",
+        "rollback_condition",
+        "source_count",
+        "source_titles",
+        "avg_source_quality",
+        "avg_source_relevance",
+        "evidence_stats",
+        "partial_fields",
+        "missing_fields",
+    )
+    snapshot = {
+        key: item.get(key)
+        for key in keys
+        if item.get(key) not in (None, "", [], {})
+    }
+    snapshot["captured_at"] = datetime.now(timezone.utc).isoformat()
+    return snapshot
+
+
+def _research_refresh_experiment_context(
+    experiment: dict,
+    item: dict,
+) -> dict:
+    """Refresh explanatory metadata while preserving the frozen experiment contract."""
+    scope = _learning_json(experiment.get("scope_json"), {})
+    context = _research_context_snapshot(item)
+    previous = scope.get("research_context")
+    previous_core = {
+        key: value for key, value in (previous or {}).items()
+        if key != "captured_at"
+    } if isinstance(previous, dict) else {}
+    context_core = {
+        key: value for key, value in context.items()
+        if key != "captured_at"
+    }
+    if previous_core == context_core:
+        return experiment
+    scope["research_context"] = context
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            """UPDATE learning_experiments
+               SET scope_json=?
+               WHERE experiment_id=?""",
+            (
+                json.dumps(scope, sort_keys=True, default=str),
+                experiment["experiment_id"],
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return {**experiment, "scope_json": json.dumps(scope, sort_keys=True, default=str)}
+
+
 def _research_prepare_experiment(
     item: dict,
     *,
@@ -5796,10 +5867,11 @@ def _research_prepare_experiment(
         and row.get("status") not in RESEARCH_EXPERIMENT_TERMINAL_STATUSES
     ]
     if existing:
+        refreshed = _research_refresh_experiment_context(existing[0], item)
         return {
             "created": False,
-            "experiment": existing[0],
-            "contract": _research_experiment_contract_from_row(existing[0]),
+            "experiment": refreshed,
+            "contract": _research_experiment_contract_from_row(refreshed),
         }
 
     contract = _research_contract_for_item(item)
@@ -5841,6 +5913,7 @@ def _research_prepare_experiment(
         "strategy": contract["target_strategy"],
         "target_mode": "paper_challenger_after_approval",
         "orchestrator_contract": contract,
+        "research_context": _research_context_snapshot(item),
     }
     change_set = [{
         "research_shadow_tag": tag,
@@ -6669,22 +6742,82 @@ def _research_experiment_orchestrator_payload(
         con.commit()
         for row in rows[:100]:
             contract = _research_experiment_contract_from_row(row)
-            counts = {
-                str(r["arm"]): int(r["n"])
-                for r in con.execute(
-                    """SELECT arm, COUNT(*) AS n
+            scope = _learning_json(row.get("scope_json"), {})
+            context = scope.get("research_context")
+            context = context if isinstance(context, dict) else {}
+            validation = _research_validate_contract(contract)
+            assignment_rows = [
+                dict(item) for item in con.execute(
+                    """SELECT arm, decision, result, symbol, closed_at
                        FROM learning_experiment_assignments
                        WHERE experiment_id=?
-                       GROUP BY arm""",
+                       ORDER BY assigned_at ASC, id ASC""",
                     (row["experiment_id"],),
                 ).fetchall()
+            ]
+            counts = {
+                arm: len([
+                    item for item in assignment_rows
+                    if str(item.get("arm") or "") == arm
+                ])
+                for arm in ("treatment", "control")
             }
-            closed = int(con.execute(
-                """SELECT COUNT(*) FROM learning_experiment_assignments
-                   WHERE experiment_id=? AND result IS NOT NULL""",
-                (row["experiment_id"],),
-            ).fetchone()[0])
-            cards.append({
+            closed_rows = [
+                item for item in assignment_rows
+                if item.get("result") is not None
+            ]
+            closed = len(closed_rows)
+            effective = _research_effective_sample(closed_rows)
+            assignments = {
+                "total": len(assignment_rows),
+                "treatment": counts.get("treatment", 0),
+                "control": counts.get("control", 0),
+                "closed": closed,
+                "treatment_closed": len([
+                    item for item in closed_rows
+                    if item.get("arm") == "treatment"
+                ]),
+                "control_closed": len([
+                    item for item in closed_rows
+                    if item.get("arm") == "control"
+                ]),
+                "blocked": len([
+                    item for item in assignment_rows
+                    if item.get("decision") == "blocked"
+                ]),
+                "contaminated": len([
+                    item for item in assignment_rows
+                    if item.get("decision") == "contaminated"
+                ]),
+                "effective_symbol_days": int(
+                    effective.get("symbol_day_count") or 0
+                ),
+                "effective_market_days": int(
+                    effective.get("market_day_count") or 0
+                ),
+            }
+            elapsed_days = 0.0
+            if bool(row.get("user_approved")):
+                activated_at = _parse_iso_datetime(row.get("activated_at"))
+                if activated_at:
+                    elapsed_days = max(
+                        0.0,
+                        (
+                            datetime.now(timezone.utc).replace(tzinfo=None)
+                            - activated_at
+                        ).total_seconds() / 86400.0,
+                    )
+            experiment_conflicts = _research_experiment_conflicts(
+                contract,
+                exclude_experiment_id=row.get("experiment_id"),
+            )
+            blocker_messages = []
+            if row.get("blocked_reason"):
+                blocker_messages.append(str(row.get("blocked_reason")))
+            for problem in validation.get("problems") or []:
+                if problem not in blocker_messages:
+                    blocker_messages.append(problem)
+            card = {
                 "experiment_id": row["experiment_id"],
                 "source_id": row.get("source_id"),
                 "status": row.get("status"),
@@ -6704,13 +6837,29 @@ def _research_experiment_orchestrator_payload(
                 "blocked_reason": row.get("blocked_reason"),
                 "last_progress_at": row.get("last_progress_at"),
                 "probation_stage": row.get("probation_stage"),
-                "assignments": {
-                    "treatment": counts.get("treatment", 0),
-                    "control": counts.get("control", 0),
-                    "closed": closed,
-                },
+                "assignments": assignments,
                 "evaluation": _learning_json(row.get("result_json"), {}),
-            })
+            }
+            card["brief"] = _research_trader_experiment_brief(
+                contract,
+                context=context,
+                state={
+                    **card,
+                    "elapsed_days": elapsed_days,
+                    "validation": validation,
+                    "blockers": blocker_messages,
+                    "conflicts": [
+                        str(item.get("reason") or "Overlapping active policy")
+                        + (
+                            f" ({item.get('strategy_key')})"
+                            if item.get("strategy_key")
+                            else ""
+                        )
+                        for item in experiment_conflicts
+                    ],
+                },
+            )
+            cards.append(card)
     finally:
         con.close()
     active_behavioral = len([
@@ -6791,6 +6940,24 @@ def _research_experiment_orchestrator_payload(
         max_behavioral=RESEARCH_MAX_BEHAVIORAL_EXPERIMENTS,
         max_shadow=RESEARCH_MAX_SHADOW_EXPERIMENTS,
     )
+    scheduler_blocked = {
+        str(item.get("id") or ""): str(item.get("reason") or "")
+        for item in scheduling.get("blocked") or []
+        if item.get("id") and item.get("reason")
+    }
+    for card in cards:
+        reason = scheduler_blocked.get(str(card.get("experiment_id") or ""))
+        if not reason:
+            continue
+        brief = card.get("brief") or {}
+        blockers = list(brief.get("blockers") or [])
+        if reason not in blockers:
+            blockers.append(reason)
+        brief["blockers"] = blockers
+        if card.get("status") in {"queued", "awaiting_approval"}:
+            brief["next_step"] = (
+                "Resolve the scheduler conflict or wait for capacity before approval."
+            )
     return {
         "success": True,
         "version": RESEARCH_ORCHESTRATOR_VERSION,
@@ -17292,6 +17459,7 @@ def _research_priority_queue(reviews: list[dict], ledger: list[dict] | None = No
             "evidence_grade": evidence_stats.get("evidence_grade"),
             "target_strategy": hyp.get("target_strategy"),
             "thesis": hyp.get("thesis"),
+            "expected_edge": hyp.get("expected_edge"),
             "priority_score": max(0, min(100, priority_score)),
             "testability_score": testability,
             "cipher_score": hyp.get("cipher_score"),
@@ -17400,6 +17568,7 @@ def _research_strategy_candidate_blueprint(item: dict) -> dict:
             "contradiction_claims": item.get("contradiction_claims"),
         },
         "thesis": thesis,
+        "expected_edge": item.get("expected_edge"),
         "fields_needed": fields,
         "partial_fields": partial_fields,
         "missing_fields": missing_fields,
@@ -17420,8 +17589,8 @@ def _research_strategy_candidate_blueprint(item: dict) -> dict:
             "title": "Flow-Confirmed Momentum Filter",
             "candidate_type": "entry_quality_filter",
             "strategy_shape": "Keep breakout/breakdown candidates only when recent tape flow confirms the intended direction.",
-            "entry_filter_rule": "For LONG candidates require positive flow_score, supportive flow_delta_pct, and non-negative depth_imbalance near the entry zone. For SHORT candidates require negative or deteriorating flow_delta_pct plus ask-heavy/depth pressure. Treat profile_poc distance as a context tag, not a hard rule in v1.",
-            "reject_filter_rule": "Shadow-reject candidates where price momentum exists but flow_score, flow_delta_pct, or depth_imbalance disagree with the trade direction.",
+            "entry_filter_rule": "The challenger asks MT7's existing order-flow confirmation check to approve the same momentum_breakout opportunity.",
+            "reject_filter_rule": "If that confirmation check returns false, the challenger does not open a Paper position; the unchanged control arm still follows the current strategy.",
             "cohort_definition": "Attach shadow tag to all momentum_breakout, balanced, and funding_arb candidates with flow telemetry; compare flow-confirmed vs flow-divergent forward outcomes by direction and BTC regime.",
             "expected_failure_mode": "Thin-orderbook spoofing can make depth imbalance look supportive immediately before reversal; require forward outcome validation by venue/liquidity bucket.",
         })
@@ -17440,8 +17609,8 @@ def _research_strategy_candidate_blueprint(item: dict) -> dict:
             "title": "Funding Crowding Filter",
             "candidate_type": "crowding_risk_filter",
             "strategy_shape": "Separate funding extremes that imply squeeze opportunity from funding extremes that imply informed crowding against the entry.",
-            "entry_filter_rule": "Annotate funding_rate extremes with trend_score and direction. Favor trades where funding crowding aligns with reversal evidence; penalize entries where funding and trend imply continuation risk against the trade.",
-            "reject_filter_rule": "Shadow-reject long entries in bearish regimes when strongly negative funding lacks flow confirmation; shadow-reject short entries when positive funding is extreme but tape absorption is absent.",
+            "entry_filter_rule": "The challenger classifies the same funding_arb opportunity using direction, funding_rate, trend_score, and whether order flow confirmed it.",
+            "reject_filter_rule": "It blocks a LONG when funding is below -0.10% and flow is unconfirmed, or a SHORT when funding is above +0.10% and flow is unconfirmed. Other buckets retain the current Paper decision.",
             "cohort_definition": "Tag all funding_arb and balanced candidates by funding_rate bucket, trend_score, direction, and flow confirmation; compare net EV across crowding regimes.",
             "expected_failure_mode": "Funding can stay extreme for long periods; premature reversal assumptions can be expensive without tape confirmation.",
         })
@@ -19209,6 +19378,16 @@ def _research_evidence_ledger_payload(
         item = {
             "research_shadow_tag": tag,
             "title": candidate.get("title") or priority.get("shadow_tag") or tag,
+            "thesis": candidate.get("thesis") or priority.get("thesis") or (registered or {}).get("hypothesis"),
+            "expected_edge": candidate.get("expected_edge") or priority.get("expected_edge"),
+            "strategy_shape": candidate.get("strategy_shape"),
+            "entry_filter_rule": candidate.get("entry_filter_rule"),
+            "reject_filter_rule": candidate.get("reject_filter_rule"),
+            "cohort_definition": candidate.get("cohort_definition"),
+            "expected_failure_mode": candidate.get("expected_failure_mode"),
+            "known_caveats": candidate.get("known_caveats") or [],
+            "gate_impact": priority.get("gate_impact"),
+            "overfitting_risk": priority.get("overfitting_risk"),
             "stage": stage,
             "target_strategy": candidate.get("target_strategy") or priority.get("target_strategy") or (registered or {}).get("target_strategy"),
             "candidate_type": candidate.get("candidate_type") or (registered or {}).get("candidate_type") or "shadow_filter",
@@ -19240,6 +19419,8 @@ def _research_evidence_ledger_payload(
                 "next_action": paper_trial.get("next_action") or "Collect forward paper outcomes, then decide keep/revert/escalate.",
             } if isinstance(paper_trial, dict) else None,
             "fields": fields[:12],
+            "partial_fields": list(priority.get("partial_fields") or [])[:12],
+            "missing_fields": list(readiness.get("missing") or [])[:12],
             "field_readiness": readiness,
             "pre_entry_ready": bool(readiness["pre_entry"]) and not readiness["missing"],
             "retrospective_only_risk": bool(readiness["retrospective"]) and not readiness["pre_entry"],

@@ -13,6 +13,7 @@ from lib.research_orchestrator import (
     normalize_contract,
     permutation_delta_test,
     scheduler_plan,
+    trader_experiment_brief,
     validate_contract,
 )
 
@@ -114,6 +115,39 @@ class ResearchOrchestratorPureTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertLess(result["one_sided_p_value"], 0.05)
 
+    def test_trader_brief_explains_change_progress_and_authority(self):
+        contract = normalize_contract({
+            "rule_type": "entry_gate",
+            "research_shadow_tag": "flow_gate",
+            "target_strategy": "momentum_breakout",
+            "hypothesis": "Require directional order-flow confirmation.",
+            "field_readiness": {"pre_entry": ["flow_score"], "missing": []},
+            "runtime_wired": True,
+            "minimum_closed_trades": 50,
+            "minimum_elapsed_days": 7,
+        })
+        brief = trader_experiment_brief(
+            contract,
+            context={
+                "title": "Flow-confirmed momentum",
+                "thesis": "Flow disagreement may identify thin breakouts.",
+                "entry_filter_rule": "The challenger requires confirmation.",
+                "reject_filter_rule": "Unconfirmed treatment opportunities are blocked.",
+                "promotion_criteria": "Positive net expectancy versus control.",
+                "rollback_condition": "Stop if net expectancy is worse.",
+            },
+            state={
+                "status": "awaiting_approval",
+                "assignments": {"closed": 0, "treatment": 0, "control": 0},
+                "elapsed_days": 0,
+            },
+        )
+        self.assertIn("30% of eligible momentum_breakout", brief["treatment"])
+        self.assertIn("70% of eligible momentum_breakout", brief["control"])
+        self.assertEqual(brief["progress"]["target_closed"], 50)
+        self.assertIn("explicit user approval", brief["authority"])
+        self.assertTrue(brief["blockers"])
+
 
 class ResearchOrchestratorRegistryTests(unittest.TestCase):
     def setUp(self):
@@ -146,6 +180,15 @@ class ResearchOrchestratorRegistryTests(unittest.TestCase):
         return {
             "research_shadow_tag": tag,
             "title": "Funding gate forward test",
+            "thesis": "Crowded funding without confirming flow may trap entries.",
+            "strategy_shape": "Block only predeclared crowding traps in the challenger arm.",
+            "entry_filter_rule": "Classify funding, direction, trend, and flow before entry.",
+            "reject_filter_rule": "Block the two declared crowding-trap buckets.",
+            "expected_failure_mode": "Funding can remain extreme for long periods.",
+            "promotion_criteria": "Positive net expectancy versus untouched control.",
+            "rollback_condition": "Stop if the challenger underperforms control.",
+            "source_count": 2,
+            "source_titles": ["Paper A", "Paper B"],
             "target_strategy": strategy,
             "candidate_type": "risk_gate",
             "field_readiness": {
@@ -197,6 +240,9 @@ class ResearchOrchestratorRegistryTests(unittest.TestCase):
             if item["experiment_id"] == experiment_id
         )
         self.assertEqual(card["assignments"]["treatment"] + card["assignments"]["control"], 1)
+        self.assertEqual(card["brief"]["source_evidence"]["source_count"], 2)
+        self.assertIn("declared crowding-trap", card["brief"]["treatment"])
+        self.assertIn("Paper-only", card["brief"]["authority"])
 
         stopped = mt7._research_stop_source_experiments(
             "research_test_gate",

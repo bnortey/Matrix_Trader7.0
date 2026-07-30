@@ -10135,6 +10135,35 @@ async function evaluateLearningExperiments() {
   }
 }
 
+function researchBriefText(label, value, color = 'var(--text3)') {
+  if (value == null || value === '' || (Array.isArray(value) && !value.length)) return '';
+  const text = Array.isArray(value) ? value.join(' · ') : value;
+  return `<div style="min-width:0;">
+    <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:3px;">${esc(label)}</div>
+    <div style="font-size:11px;color:${color};line-height:1.5;overflow-wrap:anywhere;">${esc(text)}</div>
+  </div>`;
+}
+
+function researchBriefProgress(label, current, target, pct, suffix = '') {
+  const safePct = Math.max(0, Math.min(100, Number(pct || 0)));
+  return `<div style="min-width:0;">
+    <div style="display:flex;justify-content:space-between;gap:8px;font-size:10px;margin-bottom:4px;">
+      <span style="color:var(--text3);">${esc(label)}</span>
+      <span style="color:var(--text2);font-weight:800;">${esc(current)}${suffix} / ${esc(target)}${suffix}</span>
+    </div>
+    <div style="height:5px;background:#161d27;border-radius:99px;overflow:hidden;">
+      <div style="height:100%;width:${safePct}%;background:${safePct >= 100 ? 'var(--green)' : '#7c3aed'};"></div>
+    </div>
+  </div>`;
+}
+
+function researchBriefMetric(label, value, color = 'var(--text2)') {
+  return `<div style="background:#0a0f15;border:1px solid #1d2633;border-radius:6px;padding:8px;min-width:0;">
+    <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">${esc(label)}</div>
+    <div style="font-size:11px;color:${color};font-weight:800;line-height:1.35;white-space:normal;overflow-wrap:anywhere;">${esc(value)}</div>
+  </div>`;
+}
+
 function renderResearchOrchestrator() {
   const data = I.researchOrchestrator;
   if (!data) return '';
@@ -10149,6 +10178,14 @@ function renderResearchOrchestrator() {
   );
   const cards = experiments.slice(0, 8).map(exp => {
     const assignments = exp.assignments || {};
+    const brief = exp.brief || {};
+    const progress = brief.progress || {};
+    const sourceEvidence = brief.source_evidence || {};
+    const sourceStats = sourceEvidence.evidence_stats || {};
+    const dataReadiness = brief.data || {};
+    const evaluation = brief.evaluation || {};
+    const placebo = evaluation.placebo || {};
+    const counterfactual = evaluation.gate_counterfactual || {};
     const encoded = esc(encodeURIComponent(exp.experiment_id || ''));
     const canApprove = ['awaiting_approval','queued','ready_for_experiment'].includes(exp.status);
     const canPromote = exp.status === 'promotion_candidate';
@@ -10161,17 +10198,115 @@ function renderResearchOrchestrator() {
     const stop = canStop
       ? `<button onclick="researchExperimentAction('${encoded}','stop')" style="background:#1b0808;border:1px solid #7f1d1d;color:#fca5a5;border-radius:5px;padding:6px 9px;font-size:10px;cursor:pointer;">Stop / Roll Back</button>`
       : '';
-    return `<div style="border-top:1px solid #1e2530;padding:10px 0;">
+    const blockers = brief.blockers || [];
+    const risks = brief.risks || [];
+    const conflicts = brief.conflicts || [];
+    const sourceTitles = sourceEvidence.source_titles || [];
+    const requiredFields = dataReadiness.required_pre_entry_fields || [];
+    const partialFields = dataReadiness.partial_fields || [];
+    const missingFields = dataReadiness.missing_fields || [];
+    const retrospectiveFields = dataReadiness.retrospective_fields || [];
+    const statusLabel = String(exp.lifecycle_state || exp.status || '').replaceAll('_', ' ');
+    const blockerLabel = exp.status === 'awaiting_approval'
+      ? 'Why it is not running'
+      : 'What is blocking it';
+    const authorityLabel = exp.user_approved
+      ? 'Approved Paper-only'
+      : exp.behavioral
+      ? 'No behavior change'
+      : 'Observation only';
+    const allocationLabel = exp.behavioral
+      ? `${Number(exp.treatment_pct || 0)}% challenger · ${100 - Number(exp.treatment_pct || 0)}% control`
+      : 'Labels only';
+    const evidenceVerdict = evaluation.verdict
+      ? String(evaluation.verdict).replaceAll('_', ' ')
+      : 'Not evaluated';
+    return `<div style="border:1px solid #202938;background:#0d1219;border-radius:8px;padding:12px;margin-top:10px;overflow:hidden;">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;">
         <div style="min-width:0;flex:1;">
-          <div style="font-size:12px;font-weight:850;color:var(--text);">${esc(exp.strategy_key || 'portfolio')} · ${esc(exp.idea_type || 'research')}</div>
-          <div style="font-size:10px;color:#667085;margin-top:2px;">${esc(exp.decision_surface || '')} · ${esc(exp.evaluator || '')} · treatment ${Number(exp.treatment_pct || 0)}%</div>
-          <div style="font-size:11px;color:var(--text3);line-height:1.4;margin-top:4px;">${esc(exp.hypothesis || '')}</div>
-          <div style="font-size:10px;color:#667085;margin-top:4px;">Assignments: ${Number(assignments.treatment || 0)} treatment · ${Number(assignments.control || 0)} control · ${Number(assignments.closed || 0)} closed</div>
-          ${exp.blocked_reason ? `<div style="font-size:10px;color:var(--amber);margin-top:4px;">Blocked: ${esc(exp.blocked_reason)}</div>` : ''}
+          <div style="font-size:13px;font-weight:900;color:var(--text);overflow-wrap:anywhere;">${esc(brief.title || exp.hypothesis || exp.source_id || 'Research experiment')}</div>
+          <div style="font-size:10px;color:#7d899a;margin-top:3px;line-height:1.4;">${esc(brief.type_label || exp.idea_type || 'Research')} · ${esc(exp.strategy_key || 'portfolio')} · Changes ${esc(brief.surface_label || exp.decision_surface || 'observation')}</div>
         </div>
-        <span style="font-size:9px;font-weight:900;text-transform:uppercase;color:${statusColor(exp.status)};">${esc(exp.lifecycle_state || exp.status || '')}</span>
+        <span style="font-size:9px;font-weight:900;text-transform:uppercase;color:${statusColor(exp.status)};">${esc(statusLabel)}</span>
       </div>
+      <div style="font-size:11px;color:var(--text3);line-height:1.5;margin-top:8px;">${esc(brief.status_explanation || exp.hypothesis || '')}</div>
+      ${blockers.length ? `<div style="margin-top:8px;padding:8px 9px;background:#201708;border:1px solid #5b4218;border-radius:6px;">
+        <div style="font-size:9px;color:var(--amber);text-transform:uppercase;letter-spacing:.08em;font-weight:900;">${esc(blockerLabel)}</div>
+        <div style="font-size:11px;color:#f4c97a;line-height:1.45;margin-top:3px;overflow-wrap:anywhere;">${blockers.map(esc).join('<br>')}</div>
+      </div>` : ''}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,145px),1fr));gap:7px;margin-top:10px;">
+        ${researchBriefMetric('Authority', authorityLabel, exp.user_approved ? 'var(--blue)' : 'var(--green)')}
+        ${researchBriefMetric('Assignment', allocationLabel, 'var(--text2)')}
+        ${researchBriefMetric('Forward Outcomes', `${Number(assignments.closed || 0)} closed`, Number(assignments.closed || 0) ? 'var(--blue)' : 'var(--text2)')}
+        ${researchBriefMetric('Evidence Verdict', evidenceVerdict, evaluation.verdict ? statusColor(evaluation.verdict) : 'var(--text2)')}
+      </div>
+      <details style="margin-top:10px;border-top:1px solid #202938;padding-top:9px;">
+        <summary style="cursor:pointer;color:#c4b5fd;font-size:11px;font-weight:850;list-style-position:inside;">Open full experiment brief</summary>
+        <div style="display:grid;gap:13px;margin-top:12px;">
+          <section style="background:#0a0f15;border:1px solid #1d2633;border-radius:7px;padding:10px;">
+            <div style="font-size:10px;color:#a78bfa;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">1 · What is being tested</div>
+            <div style="display:grid;gap:10px;">
+              ${researchBriefText('Research claim', brief.purpose)}
+              ${researchBriefText('Why edge might exist', brief.why_edge_might_exist)}
+              ${researchBriefText('What would change in Paper', brief.behavior_change, exp.behavioral ? 'var(--amber)' : 'var(--green)')}
+              ${researchBriefText('What this cannot prove', brief.what_this_cannot_prove, '#9aa5b5')}
+            </div>
+          </section>
+          <section style="background:#0a0f15;border:1px solid #1d2633;border-radius:7px;padding:10px;">
+            <div style="font-size:10px;color:#60a5fa;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">2 · How the comparison works</div>
+            <div style="display:grid;gap:10px;">
+              ${researchBriefText('Challenger / treatment arm', brief.treatment, '#cbd5e1')}
+              ${researchBriefText('Current champion / control arm', brief.control, '#cbd5e1')}
+              ${researchBriefText('Fair comparison', brief.comparison_method)}
+              ${researchBriefText('Primary decision metric', brief.primary_metric)}
+            </div>
+          </section>
+          <section style="background:#0a0f15;border:1px solid #1d2633;border-radius:7px;padding:10px;">
+            <div style="font-size:10px;color:#34d399;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin-bottom:9px;">3 · Forward evidence progress</div>
+            <div style="display:grid;gap:9px;">
+              ${researchBriefProgress('Closed opportunities', Number(progress.closed || 0), Number(progress.target_closed || 0), progress.closed_pct)}
+              ${researchBriefProgress('Elapsed Paper time', Number(progress.elapsed_days || 0).toFixed(1), Number(progress.target_elapsed_days || 0), progress.elapsed_pct, 'd')}
+              ${researchBriefProgress('Independent market days', Number(progress.effective_market_days || 0), Number(progress.target_effective_market_days || 0), progress.effective_days_pct)}
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr));gap:8px;margin-top:10px;">
+              ${researchBriefText('Assignments', `${Number(progress.treatment_assignments || 0)} challenger · ${Number(progress.control_assignments || 0)} control`)}
+              ${researchBriefText('Gate opportunity cost', `${Number(progress.blocked_opportunities || 0)} blocked · ${Number(counterfactual.profitable_block_rate || 0).toFixed(1)}% later profitable`)}
+              ${researchBriefText('Contamination', `${Number(progress.contaminated_assignments || 0)} assignments`)}
+              ${researchBriefText('Placebo check', placebo.available ? `p=${Number(placebo.one_sided_p_value || 0).toFixed(4)}` : 'Waiting for both closed arms')}
+            </div>
+          </section>
+          <section style="background:#0a0f15;border:1px solid #1d2633;border-radius:7px;padding:10px;">
+            <div style="font-size:10px;color:#f59e0b;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">4 · Data, sources, and costs</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:11px;">
+              ${researchBriefText('Required before entry', requiredFields.length ? requiredFields : 'No behavioral pre-entry fields')}
+              ${researchBriefText('Partial fields', partialFields)}
+              ${researchBriefText('Missing fields', missingFields.length ? missingFields : 'None')}
+              ${researchBriefText('Retrospective-only fields', retrospectiveFields)}
+              ${researchBriefText('Research sources', sourceTitles.length ? sourceTitles : `${Number(sourceEvidence.source_count || 0)} linked source(s)`)}
+              ${researchBriefText('Source evidence', `${Number(sourceStats.support_count || 0)} supporting · ${Number(sourceStats.caution_count || 0)} caution · ${Number(sourceStats.contradiction_count || 0)} contradictory claims`)}
+            </div>
+            <div style="margin-top:10px;">${researchBriefText('Trading costs included and missing', brief.costs, '#f4c97a')}</div>
+          </section>
+          <section style="background:#0a0f15;border:1px solid #1d2633;border-radius:7px;padding:10px;">
+            <div style="font-size:10px;color:#f87171;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">5 · Decision rules and failure risks</div>
+            <div style="display:grid;gap:10px;">
+              ${researchBriefText('Must be true to advance', brief.success_criteria, 'var(--green)')}
+              ${researchBriefText('Stops or falsifies the idea', brief.failure_criteria, '#fca5a5')}
+              ${researchBriefText('Known failure modes', risks.length ? risks : 'No additional risk note recorded')}
+              ${researchBriefText('Experiment conflicts', conflicts.length ? conflicts : 'No active conflict detected')}
+            </div>
+          </section>
+          <section style="background:#0a0f15;border:1px solid #1d2633;border-radius:7px;padding:10px;">
+            <div style="font-size:10px;color:#a78bfa;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">6 · What happens next</div>
+            <div style="display:grid;gap:10px;">
+              ${researchBriefText('Immediate next step', brief.next_step, '#c4b5fd')}
+              ${researchBriefText('If promoted', brief.promotion)}
+              ${researchBriefText('If stopped or falsified', brief.rollback)}
+              ${researchBriefText('Authority boundary', brief.authority, 'var(--green)')}
+            </div>
+          </section>
+        </div>
+      </details>
       ${(action || stop) ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">${action}${stop}</div>` : ''}
     </div>`;
   }).join('');
