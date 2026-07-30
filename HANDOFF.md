@@ -7,9 +7,61 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-30
-Latest implementation commit: 624d17d feat: explain research experiments clearly
-app.py: 37,703 lines
-index.html: 19,710 lines
+Latest implementation commit: e749aeb fix: preflight research experiment approvals
+app.py: 38,012 lines
+index.html: 19,750 lines
+
+---
+
+## 2026-07-30 — Fail-closed research approval preflight
+
+**Built, tested, committed, and deployed to production `207.148.66.39`:**
+
+- Added one server-owned approval-readiness result shared by the Research
+  Autopilot API, trader brief, dashboard action, and final activation route.
+  An approval action is now enabled only when the server explicitly returns
+  `can_approve=true`; lifecycle status alone is never sufficient.
+- Preflight blocks redundant champion behavior, explicitly disabled or missing
+  target strategies, missing data or runtime wiring, overlapping active policy
+  experiments, and full behavioral capacity. Generic variant contracts are
+  also rejected when every declared treatment setting already equals the
+  current Paper champion.
+- Kept the final server-side activation guard and made stale browser tabs
+  fail closed. A rejected approval response carries the refreshed orchestrator
+  state so the old button immediately becomes a disabled preflight action.
+- Added machine-readable readiness states, issue codes, champion facts,
+  expected decision delta, reachability, policy fingerprints, and safe redesign
+  guidance. Blocked cards replace the active button with
+  `Approval Blocked by Preflight`.
+- Corrected redundant experiment explanations: when treatment and control
+  already enforce the same rule, the full brief now says that no causal
+  comparison exists instead of describing the original invalid allocation as
+  runnable.
+- Applied the new preflight to the existing Flow-Confirmed Momentum Filter.
+  Production now reports both actual blockers: the champion already requires
+  flow confirmation and `momentum_breakout` is disabled. The experiment remains
+  preserved for audit but is not approvable.
+
+**Verification:**
+
+- Final full local suite: `116/116` tests passed, including `14/14`
+  orchestrator-focused tests. Python compilation, inline JavaScript parsing,
+  and `git diff --check` passed.
+- Browser acceptance confirmed the exact blocked status, zero expected
+  behavioral delta, disabled action, champion facts, and redesign paths.
+  Exact `390×845` mobile validation showed no horizontal overflow and no
+  browser errors.
+- Production file hashes match the tested backend, dashboard, and orchestrator
+  module. Served HTML contains the fail-closed action and redesign UI;
+  `matrix-trader` and `mt-learner` are active with clean restart logs.
+- Production readiness is now one genuinely distinct approval-ready challenger
+  (`research_funding_crowding_filter`), one blocked redundant challenger
+  (`research_order_flow_confirmation`), and two observation/data contracts
+  still needing data. Zero experiments are approved, zero behavioral
+  challengers are active, and live behavior remains unchanged.
+- Production SQLite integrity is `ok` with 4,006 signals and 2,754 paper-trade
+  rows. A verified 452 MB recovery snapshot was created at
+  `/opt/matrix-trader/backups/20260730T195126Z-approval-preflight`.
 
 ---
 
