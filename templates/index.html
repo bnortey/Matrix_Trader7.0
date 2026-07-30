@@ -10172,8 +10172,9 @@ function renderResearchOrchestrator() {
   const experiments = data.experiments || [];
   const statusColor = status => (
     ['falsified','rolled_back','parked'].includes(status) ? 'var(--red)' :
+    ['redundant_with_champion','target_disabled','target_unavailable','not_executable'].includes(status) ? 'var(--red)' :
     ['promotion_candidate','confirmed','completed'].includes(status) ? 'var(--green)' :
-    ['awaiting_approval','review','needs_data','queued'].includes(status) ? 'var(--amber)' :
+    ['awaiting_approval','review','needs_data','queued','missing_data','conflicts_with_active_experiment','capacity_full'].includes(status) ? 'var(--amber)' :
     'var(--blue)'
   );
   const cards = experiments.slice(0, 8).map(exp => {
@@ -10186,12 +10187,18 @@ function renderResearchOrchestrator() {
     const evaluation = brief.evaluation || {};
     const placebo = evaluation.placebo || {};
     const counterfactual = evaluation.gate_counterfactual || {};
+    const approvalReadiness = exp.approval_readiness || brief.approval_readiness || {};
+    const approvalIssues = approvalReadiness.issues || [];
+    const redesignOptions = [...new Set(approvalIssues.map(item => item && item.redesign).filter(Boolean))];
     const encoded = esc(encodeURIComponent(exp.experiment_id || ''));
-    const canApprove = ['awaiting_approval','queued','ready_for_experiment'].includes(exp.status);
+    const approvalLifecycle = ['awaiting_approval','queued','ready_for_experiment'].includes(exp.status);
+    const canApprove = approvalReadiness.can_approve === true;
     const canPromote = exp.status === 'promotion_candidate';
     const canStop = ['active','collecting','review'].includes(exp.status);
     const action = canApprove
       ? `<button onclick="researchExperimentAction('${encoded}','approve')" style="background:#10223a;border:1px solid #2563eb;color:#93c5fd;border-radius:5px;padding:6px 9px;font-size:10px;font-weight:800;cursor:pointer;">Approve Paper Challenger</button>`
+      : approvalLifecycle && exp.behavioral
+      ? `<button disabled title="${esc(approvalReadiness.summary || 'Approval preflight has not passed.')}" style="background:#171b22;border:1px solid #3a4350;color:#788493;border-radius:5px;padding:6px 9px;font-size:10px;font-weight:800;cursor:not-allowed;">Approval Blocked by Preflight</button>`
       : canPromote
       ? `<button onclick="researchExperimentAction('${encoded}','promote')" style="background:#12351f;border:1px solid #16a34a;color:var(--green);border-radius:5px;padding:6px 9px;font-size:10px;font-weight:800;cursor:pointer;">Promote One Paper Stage</button>`
       : '';
@@ -10206,12 +10213,17 @@ function renderResearchOrchestrator() {
     const partialFields = dataReadiness.partial_fields || [];
     const missingFields = dataReadiness.missing_fields || [];
     const retrospectiveFields = dataReadiness.retrospective_fields || [];
-    const statusLabel = String(exp.lifecycle_state || exp.status || '').replaceAll('_', ' ');
-    const blockerLabel = exp.status === 'awaiting_approval'
+    const displayStatus = exp.display_status || exp.lifecycle_state || exp.status || '';
+    const statusLabel = String(displayStatus).replaceAll('_', ' ');
+    const blockerLabel = canApprove
       ? 'Why it is not running'
+      : approvalLifecycle
+      ? 'Why approval is blocked'
       : 'What is blocking it';
     const authorityLabel = exp.user_approved
       ? 'Approved Paper-only'
+      : approvalLifecycle && !canApprove
+      ? 'Approval blocked'
       : exp.behavioral
       ? 'No behavior change'
       : 'Observation only';
@@ -10221,13 +10233,22 @@ function renderResearchOrchestrator() {
     const evidenceVerdict = evaluation.verdict
       ? String(evaluation.verdict).replaceAll('_', ' ')
       : 'Not evaluated';
+    const deltaLabel = approvalReadiness.decision_delta === 'zero'
+      ? 'Zero — redundant'
+      : approvalReadiness.decision_delta === 'unreachable'
+      ? 'Unreachable target'
+      : approvalReadiness.decision_delta === 'expected'
+      ? 'Distinct rule'
+      : approvalReadiness.decision_delta === 'blocked'
+      ? 'Blocked'
+      : 'Not applicable';
     return `<div style="border:1px solid #202938;background:#0d1219;border-radius:8px;padding:12px;margin-top:10px;overflow:hidden;">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;">
         <div style="min-width:0;flex:1;">
           <div style="font-size:13px;font-weight:900;color:var(--text);overflow-wrap:anywhere;">${esc(brief.title || exp.hypothesis || exp.source_id || 'Research experiment')}</div>
           <div style="font-size:10px;color:#7d899a;margin-top:3px;line-height:1.4;">${esc(brief.type_label || exp.idea_type || 'Research')} · ${esc(exp.strategy_key || 'portfolio')} · Changes ${esc(brief.surface_label || exp.decision_surface || 'observation')}</div>
         </div>
-        <span style="font-size:9px;font-weight:900;text-transform:uppercase;color:${statusColor(exp.status)};">${esc(statusLabel)}</span>
+        <span style="font-size:9px;font-weight:900;text-transform:uppercase;color:${statusColor(displayStatus)};">${esc(statusLabel)}</span>
       </div>
       <div style="font-size:11px;color:var(--text3);line-height:1.5;margin-top:8px;">${esc(brief.status_explanation || exp.hypothesis || '')}</div>
       ${blockers.length ? `<div style="margin-top:8px;padding:8px 9px;background:#201708;border:1px solid #5b4218;border-radius:6px;">
@@ -10235,7 +10256,8 @@ function renderResearchOrchestrator() {
         <div style="font-size:11px;color:#f4c97a;line-height:1.45;margin-top:3px;overflow-wrap:anywhere;">${blockers.map(esc).join('<br>')}</div>
       </div>` : ''}
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,145px),1fr));gap:7px;margin-top:10px;">
-        ${researchBriefMetric('Authority', authorityLabel, exp.user_approved ? 'var(--blue)' : 'var(--green)')}
+        ${researchBriefMetric('Authority', authorityLabel, exp.user_approved ? 'var(--blue)' : approvalLifecycle && !canApprove ? 'var(--amber)' : 'var(--green)')}
+        ${researchBriefMetric('Expected Decision Delta', deltaLabel, canApprove ? 'var(--green)' : approvalLifecycle ? 'var(--amber)' : 'var(--text2)')}
         ${researchBriefMetric('Assignment', allocationLabel, 'var(--text2)')}
         ${researchBriefMetric('Forward Outcomes', `${Number(assignments.closed || 0)} closed`, Number(assignments.closed || 0) ? 'var(--blue)' : 'var(--text2)')}
         ${researchBriefMetric('Evidence Verdict', evidenceVerdict, evaluation.verdict ? statusColor(evaluation.verdict) : 'var(--text2)')}
@@ -10259,6 +10281,16 @@ function renderResearchOrchestrator() {
               ${researchBriefText('Current champion / control arm', brief.control, '#cbd5e1')}
               ${researchBriefText('Fair comparison', brief.comparison_method)}
               ${researchBriefText('Primary decision metric', brief.primary_metric)}
+              ${researchBriefText('Approval preflight', approvalReadiness.summary || 'Not applicable at this lifecycle stage', canApprove ? 'var(--green)' : '#f4c97a')}
+              ${researchBriefText('Current champion facts', approvalReadiness.champion_facts ? [
+                `flow required: ${approvalReadiness.champion_facts.flow_required ? 'yes' : 'no'}`,
+                `minimum flow score: ${approvalReadiness.champion_facts.min_flow_score ?? '—'}`,
+                `target disabled: ${approvalReadiness.champion_facts.target_disabled ? 'yes' : 'no'}`,
+                `existing research rule: ${approvalReadiness.champion_facts.existing_rule_mode || 'none'}`,
+                `matching declared settings: ${(approvalReadiness.champion_facts.matched_variant_fields || []).join(', ') || 'none'}`,
+                `changed declared settings: ${(approvalReadiness.champion_facts.changed_variant_fields || []).join(', ') || 'none'}`
+              ] : 'Captured when approval is relevant')}
+              ${researchBriefText('Safe redesign paths', redesignOptions.length ? redesignOptions : 'No redesign required')}
             </div>
           </section>
           <section style="background:#0a0f15;border:1px solid #1d2633;border-radius:7px;padding:10px;">
@@ -10321,6 +10353,8 @@ function renderResearchOrchestrator() {
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px;margin:12px 0;">
       ${suggestionMetric('Behavioral Active', Number(summary.active_behavioral || 0), Number(summary.active_behavioral || 0) ? 'var(--blue)' : 'var(--text2)')}
       ${suggestionMetric('Behavioral Slots', Number(summary.behavioral_slots_available || 0), Number(summary.behavioral_slots_available || 0) ? 'var(--green)' : 'var(--amber)')}
+      ${suggestionMetric('Ready to Approve', Number(summary.approval_ready || 0), Number(summary.approval_ready || 0) ? 'var(--green)' : 'var(--text2)')}
+      ${suggestionMetric('Preflight Blocked', Number(summary.approval_blocked || 0), Number(summary.approval_blocked || 0) ? 'var(--amber)' : 'var(--green)')}
       ${suggestionMetric('Shadow Active', Number(summary.active_shadow || 0), 'var(--blue)')}
       ${suggestionMetric('Awaiting / Blocked', Number(summary.awaiting_or_blocked || 0), Number(summary.awaiting_or_blocked || 0) ? 'var(--amber)' : 'var(--green)')}
       ${suggestionMetric('Marker-only Trials', Number(summary.marker_only_trials || 0), Number(summary.marker_only_trials || 0) ? 'var(--red)' : 'var(--green)')}
@@ -10369,7 +10403,13 @@ async function researchExperimentAction(encodedId, action) {
       body:JSON.stringify({reason, actor:'local_user'})
     });
     const data = await res.json();
-    if (!data.success) throw new Error(data.error || `${action} failed`);
+    if (!data.success) {
+      if (data.orchestrator) {
+        I.researchOrchestrator = data.orchestrator;
+        renderIntelligence();
+      }
+      throw new Error(data.error || `${action} failed`);
+    }
     I.researchOrchestrator = data.orchestrator || null;
     const learning = await fetchIntelligenceJson('/api/intelligence/learning-effectiveness', 10000).catch(() => null);
     if (learning && learning.success) I.learningEffectiveness = learning;

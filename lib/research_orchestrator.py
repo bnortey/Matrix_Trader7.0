@@ -437,6 +437,10 @@ def trader_experiment_brief(
     evaluation = evaluation if isinstance(evaluation, dict) else {}
     validation = state.get("validation")
     validation = validation if isinstance(validation, dict) else validate_contract(contract)
+    approval_readiness = state.get("approval_readiness")
+    approval_readiness = (
+        approval_readiness if isinstance(approval_readiness, dict) else {}
+    )
 
     target_closed = max(1, int(rules.get("minimum_closed_trades") or 50))
     target_days = max(0.0, float(rules.get("minimum_elapsed_days") or 7))
@@ -496,7 +500,16 @@ def trader_experiment_brief(
             "until that missing cashflow is reviewed or measured."
         )
 
-    if status == "awaiting_approval":
+    if status == "awaiting_approval" and approval_readiness and not approval_readiness.get("can_approve"):
+        status_explanation = _text(
+            approval_readiness.get("summary")
+            or "Approval preflight found that this challenger cannot produce a valid comparison."
+        )
+        next_step = _text(
+            approval_readiness.get("next_step")
+            or "Redesign the contract, then reconcile."
+        )
+    elif status == "awaiting_approval":
         status_explanation = (
             "The contract passed technical preflight. It is not running and has "
             "not changed Paper behavior."
@@ -567,6 +580,31 @@ def trader_experiment_brief(
         f"{treatment_pct}% of eligible {strategy} opportunities are assigned "
         f"deterministically to the challenger. {treatment_rule}"
     )
+    decision_delta = _text(approval_readiness.get("decision_delta"))
+    if decision_delta == "zero":
+        treatment_rule_explanation += (
+            " Preflight found that this treatment matches the current champion."
+        )
+        control_rule = (
+            f"The current Paper champion already enforces the same rule for "
+            f"eligible {strategy} opportunities."
+        )
+        comparison = (
+            "No causal comparison exists as designed because treatment and "
+            "control make the same decision. Redesign is required."
+        )
+    elif decision_delta == "unreachable":
+        treatment_rule_explanation += (
+            " The target is currently unreachable, so this arm cannot receive assignments."
+        )
+        control_rule = (
+            f"The {strategy} control cohort is also unreachable under the "
+            "current Paper strategy configuration."
+        )
+        comparison = (
+            "No causal comparison can start until the target is reachable "
+            "through a separate governed strategy decision."
+        )
     if not contract.get("behavioral"):
         treatment_rule_explanation = (
             "This is observation-only. It attaches research labels but does not "
@@ -647,6 +685,7 @@ def trader_experiment_brief(
             "retrospective_fields": _string_list(contract.get("retrospective_fields")),
         },
         "blockers": blockers,
+        "approval_readiness": approval_readiness,
         "source_evidence": {
             "source_count": int(context.get("source_count") or 0),
             "source_titles": _string_list(context.get("source_titles")),

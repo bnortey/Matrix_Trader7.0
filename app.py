@@ -5847,6 +5847,281 @@ def _research_refresh_experiment_context(
     return {**experiment, "scope_json": json.dumps(scope, sort_keys=True, default=str)}
 
 
+RESEARCH_APPROVAL_STATUSES = {
+    "awaiting_approval",
+    "queued",
+    "ready_for_experiment",
+}
+
+RESEARCH_APPROVAL_STATE_LABELS = {
+    "ready_for_approval": "Ready for approval",
+    "redundant_with_champion": "Redundant with champion",
+    "target_disabled": "Target strategy disabled",
+    "target_unavailable": "Target strategy unavailable",
+    "missing_data": "Missing required data",
+    "conflicts_with_active_experiment": "Conflicts with active experiment",
+    "capacity_full": "Behavioral capacity full",
+    "not_executable": "No runnable Paper behavior",
+    "not_applicable": "Approval not applicable",
+}
+
+
+def _research_approval_preflight(
+    experiment: dict,
+    contract: dict | None = None,
+    *,
+    validation: dict | None = None,
+    conflicts: list[dict] | None = None,
+    paper_cfg: dict | None = None,
+    active_behavioral_count: int | None = None,
+) -> dict:
+    """Prove a pending challenger is reachable and behaviorally distinct."""
+    contract = contract or _research_experiment_contract_from_row(experiment)
+    validation = validation or _research_validate_contract(contract)
+    paper_cfg = paper_cfg or _load_paper_config()
+    status = str(experiment.get("status") or "")
+    behavioral = bool(contract.get("behavioral"))
+    target = str(
+        contract.get("target_strategy")
+        or experiment.get("strategy_key")
+        or ""
+    ).strip()
+    source_id = str(experiment.get("source_id") or "").strip()
+    issues: list[dict] = []
+
+    def add_issue(code: str, message: str, redesign: str = "") -> None:
+        if any(item.get("code") == code and item.get("message") == message for item in issues):
+            return
+        issues.append({
+            "code": code,
+            "message": message,
+            "redesign": redesign,
+        })
+
+    if status not in RESEARCH_APPROVAL_STATUSES or not behavioral:
+        return {
+            "can_approve": False,
+            "state": "not_applicable",
+            "label": RESEARCH_APPROVAL_STATE_LABELS["not_applicable"],
+            "summary": "This lifecycle state does not accept a Paper challenger approval.",
+            "issues": [],
+            "next_step": "Continue the governed lifecycle shown on the experiment card.",
+            "target_strategy": target,
+            "target_reachable": None,
+            "decision_delta": "not_applicable",
+            "prepared_policy_fingerprint": experiment.get("policy_fingerprint"),
+            "current_policy_fingerprint": None,
+            "champion_policy_changed": False,
+        }
+
+    for problem in validation.get("problems") or []:
+        add_issue(
+            "missing_data",
+            str(problem),
+            "Supply the missing pre-entry field or runnable policy, then reconcile.",
+        )
+    if not contract.get("executable"):
+        add_issue(
+            "not_executable",
+            "The contract has no executable Paper treatment.",
+            "Define and wire an exact Paper-only treatment before requesting approval.",
+        )
+
+    disabled = {
+        str(value).strip()
+        for value in (paper_cfg.get("disabled_strategies") or [])
+        if str(value).strip()
+    }
+    target_is_strategy = bool(target and target not in {"portfolio", "market", "global"})
+    if target_is_strategy:
+        registry = get_strategy_registry(include_disabled=True)
+        if target not in registry:
+            add_issue(
+                "target_unavailable",
+                f"The target strategy '{target}' is not registered in the Paper strategy registry.",
+                "Retarget the contract to a registered strategy or register it through the strategy governance workflow.",
+            )
+        elif target in disabled:
+            add_issue(
+                "target_disabled",
+                f"The target strategy '{target}' is disabled, so this experiment cannot receive eligible Paper assignments.",
+                "Retarget the experiment to an enabled strategy or make strategy enablement a separate governed decision.",
+            )
+
+    current_controls = _research_rule_controls_by_tag()
+    current_control = current_controls.get(source_id) or {}
+    current_control_mode = str(current_control.get("mode") or "")
+    current_policy = _learning_policy_snapshot(target, paper_cfg)
+    variant_policy = contract.get("variant_policy")
+    variant_policy = variant_policy if isinstance(variant_policy, dict) else {}
+    matched_variant_fields: list[str] = []
+    unresolved_variant_fields: list[str] = []
+    changed_variant_fields: list[str] = []
+    missing = object()
+
+    def champion_value(key: str):
+        parts = [part for part in str(key).split(".") if part]
+        for source in (
+            paper_cfg,
+            current_policy.get("strategy_overrides") or {},
+            current_policy.get("strategy") or {},
+        ):
+            value = source
+            for part in parts:
+                if not isinstance(value, dict) or part not in value:
+                    value = missing
+                    break
+                value = value[part]
+            if value is not missing:
+                return value
+        return missing
+
+    for key, proposed in variant_policy.items():
+        champion = champion_value(str(key))
+        if champion is missing:
+            unresolved_variant_fields.append(str(key))
+        elif champion == proposed:
+            matched_variant_fields.append(str(key))
+        else:
+            changed_variant_fields.append(str(key))
+    if (
+        variant_policy
+        and matched_variant_fields
+        and len(matched_variant_fields) == len(variant_policy)
+    ):
+        add_issue(
+            "redundant_with_champion",
+            "Every declared treatment setting already matches the Paper champion "
+            f"({', '.join(sorted(matched_variant_fields))}), so the expected behavioral delta is zero.",
+            "Change at least one predeclared treatment setting or convert the proposal into a non-behavioral policy audit.",
+        )
+    if current_control_mode == "paper_applied":
+        add_issue(
+            "redundant_with_champion",
+            "The same research rule is already applied by the Paper champion, so treatment and control would make the same decision.",
+            "Convert the proposal into a non-behavioral policy audit or declare a genuinely different threshold or rule.",
+        )
+    if (
+        source_id == "research_order_flow_confirmation"
+        and bool(paper_cfg.get("flow_required"))
+    ):
+        add_issue(
+            "redundant_with_champion",
+            "Order-flow confirmation is already required by the Paper champion, so the proposed add-flow treatment has zero behavioral delta.",
+            "Audit the existing gate with forward blocked-opportunity outcomes, or test an explicit Paper-only threshold/ablation variant.",
+        )
+
+    conflicts = (
+        conflicts
+        if conflicts is not None
+        else _research_experiment_conflicts(
+            contract,
+            exclude_experiment_id=experiment.get("experiment_id"),
+        )
+    )
+    if conflicts:
+        conflict_ids = ", ".join(
+            str(item.get("experiment_id") or "active experiment")
+            for item in conflicts
+        )
+        add_issue(
+            "conflicts_with_active_experiment",
+            f"The experiment conflicts with active policy surface: {conflict_ids}.",
+            "Wait for the conflicting experiment to finish or redesign this contract onto an orthogonal decision surface.",
+        )
+
+    if active_behavioral_count is None:
+        active_behavioral_count = len([
+            row for row in _research_learning_experiment_rows(
+                RESEARCH_EXPERIMENT_ACTIVE_STATUSES
+            )
+            if _research_experiment_contract_from_row(row).get("behavioral")
+        ])
+    if behavioral and active_behavioral_count >= RESEARCH_MAX_BEHAVIORAL_EXPERIMENTS:
+        add_issue(
+            "capacity_full",
+            "All behavioral Paper experiment slots are occupied.",
+            "Wait for an active behavioral challenger to complete or stop.",
+        )
+
+    priority = {
+        "redundant_with_champion": 0,
+        "target_disabled": 1,
+        "target_unavailable": 2,
+        "missing_data": 3,
+        "not_executable": 4,
+        "conflicts_with_active_experiment": 5,
+        "capacity_full": 6,
+    }
+    primary = min(
+        (str(item.get("code") or "") for item in issues),
+        key=lambda code: priority.get(code, 99),
+        default="ready_for_approval",
+    )
+    can_approve = not issues
+    current_fingerprint = _learning_fingerprint(current_policy)
+    if can_approve:
+        summary = (
+            "Preflight passed: the target is reachable and the challenger "
+            "introduces a distinct Paper decision rule."
+        )
+        next_step = "Review the contract and explicitly approve the Paper challenger."
+    else:
+        summary = "Approval blocked: " + " ".join(
+            str(item.get("message") or "") for item in issues
+        )
+        redesigns = [
+            str(item.get("redesign") or "")
+            for item in issues
+            if item.get("redesign")
+        ]
+        next_step = (
+            " ".join(dict.fromkeys(redesigns))
+            if redesigns
+            else "Redesign the contract, then reconcile."
+        )
+    issue_codes = {str(item.get("code") or "") for item in issues}
+    decision_delta = (
+        "zero"
+        if "redundant_with_champion" in issue_codes
+        else "unreachable"
+        if {"target_disabled", "target_unavailable"} & issue_codes
+        else "blocked"
+        if issues
+        else "expected"
+    )
+    return {
+        "can_approve": can_approve,
+        "state": primary,
+        "label": RESEARCH_APPROVAL_STATE_LABELS.get(
+            primary, primary.replace("_", " ").title()
+        ),
+        "summary": summary,
+        "issues": issues,
+        "next_step": next_step,
+        "target_strategy": target,
+        "target_reachable": not bool(
+            {"target_disabled", "target_unavailable"} & issue_codes
+        ),
+        "decision_delta": decision_delta,
+        "prepared_policy_fingerprint": experiment.get("policy_fingerprint"),
+        "current_policy_fingerprint": current_fingerprint,
+        "champion_policy_changed": bool(
+            experiment.get("policy_fingerprint")
+            and experiment.get("policy_fingerprint") != current_fingerprint
+        ),
+        "champion_facts": {
+            "flow_required": bool(paper_cfg.get("flow_required")),
+            "min_flow_score": paper_cfg.get("min_flow_score"),
+            "target_disabled": target in disabled,
+            "existing_rule_mode": current_control_mode or None,
+            "matched_variant_fields": sorted(matched_variant_fields),
+            "changed_variant_fields": sorted(changed_variant_fields),
+            "unresolved_variant_fields": sorted(unresolved_variant_fields),
+        },
+    }
+
+
 def _research_prepare_experiment(
     item: dict,
     *,
@@ -6049,23 +6324,18 @@ def _research_activate_experiment(
     validation = _research_validate_contract(contract)
     if not validation.get("valid") or not contract.get("executable"):
         raise ValueError("; ".join(validation.get("problems") or ["contract is not executable"]))
-    if (
-        str(experiment.get("source_id") or "") == "research_order_flow_confirmation"
-        and bool(_load_paper_config().get("flow_required"))
-    ):
-        raise ValueError(
-            "order-flow confirmation is already required by the Paper champion; "
-            "this challenger has no behavioral delta"
-        )
     conflicts = _research_experiment_conflicts(
         contract,
         exclude_experiment_id=experiment_id,
     )
-    if conflicts:
-        raise ValueError(
-            "experiment conflicts with active policy surface: "
-            + ", ".join(str(x.get("experiment_id")) for x in conflicts)
-        )
+    approval_preflight = _research_approval_preflight(
+        experiment,
+        contract,
+        validation=validation,
+        conflicts=conflicts,
+    )
+    if not approval_preflight.get("can_approve"):
+        raise ValueError(str(approval_preflight.get("summary") or "experiment is not approval-ready"))
     marks = ",".join("?" for _ in RESEARCH_EXPERIMENT_ACTIVE_STATUSES)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -6725,6 +6995,10 @@ def _research_experiment_orchestrator_payload(
         row for row in rows
         if row.get("status") in RESEARCH_EXPERIMENT_ACTIVE_STATUSES
     ]
+    active_behavioral = len([
+        row for row in active
+        if _research_experiment_contract_from_row(row).get("behavioral")
+    ])
     pending = [
         row for row in rows
         if row.get("status") in {
@@ -6811,17 +7085,35 @@ def _research_experiment_orchestrator_payload(
                 contract,
                 exclude_experiment_id=row.get("experiment_id"),
             )
+            approval_preflight = _research_approval_preflight(
+                row,
+                contract,
+                validation=validation,
+                conflicts=experiment_conflicts,
+                active_behavioral_count=active_behavioral,
+            )
             blocker_messages = []
             if row.get("blocked_reason"):
                 blocker_messages.append(str(row.get("blocked_reason")))
             for problem in validation.get("problems") or []:
                 if problem not in blocker_messages:
                     blocker_messages.append(problem)
+            for issue in approval_preflight.get("issues") or []:
+                message = str(issue.get("message") or "").strip()
+                if message and message not in blocker_messages:
+                    blocker_messages.append(message)
+            display_status = (
+                approval_preflight.get("state")
+                if row.get("status") in RESEARCH_APPROVAL_STATUSES
+                and not approval_preflight.get("can_approve")
+                else row.get("lifecycle_state") or row.get("status")
+            )
             card = {
                 "experiment_id": row["experiment_id"],
                 "source_id": row.get("source_id"),
                 "status": row.get("status"),
                 "lifecycle_state": row.get("lifecycle_state") or row.get("status"),
+                "display_status": display_status,
                 "strategy_key": row.get("strategy_key"),
                 "hypothesis": row.get("hypothesis"),
                 "idea_type": contract.get("idea_type"),
@@ -6839,6 +7131,7 @@ def _research_experiment_orchestrator_payload(
                 "probation_stage": row.get("probation_stage"),
                 "assignments": assignments,
                 "evaluation": _learning_json(row.get("result_json"), {}),
+                "approval_readiness": approval_preflight,
             }
             card["brief"] = _research_trader_experiment_brief(
                 contract,
@@ -6848,6 +7141,7 @@ def _research_experiment_orchestrator_payload(
                     "elapsed_days": elapsed_days,
                     "validation": validation,
                     "blockers": blocker_messages,
+                    "approval_readiness": approval_preflight,
                     "conflicts": [
                         str(item.get("reason") or "Overlapping active policy")
                         + (
@@ -6862,10 +7156,6 @@ def _research_experiment_orchestrator_payload(
             cards.append(card)
     finally:
         con.close()
-    active_behavioral = len([
-        row for row in active
-        if _research_experiment_contract_from_row(row).get("behavioral")
-    ])
     active_shadow = len(active) - active_behavioral
     source_ids = {
         str(row.get("source_id") or "") for row in rows if row.get("source_id")
@@ -6958,6 +7248,12 @@ def _research_experiment_orchestrator_payload(
             brief["next_step"] = (
                 "Resolve the scheduler conflict or wait for capacity before approval."
             )
+    readiness_counts: dict[str, int] = defaultdict(int)
+    for card in cards:
+        readiness = card.get("approval_readiness") or {}
+        state = str(readiness.get("state") or "")
+        if state and state != "not_applicable":
+            readiness_counts[state] += 1
     return {
         "success": True,
         "version": RESEARCH_ORCHESTRATOR_VERSION,
@@ -6968,6 +7264,11 @@ def _research_experiment_orchestrator_payload(
             "active_behavioral": active_behavioral,
             "active_shadow": active_shadow,
             "awaiting_or_blocked": len(pending),
+            "approval_ready": readiness_counts.get("ready_for_approval", 0),
+            "approval_blocked": sum(
+                count for state, count in readiness_counts.items()
+                if state != "ready_for_approval"
+            ),
             "behavioral_slots_available": max(
                 0, RESEARCH_MAX_BEHAVIORAL_EXPERIMENTS - active_behavioral
             ),
@@ -7005,11 +7306,14 @@ def _research_experiment_orchestrator_payload(
                 }
                 for row in rows if row.get("blocked_reason")
             ],
+            "approval_readiness_counts": dict(sorted(readiness_counts.items())),
         },
         "scheduler": scheduling,
         "experiments": cards,
         "safety": {
             "automatic_preflight": True,
+            "behavioral_delta_preflight": True,
+            "target_reachability_preflight": True,
             "automatic_assignment": True,
             "automatic_evaluation": True,
             "automatic_paper_stop": True,
@@ -23861,7 +24165,12 @@ def api_research_orchestrator_approve(experiment_id: str):
             "orchestrator": _research_experiment_orchestrator_payload(),
         })
     except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 409
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "orchestrator": _research_experiment_orchestrator_payload(),
+            "live_authority_granted": False,
+        }), 409
     except Exception as e:
         print(f"[api/research/orchestrator/approve] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500

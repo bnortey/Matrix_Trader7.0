@@ -209,6 +209,16 @@ class ResearchOrchestratorRegistryTests(unittest.TestCase):
         self.assertTrue(prepared["created"])
         experiment_id = prepared["experiment"]["experiment_id"]
         self.assertEqual(prepared["experiment"]["status"], "awaiting_approval")
+        pending = mt7._research_experiment_orchestrator_payload()
+        pending_card = next(
+            item for item in pending["experiments"]
+            if item["experiment_id"] == experiment_id
+        )
+        self.assertTrue(pending_card["approval_readiness"]["can_approve"])
+        self.assertEqual(
+            pending_card["approval_readiness"]["state"],
+            "ready_for_approval",
+        )
 
         active = mt7._research_activate_experiment(
             experiment_id,
@@ -251,6 +261,126 @@ class ResearchOrchestratorRegistryTests(unittest.TestCase):
             reason="Test rollback preserves the champion.",
         )
         self.assertEqual(stopped, [experiment_id])
+
+    def test_preflight_blocks_redundant_flow_gate_and_disabled_target(self):
+        cfg = mt7._load_paper_config()
+        cfg["flow_required"] = True
+        cfg["disabled_strategies"] = ["momentum_breakout"]
+        mt7._save_paper_config(cfg)
+        prepared = mt7._research_prepare_experiment(
+            self._item(
+                "research_order_flow_confirmation",
+                "momentum_breakout",
+            ),
+            actor="test",
+        )
+        experiment_id = prepared["experiment"]["experiment_id"]
+
+        payload = mt7._research_experiment_orchestrator_payload()
+        card = next(
+            item for item in payload["experiments"]
+            if item["experiment_id"] == experiment_id
+        )
+        readiness = card["approval_readiness"]
+        issue_codes = {item["code"] for item in readiness["issues"]}
+        self.assertFalse(readiness["can_approve"])
+        self.assertEqual(readiness["state"], "redundant_with_champion")
+        self.assertEqual(readiness["decision_delta"], "zero")
+        self.assertIn("redundant_with_champion", issue_codes)
+        self.assertIn("target_disabled", issue_codes)
+        self.assertEqual(card["display_status"], "redundant_with_champion")
+        self.assertIn("Approval blocked", card["brief"]["status_explanation"])
+        self.assertIn(
+            "already enforces the same rule",
+            card["brief"]["control"],
+        )
+        self.assertIn(
+            "No causal comparison exists",
+            card["brief"]["comparison_method"],
+        )
+        self.assertEqual(payload["summary"]["approval_ready"], 0)
+        self.assertEqual(payload["summary"]["approval_blocked"], 1)
+
+        with self.assertRaisesRegex(ValueError, "zero behavioral delta"):
+            mt7._research_activate_experiment(
+                experiment_id,
+                actor="test",
+                reason="This duplicate should never activate.",
+            )
+        response = mt7.app.test_client().post(
+            f"/api/intelligence/research/orchestrator/experiments/{experiment_id}/approve",
+            json={
+                "actor": "test",
+                "reason": "Confirm stale clients receive refreshed readiness.",
+            },
+        )
+        self.assertEqual(response.status_code, 409)
+        rejected = response.get_json()
+        self.assertFalse(rejected["success"])
+        self.assertIn("orchestrator", rejected)
+        refreshed = next(
+            item for item in rejected["orchestrator"]["experiments"]
+            if item["experiment_id"] == experiment_id
+        )
+        self.assertFalse(refreshed["approval_readiness"]["can_approve"])
+
+    def test_preflight_blocks_any_explicitly_disabled_target(self):
+        cfg = mt7._load_paper_config()
+        cfg["disabled_strategies"] = ["funding_arb"]
+        mt7._save_paper_config(cfg)
+        prepared = mt7._research_prepare_experiment(
+            self._item("disabled_funding_gate", "funding_arb"),
+            actor="test",
+        )
+        experiment_id = prepared["experiment"]["experiment_id"]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "target strategy 'funding_arb' is disabled",
+        ):
+            mt7._research_activate_experiment(
+                experiment_id,
+                actor="test",
+                reason="A disabled target is not reachable.",
+            )
+
+    def test_preflight_blocks_generic_variant_that_matches_champion(self):
+        item = self._item("matching_stop_variant", "funding_arb")
+        item["candidate_type"] = "stop_rule"
+        item["rule_control"]["rule_type"] = "stop_rule"
+        item["variant_policy"] = {"paper_stop_mode": "static"}
+        prepared = mt7._research_prepare_experiment(item, actor="test")
+        experiment_id = prepared["experiment"]["experiment_id"]
+
+        payload = mt7._research_experiment_orchestrator_payload()
+        card = next(
+            entry for entry in payload["experiments"]
+            if entry["experiment_id"] == experiment_id
+        )
+        readiness = card["approval_readiness"]
+        self.assertFalse(readiness["can_approve"])
+        self.assertEqual(readiness["state"], "redundant_with_champion")
+        self.assertEqual(readiness["decision_delta"], "zero")
+        self.assertEqual(
+            readiness["champion_facts"]["matched_variant_fields"],
+            ["paper_stop_mode"],
+        )
+        self.assertIn(
+            "Every declared treatment setting already matches",
+            readiness["summary"],
+        )
+
+    def test_dashboard_requires_server_preflight_before_approval(self):
+        source = Path("templates/index.html").read_text(encoding="utf-8")
+        self.assertIn(
+            "const canApprove = approvalReadiness.can_approve === true;",
+            source,
+        )
+        self.assertIn("Approval Blocked by Preflight", source)
+        self.assertNotIn(
+            "const canApprove = ['awaiting_approval','queued','ready_for_experiment'].includes(exp.status);",
+            source,
+        )
 
     def test_conflicting_active_experiment_is_rejected(self):
         first = mt7._research_prepare_experiment(self._item("gate_one"), actor="test")
