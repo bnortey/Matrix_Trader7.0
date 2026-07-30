@@ -664,6 +664,29 @@
       color:var(--text2); font-size:11px; line-height:1.45; text-transform:none;
       letter-spacing:0; font-weight:400; box-shadow:0 10px 28px rgba(0,0,0,.45);
     }
+    .info-tip-pop strong { color:var(--text); font-weight:800; }
+    .info-tip-row + .info-tip-row { margin-top:7px; padding-top:7px; border-top:1px solid rgba(255,255,255,.07); }
+    .info-tip-key { color:#7eb8f7; font-size:9px; font-weight:850; letter-spacing:.06em; text-transform:uppercase; margin-bottom:2px; }
+    .trader-intro {
+      background:#0d1117; border:1px solid #1e2530; border-left:3px solid var(--blue);
+      border-radius:6px; padding:10px 12px; margin-bottom:12px;
+      display:grid; grid-template-columns:minmax(0,1.15fr) minmax(220px,.85fr); gap:12px;
+    }
+    .trader-intro-title { color:var(--text); font-size:12px; font-weight:850; margin-bottom:3px; }
+    .trader-intro-text { color:var(--text2); font-size:11px; line-height:1.45; }
+    .trader-intro-use { color:#93c5fd; font-size:11px; line-height:1.45; }
+    .trader-intro-limit { color:var(--text3); font-size:10px; line-height:1.4; margin-top:4px; }
+    .evidence-line { color:var(--text3); font-size:10px; line-height:1.4; margin-top:5px; }
+    .data-state {
+      display:inline-flex; align-items:center; gap:5px; border:1px solid currentColor;
+      border-radius:10px; padding:2px 7px; font-size:9px; font-weight:850;
+      letter-spacing:.05em; text-transform:uppercase; white-space:nowrap;
+    }
+    .data-state.healthy { color:var(--green); }
+    .data-state.collecting, .data-state.info { color:var(--blue); }
+    .data-state.review, .data-state.stale { color:var(--amber); }
+    .data-state.blocked, .data-state.error, .data-state.unavailable { color:var(--red); }
+    .metric-subline { color:var(--text3); font-size:9px; line-height:1.35; margin-top:4px; overflow-wrap:anywhere; }
     @media (hover:hover) {
       .info-tip:not([open]):hover .info-tip-pop { display:block; }
       .info-tip:not([open]) .info-tip-pop { display:none; }
@@ -673,6 +696,7 @@
         position:fixed; top:72px; left:12px; right:12px; width:auto;
         max-height:38vh; overflow:auto;
       }
+      .trader-intro { grid-template-columns:1fr; gap:7px; }
     }
 
     /* TradingView timeframe buttons */
@@ -1923,9 +1947,9 @@
         <label style="display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;flex-shrink:0;">
           <input type="checkbox" id="evf-toggle" onchange="setExtremeVolFirebreak(this.checked)"
                  style="accent-color:var(--amber);width:14px;height:14px;cursor:pointer;">
-          <span id="evf-label" style="font-size:12px;font-weight:600;">Block Extreme Vol</span>
+          <span id="evf-label" style="font-size:12px;font-weight:600;">Block Extreme Volatility</span>
         </label>
-        <span style="font-size:11px;color:var(--text3);flex:1;min-width:0;">Audit data: persistent negative expectancy across all strategies</span>
+        <span style="font-size:11px;color:var(--text3);flex:1;min-width:0;">Safety rule: past extreme-volatility signals lost money across every tested strategy</span>
         <span id="evf-msg" style="font-size:11px;flex-shrink:0;"></span>
       </div>
 
@@ -2002,13 +2026,13 @@
                 <span style="color:var(--text2); font-weight:600">History</span> — Outcome record, trade reviews, and manually logged or MT7-generated trade history.
               </div>
               <div style="font-size:11px; color:var(--text3)">
-                <span style="color:var(--text2); font-weight:600">Paper</span> — Simulated execution policy, cohorts, research hooks, and paper-bot validation.
+                <span style="color:var(--text2); font-weight:600">Paper</span> — Simulated entries and exits used to test the current strategy, filters, costs, and position sizing.
               </div>
               <div style="font-size:11px; color:var(--text3)">
-                <span style="color:var(--text2); font-weight:600">Research</span> — Corpus, source quality, passive discovery, Corpus Scholar, and research governance.
+                <span style="color:var(--text2); font-weight:600">Research</span> — Collects and audits outside evidence, then turns it into ideas for controlled testing.
               </div>
               <div style="font-size:11px; color:var(--text3)">
-                <span style="color:var(--text2); font-weight:600">Live</span> — Readiness gates for assisted live and future automation.
+                <span style="color:var(--text2); font-weight:600">Live</span> — Evidence and safety requirements for any future user-confirmed real-order test.
               </div>
             </div>
             <div style="font-size:12px; color:var(--text3)">
@@ -2110,12 +2134,12 @@
           <div class="mkt-hdr">
             <button class="mkt-col-btn" onclick="mktSortBy('symbol')">Symbol <span class="sort-indicator" id="si-symbol"></span></button>
             <button class="mkt-col-btn mkt-price-lbl" onclick="mktSortBy('price')">Price <span class="sort-indicator" id="si-price"></span></button>
-            <button class="mkt-col-btn" onclick="mktSortBy('direction')">Dir <span class="sort-indicator" id="si-direction"></span></button>
-            <button class="mkt-col-btn active" onclick="mktSortBy('conviction_base')">Score <span class="sort-indicator" id="si-conviction_base"></span></button>
-            <button class="mkt-col-btn" onclick="mktSortBy('change_24h_pct')">24h% <span class="sort-indicator" id="si-change_24h_pct"></span></button>
+            <button class="mkt-col-btn" onclick="mktSortBy('direction')" title="LONG or SHORT directional read">Side <span class="sort-indicator" id="si-direction"></span></button>
+            <button class="mkt-col-btn active" onclick="mktSortBy('conviction_base')" title="MT7 signal-alignment score from 0 to 100; not a probability of profit">Conviction <span class="sort-indicator" id="si-conviction_base"></span></button>
+            <button class="mkt-col-btn" onclick="mktSortBy('change_24h_pct')" title="Price change over the last 24 hours">24h Move <span class="sort-indicator" id="si-change_24h_pct"></span></button>
             <button class="mkt-col-btn" onclick="mktSortBy('funding_rate')">Funding <span class="sort-indicator" id="si-funding_rate"></span></button>
             <button class="mkt-col-btn" onclick="mktSortBy('volume_24h')">Volume <span class="sort-indicator" id="si-volume_24h"></span></button>
-            <button class="mkt-col-btn mkt-oi-lbl" onclick="mktSortBy('derivatives_open_interest')">Deriv OI <span class="sort-indicator" id="si-derivatives_open_interest"></span></button>
+            <button class="mkt-col-btn mkt-oi-lbl" onclick="mktSortBy('derivatives_open_interest')" title="Estimated dollar value of open derivatives positions">Open Interest <span class="sort-indicator" id="si-derivatives_open_interest"></span></button>
           </div>
           <div id="mkt-rows"></div>
         </div>
@@ -2132,7 +2156,7 @@
           <!-- Risk Calculator -->
           <div class="tool-card">
             <div class="tool-title">Risk Calculator</div>
-            <div class="tool-subtitle">Position sizing based on your risk tolerance</div>
+            <div class="tool-subtitle">Estimate position exposure from the dollar loss you accept at the stop. Leverage does not reduce risk.</div>
             <div class="field-group">
               <label class="field-lbl">Account Balance (USD)</label>
               <input class="field-input" id="rc-balance" type="number" value="200" min="1" oninput="calcRisk()">
@@ -2165,17 +2189,17 @@
           <!-- Compound Planner -->
           <div class="tool-card">
             <div class="tool-title">Compound Planner</div>
-            <div class="tool-subtitle">Project account growth from consistent execution</div>
+            <div class="tool-subtitle">Explore hypothetical compounding paths. This is scenario math—not a forecast—and losses compound too.</div>
             <div class="field-group">
               <label class="field-lbl">Starting Balance (USD)</label>
               <input class="field-input" id="cp-balance" type="number" value="200" oninput="calcCompound()">
             </div>
             <div class="field-group">
-              <label class="field-lbl">Win Rate (%)</label>
+              <label class="field-lbl">Assumed Win Rate (%)</label>
               <input class="field-input" id="cp-winrate" type="number" value="55" min="1" max="99" oninput="calcCompound()">
             </div>
             <div class="field-group">
-              <label class="field-lbl">Average R:R (e.g. 2 means 2:1)</label>
+              <label class="field-lbl">Assumed Reward-to-Risk (2 means 2:1)</label>
               <input class="field-input" id="cp-rr" type="number" value="2" min="0.5" step="0.1" oninput="calcCompound()">
             </div>
             <div class="field-group">
@@ -2381,8 +2405,8 @@
         <!-- Tab identity banner -->
         <div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
           <div>
-            <span style="font-size:13px;font-weight:700;color:#ccc;letter-spacing:.04em;">YOUR REAL TRADES</span>
-            <span style="font-size:11px;color:#555;margin-left:10px;">Signals from your scans — tag outcomes after trading on MEXC</span>
+            <span style="font-size:13px;font-weight:700;color:#ccc;letter-spacing:.04em;">MANUALLY TRACKED TRADES</span>
+            <span style="font-size:11px;color:#555;margin-left:10px;">Signals you chose to track — add outcomes only when you know what happened</span>
           </div>
           <span style="font-size:11px;color:#555;background:#111;border:1px solid #222;border-radius:4px;padding:3px 8px;">Not the paper bot — see <b style="color:#888">Paper</b> tab for simulated trades</span>
         </div>
@@ -4126,7 +4150,7 @@ function setPhase(phase) {
   const evfEmptyNote = $('evf-empty-note');
   if (evfEmptyNote) {
     evfEmptyNote.textContent = (empty && evfOn)
-      ? "Extreme vol firebreak is active — some signals were suppressed. Toggle 'Block Extreme Vol' to see all signals."
+      ? "Extreme-volatility safety rule is active, so some historically weak signals were hidden. Turn off 'Block Extreme Volatility' to inspect them."
       : '';
   }
   const evfStatNote = $('evf-stat-note');
@@ -6764,15 +6788,15 @@ function renderReadinessPanel() {
       <div class="br-name">${esc(name)}</div>
       <div class="br-bar-wrap"><div class="br-bar ${barCls}" style="width:${pct}%"></div></div>
       <div class="br-pct" style="color:${pctColor}">${pct}%</div>
-      <div class="br-stats">Trades: ${s.trades_with_pnl} &nbsp;·&nbsp; Avg P&amp;L: ${avgP} &nbsp;·&nbsp; PF: ${pf}${insuf ? ' &nbsp;<span class="br-insuf">(insufficient data)</span>' : ''}</div>
+      <div class="br-stats">Resolved trades: ${s.trades_with_pnl} &nbsp;·&nbsp; Avg result: ${avgP} &nbsp;·&nbsp; Profit factor: ${pf}${insuf ? ' &nbsp;<span class="br-insuf">(still collecting)</span>' : ''}</div>
     </div>`;
   }).join('');
 
   el.innerHTML = `<div class="br-panel">
-    <div class="br-title">Bot Readiness</div>
+    <div class="br-title">Strategy Evidence Readiness</div>
     ${connHTML}
     ${rows}
-    <div class="br-footer">Execution mode: DISABLED &nbsp;·&nbsp; P11 requires review of readiness data before any live orders</div>
+    <div class="br-footer">Real-order execution: DISABLED &nbsp;·&nbsp; Readiness is evidence for review, not permission to trade</div>
   </div>`;
 }
 
@@ -6814,15 +6838,15 @@ function renderStrategyAnalytics() {
         <div class="sa-table-wrap">
           <table class="sa-table">
             <thead><tr>
-              <th>Strategy</th><th>Open</th><th>Closed</th><th>Win%</th><th>Avg P&amp;L</th><th>Total P&amp;L</th><th>Best</th><th>Worst</th><th>Last</th><th></th>
+              <th>Strategy</th><th>Open</th><th>Closed</th><th>Full-win rate</th><th>Avg result</th><th>Total result</th><th>Best symbol</th><th>Worst symbol</th><th>Last signal</th><th></th>
             </tr></thead>
             <tbody>${tableRows}</tbody>
           </table>
         </div>
       </div>
       <div class="sa-panel" style="border-top:0;padding-top:0">
-        <div class="sa-panel-title">Comparison Bars</div>
-        <div class="sa-chart-desc">Top group compares cumulative leveraged P&amp;L; bottom group compares average leveraged P&amp;L per closed trade.</div>
+        <div class="sa-panel-title">Result Comparison</div>
+        <div class="sa-chart-desc">Top group compares total recorded P&amp;L; bottom group compares the average result per closed trade. These figures reflect the leverage captured in each record.</div>
         <div class="sa-bars">
           ${summaryRows.map(r => {
             const pct = Math.min(100, Math.abs(Number(r.total_pnl || 0)) / maxAbsTotal * 100);
@@ -6918,10 +6942,10 @@ function saMetric(label, value, color) {
 function renderRiskGatesPanel() {
   const data = A.riskGates;
   if (A.riskGateLoading && !data) {
-    return `<div class="sa-panel" style="margin:14px 0"><div class="sa-panel-title">Risk Gates</div><div class="sa-empty">Loading risk gates...</div></div>`;
+    return `<div class="sa-panel" style="margin:14px 0"><div class="sa-panel-title">Scanner Safety Rules</div><div class="sa-empty">Loading safety rules...</div></div>`;
   }
   if (data && data.success === false) {
-    return `<div class="sa-panel" style="margin:14px 0"><div class="sa-panel-title">Risk Gates</div><div class="sa-empty">Risk gates unavailable: ${esc(data.error || 'unknown error')}</div></div>`;
+    return `<div class="sa-panel" style="margin:14px 0"><div class="sa-panel-title">Scanner Safety Rules</div><div class="sa-empty">Safety rules unavailable: ${esc(data.error || 'unknown error')}</div></div>`;
   }
   const gates = data && data.gates ? Object.entries(data.gates) : [];
   if (!gates.length) return '';
@@ -7080,7 +7104,7 @@ function renderRiskGatesPanel() {
     const emptyMsg = (!blockedRows && !atRiskRows && !manualRows) ? `<div class="sa-empty" style="margin-top:10px">No symbols breaching the loss gate threshold.</div>` : '';
     symbolLossGatePanel = `
       <div class="sa-panel" style="margin:14px 0">
-        <div class="sa-panel-title">Symbol Loss Gate</div>
+        <div class="sa-panel-title">Automatic Symbol Loss Block</div>
         <div class="sa-chart-desc">Auto-blocks symbols whose recent live P&L breaches the threshold. Blocked symbols get conviction=0 at scan time and are excluded from results. Manual unblock removes the auto-block for ${Number(unblockHours).toFixed(0)} hours.</div>
         <div class="sa-muted" style="font-size:11px;margin-top:6px">${esc(summary)}</div>
         ${blockedSection}
@@ -7118,7 +7142,7 @@ function renderRiskGatesPanel() {
     const empty = rows ? '' : `<div class="sa-empty" style="margin-top:10px">No elevated symbol hazards right now.</div>`;
     symbolHazardPanel = `
       <div class="sa-panel" style="margin:14px 0">
-        <div class="sa-panel-title">Symbol Hazard Register</div>
+        <div class="sa-panel-title">Symbol Risk Watchlist</div>
         <div class="sa-chart-desc">Ranks symbols by repeat live damage, paper-trade damage, worst loss, recent loss-gate pressure, and active overrides. It is read-only unless you manually block a symbol.</div>
         <div class="sa-metric-grid" style="margin-top:8px">
           ${saMetric('Tracked', String(summary.symbols || 0), '')}
@@ -7139,7 +7163,7 @@ function renderRiskGatesPanel() {
 
   return `
     <div class="sa-panel" style="margin:14px 0">
-      <div class="sa-panel-title">Risk Gates</div>
+      <div class="sa-panel-title">Scanner Safety Rules</div>
       <div class="sa-chart-desc">Live scanner safety controls. Block prevents a candidate from appearing as a trade recommendation; shadow lets it through but logs it for audit; off disables the gate.</div>
       <div class="sa-section-stack">${gateCards}</div>
     </div>
@@ -7906,27 +7930,27 @@ function renderHistorySummary(sigs) {
     </div>
     <div class="hist-stat" title="(WIN + PARTIAL) ÷ (WIN + PARTIAL + LOSS) — any profitable outcome">
       <span class="hist-stat-val" style="color:var(--green)">${winRatePositive !== null ? winRatePositive + '%' : '—'}</span>
-      <span class="hist-stat-lbl">Positive Rate</span>
+      <span class="hist-stat-lbl">Profitable or partial</span>
     </div>
     <div class="hist-stat" title="WIN only ÷ (WIN + PARTIAL + LOSS) — full TP hits only">
       <span class="hist-stat-val" style="color:var(--text2)">${winRateStrict !== null ? winRateStrict + '%' : '—'}</span>
-      <span class="hist-stat-lbl">Strict Win Rate</span>
+      <span class="hist-stat-lbl">Full-win rate</span>
     </div>
     <div class="hist-stat" title="Average pnl_pct across all outcomes with real P&L data">
       <span class="hist-stat-val" style="color:${avgPnlColor}">${avgPnlAll != null ? (parseFloat(avgPnlAll) >= 0 ? '+' : '') + avgPnlAll + '%' : '—'}</span>
-      <span class="hist-stat-lbl">Avg P&amp;L / Trade</span>
+      <span class="hist-stat-lbl">Avg result / trade</span>
     </div>
     <div class="hist-stat">
       <span class="hist-stat-val" style="color:var(--green)">${avgPosPnl != null ? '+' + avgPosPnl + '%' : '—'}</span>
-      <span class="hist-stat-lbl">Avg W+P P&amp;L</span>
+      <span class="hist-stat-lbl">Avg profitable result</span>
     </div>
     <div class="hist-stat">
       <span class="hist-stat-val" style="color:var(--red)">${avgLossPnl != null ? avgLossPnl + '%' : '—'}</span>
-      <span class="hist-stat-lbl">Avg Loss P&amp;L</span>
+      <span class="hist-stat-lbl">Avg losing result</span>
     </div>
     <div class="hist-stat">
       <span class="hist-stat-val">${avgW !== null ? avgW : '—'} / ${avgL !== null ? avgL : '—'}</span>
-      <span class="hist-stat-lbl">Avg Conv W/L</span>
+      <span class="hist-stat-lbl">Avg score: wins / losses</span>
     </div>
     <div class="hist-stat">
       <span class="hist-stat-lbl" style="margin-bottom:4px">Actual P&L</span>
@@ -8024,12 +8048,12 @@ function renderHistoryTable(sigs) {
   $('hist-body').innerHTML = `
     <table id="hist-table">
       <thead><tr>
-        ${sortTh('logged_at', 'Time')}${sortTh('symbol', 'Symbol')}${sortTh('direction', 'Dir')}
-        ${isMobile ? '' : `${sortTh('strategy', 'Strategy')}${sortTh('conviction', 'Conv')}<th>Why</th>`}
+        ${sortTh('logged_at', 'Time')}${sortTh('symbol', 'Symbol')}${sortTh('direction', 'Side')}
+        ${isMobile ? '' : `${sortTh('strategy', 'Strategy')}${sortTh('conviction', 'Conviction')}<th>Signal reason</th>`}
         ${sortTh('result', 'Result')}
         ${isMobile ? '' : sortTh('pnl_pct', 'P&L %', 'right')}
-        ${sortTh('pnl', '$P&L', 'right')}
-        ${isMobile ? '' : `${sortTh('r', 'R', 'right')}${sortTh('balance', 'Balance', 'right')}`}
+        ${sortTh('pnl', 'Simulated $ result', 'right')}
+        ${isMobile ? '' : `${sortTh('r', 'Risk units', 'right')}${sortTh('balance', 'Sim balance', 'right')}`}
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
@@ -8916,14 +8940,14 @@ function renderOpenPositions() {
     <table id="pos-table">
       <thead><tr>
         <th onclick="sortPositions('symbol')">Symbol <span class="sort-indicator" data-col="symbol"></span></th>
-        <th onclick="sortPositions('dir')">Dir <span class="sort-indicator" data-col="dir"></span></th>
+        <th onclick="sortPositions('dir')">Side <span class="sort-indicator" data-col="dir"></span></th>
         <th onclick="sortPositions('entry')">Entry <span class="sort-indicator" data-col="entry"></span></th>
         <th onclick="sortPositions('current')">Current <span class="sort-indicator" data-col="current"></span></th>
         <th onclick="sortPositions('pnl')" style="text-align:right">P&amp;L% <span class="sort-indicator" data-col="pnl"></span></th>
-        <th onclick="sortPositions('stop')">→Stop <span class="sort-indicator" data-col="stop"></span></th>
-        <th onclick="sortPositions('tp1')">→TP1 <span class="sort-indicator" data-col="tp1"></span></th>
-        <th>Notional</th>
-        <th>Liq Price</th>
+        <th onclick="sortPositions('stop')">Distance to stop <span class="sort-indicator" data-col="stop"></span></th>
+        <th onclick="sortPositions('tp1')">Distance to target 1 <span class="sort-indicator" data-col="tp1"></span></th>
+        <th>Position exposure</th>
+        <th>Est. liquidation</th>
         <th onclick="sortPositions('age')">Age <span class="sort-indicator" data-col="age"></span></th>
         <th onclick="sortPositions('strategy')">Strategy <span class="sort-indicator" data-col="strategy"></span></th>
         <th>Outcome</th>
@@ -9266,39 +9290,42 @@ function renderOpsWatchdogPanel(ops, compact = false) {
   const checks = Array.isArray(ops.checks) ? ops.checks : [];
   const checkRows = checks.map(c => {
     const cColor = colorMap[c.status] || 'var(--blue)';
+    const cLabel = {pass:'Ready', warn:'Needs review', fail:'Blocked', info:'Information'}[String(c.status || 'info').toLowerCase()] || String(c.status || 'info').replace(/_/g, ' ');
     return `<div style="background:#0b0f15;border:1px solid #1e2530;border-left:3px solid ${cColor};border-radius:5px;padding:9px;min-width:0;">
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">
         <div style="font-size:12px;color:var(--text);font-weight:750;line-height:1.3;">${esc(c.name || 'Check')}</div>
-        <div style="font-size:10px;color:${cColor};font-weight:800;text-transform:uppercase;white-space:nowrap;">${esc(c.status || 'info')}</div>
+        <div style="font-size:10px;color:${cColor};font-weight:800;text-transform:uppercase;white-space:nowrap;">${esc(cLabel)}</div>
       </div>
       <div style="font-family:var(--mono);font-size:12px;color:var(--text2);margin-top:5px;overflow-wrap:anywhere;">${esc(c.value == null ? '—' : String(c.value))}</div>
       ${compact ? '' : `<div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:5px;">${esc(c.detail || '')}</div>`}
       ${c.action && !compact ? `<div style="font-size:10px;color:var(--amber);line-height:1.35;margin-top:5px;">${esc(c.action)}</div>` : ''}
     </div>`;
   }).join('');
-  const metric = (label, value, color = 'var(--text2)') => `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px;">
-    <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px;">${label}</div>
+  const metric = (label, value, color = 'var(--text2)', helpKey = '', subline = '') => `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px;">
+    <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px;display:flex;align-items:center;">${label}${helpKey ? traderHelp(helpKey, `About ${label}`) : ''}</div>
     <div style="font-family:var(--mono);font-size:13px;color:${color};font-weight:800;overflow-wrap:anywhere;">${esc(value == null ? '—' : String(value))}</div>
+    ${subline ? `<div class="metric-subline">${esc(subline)}</div>` : ''}
   </div>`;
   const learnerAge = ops.learner && ops.learner.heartbeat_age_seconds != null
     ? `${Math.round(Number(ops.learner.heartbeat_age_seconds) / 60)}m`
     : 'missing';
   const edge = ops.edge_lab || {};
   const paper = ops.paper || {};
+  const edgeCoverage = coverageDisplay(edge.matched, edge.total, edge.coverage_pct);
   return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:${compact ? '13px' : '16px'};margin-bottom:16px;">
     <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px;">
       <div>
-        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;">Ops Watchdog</div>
-        <div style="font-size:${compact ? '14px' : '16px'};font-weight:800;color:var(--text);">System health and deploy integrity</div>
-        ${compact ? '' : '<div style="font-size:12px;color:var(--muted);margin-top:4px;">This must stay clean before MT7 uses strategy evidence for scale-up decisions.</div>'}
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;">System Health Monitor</div>
+        <div style="font-size:${compact ? '14px' : '16px'};font-weight:800;color:var(--text);">Is MT7 operating normally?</div>
+        ${compact ? '' : '<div style="font-size:12px;color:var(--muted);margin-top:4px;">Checks application health, data freshness, learning services, current-cohort Edge data, and assisted-live readiness.</div>'}
       </div>
       <div style="border:1px solid ${postureColor};color:${postureColor};border-radius:5px;padding:5px 9px;font-size:11px;font-weight:800;text-transform:uppercase;">${posture} · ${Number(ops.fail_count || 0)} fail / ${Number(ops.warn_count || 0)} warn</div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px;margin-bottom:10px;">
-      ${metric('Build', version.git_commit || version.app_sha || 'unknown', version.git_commit || version.app_sha ? 'var(--blue)' : 'var(--amber)')}
-      ${metric('Learner', learnerAge, learnerAge === 'missing' ? 'var(--red)' : 'var(--green)')}
-      ${metric('Edge Coverage', edge.coverage_pct == null ? 'unavailable' : `${edge.coverage_pct}%`, Number(edge.coverage_pct || 0) >= 60 ? 'var(--green)' : 'var(--amber)')}
-      ${metric('P12 Posture', paper.scale_up_ready ? 'review-ready' : 'blocked', paper.scale_up_ready ? 'var(--green)' : 'var(--amber)')}
+      ${metric('App version', version.git_commit || version.app_sha || 'unknown', version.git_commit || version.app_sha ? 'var(--blue)' : 'var(--amber)', '', 'Identifies the code running now')}
+      ${metric('Learning service', learnerAge, learnerAge === 'missing' ? 'var(--red)' : 'var(--green)', '', 'Time since the latest heartbeat')}
+      ${metric('Current-cohort Edge data', edgeCoverage.value, edgeCoverage.state === 'healthy' ? 'var(--green)' : edgeCoverage.state === 'collecting' ? 'var(--blue)' : 'var(--amber)', 'current_edge_coverage', edge.measurement_window_start ? `Paper cohort since ${edge.measurement_window_start}` : 'Current Paper cohort')}
+      ${metric('Assisted-live readiness', paper.scale_up_ready ? 'review-ready' : 'blocked', paper.scale_up_ready ? 'var(--green)' : 'var(--amber)', 'assisted_live_readiness', 'Safety review status—not an execution switch')}
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(${compact ? '210px' : '240px'},1fr));gap:8px;">${checkRows}</div>
   </div>`;
@@ -9499,12 +9526,12 @@ journalctl -u mt-learner -f</pre>`;
     <!-- Shadow Validation -->
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
-        <h3 style="margin:0;font-size:15px;">Agent Shadow Validation</h3>
+        <h3 style="margin:0;font-size:15px;">Are Cipher Analyst Scores Adding Value?</h3>
         ${phaseBadge}
       </div>
       ${progressBar}
       ${critRows}
-      <div style="margin-top:12px;font-size:12px;color:var(--muted);">Phase 2 applies agent delta to conviction. Until then, all agent outputs are stored and studied only.</div>
+      <div style="margin-top:12px;font-size:12px;color:var(--muted);">Analyst score adjustments remain research-only until the required forward evidence passes. They currently cannot change signal conviction.</div>
     </div>
 
     <!-- Agent Findings -->
@@ -9540,15 +9567,15 @@ journalctl -u mt-learner -f</pre>`;
 
     <!-- Tag Attribution -->
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
-      <h3 style="margin:0 0 14px;font-size:15px;">Cipher Tag Attribution</h3>
+      <h3 style="margin:0 0 14px;font-size:15px;">Which Signal Tags Help or Hurt?</h3>
       ${renderTagAttribution()}
     </div>
 
     <!-- Parallel Hypothesis Lab -->
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
       <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
-        <h3 style="margin:0;font-size:15px;">Parallel Hypothesis Lab</h3>
-        <span style="font-size:12px;color:var(--text3);">Shadow-only. No scanner, paper, or live config is changed.</span>
+        <h3 style="margin:0;font-size:15px;">Ideas Being Tested in Parallel</h3>
+        <span style="font-size:12px;color:var(--text3);">Research-only. No scanner, Paper, or live setting is changed.</span>
       </div>
       ${renderParallelHypotheses()}
     </div>
@@ -9564,7 +9591,7 @@ journalctl -u mt-learner -f</pre>`;
 
     <!-- Strategy Proposals -->
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:16px;">
-      <h3 style="margin:0 0 14px;font-size:15px;">Strategy Proposals</h3>
+      <h3 style="margin:0 0 14px;font-size:15px;">Strategy Ideas Awaiting Review</h3>
       ${suggestionsHtml}
     </div>
 
@@ -9606,14 +9633,14 @@ function renderTagAttribution() {
     <td style="padding:4px 8px;font-size:12px;text-align:right;${dc(r.delta_pnl)}">${sign(r.delta_pnl)}%</td>
   </tr>`).join('');
   const tableHead = `<thead><tr>
-    <th style="${thL}">Tag / Regime</th>
-    <th style="${thR}">n</th><th style="${thR}">W+P%</th><th style="${thR}">Avg P&L</th>
-    <th style="${thR}">ΔW+P</th><th style="${thR}">ΔP&L</th>
+    <th style="${thL}">Tag / market regime</th>
+    <th style="${thR}">Sample</th><th style="${thR}">Profitable / partial</th><th style="${thR}">Avg result</th>
+    <th style="${thR}">Rate vs baseline</th><th style="${thR}">Avg result vs baseline</th>
   </tr></thead>`;
   return `
     <div style="font-size:12px;color:var(--text2);margin-bottom:10px;">
-      Baseline &mdash; n=${base.n} &nbsp;·&nbsp; W+P ${fmt(base.wp_rate)}% &nbsp;·&nbsp; Avg P&L ${fmt(base.avg_pnl)}%
-      <span style="color:var(--text3);margin-left:8px;">ΔW+P and ΔP&L vs baseline. Tags with &lt;5 signals omitted.</span>
+      Baseline &mdash; sample ${base.n} &nbsp;·&nbsp; profitable or partial ${fmt(base.wp_rate)}% &nbsp;·&nbsp; average result ${fmt(base.avg_pnl)}%
+      <span style="color:var(--text3);margin-left:8px;">The last two columns show improvement or decline versus baseline. Tags with fewer than 5 signals are omitted.</span>
     </div>
     <div style="overflow-x:auto;">
       <table style="width:100%;border-collapse:collapse;">${tableHead}<tbody>${tagBody}</tbody></table>
@@ -10333,10 +10360,8 @@ const HERMES_METRIC_HELP = {
 
 function hermesMetric(label, value, color, helpText) {
   const tip = helpText || HERMES_METRIC_HELP[label] || '';
-  const tipAttr = tip ? ` title="${esc(tip)}"` : '';
-  const helpBadge = tip ? '<span style="display:inline-flex;align-items:center;justify-content:center;width:13px;height:13px;border:1px solid #2a3545;border-radius:50%;font-size:8px;color:var(--blue);margin-left:4px;vertical-align:1px;">?</span>' : '';
-  return `<div${tipAttr} style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px;min-width:0;cursor:${tip ? 'help' : 'default'};">
-    <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(label)}${helpBadge}</div>
+  return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px;min-width:0;">
+    <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px;display:flex;align-items:center;">${esc(label)}${tip ? infoTip(tip, `About ${label}`) : ''}</div>
     <div style="font-size:16px;font-weight:800;color:${color || 'var(--text)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${value ?? '—'}</div>
   </div>`;
 }
@@ -11783,8 +11808,8 @@ function renderHermesPanel() {
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
       <div>
         <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Hermes Advisory Group</div>
-        <h3 style="font-size:17px;margin:0 0 5px;">Consultancy Portal</h3>
-        <div style="font-size:12px;color:var(--muted);">An independent advisory firm that audits your trading system weekly. Eight specialist desks — performance audit, quant validation, risk &amp; capital, execution quality, Cipher oversight, and a red team — analyze your signal history and paper trade data, then write structured advisory memos with verdicts and recommended experiments. Hermes does not trade and cannot change settings. Its job is to tell you what's working, what's broken, and what to test next.</div>
+        <h3 style="font-size:17px;margin:0 0 5px;">Independent System Audit</h3>
+        <div style="font-size:12px;color:var(--muted);">Hermes reviews recorded signals, simulated trades, risk, execution quality, Cipher research, and statistical evidence. It explains what appears to work, what is weak, and the next controlled test. Hermes cannot place trades or change settings.</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;">
         <span id="hermes-run-status" style="font-size:11px;color:var(--text2);"></span>
@@ -11793,6 +11818,7 @@ function renderHermesPanel() {
       </div>
     </div>
 
+    ${traderIntro('How to use the Hermes audit', 'Treat Hermes as an independent review of MT7—not as a market signal.', 'Read the verdict first, verify the evidence and sample size, then run only one controlled experiment at a time.', 'A positive average result is not proof of future profit. Small samples, changing regimes, leverage, and trading costs can reverse the conclusion.')}
     ${renderOpsWatchdogPanel(I.opsWatchdog, true)}
     ${renderHermesOrgChart(profile)}
     ${renderHermesMemo(memo)}
@@ -11800,17 +11826,17 @@ function renderHermesPanel() {
     ${renderHermesResearchPipeline(Object.assign({}, research, I.researchPipeline || {}))}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px;">
-      ${hermesMetric('Health Score', score + '/100', scoreColor)}
-      ${hermesMetric('Live EV 30D', hermesPct(live.ev_per_trade_pct), Number(live.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)')}
-      ${hermesMetric('Live W+P 30D', hermesRate(live.win_partial_rate), 'var(--text2)')}
-      ${hermesMetric('Paper EV', hermesPct(paper.ev_per_trade_pct), Number(paper.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)')}
-      ${hermesMetric('Paper Closed', paper.closed ?? 0, (paper.closed || 0) >= 50 ? 'var(--green)' : 'var(--amber)')}
-      ${hermesMetric('Active Learner Ideas', (suggestions.active || []).length, (suggestions.active || []).length ? 'var(--amber)' : 'var(--green)')}
+      ${hermesMetric('System health score', score + '/100', scoreColor, 'A combined review score for data freshness, evidence quality, risk, and operational health. It is not a profit forecast.')}
+      ${hermesMetric('30-day avg signal result', hermesPct(live.ev_per_trade_pct), Number(live.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)', TRADER_HELP.expected_value)}
+      ${hermesMetric('30-day profitable / partial', hermesRate(live.win_partial_rate), 'var(--text2)', TRADER_HELP.win_partial_rate)}
+      ${hermesMetric('Paper avg result', hermesPct(paper.ev_per_trade_pct), Number(paper.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)', TRADER_HELP.expected_value)}
+      ${hermesMetric('Paper trades closed', paper.closed ?? 0, (paper.closed || 0) >= 50 ? 'var(--green)' : 'var(--amber)', TRADER_HELP.paper_cohort)}
+      ${hermesMetric('Ideas being tested', (suggestions.active || []).length, (suggestions.active || []).length ? 'var(--amber)' : 'var(--green)', 'Learner suggestions currently collecting shadow or Paper evidence. These are experiments, not approved strategy changes.')}
     </div>
 
     <div style="display:grid;grid-template-columns:minmax(0,1.2fr) minmax(280px,.8fr);gap:12px;margin-bottom:14px;">
       <div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:15px;">
-        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">MT7 Pre-Brief For Hermes</div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Recommended Next Controlled Test</div>
         <div style="font-size:15px;font-weight:800;margin-bottom:8px;color:var(--text);">${esc(rec.title || 'No recommendation')}</div>
         <div style="font-size:13px;color:var(--text2);line-height:1.55;margin-bottom:8px;">${esc(rec.hypothesis || '')}</div>
         <div style="font-size:13px;color:var(--text);line-height:1.55;background:#0b0f15;border-left:3px solid var(--blue);border-radius:4px;padding:10px;margin-bottom:8px;">${esc(rec.experiment || '')}</div>
@@ -11827,24 +11853,24 @@ function renderHermesPanel() {
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:14px;">
       <div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:15px;">
-        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Live Signal Desk</div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Recorded Signal Outcomes</div>
         <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:10px;">
-          ${hermesMetric('All-Time EV', hermesPct(liveAll.ev_per_trade_pct), Number(liveAll.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)')}
-          ${hermesMetric('All-Time Closed', liveAll.closed ?? 0, 'var(--text2)')}
+          ${hermesMetric('All-time avg result', hermesPct(liveAll.ev_per_trade_pct), Number(liveAll.ev_per_trade_pct) >= 0 ? 'var(--green)' : 'var(--red)', TRADER_HELP.expected_value)}
+          ${hermesMetric('All-time closed', liveAll.closed ?? 0, 'var(--text2)', 'Recorded signals with a resolved outcome. Older records may have been created under different strategy settings.')}
         </div>
         ${hermesMiniTable((h.signals && h.signals.strategies) || [], [
           {key:'strategy_key',label:'Strategy'},
-          {key:'n',label:'N'},
-          {key:'ev',label:'EV',format:v=>hermesPct(v)},
-          {key:'total_pnl',label:'Total',format:v=>hermesPct(v)},
+          {key:'n',label:'Sample'},
+          {key:'ev',label:'Avg result',format:v=>hermesPct(v)},
+          {key:'total_pnl',label:'Total result',format:v=>hermesPct(v)},
         ], 'No strategy outcome rows available.')}
       </div>
 
       <div style="background:#10151c;border:1px solid #202936;border-radius:7px;padding:15px;">
-        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Paper Execution Desk</div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Simulated Trade Outcomes</div>
         <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:10px;">
-          ${hermesMetric('W+P Rate', hermesRate(paper.win_partial_rate), 'var(--text2)')}
-          ${hermesMetric('Open', paper.open ?? 0, 'var(--text2)')}
+          ${hermesMetric('Profitable / partial', hermesRate(paper.win_partial_rate), 'var(--text2)', TRADER_HELP.win_partial_rate)}
+          ${hermesMetric('Open simulations', paper.open ?? 0, 'var(--text2)', 'Paper positions that have entered but have not reached a stop, target, or close condition.')}
         </div>
         ${paper.sample_warning ? `<div style="font-size:11px;color:var(--amber);margin-bottom:8px;">${esc(paper.sample_warning)} — keep this as validation, not proof.</div>` : ''}
         ${hermesMiniTable(paper.worst_trades || [], [
@@ -13101,10 +13127,10 @@ function renderEdgeLabPanel() {
   }).join('');
 
   const thead = `<thead><tr>
-    <th style="${thL}">State</th><th style="${thL}">Factor Group</th>
-    <th style="${thR}">Raw / Eff n</th><th style="${thR}">TP Rate</th><th style="${thR}">Edge Δ</th>
-    <th style="${thR}">Net EV</th><th style="${thR}">Confirm EV</th><th style="${thR}">Ambig</th><th style="${thR}">Top-5 Share</th>
-    <th style="${thL}">Template</th><th style="${thL}">Evidence</th>
+    <th style="${thL}">Market state</th><th style="${thL}">Condition type</th>
+    <th style="${thR}" title="Raw observations / conservative independent symbol-day sample">Raw / usable sample</th><th style="${thR}" title="Share of resolved paths that reached the take-profit first">Target-hit rate</th><th style="${thR}" title="Difference from the same-run baseline">Improvement vs baseline</th>
+    <th style="${thR}" title="Average after-cost path result">Avg after-cost result</th><th style="${thR}" title="Average after-cost result in the later confirmation period">Later-period result</th><th style="${thR}" title="Share where target and stop touched in the same candle">Unclear paths</th><th style="${thR}" title="Share of target hits supplied by the five most dominant symbols">Top-5 concentration</th>
+    <th style="${thL}">Target / stop test</th><th style="${thL}">Evidence strength</th>
   </tr></thead>`;
 
   const groupKeys = Object.keys(groups);
@@ -13115,25 +13141,26 @@ function renderEdgeLabPanel() {
   const mlForward = ml.forward_shadow || mlMetrics.forward_shadow || {};
   const mlGates = ml.gates || {};
   const mlChecks = mlGates.checks || {};
+  const mlCoverage = coverageDisplay(ml.joined_count, ml.eligible_count, ml.coverage_pct, 'No eligible trades');
   const mlGateRows = Object.entries(mlChecks).map(([key, passed]) =>
     `<span style="border:1px solid ${passed ? 'rgba(0,230,118,.30)' : 'rgba(255,179,0,.35)'};color:${passed ? 'var(--green)' : 'var(--amber)'};border-radius:4px;padding:3px 6px;font-size:10px;">${passed ? '✓' : '○'} ${esc(key.replace(/_/g, ' '))}</span>`
   ).join('');
   const metaLabelCard = ml.available ? `<div style="background:#0d1117;border:1px solid #253246;border-radius:6px;padding:14px 16px;margin-bottom:14px;">
     <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px;">
       <div>
-        <div style="font-size:10px;color:#7eb8f7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Statistical Meta-Labeler · Shadow Only</div>
-        <div style="font-size:13px;color:var(--text2);line-height:1.45;">Walk-forward probability calibration over paper outcomes and fully closed pre-entry Edge Lab states. It cannot change conviction, filters, sizing, leverage, or execution.</div>
+        <div style="font-size:10px;color:#7eb8f7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Probability Quality Model · Research Only</div>
+        <div style="font-size:13px;color:var(--text2);line-height:1.45;">Tests whether Edge Lab can estimate outcome probabilities on trades it did not train on. It cannot change conviction, filters, sizing, leverage, or execution.</div>
       </div>
       <div style="border:1px solid ${mlGates.evidence_ready ? 'var(--green)' : 'var(--amber)'};color:${mlGates.evidence_ready ? 'var(--green)' : 'var(--amber)'};border-radius:5px;padding:5px 8px;font-size:10px;font-weight:800;text-transform:uppercase;">${mlGates.evidence_ready ? 'Evidence gates passed' : 'Collecting evidence'} · no authority</div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px;">
-      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Coverage</div><div style="font-size:18px;font-weight:800;color:${Number(ml.coverage_pct || 0) >= 95 ? 'var(--green)' : 'var(--amber)'};">${Number(ml.coverage_pct || 0).toFixed(1)}%</div></div>
-      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Walk-forward n</div><div style="font-size:18px;font-weight:800;color:var(--text);">${Number(ml.test_count || 0)}</div></div>
-      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Model Brier</div><div style="font-size:18px;font-weight:800;color:var(--text);">${mlModel.brier == null ? '—' : Number(mlModel.brier).toFixed(3)}</div></div>
-      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Calibration ECE</div><div style="font-size:18px;font-weight:800;color:var(--text);">${mlModel.ece == null ? '—' : Number(mlModel.ece).toFixed(3)}</div></div>
-      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Forward outcomes</div><div style="font-size:18px;font-weight:800;color:${mlForward.ready ? 'var(--green)' : 'var(--text)'};">${Number(mlForward.count || 0)}/${Number(mlForward.target || 50)}</div></div>
-      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Shadow allow</div><div style="font-size:18px;font-weight:800;color:${Number(mlAllow.avg_pnl_pct || 0) > 0 ? 'var(--green)' : 'var(--text)'};">${Number(mlAllow.count || 0)} · ${mlAllow.avg_pnl_pct == null ? '—' : fmtPct(mlAllow.avg_pnl_pct)}</div></div>
-      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Gates</div><div style="font-size:18px;font-weight:800;color:var(--text);">${Number(mlGates.passed || 0)}/${Number(mlGates.total || 0)}</div></div>
+      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;display:flex;align-items:center;">Historical data matched${traderHelp('historical_edge_coverage')}</div><div style="font-size:18px;font-weight:800;color:${mlCoverage.state === 'healthy' ? 'var(--green)' : 'var(--amber)'};">${esc(mlCoverage.value)}</div></div>
+      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Out-of-sample trades</div><div style="font-size:18px;font-weight:800;color:var(--text);">${Number(ml.test_count || 0)}</div><div class="metric-subline">Later trades reserved for testing</div></div>
+      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;display:flex;align-items:center;">Prediction error (Brier)${traderHelp('prediction_error')}</div><div style="font-size:18px;font-weight:800;color:var(--text);">${mlModel.brier == null ? '—' : Number(mlModel.brier).toFixed(3)}</div><div class="metric-subline">Lower is better</div></div>
+      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;display:flex;align-items:center;">Confidence gap (ECE)${traderHelp('calibration_gap')}</div><div style="font-size:18px;font-weight:800;color:var(--text);">${mlModel.ece == null ? '—' : Number(mlModel.ece).toFixed(3)}</div><div class="metric-subline">Lower is better</div></div>
+      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;">Forward results collected</div><div style="font-size:18px;font-weight:800;color:${mlForward.ready ? 'var(--green)' : 'var(--text)'};">${Number(mlForward.count || 0)}/${Number(mlForward.target || 50)}</div><div class="metric-subline">Fresh outcomes after the model run</div></div>
+      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;display:flex;align-items:center;">Research model keeps${traderHelp('shadow_only')}</div><div style="font-size:18px;font-weight:800;color:${Number(mlAllow.avg_pnl_pct || 0) > 0 ? 'var(--green)' : 'var(--text)'};">${Number(mlAllow.count || 0)} · ${mlAllow.avg_pnl_pct == null ? '—' : fmtPct(mlAllow.avg_pnl_pct)}</div><div class="metric-subline">Count · average Paper result</div></div>
+      <div><div style="font-size:10px;color:var(--text3);text-transform:uppercase;display:flex;align-items:center;">Evidence checks${traderHelp('evidence_checks')}</div><div style="font-size:18px;font-weight:800;color:var(--text);">${Number(mlGates.passed || 0)}/${Number(mlGates.total || 0)}</div><div class="metric-subline">Passed / required</div></div>
     </div>
     <div style="display:flex;gap:5px;flex-wrap:wrap;">${mlGateRows}</div>
     <div style="font-size:10px;color:var(--text3);margin-top:9px;">Run ${Number(ml.run_id || 0)} · ${esc(ml.version || '')} · ${esc(ml.generated_at || '')}</div>
@@ -13143,17 +13170,17 @@ function renderEdgeLabPanel() {
   const challengerCard = ml2.available ? `<div style="background:#0d1117;border:1px solid #253246;border-radius:6px;padding:14px 16px;margin-bottom:14px;">
     <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:flex-start;">
       <div>
-        <div style="font-size:10px;color:#a78bfa;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">V2 Net-Utility Challenger · Shadow Only</div>
-        <div style="font-size:12px;color:var(--text2);line-height:1.5;">Predicts leverage-normalized net Paper P&L and keeps trades from the same hourly entry episode in one temporal split. V1 remains frozen and untouched.</div>
+        <div style="font-size:10px;color:#a78bfa;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Net-Result Challenger Model · Research Only</div>
+        <div style="font-size:12px;color:var(--text2);line-height:1.5;">Tests whether a newer model estimates after-cost Paper outcomes better than a simple baseline while preventing closely related entries from leaking across the test split.</div>
       </div>
-      <div style="border:1px solid ${ml2Gates.evidence_ready ? 'var(--green)' : 'var(--amber)'};color:${ml2Gates.evidence_ready ? 'var(--green)' : 'var(--amber)'};border-radius:5px;padding:5px 8px;font-size:10px;font-weight:800;">${Number(ml2Gates.passed || 0)}/${Number(ml2Gates.total || 0)} GATES · NO AUTHORITY</div>
+      <div style="border:1px solid ${ml2Gates.evidence_ready ? 'var(--green)' : 'var(--amber)'};color:${ml2Gates.evidence_ready ? 'var(--green)' : 'var(--amber)'};border-radius:5px;padding:5px 8px;font-size:10px;font-weight:800;">${Number(ml2Gates.passed || 0)}/${Number(ml2Gates.total || 0)} EVIDENCE CHECKS · RESEARCH ONLY</div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:10px;">
-      ${saMetric('Grouped test n', Number(ml2Metrics.test_count || 0), '')}
-      ${saMetric('RMSE', ml2Metrics.rmse == null ? '—' : Number(ml2Metrics.rmse).toFixed(3), '')}
-      ${saMetric('Baseline RMSE', ml2Metrics.baseline_rmse == null ? '—' : Number(ml2Metrics.baseline_rmse).toFixed(3), '')}
-      ${saMetric('Shadow allow', Number(ml2Metrics.shadow_allow_count || 0), '')}
-      ${saMetric('Allow net utility', ml2Metrics.shadow_allow_avg_target == null ? '—' : fmtPct(ml2Metrics.shadow_allow_avg_target), Number(ml2Metrics.shadow_allow_avg_target || 0) > 0 ? 'var(--green)' : '')}
+      ${saMetric('Out-of-sample groups', Number(ml2Metrics.test_count || 0), '')}
+      ${saMetric('Model error (RMSE)', ml2Metrics.rmse == null ? '—' : Number(ml2Metrics.rmse).toFixed(3), '')}
+      ${saMetric('Simple baseline error', ml2Metrics.baseline_rmse == null ? '—' : Number(ml2Metrics.baseline_rmse).toFixed(3), '')}
+      ${saMetric('Research model keeps', Number(ml2Metrics.shadow_allow_count || 0), '')}
+      ${saMetric('Kept-trade avg net result', ml2Metrics.shadow_allow_avg_target == null ? '—' : fmtPct(ml2Metrics.shadow_allow_avg_target), Number(ml2Metrics.shadow_allow_avg_target || 0) > 0 ? 'var(--green)' : '')}
     </div>
   </div>` : '';
   const validations = strategyValidation.validations || [];
@@ -13177,16 +13204,16 @@ function renderEdgeLabPanel() {
   const strategyCard = strategyValidation.available ? `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:14px;">
     <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">
       <div>
-        <div style="font-size:13px;font-weight:700;color:var(--text);">MT7 Strategy-Conditioned Validation</div>
-        <div style="font-size:11px;color:var(--text3);line-height:1.5;margin-top:3px;">Net Paper performance inside the same strategy and direction, compared with trades that did not have the condition. Observational and review-only.</div>
+        <div style="font-size:13px;font-weight:700;color:var(--text);">Does This Condition Help a Strategy?</div>
+        <div style="font-size:11px;color:var(--text3);line-height:1.5;margin-top:3px;">Compares simulated trades from the same strategy and side when a condition was present versus absent. This is observational evidence for a future test—not permission to change the strategy.</div>
       </div>
-      <div style="font-size:10px;color:var(--amber);border:1px solid rgba(245,158,11,.35);padding:5px 8px;border-radius:5px;">${drafts.length} gated draft${drafts.length === 1 ? '' : 's'} · no automatic apply</div>
+      <div style="font-size:10px;color:var(--amber);border:1px solid rgba(245,158,11,.35);padding:5px 8px;border-radius:5px;">${drafts.length} idea${drafts.length === 1 ? '' : 's'} awaiting evidence · no automatic changes</div>
     </div>
-    ${validationRows ? `<div style="overflow-x:auto;margin-top:10px;"><table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr><th style="${thL}">Strategy</th><th style="${thL}">Condition</th><th style="${thR}">n</th><th style="${thR}">Net uplift</th><th style="${thR}">PF</th><th style="${thL}">Evidence</th></tr></thead><tbody>${validationRows}</tbody></table></div>` : `<div style="font-size:11px;color:var(--text3);margin-top:10px;">No condition has the minimum Paper evidence yet.</div>`}
+    ${validationRows ? `<div style="overflow-x:auto;margin-top:10px;"><table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr><th style="${thL}">Strategy / side</th><th style="${thL}">Condition</th><th style="${thR}">Sample</th><th style="${thR}">Avg-result improvement</th><th style="${thR}">Profit factor</th><th style="${thL}">Evidence strength</th></tr></thead><tbody>${validationRows}</tbody></table></div>` : `<div style="font-size:11px;color:var(--text3);margin-top:10px;">No condition has enough comparable simulated trades yet.</div>`}
     <div style="border-top:1px solid var(--border);margin-top:12px;padding-top:10px;">
-      <div style="font-size:11px;font-weight:700;color:var(--text);">Rejected-candidate counterfactuals</div>
-      <div style="font-size:10px;color:var(--text3);line-height:1.45;margin-top:3px;">Matches every instrumented strategy gate—not only funding arbitrage—to a fully closed, pre-candidate v2 path. Coverage ${Number(blockedPaths.coverage_pct || 0).toFixed(1)}% (${Number(blockedPaths.matched_candidates || 0)}/${Number(blockedPaths.candidate_count || 0)} candidates).</div>
-      ${blockedPathRows ? `<div style="overflow-x:auto;margin-top:8px;"><table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr><th style="${thL}">Strategy</th><th style="${thL}">Gate</th><th style="${thL}">Path</th><th style="${thR}">Resolved n</th><th style="${thR}">Net EV</th></tr></thead><tbody>${blockedPathRows}</tbody></table></div>` : `<div style="font-size:10px;color:var(--text3);margin-top:6px;">No v2 counterfactual paths are mature yet. The version upgrader will fill this progressively.</div>`}
+      <div style="font-size:11px;font-weight:700;color:var(--text);">What Happened to Rejected Setups?</div>
+      <div style="font-size:10px;color:var(--text3);line-height:1.45;margin-top:3px;">For every instrumented strategy—not only funding arbitrage—MT7 checks the later path of setups blocked before entry. Data matched ${Number(blockedPaths.coverage_pct || 0).toFixed(1)}% (${Number(blockedPaths.matched_candidates || 0)}/${Number(blockedPaths.candidate_count || 0)}) of rejected setups.</div>
+      ${blockedPathRows ? `<div style="overflow-x:auto;margin-top:8px;"><table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr><th style="${thL}">Strategy / side</th><th style="${thL}">Blocking rule</th><th style="${thL}">Target / stop test</th><th style="${thR}">Resolved sample</th><th style="${thR}">Avg after-cost result</th></tr></thead><tbody>${blockedPathRows}</tbody></table></div>` : `<div style="font-size:10px;color:var(--text3);margin-top:6px;">No rejected setups have enough fully resolved later paths yet.</div>`}
     </div>
     <div style="font-size:10px;color:var(--text3);margin-top:9px;">Every generated draft is filter-only: leverage change none, position-size change none, exposure change none. Any future risk increase requires an explicit, separately quantified user decision.</div>
   </div>` : '';
@@ -13206,6 +13233,12 @@ function renderEdgeLabPanel() {
   }).join('') : '';
 
   return `<div style="max-width:1180px;margin:0 auto;">
+    ${traderIntro(
+      'How to use Edge Lab',
+      'Edge Lab replays historical market states and tests research models without changing MT7 trading behavior.',
+      'Finding conditions worth forward-testing and identifying conditions that consistently damage results.',
+      'A high coverage number or attractive historical result does not by itself prove model accuracy, profitability, or readiness.'
+    )}
     ${metaLabelCard}
     ${challengerCard}
     ${strategyCard}
@@ -13233,13 +13266,13 @@ function renderEdgeLabPanel() {
           <div style="font-size:10px;color:var(--text3);margin-top:2px;">${esc(meta.generated_at || 'generation time unavailable')}</div>
         </div>
         <div>
-          <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">V2 Coverage</div>
-          <div style="font-size:13px;color:${Number(meta.label_v2_coverage_pct || 0) >= 95 ? 'var(--green)' : 'var(--amber)'};margin-top:4px;">Labels ${Number(meta.label_v2_coverage_pct || 0).toFixed(1)}% · Features ${Number(meta.feature_v2_coverage_pct || 0).toFixed(1)}%</div>
-          <div style="font-size:10px;color:var(--text3);margin-top:2px;">${Number(meta.label_v2_coverage_pct || 0) >= 95 && Number(meta.feature_v2_coverage_pct || 0) >= 95 ? 'Eligible for candidate evidence tiers' : 'All factor rows forced to research only during migration'}</div>
+          <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">Historical Data Upgrade</div>
+          <div style="font-size:13px;color:${Number(meta.label_v2_coverage_pct || 0) >= 95 ? 'var(--green)' : 'var(--amber)'};margin-top:4px;">Outcomes ${Number(meta.label_v2_coverage_pct || 0).toFixed(1)}% · Inputs ${Number(meta.feature_v2_coverage_pct || 0).toFixed(1)}%</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:2px;">${Number(meta.label_v2_coverage_pct || 0) >= 95 && Number(meta.feature_v2_coverage_pct || 0) >= 95 ? 'Enough upgraded rows for evidence grading' : 'Older rows remain research-only until upgraded'}</div>
         </div>
       </div>
-      <div style="font-size:11px;color:var(--text3);margin-top:10px;">Edge Δ uses the current-run baseline. Net EV deducts ${Number(meta.round_trip_cost_pct || 0).toFixed(3)}% for fee/slippage assumptions; generic factor funding included: ${meta.funding_included ? 'yes' : 'no'}. Effective n is a conservative symbol-day count, not raw overlapping candles.</div>
-      <div style="font-size:10px;color:var(--amber);margin-top:5px;">Horizon warning: Edge Lab factor paths resolve at ${Number(meta.path_horizon_hours || 24)}h while MT7 live/manual outcomes may remain open to ${Number(meta.live_outcome_horizon_hours || 84)}h. These are separate evidence windows, not interchangeable performance figures.</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:10px;">“Improvement vs baseline” compares a state with the same research run’s average. Average results deduct ${Number(meta.round_trip_cost_pct || 0).toFixed(3)}% for assumed fees and slippage. Funding is included only where explicitly stated. The usable sample counts conservative symbol-days, not overlapping candles.</div>
+      <div style="font-size:10px;color:var(--amber);margin-top:5px;">Time-window warning: Edge Lab resolves paths after ${Number(meta.path_horizon_hours || 24)} hours, while manually tracked outcomes may stay open for ${Number(meta.live_outcome_horizon_hours || 84)} hours. Do not compare these performance figures as if they used the same exit rules.</div>
     </div>
 
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 16px;margin-bottom:14px;">
@@ -13263,7 +13296,7 @@ function renderEdgeLabPanel() {
         </div>
       </div>
       <div style="border-top:1px solid var(--border);margin-top:10px;padding-top:9px;font-size:11px;color:var(--text3);line-height:1.5;">
-        Practical read: prioritize positive confirmation Net EV, adequate effective n, low ambiguity, controlled q-value, and independent Paper confirmation. A green Edge Δ alone is not evidence of deployable profit.
+        Practical read: prioritize a positive later-period result, a meaningful independent sample, few unclear paths, low symbol concentration, and confirmation in fresh Paper trades. One green historical number is not deployable evidence.
       </div>
     </div>
 
@@ -13292,14 +13325,14 @@ function renderIntelSubTabs() {
   const recoveryCount = Number(((I.disabledStrategyShadow || {}).summary || {}).reenable_candidate_count || 0);
   const tabs = [
     ['overview', 'Overview'],
-    ['firm', 'The Firm'],
+    ['firm', 'Analyst Team'],
     ['reports', 'Reports'],
     ['trade_buddy', 'Trade Buddy'],
     ['missed', 'Missed Moves'],
-    ['suggestions', `Suggestions${sugCount ? ` <span id="suggestions-badge" style="background:#ef4444;color:#fff;border-radius:8px;padding:1px 5px;font-size:9px;margin-left:4px;">${sugCount}</span>` : ''}`],
-    ['recovery', `Recovery${recoveryCount ? ` <span style="background:#22c55e;color:#000;border-radius:8px;padding:1px 5px;font-size:9px;margin-left:4px;">${recoveryCount}</span>` : ''}`],
-    ['hermes', 'Hermes'],
-    ['edge_lab', 'Edge Lab'],
+    ['suggestions', `Strategy Ideas${sugCount ? ` <span id="suggestions-badge" style="background:#ef4444;color:#fff;border-radius:8px;padding:1px 5px;font-size:9px;margin-left:4px;">${sugCount}</span>` : ''}`],
+    ['recovery', `Strategy Recovery${recoveryCount ? ` <span style="background:#22c55e;color:#000;border-radius:8px;padding:1px 5px;font-size:9px;margin-left:4px;">${recoveryCount}</span>` : ''}`],
+    ['hermes', 'Hermes Audit'],
+    ['edge_lab', 'Edge Lab Research'],
   ];
   const firm = I.roster && I.roster.firm ? I.roster.firm : {name:'Cipher Research Group', tagline:'We read the market structure. Not its noise.'};
   return `<div style="max-width:1180px;margin:0 auto 14px;">
@@ -13654,9 +13687,9 @@ async function expandAgentBio(key) {
   `;
 }
 
-function reportMetric(label, value) {
+function reportMetric(label, value, help = '') {
   return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;">
-    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">${label}</div>
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;display:flex;align-items:center;">${esc(label)}${help ? infoTip(help, `About ${label}`) : ''}</div>
     <div style="font-size:18px;font-weight:700;margin-top:3px;">${value}</div>
   </div>`;
 }
@@ -13664,17 +13697,171 @@ function reportMetric(label, value) {
 function reportTable(rows, cols, emptyText) {
   if (!rows || rows.length === 0) return `<div style="color:var(--muted);font-size:13px;">${emptyText || 'No data yet.'}</div>`;
   return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
-    <thead><tr>${cols.map(c => `<th style="text-align:left;color:var(--muted);font-weight:400;padding:6px;border-bottom:1px solid var(--border);">${c.label}</th>`).join('')}</tr></thead>
+    <thead><tr>${cols.map(c => `<th style="text-align:left;color:var(--muted);font-weight:400;padding:6px;border-bottom:1px solid var(--border);"><span style="display:inline-flex;align-items:center;">${esc(c.label)}${c.help ? infoTip(c.help, `About ${c.label}`) : ''}</span></th>`).join('')}</tr></thead>
     <tbody>${rows.map(r => `<tr>${cols.map(c => `<td style="padding:7px 6px;border-bottom:1px solid rgba(255,255,255,.04);">${esc(c.format ? c.format(r[c.key], r) : (r[c.key] ?? '—'))}</td>`).join('')}</tr>`).join('')}</tbody>
   </table></div>`;
 }
 
-function infoTip(text, label = 'About this section') {
-  if (!text) return '';
+const TRADER_HELP = {
+  conviction: {
+    meaning: 'MT7’s 0–100 score for how many independent signal inputs agree.',
+    use: 'Use it to rank otherwise valid setups. It is not a probability of profit.',
+    read: 'Higher means stronger alignment; always review structure, invalidation, liquidity, and signal age.',
+    limit: 'Conviction does not override a risk gate or guarantee a profitable outcome.',
+  },
+  expected_value: {
+    meaning: 'Average outcome per resolved trade in the stated sample. MT7 may abbreviate this as EV.',
+    use: 'Use it to compare strategies or conditions only when their samples, costs, and time windows are comparable.',
+    read: 'Positive is favorable; sample size, outliers, fees, slippage, and drawdown still matter.',
+    limit: 'Historical or Paper EV is evidence, not a promise of future profit.',
+  },
+  win_partial_rate: {
+    meaning: 'The percentage of resolved trades that finished as a full win or a partial win.',
+    use: 'Shows how often a method produced some profit, while average outcome shows how large those results were.',
+    read: 'Always read this beside sample size, average P&L, profit factor, and drawdown.',
+    limit: 'A high rate can still lose money if losses are much larger than wins.',
+  },
+  profit_factor: {
+    meaning: 'Gross winning dollars divided by gross losing dollars for the stated sample.',
+    use: 'Shows whether total gains outweighed total losses.',
+    read: 'Above 1 means gains exceeded losses; MT7 generally wants at least 1.25 before readiness review.',
+    limit: 'Small samples and one unusually large winner can inflate this figure.',
+  },
+  drawdown: {
+    meaning: 'The decline from a prior equity peak to a later low.',
+    use: 'Shows how much capital the approach gave back while producing its returns.',
+    read: 'Lower is safer. Read both percentage and dollar drawdown when available.',
+    limit: 'Paper drawdown may understate live slippage, gaps, liquidation risk, and operational failures.',
+  },
+  current_edge_coverage: {
+    meaning: 'The share of closed trades in the current Paper cohort that have a usable Edge Lab snapshot from before entry.',
+    use: 'Tells you whether current forward results can be connected to the market state Edge Lab measured.',
+    read: 'A value such as 8/10 means eight of ten eligible trades matched. 0/0 means collecting—not zero-quality coverage.',
+    limit: 'This is current-cohort attribution coverage, not model accuracy or historical database coverage.',
+  },
+  historical_edge_coverage: {
+    meaning: 'The share of historical eligible trades that could be joined to a usable pre-entry Edge Lab state for the latest model run.',
+    use: 'Shows whether the historical training/evaluation sample has enough feature data.',
+    read: 'Read the numerator, denominator, run time, and date window together.',
+    limit: 'High join coverage does not mean the model is accurate, profitable, or ready to influence trading.',
+  },
+  prediction_error: {
+    meaning: 'Brier score: the average squared error of the model’s probability forecasts.',
+    use: 'Compares how accurate and well-calibrated probability models are.',
+    read: 'Lower is better. Compare it with a simple baseline and out-of-sample results.',
+    limit: 'A low training error is not sufficient; forward performance and drift checks must also pass.',
+  },
+  calibration_gap: {
+    meaning: 'Expected Calibration Error (ECE): the gap between stated confidence and how often outcomes actually occurred.',
+    use: 'Shows whether a model saying “70%” behaves like 70% over many comparable cases.',
+    read: 'Lower is better; MT7’s research gate currently targets 0.10 or less.',
+    limit: 'Calibration can change across regimes and requires a meaningful forward sample.',
+  },
+  shadow_only: {
+    meaning: 'A research-only calculation that records what would have happened without changing trading behavior.',
+    use: 'Lets MT7 test an idea safely before Paper or live consideration.',
+    read: 'Shadow results can support further testing but cannot create orders, change leverage, or resize positions.',
+    limit: 'Counterfactual fills and costs may differ from real execution.',
+  },
+  evidence_checks: {
+    meaning: 'Predefined tests that must pass before MT7 treats a research result as mature enough for review.',
+    use: 'Prevents one attractive statistic from bypassing sample, stability, cost, or safety requirements.',
+    read: 'A result such as 2/10 means two of ten checks currently pass.',
+    limit: 'Passing all checks permits human review; it does not automatically approve or deploy a change.',
+  },
+  regime: {
+    meaning: 'A measured description of the current market environment, such as trending, choppy, risk-on, or risk-off.',
+    use: 'Helps decide which strategy types deserve preference or caution.',
+    read: 'Read the label with confidence, breadth, sample size, and the evidence that would invalidate it.',
+    limit: 'A regime is context, not an exact price forecast or standalone entry.',
+  },
+  transfer_risk: {
+    meaning: 'The chance that a research finding fails when moved from its original market, timeframe, dataset, or backtest into MT7.',
+    use: 'Flags ideas that need stronger testing for crypto-perp leverage, fees, slippage, and changing liquidity.',
+    read: 'Higher risk means more validation is required before Paper consideration.',
+    limit: 'Low transfer risk does not prove profitability.',
+  },
+  evidence_tension: {
+    meaning: 'A map of where sources support, caution against, or contradict the same research idea.',
+    use: 'Prevents MT7 from presenting one-sided research as settled fact.',
+    read: 'More tension means the idea needs investigation—not that it has more trading edge.',
+    limit: 'Source disagreement can reflect different markets, periods, definitions, or data quality.',
+  },
+  assisted_live_readiness: {
+    meaning: 'Whether the current Paper policy and safety controls have enough evidence for a human-assisted live design review.',
+    use: 'Shows what remains before any real-order workflow should be considered.',
+    read: 'Blocked means at least one required safety or evidence condition has not passed.',
+    limit: 'Review-ready never enables silent automation; explicit order confirmation and the master live gate still apply.',
+  },
+  paper_cohort: {
+    meaning: 'A forward group of Paper trades collected under one clearly identified policy and start time.',
+    use: 'Keeps current-policy evidence separate from older trades produced under different settings.',
+    read: 'Judge it by closed sample, duration, net outcome, profit factor, drawdown, and concentration.',
+    limit: 'Do not blend older cohorts into current-policy claims.',
+  },
+  data_states: {
+    meaning: 'MT7 separates Healthy, Collecting, Needs Review, Blocked, Stale, Unavailable, and Error.',
+    use: 'This prevents missing evidence from being mistaken for a real zero or a failed calculation.',
+    read: 'Collecting means wait for observations; Unavailable means a source is missing; Error means a calculation or request failed.',
+    limit: 'Only a measured zero should be displayed as 0.',
+  },
+};
+
+function infoTip(help, label = 'About this section') {
+  if (!help) return '';
+  const spec = typeof help === 'string' ? {meaning: help} : help;
+  const rows = [
+    ['Meaning', spec.meaning],
+    ['Why traders care', spec.use],
+    ['How to read it', spec.read],
+    ['Important limit', spec.limit],
+  ].filter(([, value]) => value).map(([key, value]) => `
+    <div class="info-tip-row">
+      <div class="info-tip-key">${esc(key)}</div>
+      <div>${esc(value)}</div>
+    </div>`).join('');
   return `<details class="info-tip">
     <summary aria-label="${esc(label)}" title="${esc(label)}">i</summary>
-    <div class="info-tip-pop">${esc(text)}</div>
+    <div class="info-tip-pop">${rows}</div>
   </details>`;
+}
+
+function traderHelp(key, label = '') {
+  const spec = TRADER_HELP[key];
+  return spec ? infoTip(spec, label || `About ${key.replace(/_/g, ' ')}`) : '';
+}
+
+function traderIntro(title, meaning, use, limit = '') {
+  return `<div class="trader-intro">
+    <div>
+      <div class="trader-intro-title">${esc(title)}</div>
+      <div class="trader-intro-text">${esc(meaning)}</div>
+    </div>
+    <div>
+      <div class="trader-intro-use"><b>Use it for:</b> ${esc(use)}</div>
+      ${limit ? `<div class="trader-intro-limit"><b>Do not assume:</b> ${esc(limit)}</div>` : ''}
+    </div>
+  </div>`;
+}
+
+function dataStateBadge(state, label = '') {
+  const normalized = String(state || 'info').toLowerCase().replace(/\s+/g, '_');
+  const cls = {
+    pass:'healthy', healthy:'healthy', measured:'healthy',
+    collecting:'collecting', warming:'collecting', info:'info',
+    review:'review', warn:'review', needs_review:'review', stale:'stale',
+    blocked:'blocked', fail:'error', error:'error', unavailable:'unavailable',
+  }[normalized] || 'info';
+  const text = label || normalized.replace(/_/g, ' ');
+  return `<span class="data-state ${cls}">${esc(text)}</span>`;
+}
+
+function coverageDisplay(matched, total, pct, emptyLabel = 'Collecting') {
+  const n = Number(matched || 0);
+  const d = Number(total || 0);
+  if (!d) return {value: `${emptyLabel} · ${n}/${d}`, state:'collecting'};
+  const measuredPct = pct == null ? (n / d * 100) : Number(pct);
+  return {value: `${measuredPct.toFixed(1)}% · ${n}/${d}`, state: measuredPct >= 60 ? 'healthy' : 'review'};
 }
 
 function sectionBlock(title, body, help = '') {
@@ -14272,9 +14459,9 @@ function renderReportPanel() {
     ${sectionBlock('Session Breakdown', reportTable(Object.entries(d.sessions || {}).map(([session,v]) => ({session, count:v.count, symbols:(v.symbols||[]).slice(0,5).join(', ')})), [{key:'session',label:'Session'},{key:'count',label:'Signals'},{key:'symbols',label:'Leaders'}], 'No session data yet.'))}
     ${sectionBlock('Explosive Move Autopsy', d.explosive_move ? `<div style="font-size:13px;line-height:1.6;"><b>${esc(d.explosive_move.symbol)}</b> moved ${Number(d.explosive_move.change_24h_pct||0).toFixed(2)}% with funding ${Number(d.explosive_move.funding_rate||0).toFixed(5)}.</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:10px;"><div style="color:var(--muted);font-size:12px;">Kenny: ${esc(n.funding_autopsy || 'Funding note generated from report data.')}</div><div style="color:var(--muted);font-size:12px;">Niobe: ${esc(n.microstructure_autopsy || 'Microstructure note generated from report data.')}</div><div style="color:var(--muted);font-size:12px;">Ghost: ${esc(n.cross_venue_autopsy || 'Cross-venue note generated from report data.')}</div></div>` : '<div style="color:var(--muted);font-size:13px;">No live mover snapshot available.</div>')}
     ${sectionBlock("What's Coiling", reportTable(d.whats_coiling, [{key:'symbol',label:'Pair'},{key:'funding_rate',label:'Funding',format:v=>Number(v||0).toFixed(5)},{key:'change_24h_pct',label:'Move %',format:v=>Number(v||0).toFixed(2)},{key:'watch',label:'Watch'}], 'No coiling setups detected.'), 'Highlights names where extreme carry has not yet resolved through price. Wait for structure, volume, and a fresh MT7 signal.')}
-    ${sectionBlock('Agent Disagreement Log', reportTable(d.disagreements, [{key:'symbol',label:'Pair'},{key:'direction',label:'Side'},{key:'conviction',label:'Conviction'},{key:'disagreement_score',label:'Score'}], 'No major disagreements logged.'), 'Shows where Narrative and Structural evidence materially diverged. Disagreement is a reason for caution and investigation, not a contrarian signal.')}
-    ${sectionBlock('Strategy Performance by Regime', reportTable(d.strategy_regime_perf, [{key:'strategy',label:'Strategy'},{key:'regime',label:'Regime'},{key:'sample',label:'N'},{key:'win',label:'W'},{key:'loss',label:'L'},{key:'partial',label:'P'},{key:'avg_pnl_pct',label:'Avg P&L',format:v=>v===null||v===undefined?'—':Number(v).toFixed(2)+'%'}], 'No closed strategy/regime outcomes yet.'), 'Compares realized outcomes within each strategy/regime bucket. Small samples are descriptive only and must pass paper cohort gates before promotion.')}
-    ${sectionBlock('Paper Desk Performance', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;">${reportMetric('Open', (d.paper_desk||{}).open ?? 0)}${reportMetric('Closed', (d.paper_desk||{}).closed ?? 0)}${reportMetric('W+P Rate', Number((d.paper_desk||{}).win_rate_pct||0).toFixed(1)+'%')}${reportMetric('Expectancy', Number((d.paper_desk||{}).avg_pnl_pct||0).toFixed(2)+'%')}${reportMetric('Profit Factor', (d.paper_desk||{}).profit_factor ?? '—')}${reportMetric('Realized P&L', '$'+Number((d.paper_desk||{}).realized_pnl_usd||0).toFixed(2))}${reportMetric('Max Drawdown', '$'+Number((d.paper_desk||{}).max_drawdown_usd||0).toFixed(2))}${reportMetric('Compounded', (d.paper_desk||{}).compounded_trades ?? 0)}</div>`, 'Shows recent net expectancy, profit factor, realized dollar P&L, and drawdown. These are descriptive paper outcomes—not permission to raise leverage or size.')}
+    ${sectionBlock('Analyst Disagreement Log', reportTable(d.disagreements, [{key:'symbol',label:'Pair'},{key:'direction',label:'Side'},{key:'conviction',label:'Conviction',help:TRADER_HELP.conviction},{key:'disagreement_score',label:'Disagreement',help:'How far the narrative and market-structure analysts are from agreement. Higher means more unresolved conflict and usually less confidence.'}], 'No major disagreements logged.'), 'Shows where Narrative and Structural evidence materially diverged. Disagreement is a reason for caution and investigation, not a contrarian signal.')}
+    ${sectionBlock('Strategy Results by Market Regime', reportTable(d.strategy_regime_perf, [{key:'strategy',label:'Strategy'},{key:'regime',label:'Market regime',help:TRADER_HELP.regime},{key:'sample',label:'Sample'},{key:'win',label:'Wins'},{key:'loss',label:'Losses'},{key:'partial',label:'Partials'},{key:'avg_pnl_pct',label:'Avg result',help:TRADER_HELP.expected_value,format:v=>v===null||v===undefined?'—':Number(v).toFixed(2)+'%'}], 'No closed strategy/regime outcomes yet.'), 'Compares recorded outcomes within each strategy and market-regime bucket. Small samples describe what happened; they do not prove a repeatable edge.')}
+    ${sectionBlock('Simulated Trading Performance', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;">${reportMetric('Open simulations', (d.paper_desk||{}).open ?? 0)}${reportMetric('Closed simulations', (d.paper_desk||{}).closed ?? 0)}${reportMetric('Profitable / partial', Number((d.paper_desk||{}).win_rate_pct||0).toFixed(1)+'%', TRADER_HELP.win_partial_rate)}${reportMetric('Avg result', Number((d.paper_desk||{}).avg_pnl_pct||0).toFixed(2)+'%', TRADER_HELP.expected_value)}${reportMetric('Profit factor', (d.paper_desk||{}).profit_factor ?? '—', TRADER_HELP.profit_factor)}${reportMetric('Closed P&L', '$'+Number((d.paper_desk||{}).realized_pnl_usd||0).toFixed(2))}${reportMetric('Largest drawdown', '$'+Number((d.paper_desk||{}).max_drawdown_usd||0).toFixed(2), TRADER_HELP.drawdown)}${reportMetric('Compounded trades', (d.paper_desk||{}).compounded_trades ?? 0, 'Closed simulated trades whose sizing used realized equity rather than only the fixed starting base.')}</div>`, 'Shows recent simulated outcomes after configured costs. Use the sample, average result, profit factor, and drawdown together. These figures are not permission to raise leverage or position size.')}
     ${I.report.type === 'weekly' ? (() => {
       const spotKey = d.spotlight_key || d.spotlight_analyst_key || 'funding';
       const spotAgent = (I.roster && I.roster.agents && I.roster.agents[spotKey]) || {};
@@ -15005,7 +15192,7 @@ async function loadPaperTrading() {
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px;">
         <div>
           <div style="font-size:15px;font-weight:700;color:var(--text);letter-spacing:.04em">PAPER TRADING</div>
-          <div style="font-size:11px;color:var(--text3);margin-top:2px">Simulated bot — validates order flow confirmation before live trading</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px">Forward-test MT7 with simulated entries, exits, costs, and position sizing—no real orders</div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;">
           <span style="font-size:12px;color:${enabled ? '#22c55e' : '#555'}">${enabled ? '● RUNNING' : '○ PAUSED'}</span>
@@ -15025,8 +15212,8 @@ async function loadPaperTrading() {
     const explainerHtml = `
       <div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 12px;margin-bottom:14px;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
         <div>
-          <div style="font-size:12px;font-weight:800;color:#ccc;letter-spacing:.04em;">CURRENT PAPER POLICY TRIAL</div>
-          <div style="font-size:11px;color:#777;margin-top:2px;">Paper is the simulation lane for the execution policy that may later become assisted live.</div>
+          <div style="font-size:12px;font-weight:800;color:#ccc;letter-spacing:.04em;">CURRENT SIMULATED POLICY TRIAL</div>
+          <div style="font-size:11px;color:#777;margin-top:2px;">Use the current cohort to judge whether today’s strategy, filters, and sizing work together under forward conditions.</div>
         </div>
         <span style="font-size:10px;color:#555;background:#111;border:1px solid #222;border-radius:4px;padding:3px 8px;">No real orders · live automation locked</span>
       </div>`;
@@ -15043,26 +15230,26 @@ async function loadPaperTrading() {
 
     const configHtml = `
       <div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:12px;margin-bottom:14px;">
-        <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#555;margin-bottom:10px;">CONFIGURATION</div>
+        <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#555;margin-bottom:10px;">SIMULATION SETTINGS</div>
         <div style="margin-bottom:10px;">
-          <div style="font-size:10px;color:#555;margin-bottom:6px;letter-spacing:.04em">ACTIVE STRATEGIES</div>
+          <div style="font-size:10px;color:#555;margin-bottom:6px;letter-spacing:.04em">STRATEGIES BEING TESTED</div>
           <div style="display:flex;flex-wrap:wrap;gap:10px 20px;">${stratToggles}</div>
         </div>
         <div style="border:1px solid ${sizingPolicy.mode === 'compound_realized' ? '#ef444466' : '#2563eb55'};background:${sizingPolicy.mode === 'compound_realized' ? '#180b0b' : '#07111e'};border-radius:6px;padding:10px;margin-bottom:12px;">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;">
             <div>
-              <div style="font-size:10px;color:${sizingPolicy.mode === 'compound_realized' ? '#fca5a5' : '#93c5fd'};font-weight:800;letter-spacing:.07em;text-transform:uppercase;">Paper Sizing Policy · ${esc(sizingPolicy.mode_label || 'Fixed Base')}</div>
+              <div style="font-size:10px;color:${sizingPolicy.mode === 'compound_realized' ? '#fca5a5' : '#93c5fd'};font-weight:800;letter-spacing:.07em;text-transform:uppercase;">Simulated Position Sizing · ${esc(sizingPolicy.mode_label || 'Fixed Base')}</div>
               <div style="font-size:11px;color:#9ca3af;margin-top:4px;line-height:1.45;">${esc(sizingPolicy.reason || '')}</div>
             </div>
             <span style="font-size:10px;color:${sizingPolicy.entry_allowed === false ? '#fca5a5' : '#86efac'};border:1px solid currentColor;border-radius:4px;padding:3px 7px;">${sizingPolicy.entry_allowed === false ? 'NEW ENTRIES BLOCKED' : 'ENTRY SIZING ACTIVE'}</span>
           </div>
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:7px;margin-top:9px;">
-            ${paperStat('Realized Equity', fmtUsd(sizingPolicy.realized_equity_usd), (sizingPolicy.realized_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', 'Closed Paper P&L only')}
-            ${paperStat('Sizing Base', fmtUsd(sizingPolicy.effective_sizing_base_usd), '#60a5fa', sizingPolicy.mode_label || 'Fixed Base')}
-            ${paperStat('Risk Target', fmtUsd(sizingPolicy.target_risk_budget_usd), '#f59e0b', `${Number(sizingPolicy.risk_pct_per_trade || 0).toFixed(1)}% sizing input`)}
-            ${paperStat('Max Single Notional', fmtUsd(sizingPolicy.maximum_single_notional_usd), '#c4b5fd', 'Deep-liquidity hard cap')}
-            ${paperStat('Max Concurrent', fmtUsd(sizingPolicy.maximum_concurrent_notional_usd), '#c4b5fd', `${sizingPolicy.max_open_positions || 0} positions at hard cap`)}
-            ${paperStat('Current Drawdown', fmtPct(sizingPolicy.current_drawdown_pct), sizingPolicy.drawdown_fallback_active ? '#ef4444' : '#888', `Fallback at ${Number(sizingPolicy.drawdown_fallback_pct || 0).toFixed(1)}%`)}
+            ${paperStat('Closed-trade equity', fmtUsd(sizingPolicy.realized_equity_usd), (sizingPolicy.realized_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', 'Starting balance plus P&L from closed Paper trades only. Open-position gains and losses are excluded.')}
+            ${paperStat('Equity used for sizing', fmtUsd(sizingPolicy.effective_sizing_base_usd), '#60a5fa', 'The dollar base MT7 currently uses to calculate simulated position sizes.')}
+            ${paperStat('Loss budget / trade', fmtUsd(sizingPolicy.target_risk_budget_usd), '#f59e0b', `Target loss at the planned stop using the ${Number(sizingPolicy.risk_pct_per_trade || 0).toFixed(1)}% risk input. Actual gaps and slippage can be worse.`)}
+            ${paperStat('Max one-position exposure', fmtUsd(sizingPolicy.maximum_single_notional_usd), '#c4b5fd', 'Hard cap on the dollar exposure of one simulated position. This is exposure, not the intended loss.')}
+            ${paperStat('Max total exposure', fmtUsd(sizingPolicy.maximum_concurrent_notional_usd), '#c4b5fd', `${sizingPolicy.max_open_positions || 0} positions at the hard per-position cap.`)}
+            ${paperStat('Current drawdown', fmtPct(sizingPolicy.current_drawdown_pct), sizingPolicy.drawdown_fallback_active ? '#ef4444' : '#888', TRADER_HELP.drawdown)}
           </div>
           <div style="font-size:10px;color:${sizingPolicy.mode === 'compound_realized' ? '#fca5a5' : '#667085'};line-height:1.45;margin-top:8px;">
             ${esc(sizingPolicy.eligible_equity_definition || '')}${sizingPolicy.mode === 'compound_realized' ? ` · ${esc(sizingPolicy.loss_warning || '')}` : ''}
@@ -15187,29 +15374,29 @@ async function loadPaperTrading() {
         ${renderPaperCohortReview(cohortReview)}
         ${renderPaperCohortEdgeLoading()}
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-bottom:10px;">
-          ${paperStat('Paper Account', fmtUsd(acct.current_value_usd), (acct.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', `Started at ${fmtUsd(acct.starting_balance_usd)}`)}
-          ${paperStat('Hard P&L', fmtUsdSigned(s.all_closed.total_pnl_usd), s.all_closed.total_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Real dollar P&L accrued from paper position sizes')}
-          ${paperStat('Avg $ / Trade', fmtUsdSigned(s.all_closed.avg_pnl_usd), s.all_closed.avg_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Average dollar P&L per closed paper trade')}
+          ${paperStat('Simulated equity', fmtUsd(acct.current_value_usd), (acct.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', `Started at ${fmtUsd(acct.starting_balance_usd)}`)}
+          ${paperStat('Realized simulated P&L', fmtUsdSigned(s.all_closed.total_pnl_usd), s.all_closed.total_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Dollar profit or loss accrued from closed simulated positions')}
+          ${paperStat('Average $ result', fmtUsdSigned(s.all_closed.avg_pnl_usd), s.all_closed.avg_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Average dollar result per closed simulated trade')}
           ${paperStat('Profit Factor', Number(s.all_closed.profit_factor || 0).toFixed(2), s.all_closed.profit_factor >= 1 ? '#22c55e' : '#ef4444', 'Gross dollars won divided by gross dollars lost')}
           ${paperStat('Costs Paid', fmtUsd(s.all_closed.total_cost_usd), '#f59e0b', 'Estimated fee plus slippage drag in dollars')}
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:14px;">
-          ${paperStat('Pending Entries', s.pending_count ?? 0, '#f59e0b', 'Limit entries waiting for entry1 to be touched')}
-          ${paperStat('Open Positions', s.open_count, '#60a5fa', 'Currently active paper trades')}
-          ${paperStat('Flow Rejected', s.rejected_count, '#555', 'Signals that failed order flow confirmation')}
-          ${paperStat('Entry Expired', s.entry_expired_count ?? 0, '#555', 'Pending entries that never filled before timeout')}
-          ${paperStat('Hold Expired', s.hold_expired_count ?? 0, '#555', 'Open trades that never hit TP/SL before max hold')}
-          ${paperStat('Strict Win Rate', s.all_closed.win_rate + '%', s.all_closed.win_rate >= 50 ? '#22c55e' : '#ef4444', `${s.all_closed.count} closed trades`)}
-          ${paperStat('W+P Rate', (s.all_closed.win_partial_rate ?? 0) + '%', (s.all_closed.win_partial_rate ?? 0) >= 50 ? '#22c55e' : '#ef4444', 'Wins plus partial wins')}
-          ${paperStat('Net Avg P&L', fmtPct(s.all_closed.avg_pnl), s.all_closed.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average leveraged P&L after fees/slippage')}
-          ${paperStat('Best Trade $', fmtUsdSigned(s.all_closed.best_pnl_usd), s.all_closed.best_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Largest closed paper winner in dollars')}
-          ${paperStat('Worst Trade $', fmtUsdSigned(s.all_closed.worst_pnl_usd), s.all_closed.worst_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Largest closed paper loser in dollars')}
-          ${paperStat('Gross Avg P&L', fmtPct(s.all_closed.avg_gross_pnl), s.all_closed.avg_gross_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average before fees/slippage')}
-          ${paperStat('Avg Cost', fmtPct(s.all_closed.avg_cost), '#f59e0b', 'Average fee plus slippage drag')}
-          ${paperStat('✓ Flow Win Rate', flowC.win_rate + '%', flowC.win_rate >= 50 ? '#22c55e' : '#ef4444', `Flow-confirmed: ${flowC.count} trades`)}
-          ${paperStat('✗ No-Flow Win Rate', flowU.win_rate + '%', flowU.win_rate >= 50 ? '#22c55e' : '#ef4444', `No flow confirmation: ${flowU.count} trades`)}
-          ${paperStat('✓ Flow Avg P&L', fmtPct(flowC.avg_pnl), flowC.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Avg P&L for flow-confirmed entries')}
-          ${paperStat('✗ No-Flow Avg P&L', fmtPct(flowU.avg_pnl), flowU.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Avg P&L for non-flow entries')}
+          ${paperStat('Awaiting entry', s.pending_count ?? 0, '#f59e0b', 'Simulated limit entries waiting for the entry price to be touched')}
+          ${paperStat('Active simulated trades', s.open_count, '#60a5fa', 'Currently active simulated positions')}
+          ${paperStat('Rejected by order-flow check', s.rejected_count, '#555', 'Signals that did not receive the required recent buying or selling confirmation')}
+          ${paperStat('Expired before entry', s.entry_expired_count ?? 0, '#555', 'Simulated entries that never filled before timeout')}
+          ${paperStat('Expired before exit', s.hold_expired_count ?? 0, '#555', 'Simulated trades that never hit a target or stop before the maximum holding time')}
+          ${paperStat('Full-target win rate', s.all_closed.win_rate + '%', s.all_closed.win_rate >= 50 ? '#22c55e' : '#ef4444', `${s.all_closed.count} closed trades; partial profits are excluded`)}
+          ${paperStat('Profitable or partial rate', (s.all_closed.win_partial_rate ?? 0) + '%', (s.all_closed.win_partial_rate ?? 0) >= 50 ? '#22c55e' : '#ef4444', 'Share that closed as a full or partial profit')}
+          ${paperStat('Average result after costs', fmtPct(s.all_closed.avg_pnl), s.all_closed.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average leveraged result after simulated fees and slippage')}
+          ${paperStat('Best $ result', fmtUsdSigned(s.all_closed.best_pnl_usd), s.all_closed.best_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Largest closed simulated winner in dollars')}
+          ${paperStat('Worst $ result', fmtUsdSigned(s.all_closed.worst_pnl_usd), s.all_closed.worst_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Largest closed simulated loser in dollars')}
+          ${paperStat('Average result before costs', fmtPct(s.all_closed.avg_gross_pnl), s.all_closed.avg_gross_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average result before simulated fees and slippage')}
+          ${paperStat('Average trading cost', fmtPct(s.all_closed.avg_cost), '#f59e0b', 'Average simulated fee plus slippage drag')}
+          ${paperStat('Order-flow-confirmed full wins', flowC.win_rate + '%', flowC.win_rate >= 50 ? '#22c55e' : '#ef4444', `Based on ${flowC.count} trades that had recent order-flow confirmation`)}
+          ${paperStat('Unconfirmed full wins', flowU.win_rate + '%', flowU.win_rate >= 50 ? '#22c55e' : '#ef4444', `Based on ${flowU.count} trades without order-flow confirmation`)}
+          ${paperStat('Confirmed average result', fmtPct(flowC.avg_pnl), flowC.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average result for order-flow-confirmed entries')}
+          ${paperStat('Unconfirmed average result', fmtPct(flowU.avg_pnl), flowU.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average result for entries without order-flow confirmation')}
         </div>`;
 
       // Flow edge callout
@@ -15429,7 +15616,7 @@ async function loadPaperTrading() {
     const impactSummary = (researchRuntimeImpact && researchRuntimeImpact.success && researchRuntimeImpact.summary) ? researchRuntimeImpact.summary : {};
     const researchHooksOpen = Number(impactSummary.active_runtime_hooks || 0) > 0 || Number(impactSummary.blocked_total || 0) > 0;
     const activePositionsHtml = paperFold(
-      'Active Paper Positions',
+      'Active Simulated Positions',
       `${pendingTrades.length} pending · ${openTrades.length} open`,
       pendingHtml + openHtml,
       {open: true, color: '#60a5fa'}
@@ -15441,20 +15628,20 @@ async function loadPaperTrading() {
       {open: true, color: '#22c55e'}
     );
     const configurationSectionHtml = paperFold(
-      'Paper Configuration',
-      'Strategy toggles, sizing, stops, fees, and safety controls',
+      'Simulation Settings',
+      'Strategies, sizing, stops, costs, and safety controls',
       configHtml,
       {open: false, color: '#9ca3af'}
     );
     const policyContextHtml = paperFold(
-      'Policy Context',
-      'Explains whether broad History/live records are comparable to the current Paper policy',
+      'Evidence Comparability',
+      'Explains whether older tracked outcomes are comparable to the current simulated policy',
       alignmentHtml + divergenceHtml + disabledShadowHtml,
       {open: false, color: '#38bdf8'}
     );
     const researchHooksHtml = paperFold(
-      'Research Hooks',
-      'Only research rules that affect or may affect Paper behavior belong here',
+      'Research Rules Being Tested',
+      'Research rules that affect or may affect simulated behavior',
       researchRulebookHtml,
       {open: researchHooksOpen, color: researchHooksOpen ? '#22c55e' : '#9ca3af'}
     );
@@ -15483,8 +15670,8 @@ function paperConfigField(label, inputHtml) {
 }
 
 function paperStat(label, value, color, tip) {
-  return `<div title="${tip}" style="background:#0d1117;border:1px solid #1e2530;border-radius:5px;padding:8px 10px;cursor:default;">
-    <div style="font-size:10px;color:#555;letter-spacing:.05em;margin-bottom:4px">${label}</div>
+  return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:5px;padding:8px 10px;">
+    <div style="font-size:10px;color:#667085;letter-spacing:.05em;margin-bottom:4px;display:flex;align-items:center;">${esc(label)}${tip ? infoTip(tip, `About ${label}`) : ''}</div>
     <div style="font-size:16px;font-weight:700;color:${color}">${value}</div>
   </div>`;
 }
@@ -15543,7 +15730,7 @@ async function researchWorkspaceAction(action) {
   const labels = {
     seed: 'Indexing local corpus...',
     discover: 'Running controlled web discovery...',
-    scholar: 'Rebuilding Corpus Scholar...',
+    scholar: 'Rebuilding research analysis...',
     memo: 'Generating research memo...',
     approve: 'Approving safe sync candidates...',
     export: 'Exporting approved sync package...',
@@ -15570,7 +15757,7 @@ async function researchWorkspaceAction(action) {
     showOverrideMsg(
       action === 'seed' ? `Indexed ${d.added || 0} new and upgraded ${d.updated || 0} sources.` :
       action === 'discover' ? `Web discovery added ${d.added || 0} sources.` :
-      action === 'scholar' ? `Corpus Scholar rebuilt: ${d.summary?.source_dossier_count || 0} dossiers, ${d.summary?.concept_count || 0} concepts.` :
+      action === 'scholar' ? `Research analysis rebuilt: ${d.summary?.source_dossier_count || 0} source audits, ${d.summary?.concept_count || 0} ideas.` :
       action === 'memo' ? `Research memo generated. ${d.memo?.registered_shadow_experiments || 0} shadow experiments registered.` :
       action === 'approve' ? `Approved ${d.changed || 0} safe sync candidates.` :
       `Exported ${d.source_count || 0} approved sources.`
@@ -15961,38 +16148,38 @@ function renderResearchWorkspace(d) {
 
   const scholarPanel = `
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-bottom:10px;">
-      ${paperStat('Scholar Status', esc(scholar.label || 'Shell'), '#38bdf8', 'Corpus Scholar implementation status')}
-      ${paperStat('Concepts', Number(scholar.concept_count || 0), '#38bdf8', 'Collapsed research concepts')}
-      ${paperStat('Concept Links', Number(scholar.concept_edge_count || 0), '#9ca3af', 'Concept map edges from shared fields/sources/strategy')}
-      ${paperStat('Priorities', Number(scholar.priority_count || 0), Number(scholar.priority_count || 0) ? '#22c55e' : '#9ca3af', 'Ranked research hypotheses')}
-      ${paperStat('Dossiers', Number(scholar.dossier_count || 0), Number(scholar.dossier_count || 0) ? '#22c55e' : '#9ca3af', 'Durable source dossiers')}
-      ${paperStat('Contradictions', Number(scholar.contradiction_item_count || 0), Number(scholar.contradiction_item_count || 0) ? '#ef4444' : '#22c55e', 'Concepts with caution/contradiction tension')}
-      ${paperStat('High Transfer Risk', Number(scholar.high_transfer_risk_concepts || 0), Number(scholar.high_transfer_risk_concepts || 0) ? '#ef4444' : '#22c55e', 'Concepts likely to fail when moved into MT7')}
+      ${paperStat('Analysis status', esc(scholar.label || 'Starting'), '#38bdf8', 'Whether the research analysis layer has enough indexed material to organize and critique ideas.')}
+      ${paperStat('Research ideas', Number(scholar.concept_count || 0), '#38bdf8', 'Related claims grouped into ideas that MT7 can evaluate.')}
+      ${paperStat('Related ideas', Number(scholar.concept_edge_count || 0), '#9ca3af', 'Connections between ideas that share sources, fields, or a target strategy.')}
+      ${paperStat('Ideas ranked', Number(scholar.priority_count || 0), Number(scholar.priority_count || 0) ? '#22c55e' : '#9ca3af', 'Research ideas ranked for controlled testing—not approval.')}
+      ${paperStat('Source audits', Number(scholar.dossier_count || 0), Number(scholar.dossier_count || 0) ? '#22c55e' : '#9ca3af', 'Source-level reviews of text quality, claims, relevance, and limitations.')}
+      ${paperStat('Evidence conflicts', Number(scholar.contradiction_item_count || 0), Number(scholar.contradiction_item_count || 0) ? '#ef4444' : '#22c55e', TRADER_HELP.evidence_tension)}
+      ${paperStat('Needs extra validation', Number(scholar.high_transfer_risk_concepts || 0), Number(scholar.high_transfer_risk_concepts || 0) ? '#ef4444' : '#22c55e', TRADER_HELP.transfer_risk)}
     </div>
     <div style="background:#0d1117;border:1px solid #1e2530;border-left:3px solid #38bdf8;border-radius:6px;padding:10px;margin-bottom:10px;font-size:11px;color:var(--text2);line-height:1.45;">
-      Corpus Scholar now builds deterministic source dossiers, concept links, contradiction/tension maps, and transfer-risk scores. It is still advisory: no scholar artifact can alter scoring, paper behavior, or live execution without the governance path.
+      Research Analysis organizes sources into audited ideas, highlights conflicting evidence, and flags ideas that may not transfer safely into crypto perpetuals. It is advisory: nothing here can alter scoring, Paper behavior, or real-order controls without testing and approval.
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;margin-bottom:12px;">
       <div>
-        ${researchSectionLabel('Source Dossiers', 'Audited summaries of each indexed source: text quality, claims, relevance, and how safely its findings may transfer into MT7.')}
+        ${researchSectionLabel('Source Audits', 'Audited summaries of each indexed source: text quality, claims, relevance, and how safely its findings may transfer into MT7.')}
         <div style="display:grid;gap:8px;">${dossierRows || '<div style="font-size:12px;color:var(--muted);">No source dossiers yet.</div>'}</div>
       </div>
       <div>
-        ${researchSectionLabel('Concept Map', 'Groups related source claims into testable MT7 ideas and shows the fields, strategy target, and evidence behind each concept.')}
+        ${researchSectionLabel('Related Research Ideas', 'Groups related source claims into testable MT7 ideas and shows the fields, strategy target, and evidence behind each idea.')}
         <div style="display:grid;gap:8px;">${conceptRows || priorityRows || '<div style="font-size:12px;color:var(--muted);">No concept map yet.</div>'}</div>
       </div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;margin-bottom:12px;">
       <div>
-        ${researchSectionLabel('Evidence Tension Map', 'Shows concepts whose evidence includes cautions, direct contradictions, or weak coverage. A higher score means more unresolved tension—not more alpha. Review before shadow testing or promotion.')}
+        ${researchSectionLabel('Evidence Conflict Map', TRADER_HELP.evidence_tension)}
         <div style="display:grid;gap:8px;">${contradictionRows || '<div style="font-size:12px;color:var(--muted);">No contradiction tension detected yet.</div>'}</div>
       </div>
       <div>
-        ${researchSectionLabel('Transfer-Risk Queue', 'Ranks ideas that may fail when moved from another market, timeframe, dataset, or backtest into MT7 crypto-perp trading with leverage, fees, slippage, and live data constraints.')}
+        ${researchSectionLabel('Ideas Needing Extra Validation', TRADER_HELP.transfer_risk)}
         <div style="display:grid;gap:8px;">${highRiskConceptRows || highRiskSourceRows || '<div style="font-size:12px;color:var(--muted);">No high transfer-risk items detected.</div>'}</div>
       </div>
     </div>
-    ${researchSectionLabel('Shadow Priorities', 'The research ideas most worth measuring next. Priority means test first in shadow/paper mode; it does not mean approve for live behavior.')}
+    ${researchSectionLabel('Ideas to Test Next', 'The research ideas most worth measuring next. Priority means test first in research or Paper mode; it does not mean approve for real trading.')}
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;">${priorityRows || candidateRows || '<div style="font-size:12px;color:var(--muted);">No scholar priorities yet. Index sources and generate a research memo.</div>'}</div>`;
 
   const governancePanel = `
@@ -16044,7 +16231,7 @@ function renderResearchWorkspace(d) {
       ${paperStat('Last Status', esc(scheduler.last_status || 'idle'), scheduler.last_status === 'error' ? '#ef4444' : scheduler.last_status === 'ok' ? '#22c55e' : '#9ca3af', 'Last scheduler outcome')}
     </div>
     <div style="background:#0d1117;border:1px solid #1e2530;border-left:3px solid #38bdf8;border-radius:6px;padding:10px;margin-bottom:10px;font-size:11px;color:var(--text2);line-height:1.45;">
-      Passive research can index the corpus, run controlled web discovery, rebuild Corpus Scholar, generate memos on cadence, and raise drift alerts. It cannot change scoring, paper config, sizing, or live execution.
+      Automatic research updates can index the library, run controlled web discovery, rebuild research analysis, generate memos, and flag changed or conflicting evidence. They cannot change scoring, Paper settings, sizing, or real-order controls.
       ${scheduler.last_error ? `<div style="color:#ef4444;margin-top:6px;">Last error: ${esc(scheduler.last_error)}</div>` : ''}
     </div>
     <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px;">
@@ -16068,7 +16255,7 @@ function renderResearchWorkspace(d) {
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
       <div>
         <div style="font-size:15px;font-weight:800;color:var(--text);letter-spacing:.04em;">RESEARCH WORKSPACE</div>
-        <div style="font-size:11px;color:var(--text3);margin-top:2px;">Corpus, passive discovery, Corpus Scholar, and research governance. Research informs trading; it does not control execution.</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:2px;">Collect, audit, compare, and test outside research before it can influence MT7. Research never places trades.</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <span style="border:1px solid ${verdictColor};color:${verdictColor};border-radius:5px;padding:5px 9px;font-size:11px;font-weight:900;text-transform:uppercase;">${esc(verdict.label || 'Review')}</span>
@@ -16077,25 +16264,25 @@ function renderResearchWorkspace(d) {
     </div>
     <div style="background:#0d1117;border:1px solid #1e2530;border-left:3px solid ${verdictColor};border-radius:6px;padding:12px 14px;margin-bottom:12px;">
       <div style="font-size:12px;color:var(--text2);line-height:1.45;margin-bottom:8px;">${esc(verdict.summary || '')}</div>
-      <div style="font-size:10px;color:var(--text3);line-height:1.45;">Forbidden: ${esc(d.scope?.forbidden_path || '')}. Required: ${esc(d.scope?.required_path || '')}.</div>
+      <div style="font-size:10px;color:var(--text3);line-height:1.45;"><b>Safety rule:</b> an article cannot directly change a strategy. Evidence must be reviewed, tested without authority, validated in Paper, and explicitly approved.</div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:8px;margin-bottom:12px;">
-      ${paperStat('Workflow', esc(String(workflow.posture || 'unknown').replace(/_/g, ' ')), workflow.posture === 'healthy' ? '#22c55e' : workflow.posture === 'blocked' ? '#ef4444' : '#f59e0b', 'Research workflow posture')}
-      ${paperStat('Sources', Number(corpus.source_count || 0), '#9ca3af', 'Indexed corpus size')}
-      ${paperStat('Full Text', researchPct(corpus.full_text_ratio), Number(corpus.full_text_ratio || 0) >= 0.7 ? '#22c55e' : '#f59e0b', 'Readable corpus coverage')}
-      ${paperStat('Scholar Priorities', Number(scholar.priority_count || 0), Number(scholar.priority_count || 0) ? '#38bdf8' : '#9ca3af', 'Ranked source-derived concepts')}
-      ${paperStat('Shadow Tests', `${Number(gov.evaluated_research_tests || 0)}/${Number(gov.registered_research_tests || 0)}`, Number(gov.pending_evaluators || 0) ? '#f59e0b' : '#38bdf8', 'Evaluated registered research tests')}
-      ${paperStat('Live Behavior', '0 active', '#22c55e', 'Research workspace cannot change live behavior')}
+      ${paperStat('Research status', esc(String(workflow.posture || 'unknown').replace(/_/g, ' ')), workflow.posture === 'healthy' ? '#22c55e' : workflow.posture === 'blocked' ? '#ef4444' : '#f59e0b', 'Overall status of source quality, analysis, testing, and safety checks.')}
+      ${paperStat('Research sources', Number(corpus.source_count || 0), '#9ca3af', 'Sources indexed into MT7’s research library.')}
+      ${paperStat('Readable sources', researchPct(corpus.full_text_ratio), Number(corpus.full_text_ratio || 0) >= 0.7 ? '#22c55e' : '#f59e0b', 'Share of indexed sources with enough text to audit their claims.')}
+      ${paperStat('Ideas to test', Number(scholar.priority_count || 0), Number(scholar.priority_count || 0) ? '#38bdf8' : '#9ca3af', 'Source-derived ideas ranked for controlled evaluation.')}
+      ${paperStat('Research tests', `${Number(gov.evaluated_research_tests || 0)}/${Number(gov.registered_research_tests || 0)}`, Number(gov.pending_evaluators || 0) ? '#f59e0b' : '#38bdf8', 'Completed evaluations divided by registered research tests.')}
+      ${paperStat('Trading changes', '0 active', '#22c55e', 'Research cannot directly change Paper settings or real-order behavior.')}
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:12px;">
       <div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:11px 12px;">
         ${researchSectionLabel('Actions', 'Manual research operations. These can index, discover, summarize, or organize evidence; none can change scoring, sizing, paper behavior, or live execution.')}
         <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:8px;">
-          <button onclick="researchWorkspaceAction('seed')" style="padding:7px 10px;border-radius:4px;border:1px solid rgba(96,165,250,.35);background:#101827;color:#60a5fa;font-size:11px;font-weight:800;cursor:pointer;">Index Corpus</button>
+          <button onclick="researchWorkspaceAction('seed')" style="padding:7px 10px;border-radius:4px;border:1px solid rgba(96,165,250,.35);background:#101827;color:#60a5fa;font-size:11px;font-weight:800;cursor:pointer;">Index Research Library</button>
           <button onclick="researchWorkspaceAction('discover')" style="padding:7px 10px;border-radius:4px;border:1px solid rgba(34,197,94,.35);background:#0d1f16;color:#22c55e;font-size:11px;font-weight:800;cursor:pointer;">Web Discover</button>
           <button onclick="showUploadResearchPdf()" style="padding:7px 10px;border-radius:4px;border:1px solid rgba(245,158,11,.35);background:#1f1609;color:#f59e0b;font-size:11px;font-weight:800;cursor:pointer;">Upload PDF</button>
           <button onclick="showAddResearchSource()" style="padding:7px 10px;border-radius:4px;border:1px solid #1e2530;background:#10151c;color:#ccc;font-size:11px;font-weight:800;cursor:pointer;">Add Source</button>
-          <button onclick="researchWorkspaceAction('scholar')" style="padding:7px 10px;border-radius:4px;border:1px solid rgba(96,165,250,.35);background:rgba(96,165,250,.08);color:#60a5fa;font-size:11px;font-weight:800;cursor:pointer;">Rebuild Scholar</button>
+          <button onclick="researchWorkspaceAction('scholar')" style="padding:7px 10px;border-radius:4px;border:1px solid rgba(96,165,250,.35);background:rgba(96,165,250,.08);color:#60a5fa;font-size:11px;font-weight:800;cursor:pointer;">Rebuild Research Analysis</button>
           <button onclick="researchWorkspaceAction('memo')" style="padding:7px 10px;border-radius:4px;border:1px solid rgba(34,197,94,.35);background:rgba(34,197,94,.08);color:#22c55e;font-size:11px;font-weight:800;cursor:pointer;">Generate Memo</button>
           <button onclick="browseResearchLibrary()" style="padding:7px 10px;border-radius:4px;border:1px solid #1e2530;background:#10151c;color:#ccc;font-size:11px;font-weight:800;cursor:pointer;">Browse Library</button>
         </div>
@@ -16106,12 +16293,12 @@ function renderResearchWorkspace(d) {
         ${nextActions || '<div style="font-size:11px;color:var(--text3);">No next actions generated.</div>'}
       </div>
     </div>
-    ${liveGateSection('Research Intake Gates', 'Quality controls before research can influence MT7', d.gates || [], {open: true, color: verdictColor, help: 'Checks whether research is discoverable, readable, relevant to crypto perps, critically reviewed, and still shadow-only. Passing a gate makes evidence usable—not live.'})}
-    ${paperFold('Passive Research Scheduler', `${scheduler.enabled ? 'enabled' : 'disabled'} · ${Number((scheduler.drift_alerts || []).length)} drift alerts`, schedulerPanel, {open: true, color: scheduler.enabled ? '#38bdf8' : '#9ca3af', help: 'Runs research housekeeping on a cadence: indexing, controlled discovery, Scholar rebuilds, memos, and drift alerts. It has no trading authority.'})}
-    ${paperFold('Research Inbox', `${Number(inbox.needs_full_text_count || 0)} need full text · ${Number(inbox.sync_pending_count || 0)} sync pending`, discoveryPanel, {open: true, color: Number(inbox.needs_full_text_count || 0) ? '#ef4444' : '#38bdf8', help: 'New or incomplete sources waiting for full text, quality review, relevance checks, or safe online-sync approval.'})}
-    ${paperFold('Corpus Library', `${Number(corpus.source_count || 0)} sources · ${researchPct(corpus.full_text_ratio)} full text`, corpusPanel, {open: true, color: '#38bdf8', help: 'The indexed evidence base. Use it to inspect source quality and provenance before trusting a research-derived idea.'})}
-    ${paperFold('Corpus Scholar', `${Number(scholar.priority_count || 0)} priorities · ${Number(scholar.strategy_candidate_count || 0)} candidates`, scholarPanel, {open: true, color: '#22c55e', help: 'Turns source claims into concept maps, evidence tensions, transfer-risk assessments, and shadow-test priorities. It cannot change trading behavior.'})}
-    ${paperFold('Research Governance', `${Number((govReview.summary || {}).queue_count || 0)} queued · ${Number((govReview.summary || {}).needs_wiring_count || 0)} need wiring`, governancePanel, {open: true, color: '#f59e0b', help: 'Tracks the path from a research idea to controlled testing, explicit approval, rollback rules, and—only after evidence—possible paper or live consideration.'})}
+    ${liveGateSection('Research Quality Checks', 'What must be true before research can guide an MT7 experiment', d.gates || [], {open: true, color: verdictColor, help: 'Checks whether research is discoverable, readable, relevant to crypto perps, critically reviewed, and still research-only. Passing makes evidence usable—not approved for trading.'})}
+    ${paperFold('Automatic Research Updates', `${scheduler.enabled ? 'enabled' : 'disabled'} · ${Number((scheduler.drift_alerts || []).length)} evidence-change alerts`, schedulerPanel, {open: true, color: scheduler.enabled ? '#38bdf8' : '#9ca3af', help: 'Runs indexing, controlled discovery, research analysis, memos, and evidence-change alerts on a schedule. It has no trading authority.'})}
+    ${paperFold('Sources Needing Attention', `${Number(inbox.needs_full_text_count || 0)} need full text · ${Number(inbox.sync_pending_count || 0)} sync pending`, discoveryPanel, {open: true, color: Number(inbox.needs_full_text_count || 0) ? '#ef4444' : '#38bdf8', help: 'New or incomplete sources waiting for readable text, quality review, relevance checks, or safe sync approval.'})}
+    ${paperFold('Research Library', `${Number(corpus.source_count || 0)} sources · ${researchPct(corpus.full_text_ratio)} readable`, corpusPanel, {open: true, color: '#38bdf8', help: 'The indexed evidence base. Inspect source quality and origin before trusting a research-derived idea.'})}
+    ${paperFold('Research Analysis', `${Number(scholar.priority_count || 0)} ideas ranked · ${Number(scholar.strategy_candidate_count || 0)} test candidates`, scholarPanel, {open: true, color: '#22c55e', help: 'Turns claims into related ideas, evidence conflicts, transfer-risk reviews, and priorities for controlled testing. It cannot change trading behavior.'})}
+    ${paperFold('Research Approval & Safety', `${Number((govReview.summary || {}).queue_count || 0)} queued · ${Number((govReview.summary || {}).needs_wiring_count || 0)} need data wiring`, governancePanel, {open: true, color: '#f59e0b', help: 'Tracks the path from a research idea to testing, explicit approval, rollback rules, and—only after evidence—possible Paper or assisted-live consideration.'})}
   `;
 }
 
@@ -16152,14 +16339,27 @@ function liveGateColor(g) {
 
 function liveGateCard(g) {
   const c = liveGateColor(g);
-  const status = String(g?.status || 'info').toUpperCase();
+  const rawStatus = String(g?.status || 'info').toLowerCase();
+  const status = {
+    pass: 'Ready',
+    green: 'Ready',
+    warn: 'Needs review',
+    amber: 'Needs review',
+    fail: 'Blocked',
+    red: 'Blocked',
+    wait: 'Collecting',
+    blue: 'Collecting',
+    lock: 'Safety lock',
+    info: 'Information',
+    gray: 'Information',
+  }[rawStatus] || rawStatus.replace(/_/g, ' ');
   return `<div style="background:#0d1117;border:1px solid #1e2530;border-left:3px solid ${c};border-radius:6px;padding:9px 10px;min-height:104px;">
     <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;margin-bottom:7px;">
       <div style="font-size:11px;color:var(--text);font-weight:850;line-height:1.25;">${esc(g?.name || 'Gate')}</div>
-      <div style="font-size:9px;color:${c};font-weight:900;letter-spacing:.06em;">${esc(status)}</div>
+      <div style="font-size:9px;color:${c};font-weight:900;letter-spacing:.04em;text-transform:uppercase;">${esc(status)}</div>
     </div>
     <div style="font-family:var(--mono);font-size:14px;font-weight:800;color:${c};margin-bottom:3px;">${esc(g?.value ?? '—')}</div>
-    <div style="font-size:10px;color:#667085;margin-bottom:6px;">Target: ${esc(g?.target || '—')}</div>
+    <div style="font-size:10px;color:#667085;margin-bottom:6px;">Required: ${esc(g?.target || '—')}</div>
     <div style="font-size:10px;color:var(--text3);line-height:1.35;">${esc(g?.detail || '')}</div>
   </div>`;
 }
@@ -16205,12 +16405,12 @@ function renderLiveReadiness(d) {
 
   const topStats = `
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:8px;margin-bottom:12px;">
-      ${paperStat('Overall', esc(verdict.label || 'Review'), verdictColor, 'Current live promotion verdict')}
-      ${paperStat('Paper Cohort', `${Number(actuals.paper_cohort_sample_n || 0)} closed`, '#38bdf8', 'Closed trades in current paper cohort')}
-      ${paperStat('Paper W+P', actuals.paper_cohort_win_partial_rate == null ? '—' : `${Number(actuals.paper_cohort_win_partial_rate).toFixed(1)}%`, Number(actuals.paper_cohort_win_partial_rate || 0) >= 55 ? '#22c55e' : '#f59e0b', 'Current paper cohort wins plus partial wins')}
-      ${paperStat('Paper PF', actuals.paper_cohort_profit_factor == null ? '—' : Number(actuals.paper_cohort_profit_factor).toFixed(2), Number(actuals.paper_cohort_profit_factor || 0) >= 1.25 ? '#22c55e' : '#f59e0b', 'Current paper cohort profit factor')}
-      ${paperStat('Drawdown', `${Number(actuals.drawdown_pct || 0).toFixed(1)}%`, Number(actuals.drawdown_pct || 0) < 40 ? '#22c55e' : '#ef4444', 'Paper account drawdown')}
-      ${paperStat('Live Gate', exec.live_trading_enabled ? 'enabled' : 'disabled', exec.live_trading_enabled ? '#ef4444' : '#38bdf8', 'LIVE_TRADING_ENABLED environment gate')}
+      ${paperStat('Readiness status', esc(verdict.label || 'Review'), verdictColor, TRADER_HELP.assisted_live_readiness)}
+      ${paperStat('Current trial sample', `${Number(actuals.paper_cohort_sample_n || 0)} closed`, '#38bdf8', TRADER_HELP.paper_cohort)}
+      ${paperStat('Profitable / partial', actuals.paper_cohort_win_partial_rate == null ? '—' : `${Number(actuals.paper_cohort_win_partial_rate).toFixed(1)}%`, Number(actuals.paper_cohort_win_partial_rate || 0) >= 55 ? '#22c55e' : '#f59e0b', TRADER_HELP.win_partial_rate)}
+      ${paperStat('Profit factor', actuals.paper_cohort_profit_factor == null ? '—' : Number(actuals.paper_cohort_profit_factor).toFixed(2), Number(actuals.paper_cohort_profit_factor || 0) >= 1.25 ? '#22c55e' : '#f59e0b', TRADER_HELP.profit_factor)}
+      ${paperStat('Account drawdown', `${Number(actuals.drawdown_pct || 0).toFixed(1)}%`, Number(actuals.drawdown_pct || 0) < 40 ? '#22c55e' : '#ef4444', TRADER_HELP.drawdown)}
+      ${paperStat('Real-order master switch', exec.live_trading_enabled ? 'enabled' : 'disabled', exec.live_trading_enabled ? '#ef4444' : '#38bdf8', 'Environment-level safety switch. Disabled means MT7 cannot stage real orders even if evidence checks pass.')}
     </div>`;
 
   const liveProfileRows = (profileRegistry.profiles || []).slice(0, 4).map(researchStrategyProfileCard).join('');
@@ -16230,8 +16430,8 @@ function renderLiveReadiness(d) {
   return `
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
       <div>
-        <div style="font-size:15px;font-weight:800;color:var(--text);letter-spacing:.04em;">LIVE READINESS</div>
-        <div style="font-size:11px;color:var(--text3);margin-top:2px;">Assisted live and future automation gates. Paper policy is the blueprint; broad History is context.</div>
+        <div style="font-size:15px;font-weight:800;color:var(--text);letter-spacing:.04em;">ASSISTED-LIVE READINESS</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:2px;">Evidence and safety checks required before MT7 can even be considered for user-confirmed real orders.</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <span style="border:1px solid ${verdictColor};color:${verdictColor};border-radius:5px;padding:5px 9px;font-size:11px;font-weight:900;text-transform:uppercase;">${esc(verdict.label || 'Review')}</span>
@@ -16240,6 +16440,7 @@ function renderLiveReadiness(d) {
     </div>
 
     ${liveWarning}
+    ${traderIntro('How to use this screen', 'This is a readiness review, not an order screen and not a recommendation to go live.', 'Resolve every blocker, confirm the current Paper policy has enough trades, and review drawdown and profit quality before considering a tiny assisted test.', 'Passing every check does not guarantee profit. The master switch and per-order confirmation remain separate safety controls.')}
 
     <div style="background:#0d1117;border:1px solid #1e2530;border-left:3px solid ${verdictColor};border-radius:6px;padding:12px 14px;margin-bottom:12px;">
       <div style="font-size:12px;color:var(--text2);line-height:1.45;margin-bottom:10px;">${esc(verdict.summary || '')}</div>
@@ -16252,7 +16453,7 @@ function renderLiveReadiness(d) {
 
     <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,0.8fr);gap:10px;margin-bottom:12px;">
       <div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:11px 12px;">
-        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:5px;">Current Blockers</div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:5px;">Why This Is Not Ready Yet</div>
         ${blockerRows}
       </div>
       <div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:11px 12px;">
@@ -16261,9 +16462,9 @@ function renderLiveReadiness(d) {
       </div>
     </div>
 
-    ${liveGateSection('Paper Policy Gates', 'Blocking evidence for assisted-live review', gates.paper_policy || [], {open: true, color: verdictColor})}
-    ${liveGateSection('Execution Locks', 'Safety rails that stay visible before any live test', gates.execution_locks || [], {open: true, color: '#38bdf8'})}
-    ${liveGateSection('History Context', 'Useful evidence, not policy authority', gates.context || [], {open: false, color: '#9ca3af'})}
+    ${liveGateSection('Paper Evidence Requirements', 'What the current simulated policy must prove', gates.paper_policy || [], {open: true, color: verdictColor})}
+    ${liveGateSection('Real-Order Safety Locks', 'Controls that remain mandatory before every assisted test', gates.execution_locks || [], {open: true, color: '#38bdf8'})}
+    ${liveGateSection('Older Evidence — Context Only', 'Useful background that cannot override current Paper evidence', gates.context || [], {open: false, color: '#9ca3af'})}
 
     ${paperFold('Policy Context Detail', 'Why Paper and History may diverge', contextStats + `<div style="font-size:10px;color:var(--text3);line-height:1.45;">${esc(d.scope?.paper_authority || '')} ${esc(d.scope?.history_role || '')}</div>`, {open: false, color: '#9ca3af'})}
 
@@ -16324,19 +16525,19 @@ function renderExecutionPolicyAlignment(payload) {
     <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px;">
       <div>
         <div style="font-size:13px;font-weight:800;color:var(--text);letter-spacing:.04em;">POLICY COMPARABILITY</div>
-        <div style="font-size:11px;color:var(--text3);line-height:1.45;margin-top:3px;">Shows whether broad History/live EV can be compared to Paper EV. Paper does not need to match History; this prevents apples-to-oranges reads.</div>
+        <div style="font-size:11px;color:var(--text3);line-height:1.45;margin-top:3px;">Shows whether older tracked results can be fairly compared with the current simulated policy. This prevents apples-to-oranges conclusions.</div>
       </div>
       <div style="border:1px solid ${verdictColor};color:${verdictColor};border-radius:5px;padding:6px 9px;font-size:11px;font-weight:900;text-transform:uppercase;">${esc(verdict.label || 'Review')}</div>
     </div>
     <div style="font-size:12px;color:var(--text2);line-height:1.45;margin-bottom:9px;border-left:3px solid ${verdictColor};padding-left:9px;">${esc(verdict.summary || '')}</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px;margin-bottom:10px;">
-      ${paperStat('Comparability', esc(verdict.label || 'Review'), verdictColor, 'Whether broad History/live EV and Paper EV are measuring the same policy universe')}
+      ${paperStat('Fair to compare?', esc(verdict.label || 'Review'), verdictColor, 'Whether older tracked outcomes and current simulated outcomes used sufficiently similar strategies and rules.')}
       ${paperStat('Strategy Overlap', `${Number(summary.strategy_overlap_pct || 0).toFixed(1)}%`, Number(summary.strategy_overlap_pct || 0) >= 80 ? '#22c55e' : Number(summary.strategy_overlap_pct || 0) >= 50 ? '#f59e0b' : '#ef4444', 'Active strategy overlap between History/live and Paper samples')}
-      ${paperStat('History Outside Policy', `${Number(summary.history_outside_policy_count || 0)} · ${Number(summary.history_outside_policy_pct || 0).toFixed(1)}%`, Number(summary.history_outside_policy_pct || 0) <= 5 ? '#22c55e' : Number(summary.history_outside_policy_pct || 0) <= 25 ? '#f59e0b' : '#ef4444', 'History/live outcomes from strategies not currently enabled in Paper')}
-      ${paperStat('History EV', historyEv.avg_pnl_pct == null ? '—' : fmtPct(Number(historyEv.avg_pnl_pct)), Number(historyEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', 'All History/live EV in the lookback')}
-      ${paperStat('Policy History EV', insideEv.avg_pnl_pct == null ? '—' : fmtPct(Number(insideEv.avg_pnl_pct)), Number(insideEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', 'History/live EV after filtering to Paper-enabled strategies')}
-      ${paperStat('Outside Policy EV', outsideEv.avg_pnl_pct == null ? '—' : fmtPct(Number(outsideEv.avg_pnl_pct)), Number(outsideEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', 'History/live EV from strategies not enabled in Paper')}
-      ${paperStat('Paper EV', paperEv.avg_pnl_pct == null ? '—' : fmtPct(Number(paperEv.avg_pnl_pct)), Number(paperEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', 'Closed Paper Trader EV in the lookback')}
+      ${paperStat('Older outcomes outside policy', `${Number(summary.history_outside_policy_count || 0)} · ${Number(summary.history_outside_policy_pct || 0).toFixed(1)}%`, Number(summary.history_outside_policy_pct || 0) <= 5 ? '#22c55e' : Number(summary.history_outside_policy_pct || 0) <= 25 ? '#f59e0b' : '#ef4444', 'Older outcomes from strategies that are not enabled in the current simulated policy.')}
+      ${paperStat('Older avg result', historyEv.avg_pnl_pct == null ? '—' : fmtPct(Number(historyEv.avg_pnl_pct)), Number(historyEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', TRADER_HELP.expected_value)}
+      ${paperStat('Comparable older avg result', insideEv.avg_pnl_pct == null ? '—' : fmtPct(Number(insideEv.avg_pnl_pct)), Number(insideEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', 'Average older result after keeping only strategies enabled in the current simulated policy.')}
+      ${paperStat('Outside-policy avg result', outsideEv.avg_pnl_pct == null ? '—' : fmtPct(Number(outsideEv.avg_pnl_pct)), Number(outsideEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', 'Average result from older strategies that are not part of the current simulated policy.')}
+      ${paperStat('Current Paper avg result', paperEv.avg_pnl_pct == null ? '—' : fmtPct(Number(paperEv.avg_pnl_pct)), Number(paperEv.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', TRADER_HELP.expected_value)}
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:9px;margin-bottom:10px;">
       <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px;">
@@ -16355,7 +16556,7 @@ function renderExecutionPolicyAlignment(payload) {
     ${notes ? `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;margin-bottom:10px;">${notes}</div>` : ''}
     <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:9px 10px;">
       <div style="display:grid;grid-template-columns:minmax(120px,1.4fr) 58px 70px 58px 70px minmax(120px,1fr);gap:8px;font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px;">
-        <span>Strategy</span><span style="text-align:right;">Hist N</span><span style="text-align:right;">Hist EV</span><span style="text-align:right;">Paper N</span><span style="text-align:right;">Paper EV</span><span>Status</span>
+        <span>Strategy</span><span style="text-align:right;">Older sample</span><span style="text-align:right;">Older avg</span><span style="text-align:right;">Paper sample</span><span style="text-align:right;">Paper avg</span><span>Status</span>
       </div>
       ${strategyRows || '<div style="font-size:11px;color:var(--text3);padding:8px 0;">No recent strategy sample.</div>'}
     </div>
@@ -16621,10 +16822,10 @@ function renderPaperCohortStrip(cohort) {
       </div>
       <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;font-family:var(--mono);font-size:12px;color:#888;">
         <span><b style="color:${okColor};font-size:16px;">${count}</b><span style="color:#555">/${target}</span> trades</span>
-        <span>W+P <b style="color:${Number(st.win_partial_rate || 0) >= 50 ? '#22c55e' : '#ef4444'}">${wp}</b></span>
-        <span>Avg <b style="color:${Number(st.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${avg}</b></span>
-        <span>PF <b style="color:${Number(st.profit_factor || 0) >= 1.25 ? '#22c55e' : '#f59e0b'}">${pf}</b></span>
-        <span>$ <b style="color:${Number(st.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444'}">${usd}</b></span>
+        <span>Profitable/partial <b style="color:${Number(st.win_partial_rate || 0) >= 50 ? '#22c55e' : '#ef4444'}">${wp}</b></span>
+        <span>Avg result <b style="color:${Number(st.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${avg}</b></span>
+        <span>Profit factor <b style="color:${Number(st.profit_factor || 0) >= 1.25 ? '#22c55e' : '#f59e0b'}">${pf}</b></span>
+        <span>Total $ result <b style="color:${Number(st.total_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444'}">${usd}</b></span>
       </div>
     </div>
     <div style="height:4px;background:#111827;border-radius:99px;overflow:hidden;margin-top:8px;">
@@ -16637,7 +16838,7 @@ function renderPaperCohortReview(payload) {
   if (!payload) return '';
   if (!payload.success) {
     return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px 11px;margin-bottom:10px;color:#777;font-size:12px;">
-      Cohort Review unavailable: ${esc(payload.error || 'report not ready')}
+      Current trial review unavailable: ${esc(payload.error || 'report not ready')}
     </div>`;
   }
   const r = payload.review || {};
@@ -16659,11 +16860,17 @@ function renderPaperCohortReview(payload) {
     wait:'#60a5fa',
     fail:'#ef4444',
   })[status] || '#9ca3af';
+  const gateLabel = status => ({
+    pass:'Ready',
+    watch:'Needs setup',
+    wait:'Collecting',
+    fail:'Blocked',
+  })[status] || 'Information';
   const gateHtml = gates.map(g => `
     <div title="${esc(g.detail || '')}" style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:7px 9px;">
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:3px;">
         <span style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;">${esc(g.name || '')}</span>
-        <span style="font-size:9px;color:${gateColor(g.status)};text-transform:uppercase;font-weight:800;">${esc(g.status || '')}</span>
+        <span style="font-size:9px;color:${gateColor(g.status)};text-transform:uppercase;font-weight:800;">${esc(gateLabel(g.status))}</span>
       </div>
       <div style="font-family:var(--mono);font-size:13px;font-weight:800;color:var(--text2);">${esc(g.value ?? '—')}</div>
       <div style="font-size:10px;color:#667085;margin-top:2px;">Target ${esc(g.target || '—')}</div>
@@ -16672,7 +16879,7 @@ function renderPaperCohortReview(payload) {
     const avg = Number(item.avg_pnl || 0);
     return `<div style="display:flex;justify-content:space-between;gap:10px;border-top:1px solid #18202b;padding-top:5px;margin-top:5px;font-size:11px;">
       <span style="color:#9ca3af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(String(item.key || 'unknown').replace(/_/g, ' '))}</span>
-      <span style="font-family:var(--mono);color:${avg >= 0 ? '#22c55e' : '#ef4444'}">${Number(item.count || 0)} · ${fmtPct(avg)} · PF ${Number(item.profit_factor || 0).toFixed(2)}</span>
+      <span style="font-family:var(--mono);color:${avg >= 0 ? '#22c55e' : '#ef4444'}">${Number(item.count || 0)} trades · ${fmtPct(avg)} avg · profit factor ${Number(item.profit_factor || 0).toFixed(2)}</span>
     </div>`;
   };
   const stratRows = strategies.slice(0, 4).map(row).join('');
@@ -16689,9 +16896,9 @@ function renderPaperCohortReview(payload) {
   return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 11px;margin-bottom:10px;">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
       <div>
-        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Cohort Review</div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Current Trial Review</div>
         <div style="font-size:16px;font-weight:850;color:${decisionColor};margin-top:2px;">${esc(r.decision_label || 'Review')}</div>
-        <div style="font-size:10px;color:#667085;margin-top:3px;">P12 evidence target ${Number(r.target_count || 50)} closed${Number(r.configured_target_count || 0) < Number(r.target_count || 50) ? ` · experiment target ${Number(r.configured_target_count || 0)} is progress-only` : ''}</div>
+        <div style="font-size:10px;color:#667085;margin-top:3px;">Assisted-live evidence target: ${Number(r.target_count || 50)} closed trades${Number(r.configured_target_count || 0) < Number(r.target_count || 50) ? ` · the smaller ${Number(r.configured_target_count || 0)}-trade experiment target shows progress only` : ''}</div>
       </div>
       <button onclick="loadPaperTrading()" title="Refresh cohort review" style="background:transparent;border:1px solid #263244;color:#9ca3af;border-radius:5px;padding:6px 9px;font-size:11px;cursor:pointer;">Refresh</button>
     </div>
@@ -16703,35 +16910,35 @@ function renderPaperCohortReview(payload) {
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:9px;">
       <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;">
-        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Baseline Comparison</div>
+        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Current Trial vs Earlier Trades</div>
         <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:7px;font-family:var(--mono);font-size:12px;">
-          <div><span style="color:#667085;">Cohort</span><br><b style="color:${Number(cohort.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(cohort.avg_pnl || 0)}</b> <span style="color:#667085;">W+P ${Number(cohort.win_partial_rate || 0).toFixed(1)}%</span></div>
-          <div><span style="color:#667085;">Prior</span><br><b style="color:${Number(baseline.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(baseline.avg_pnl || 0)}</b> <span style="color:#667085;">W+P ${Number(baseline.win_partial_rate || 0).toFixed(1)}%</span></div>
+          <div><span style="color:#667085;">Current trial</span><br><b style="color:${Number(cohort.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(cohort.avg_pnl || 0)}</b> <span style="color:#667085;">profitable/partial ${Number(cohort.win_partial_rate || 0).toFixed(1)}%</span></div>
+          <div><span style="color:#667085;">Earlier trades</span><br><b style="color:${Number(baseline.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(baseline.avg_pnl || 0)}</b> <span style="color:#667085;">profitable/partial ${Number(baseline.win_partial_rate || 0).toFixed(1)}%</span></div>
         </div>
-        <div style="font-size:11px;color:#9ca3af;margin-top:7px;">Delta: <b style="font-family:var(--mono);color:${Number(delta.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(delta.avg_pnl || 0)}</b> avg P&L, <b style="font-family:var(--mono);color:${Number(delta.win_partial_rate || 0) >= 0 ? '#22c55e' : '#ef4444'}">${Number(delta.win_partial_rate || 0).toFixed(1)}%</b> W+P.</div>
+        <div style="font-size:11px;color:#9ca3af;margin-top:7px;">Change: <b style="font-family:var(--mono);color:${Number(delta.avg_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">${fmtPct(delta.avg_pnl || 0)}</b> average result, <b style="font-family:var(--mono);color:${Number(delta.win_partial_rate || 0) >= 0 ? '#22c55e' : '#ef4444'}">${Number(delta.win_partial_rate || 0).toFixed(1)}</b> percentage points profitable/partial.</div>
       </div>
       <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;">
-        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Strategy Split</div>
+        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Results by Strategy</div>
         ${stratRows || '<div style="font-size:11px;color:#667085;">No closed cohort strategy sample yet.</div>'}
         ${dirRows ? `<div style="margin-top:7px;">${dirRows}</div>` : ''}
       </div>
       <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;">
-        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Robust Evidence</div>
+        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Is Profit Broad or Outlier-Driven?</div>
         <div style="font-size:11px;color:#9ca3af;line-height:1.6;">
-          10% trimmed EV: <b style="font-family:var(--mono);color:${Number(cohort.trimmed_avg_pnl || 0) > 0 ? '#22c55e' : '#f59e0b'}">${fmtPct(Number(cohort.trimmed_avg_pnl || 0))}</b><br>
-          P&L without best winner: <b style="font-family:var(--mono);color:${Number(cohort.leave_best_out_total_pnl_usd || 0) > 0 ? '#22c55e' : '#f59e0b'}">${fmtUsdSigned(Number(cohort.leave_best_out_total_pnl_usd || 0))}</b><br>
-          Cohort drawdown: <b style="font-family:var(--mono);color:${Number(cohort.max_drawdown_pct || 0) <= 20 ? '#22c55e' : '#ef4444'}">${Number(cohort.max_drawdown_pct || 0).toFixed(1)}%</b><br>
+          Average after trimming extreme results: <b style="font-family:var(--mono);color:${Number(cohort.trimmed_avg_pnl || 0) > 0 ? '#22c55e' : '#f59e0b'}">${fmtPct(Number(cohort.trimmed_avg_pnl || 0))}</b><br>
+          Total result without best winner: <b style="font-family:var(--mono);color:${Number(cohort.leave_best_out_total_pnl_usd || 0) > 0 ? '#22c55e' : '#f59e0b'}">${fmtUsdSigned(Number(cohort.leave_best_out_total_pnl_usd || 0))}</b><br>
+          Current-trial drawdown: <b style="font-family:var(--mono);color:${Number(cohort.max_drawdown_pct || 0) <= 20 ? '#22c55e' : '#ef4444'}">${Number(cohort.max_drawdown_pct || 0).toFixed(1)}%</b><br>
           Top-winner share: <b style="font-family:var(--mono);color:var(--text2)">${cohort.top_winner_share_pct == null ? '—' : Number(cohort.top_winner_share_pct).toFixed(1) + '%'}</b><br>
-          Recent 20: <b style="font-family:var(--mono);color:${Number(recent20.avg_pnl || 0) > 0 ? '#22c55e' : '#f59e0b'}">${Number(recent20.count || 0)}/20 · ${fmtPct(Number(recent20.avg_pnl || 0))} · PF ${Number(recent20.profit_factor || 0).toFixed(2)}</b><br>
-          Recent 50: <b style="font-family:var(--mono);color:${Number(recent50.avg_pnl || 0) > 0 ? '#22c55e' : '#f59e0b'}">${Number(recent50.count || 0)}/50 · ${fmtPct(Number(recent50.avg_pnl || 0))} · PF ${Number(recent50.profit_factor || 0).toFixed(2)}</b>
+          Recent 20 trades: <b style="font-family:var(--mono);color:${Number(recent20.avg_pnl || 0) > 0 ? '#22c55e' : '#f59e0b'}">${Number(recent20.count || 0)}/20 · ${fmtPct(Number(recent20.avg_pnl || 0))} avg · profit factor ${Number(recent20.profit_factor || 0).toFixed(2)}</b><br>
+          Recent 50 trades: <b style="font-family:var(--mono);color:${Number(recent50.avg_pnl || 0) > 0 ? '#22c55e' : '#f59e0b'}">${Number(recent50.count || 0)}/50 · ${fmtPct(Number(recent50.avg_pnl || 0))} avg · profit factor ${Number(recent50.profit_factor || 0).toFixed(2)}</b>
         </div>
       </div>
       <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 9px;">
-        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Learning Inputs</div>
+        <div style="font-size:9px;color:#667085;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Supporting Evidence</div>
         <div style="font-size:11px;color:#9ca3af;line-height:1.55;">
           Edge Lab: <b style="color:${r.edge_lab?.available ? '#22c55e' : '#f59e0b'}">${r.edge_lab?.available ? 'available' : 'waiting'}</b><br>
           Hermes sources: <b style="color:var(--text2)">${Number(hermes.source_count || 0)}</b><br>
-          Shadow experiments: <b style="color:var(--text2)">${Number(hermes.shadow_experiment_count || 0)}</b><br>
+          Research-only tests: <b style="color:var(--text2)">${Number(hermes.shadow_experiment_count || 0)}</b><br>
           Latest research memo: <b style="color:var(--text2)">${esc(memoAt)}</b>
         </div>
       </div>
@@ -16837,8 +17044,8 @@ function edgeAlignmentText(label, bestEdge) {
 
 function renderPaperCohortEdgeLoading() {
   return `<div id="paper-cohort-edge-card" style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 11px;margin-bottom:10px;">
-    <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Edge Lab Cohort Attribution</div>
-    <div style="font-size:12px;color:#777;margin-top:6px;">Loading Edge Lab attribution...</div>
+    <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Edge Lab Match for Current Trial</div>
+    <div style="font-size:12px;color:#777;margin-top:6px;">Loading current-trial Edge Lab matches...</div>
   </div>`;
 }
 
@@ -16860,7 +17067,7 @@ function renderPaperCohortEdge(data) {
   if (!data) return '';
   if (!data.success) {
     return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px 11px;margin-bottom:10px;color:#777;font-size:12px;">
-      Edge Lab attribution unavailable: ${esc(data.error || 'report not ready')}
+      Current-trial Edge Lab match unavailable: ${esc(data.error || 'report not ready')}
     </div>`;
   }
   const s = data.summary || {};
@@ -16869,9 +17076,8 @@ function renderPaperCohortEdge(data) {
   const align = s.by_alignment || {};
   const strat = s.by_strategy || {};
   const factors = s.top_positive_factors || [];
-  const coverage = Number(s.coverage_pct || 0);
+  const coverage = s.coverage_pct == null ? null : Number(s.coverage_pct);
   const maxIso = edge.max_timestamp_iso ? new Date(edge.max_timestamp_iso + 'Z').toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '—';
-  const totalTrades = Number(s.total_trades || 0);
   const matchedTrades = Number(s.matched_trades || 0);
   const closedTrades = Number(s.closed_trades || 0);
   const favorableClosed = Number((align.favorable || {}).count || 0);
@@ -16896,7 +17102,7 @@ function renderPaperCohortEdge(data) {
     const avg = Number(v.avg_pnl || 0);
     return `<div style="display:flex;justify-content:space-between;gap:10px;font-size:11px;color:#888;border-top:1px solid #18202b;padding-top:5px;margin-top:5px;">
       <span>${esc(k.replace(/_/g, ' '))}</span>
-      <span style="font-family:var(--mono);color:${avg >= 0 ? '#22c55e' : '#ef4444'}">${Number(v.count || 0)} · ${fmtPct(avg)} · W+P ${Number(v.win_partial_rate || 0).toFixed(1)}%</span>
+      <span style="font-family:var(--mono);color:${avg >= 0 ? '#22c55e' : '#ef4444'}">${Number(v.count || 0)} ${Number(v.count || 0) === 1 ? 'trade' : 'trades'} · ${fmtPct(avg)} avg · profitable/partial ${Number(v.win_partial_rate || 0).toFixed(1)}%</span>
     </div>`;
   }).join('');
   const factorRows = factors.slice(0, 4).map(f => {
@@ -16921,22 +17127,25 @@ function renderPaperCohortEdge(data) {
       <div style="color:#7b8494;line-height:1.45;margin-top:4px;">${esc(state)}${path ? ` · ${esc(path)}` : ''}</div>
     </div>`;
   }).join('');
-  const coverageColor = coverage >= 80 ? '#22c55e' : coverage >= 40 ? '#f59e0b' : '#ef4444';
+  const coverageColor = coverage == null ? '#9ca3af' : coverage >= 80 ? '#22c55e' : coverage >= 40 ? '#f59e0b' : '#ef4444';
+  const coverageText = coverage == null
+    ? `Collecting · ${matchedTrades}/${closedTrades}`
+    : `${coverage.toFixed(1)}% · ${matchedTrades}/${closedTrades} closed`;
   return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 11px;margin-bottom:10px;">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
       <div>
-        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Edge Lab Cohort Attribution</div>
-        <div style="font-size:11px;color:#777;margin-top:2px;">Latest Edge candle ${esc(maxIso)} · match window ${Number(edge.max_match_age_minutes || 30)}m</div>
+        <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Edge Lab Match for Current Trial</div>
+        <div style="font-size:11px;color:#777;margin-top:2px;">Closed trades only · latest Edge candle ${esc(maxIso)} · nearest-state window ${Number(edge.max_match_age_minutes || 30)}m</div>
       </div>
-      <div style="font-size:11px;color:${coverageColor};font-family:var(--mono);font-weight:800;">${coverage.toFixed(1)}% coverage</div>
+      <div style="font-size:11px;color:${coverageColor};font-family:var(--mono);font-weight:800;">${coverageText}</div>
     </div>
     <div style="border:1px solid #1e2530;background:#0b0f15;border-radius:5px;padding:8px 9px;margin-bottom:8px;">
-      <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.07em;font-weight:800;margin-bottom:3px;">Cohort Verdict</div>
+      <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.07em;font-weight:800;margin-bottom:3px;">What the Match Says</div>
       <div style="font-size:12px;color:${verdictColor};line-height:1.45;">${esc(verdictText)}</div>
       <div style="font-size:11px;color:#667085;line-height:1.45;margin-top:4px;">Edge Lab compares each paper entry to the closest same-symbol 15m historical state. It helps explain whether winners and losers are happening in historically favorable conditions.</div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:7px;margin-bottom:8px;">
-      ${metric('Matched', `${matchedTrades}/${totalTrades}`, coverageColor, 'Paper trades with a same-symbol Edge Lab candle near entry')}
+      ${metric('Closed trades matched', `${matchedTrades}/${closedTrades}`, coverageColor, 'Closed current-trial trades with a same-symbol Edge Lab candle near entry')}
       ${bucket('favorable', 'Favorable')}
       ${bucket('mild', 'Mild')}
       ${bucket('unfavorable', 'Unfavorable')}

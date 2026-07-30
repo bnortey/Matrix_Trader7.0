@@ -160,6 +160,49 @@ class ProductionRegressionTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(second["coverage_pct"], 75.0)
 
+    @patch("app._hermes_research_pipeline_summary", return_value={"library": {"source_count": 2}})
+    @patch("app._learner_running", return_value=True)
+    @patch("app._file_age_seconds", return_value=60)
+    @patch("app._edge_lab_cohort_coverage_cached")
+    @patch("app._annotate_suggestion_authority", return_value=[])
+    @patch("app._load_suggestions", return_value=[])
+    @patch("app._compute_goal_actuals")
+    @patch("app._load_goals", return_value={})
+    @patch("app._version_payload", return_value={"app_sha": "abc123", "git_commit": "abc123"})
+    def test_watchdog_treats_empty_current_cohort_as_collecting_not_zero_quality(
+        self,
+        version,
+        goals,
+        actuals,
+        suggestions,
+        authority,
+        coverage,
+        ages,
+        learner,
+        research,
+    ):
+        actuals.return_value = {
+            "max_drawdown_usd": 0,
+            "drawdown_pct": 0,
+            "return_pct": 0,
+            "scale_up_blockers": ["collect more trades"],
+            "scale_up_ready": False,
+            "active_safety_controls": [],
+        }
+        coverage.return_value = {
+            "available": True,
+            "coverage_pct": None,
+            "matched": 0,
+            "total": 0,
+            "measurement_state": "collecting",
+        }
+        payload = mt7._ops_watchdog_payload()
+        check = next(c for c in payload["checks"] if c["name"] == "Current Paper Cohort Edge Coverage")
+        self.assertEqual(check["status"], "info")
+        self.assertEqual(check["value"], "collecting · 0/0")
+        self.assertEqual(payload["warn_count"], 1)
+        self.assertNotIn("P12", " ".join(c["name"] for c in payload["checks"]))
+
     def test_frontend_contains_first_load_and_batch_upload_regressions(self):
         source = Path("templates/index.html").read_text(encoding="utf-8")
         self.assertIn("fetch('/api/scan/strategy'", source)
@@ -168,6 +211,17 @@ class ProductionRegressionTests(unittest.TestCase):
         self.assertIn("loadOpsWatchdog", source)
         self.assertIn("overflow-y:auto;overflow-x:hidden", source)
         self.assertIn("max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch", source)
+        self.assertIn("const TRADER_HELP =", source)
+        self.assertIn("function coverageDisplay(", source)
+        self.assertIn("`${emptyLabel} · ${n}/${d}`", source)
+        self.assertIn("ASSISTED-LIVE READINESS", source)
+        self.assertIn("Profitable or partial rate", source)
+        self.assertIn("Average result after costs", source)
+        self.assertIn("Why This Is Not Ready Yet", source)
+        self.assertIn("Is Profit Broad or Outlier-Driven?", source)
+        self.assertIn("Evidence Conflict Map", source)
+        self.assertIn("Research Approval & Safety", source)
+        self.assertNotIn(">P12 Posture<", source)
         self.assertNotIn("Missed-mover autopsy not available.", source)
 
 

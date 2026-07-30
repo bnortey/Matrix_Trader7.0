@@ -1277,12 +1277,19 @@ def _edge_lab_cohort_coverage_fast() -> dict:
         total = len(trades)
         return {
             "available": True,
-            "coverage_pct": round(matched / total * 100, 1) if total else 0,
+            "coverage_pct": round(matched / total * 100, 1) if total else None,
             "matched": matched,
             "total": total,
             "coverage_reasons": dict(sorted(reasons.items())),
             "feature_source": "candle_feature_snapshots",
-            "note": "Coverage over closed trades in the current paper cohort.",
+            "measurement_state": "measured" if total else "collecting",
+            "measurement_window_start": str(since),
+            "note": (
+                "Share of closed trades in the current Paper cohort with a usable "
+                "pre-entry Edge Lab snapshot."
+                if total
+                else "The current Paper cohort has no closed trades to measure yet."
+            ),
         }
     except Exception as e:
         return {"available": os.path.exists(EDGE_LAB_DB_PATH), "coverage_pct": None, "matched": 0, "total": 0, "error": str(e)}
@@ -1433,18 +1440,30 @@ def _ops_watchdog_payload() -> dict:
         "signals.db should update as scanners, paper trades, or evaluations run.",
         "missing" if db_age is None else f"{round(db_age / 60, 1)}m old",
     ))
+    edge_total = int(edge_coverage.get("total") or 0)
+    edge_matched = int(edge_coverage.get("matched") or 0)
     edge_status = "pass" if edge_coverage.get("coverage_pct") is not None and edge_coverage.get("coverage_pct") >= 60 else "warn"
-    if edge_coverage.get("refreshing") and edge_coverage.get("coverage_pct") is None:
+    if edge_total == 0 and edge_coverage.get("available"):
+        edge_status = "info"
+    elif edge_coverage.get("refreshing") and edge_coverage.get("coverage_pct") is None:
         edge_status = "info"
     elif not edge_coverage.get("available"):
         edge_status = "fail"
     checks.append(_ops_check(
-        "Edge Lab Coverage",
+        "Current Paper Cohort Edge Coverage",
         edge_status,
-        "Cohort attribution needs enough symbol coverage before informing decisions.",
-        f"{edge_coverage.get('coverage_pct')}%" if edge_coverage.get("coverage_pct") is not None else "unavailable",
+        "Share of current-cohort closed trades with a usable pre-entry Edge Lab snapshot.",
         (
-            "Coverage is warming in the background; refresh shortly."
+            f"{edge_coverage.get('coverage_pct')}% · {edge_matched}/{edge_total}"
+            if edge_coverage.get("coverage_pct") is not None
+            else f"collecting · {edge_matched}/{edge_total}"
+            if edge_total == 0 and edge_coverage.get("available")
+            else "unavailable"
+        ),
+        (
+            "Let the current Paper cohort close trades before judging forward coverage."
+            if edge_status == "info" and edge_total == 0
+            else "Coverage is warming in the background; refresh shortly."
             if edge_status == "info"
             else "Add cohort symbols to Edge Lab ingestion before using attribution."
             if edge_status != "pass"
@@ -1452,7 +1471,7 @@ def _ops_watchdog_payload() -> dict:
         ),
     ))
     checks.append(_ops_check(
-        "P12 Gate Posture",
+        "Assisted-Live Readiness",
         "pass" if actuals.get("scale_up_ready") and not actuals.get("active_safety_controls") else "warn",
         "Readiness for design review only; silent live trading remains disabled by safety rules.",
         "ready" if actuals.get("scale_up_ready") else "blocked",
@@ -32529,21 +32548,21 @@ def _live_readiness_payload() -> dict:
             "Paper must keep collecting policy evidence before any assisted-live review.",
         ),
         _live_readiness_gate(
-            "Paper cohort sample",
+            "Current Paper trial sample",
             "pass" if cohort_n >= cohort_target else "wait",
             f"{cohort_n}/{cohort_target}",
             f">= {cohort_target} closed",
-            "Closed trades in the current paper policy cohort.",
+            "Closed trades recorded since the current Paper policy trial began.",
         ),
         _live_readiness_gate(
-            "Paper W+P rate",
+            "Profitable or partial rate",
             "wait" if cohort_n < cohort_target else ("pass" if cohort_wp is not None and float(cohort_wp) >= cohort_wp_floor else "fail"),
             "—" if cohort_wp is None else f"{float(cohort_wp):.1f}%",
             f">= {cohort_wp_floor:.0f}%",
-            "Wins plus partial wins for the current paper policy cohort.",
+            "Share of current-trial trades that finished as a full or partial profit.",
         ),
         _live_readiness_gate(
-            "Paper net EV",
+            "Average result after costs",
             "wait" if cohort_n < cohort_target else (
                 "pass"
                 if cohort_avg is not None
@@ -32557,7 +32576,7 @@ def _live_readiness_payload() -> dict:
                 else f"{float(cohort_avg):+.2f}% / ${float(cohort_avg_usd or 0):+.2f}"
             ),
             "> 0% and > $0",
-            "Net EV must be positive after paper fees and slippage in both percentage and dollar terms.",
+            "The average result must be positive after simulated fees and slippage in both percentage and dollar terms.",
         ),
         _live_readiness_gate(
             "Paper profit factor",
@@ -32567,16 +32586,16 @@ def _live_readiness_payload() -> dict:
             "Gross dollars won divided by gross dollars lost in the paper cohort.",
         ),
         _live_readiness_gate(
-            "Paper rolling stability",
+            "Recent-window consistency",
             "wait" if cohort_n < cohort_target else (
                 "pass" if cohort_rolling_stable else "fail"
             ),
-            "20/50 stable" if cohort_rolling_stable else "not stable",
-            "20/50 EV > 0, PF >= 1.0, W+P >= 50%",
-            "Recent 20- and 50-trade windows must both remain net-positive.",
+            "recent 20 and 50 are stable" if cohort_rolling_stable else "not yet stable",
+            "both averages > 0; profit factor >= 1.0; profitable/partial >= 50%",
+            "The most recent 20- and 50-trade windows must both remain net-positive instead of relying on older wins.",
         ),
         _live_readiness_gate(
-            "Paper outlier resilience",
+            "Profit without outlier dependence",
             "wait" if cohort_n < cohort_target else (
                 "pass"
                 if cohort_trimmed is not None
@@ -32586,29 +32605,29 @@ def _live_readiness_payload() -> dict:
             ),
             (
                 "—" if cohort_trimmed is None
-                else f"trim {float(cohort_trimmed):+.2f}% / ex-best ${float(cohort_ex_best_usd or 0):+.2f}"
+                else f"trimmed avg {float(cohort_trimmed):+.2f}% / without best ${float(cohort_ex_best_usd or 0):+.2f}"
             ),
             "both > 0",
-            "A 10% trimmed mean and P&L after removing the best dollar winner must stay positive.",
+            "The average after trimming extreme results and total P&L after removing the best winner must both stay positive.",
         ),
         _live_readiness_gate(
-            "Paper cohort drawdown",
+            "Current-trial drawdown",
             "wait" if cohort_n < cohort_target else (
                 "pass" if cohort_drawdown <= cohort_drawdown_limit else "fail"
             ),
             f"{cohort_drawdown:.1f}%",
             f"<= {cohort_drawdown_limit:.1f}%",
-            "Peak-to-trough drawdown inside the isolated policy cohort.",
+            "Peak-to-trough drawdown measured only within the current Paper trial.",
         ),
         _live_readiness_gate(
-            "Paper account drawdown",
+            "Whole Paper account drawdown",
             "pass" if drawdown_pct < max_drawdown_pct else "fail",
             f"{drawdown_pct:.1f}%",
             f"< {max_drawdown_pct:.1f}%",
             "Paper equity drawdown must stay inside the configured risk limit.",
         ),
         _live_readiness_gate(
-            "Paper safety controls",
+            "Paper risk controls",
             "pass" if not safety_controls else "fail",
             "clear" if not safety_controls else f"{len(safety_controls)} active",
             "clear",
@@ -33418,10 +33437,15 @@ def api_paper_cohort_edge():
                 if match.get("edge_delta") is not None and float(match.get("edge_delta") or 0) > 0:
                     by_factor[f"{match.get('group')}:{match.get('group_key')}"].append(t)
 
-        coverage_count = len([t for t in attributed if (t.get("edge_lab") or {}).get("matched")])
+        matched_closed = [
+            t for t in closed if (t.get("edge_lab") or {}).get("matched")
+        ]
+        matched_all = [
+            t for t in attributed if (t.get("edge_lab") or {}).get("matched")
+        ]
         coverage_reasons = defaultdict(int)
         unmatched_symbols = defaultdict(lambda: {"count": 0, "reasons": defaultdict(int)})
-        for trade in attributed:
+        for trade in closed:
             edge = trade.get("edge_lab") or {}
             reason = edge.get("coverage_reason") or "unknown"
             coverage_reasons[reason] += 1
@@ -33432,8 +33456,15 @@ def api_paper_cohort_edge():
         summary = {
             "total_trades": len(attributed),
             "closed_trades": len(closed),
-            "matched_trades": coverage_count,
-            "coverage_pct": round(coverage_count / len(attributed) * 100, 1) if attributed else 0,
+            "open_or_pending_trades": len(attributed) - len(closed),
+            "matched_all_trades": len(matched_all),
+            "matched_trades": len(matched_closed),
+            "coverage_pct": (
+                round(len(matched_closed) / len(closed) * 100, 1)
+                if closed
+                else None
+            ),
+            "coverage_basis": "closed_current_trial_trades",
             "coverage_reasons": dict(sorted(coverage_reasons.items())),
             "unmatched_symbols": [
                 {
@@ -33560,7 +33591,7 @@ def _build_paper_cohort_review() -> dict:
             "decision_color": "amber",
             "summary": "No current paper cohort start is configured, so MT7 cannot isolate this test from older paper trades.",
             "recommendation": "Set a cohort start timestamp before judging paper changes.",
-            "gates": [_paper_cohort_gate("Sample", "fail", f"0/{target}", f"{target} closed", "No isolated cohort sample yet.")],
+            "gates": [_paper_cohort_gate("Closed trades collected", "watch", f"0/{target}", f"{target} closed", "Set a current-trial start time before collecting this sample.")],
             "cohort": _paper_review_stats([], starting_balance),
             "baseline": _paper_review_stats([], starting_balance),
             "strategy_breakdown": [],
@@ -33623,14 +33654,14 @@ def _build_paper_cohort_review() -> dict:
 
     gates = [
         _paper_cohort_gate(
-            "Sample",
+            "Closed trades collected",
             "pass" if sample_ready else ("watch" if count >= max(10, target // 2) else "wait"),
             f"{count}/{target}",
             f"{target} closed",
-            "P12 requires at least 50 isolated closed trades, even if the configured experiment target is smaller.",
+            "Assisted-live review requires at least 50 isolated closed trades, even if the configured experiment target is smaller.",
         ),
         _paper_cohort_gate(
-            "W+P Rate",
+            "Profitable or partial rate",
             "wait" if not sample_ready else (
                 "pass" if wp >= PAPER_READINESS_WP_FLOOR_PCT else "fail"
             ),
@@ -33639,13 +33670,13 @@ def _build_paper_cohort_review() -> dict:
             "Wins plus partial wins must clear the reliability floor on the full isolated cohort.",
         ),
         _paper_cohort_gate(
-            "Net EV",
+            "Average result after costs",
             "wait" if not sample_ready else (
                 "pass" if avg > 0 and avg_usd > 0 else "fail"
             ),
             f"{avg:+.2f}% / ${avg_usd:+.2f}",
             "> 0% and > $0",
-            "Average net paper P&L must be positive in both percentage and actual position-size dollars after fees and slippage.",
+            "Average Paper result must be positive in both percentage and actual position-size dollars after fees and slippage.",
         ),
         _paper_cohort_gate(
             "Profit Factor",
@@ -33657,7 +33688,7 @@ def _build_paper_cohort_review() -> dict:
             "Gross dollars won divided by gross dollars lost.",
         ),
         _paper_cohort_gate(
-            "Rolling Stability",
+            "Recent-window consistency",
             "wait" if not sample_ready else (
                 "pass" if rolling_stable else "fail"
             ),
@@ -33665,20 +33696,20 @@ def _build_paper_cohort_review() -> dict:
                 f"{window}: {float((rolling.get(str(window)) or {}).get('avg_pnl') or 0):+.2f}%"
                 for window in PAPER_READINESS_RECENT_WINDOWS
             ),
-            "20/50 EV > 0, PF >= 1.0, W+P >= 50%",
+            "both averages > 0; profit factor >= 1.0; profitable/partial >= 50%",
             "Both recent windows must remain net-positive so an older winning regime cannot hide current decay.",
         ),
         _paper_cohort_gate(
-            "Outlier Resilience",
+            "Profit without outlier dependence",
             "wait" if not sample_ready else (
                 "pass" if trimmed_avg > 0 and leave_best_usd > 0 else "fail"
             ),
-            f"trim {trimmed_avg:+.2f}% / ex-best ${leave_best_usd:+.2f}",
+            f"trimmed avg {trimmed_avg:+.2f}% / without best ${leave_best_usd:+.2f}",
             "both > 0",
             "The 10% trimmed mean and total P&L after removing the single best dollar winner must both remain positive.",
         ),
         _paper_cohort_gate(
-            "Cohort Drawdown",
+            "Current-trial drawdown",
             "wait" if not sample_ready else (
                 "pass" if cohort_drawdown <= drawdown_limit else "fail"
             ),
@@ -33687,9 +33718,9 @@ def _build_paper_cohort_review() -> dict:
             "Peak-to-trough drawdown is calculated only inside the isolated cohort using actual paper position sizes.",
         ),
         _paper_cohort_gate(
-            "Prior Sample Context",
+            "Change from earlier trades",
             "pass" if avg > baseline_avg and wp >= baseline_wp else "watch",
-            f"{avg - baseline_avg:+.2f}% EV / {wp - baseline_wp:+.1f}% W+P",
+            f"{avg - baseline_avg:+.2f}% average / {wp - baseline_wp:+.1f} points profitable-or-partial",
             "informational",
             "The older mixed-policy sample is useful context but cannot authorize or block the current policy.",
             blocking=False,
