@@ -7,9 +7,79 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-29
-Latest implementation commit: 2a988fe feat: complete report intelligence closeout
-app.py: 35,021 lines
-index.html: 19,172 lines
+Latest implementation commit: c989b84 fix: restore MT7 dashboard reliability
+app.py: 35,384 lines
+index.html: 19,252 lines
+
+---
+
+## 2026-07-29 — Production dashboard reliability and measured-regime fix
+
+**Built, tested, and deployed to production `207.148.66.39`:**
+
+- Replaced the dashboard's normal all-strategy scan call with
+  `POST /api/scan/strategy`, which scans only the selected exchange and
+  strategy. The deliberate broad-scan route still exists.
+  - The old normal path took `112.84s` in production.
+  - Browser acceptance completed a MEXC Balanced scan in `5.8s`; a separate
+    production request completed in `9.08s` across `1,043` contracts.
+  - Empty valid results now explain that no signals met the selected threshold
+    instead of presenting a failed-fetch retry state.
+- Fixed Missed Mover Autopsy first-load behavior.
+  - The panel now shows an immediate loading state and an explicit retry error.
+  - A successful autopsy is retained even if auxiliary radar/evaluation calls
+    fail.
+  - Expensive kline evidence is collected only for the ranked display cohort
+    and in bounded parallel workers instead of serially for every large mover.
+  - Production latency fell from roughly `53s` to `13.0s`; the rendered panel
+    showed 38 candidates and 12 ranked shadow rows during acceptance.
+- Fixed Ops Watchdog's permanent loading state.
+  - Edge Lab cohort coverage is refreshed in a thread-safe 15-minute
+    background cache, so the first health request can return a truthful
+    warming state without opening the roughly 20 GB Edge Lab database on the
+    request path.
+  - Watchdog now has its own 30-second frontend timeout, visible failure
+    message, and retry control.
+  - Production returned in `2.54s`; desktop and mobile showed
+    `REVIEW · 0 fail / 2 warn`.
+- Upgraded Cipher's market-regime measurement to
+  `cipher-v11-measured-market-regime`.
+  - The daily report now classifies the broad ticker snapshot using breadth,
+    median move, market-wide expansion, and extreme-funding participation.
+  - Sparse agent-regime coverage and missing agent fields can no longer turn
+    the whole market into `unknown`.
+  - MT7 still abstains explicitly when both the broad market and classified
+    signal samples are genuinely too small.
+  - Production classified the current `1,043`-contract market as `choppy`,
+    medium confidence, mixed directional bias, with the report evidence
+    visible in a new Measured Market Regime section.
+- Added batch Research PDF ingestion.
+  - The upload dialog accepts up to 20 PDFs at once, with common tags and MT7
+    fields, per-file results, and partial-success errors.
+  - Limits are 25 MB per PDF and 250 MB per batch.
+  - The legacy single-file `file` field and single-file title override remain
+    compatible.
+- Fixed Intelligence mobile containment. The page itself no longer shifts
+  horizontally when selecting right-side tabs; the tab strip scrolls
+  independently while report and Watchdog content remain inside the viewport.
+
+**Verification and preservation:**
+
+- Full local suite: `101/101` tests passed. Python compile, inline JavaScript
+  parse, and `git diff --check` passed.
+- Desktop and 390 × 844 mobile browser acceptance passed for selected-strategy
+  scans, Missed Mover first-load/render, Ops Watchdog, Cipher's measured
+  regime, and the batch PDF dialog. The mobile document width remained exactly
+  390 px.
+- No strategy rules, leverage, position size, risk gates, live settings, or
+  trading database schema were changed.
+- Production SQLite integrity is `ok`: `3,970` signals and `2,719` Paper rows
+  (`304 closed`, `30 entry_expired`, `2 expired`, `2,381 flow_rejected`,
+  `1 open`, `1 pending`). Both `matrix-trader` and `mt-learner` are active.
+- Server rollback snapshot:
+  `/opt/matrix-trader/backups/20260730T020000Z-dashboard-reliability`.
+  It is 467 MB and contains the pre-deploy application files, consistent
+  database, verified compressed database, hashes, and pre-deploy statistics.
 
 ---
 
