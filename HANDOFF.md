@@ -7,9 +7,59 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-30
-Latest implementation commit: 6493362 feat: orchestrate causal research experiments
-app.py: 37,522 lines
-index.html: 19,575 lines
+Latest implementation commit: 624d17d feat: explain research experiments clearly
+app.py: 37,703 lines
+index.html: 19,710 lines
+
+---
+
+## 2026-07-30 — Approval-ready research experiment briefs
+
+**Built, tested, committed, and deployed to production `207.148.66.39`:**
+
+- Reworked every Research Autopilot experiment card into a plain-language,
+  approval-ready brief under Intelligence → Strategy Ideas. The collapsed card
+  shows the experiment type, target strategy, decision surface, authority,
+  allocation, progress, outcomes, verdict, and exact reason it is not running.
+- Added an expandable full brief covering the hypothesis, expected source of
+  edge, exact treatment and control behavior, cohort assignment, primary
+  metric, forward-test progress, validation blockers, source evidence and
+  quality, relevant trading costs, failure risks, promotion requirements,
+  rollback behavior, authority ceiling, and what the test cannot prove.
+- Made current runtime behavior explicit for the initial gate experiments:
+  the order-flow challenger uses MT7's existing flow confirmation, while the
+  funding challenger blocks only the predeclared extreme-funding cases without
+  flow confirmation. The control arm remains the current strategy policy.
+- Preserved experiment integrity by refreshing explanatory provenance only.
+  Existing frozen contracts, policy fingerprints, approvals, lifecycle
+  timestamps, assignments, and outcome progress are not rewritten by the
+  explanation refresh.
+- Added exact decision thresholds to every brief: at least 50 closed outcomes,
+  seven elapsed days, 20 independent market days, complete relevant costs,
+  placebo/falsification checks, and the two-stage manual Paper promotion path.
+  The UI states that no experiment can change live trading or increase risk.
+- Added richer research provenance to candidates and ledger entries, including
+  thesis, expected edge, strategy shape, entry and rejection rules, cohort
+  definition, known caveats, failure modes, gate impact, overfit risk, and
+  missing or partial evidence fields.
+
+**Verification:**
+
+- Final full local suite: `112/112` tests passed, including `10/10`
+  orchestrator-focused tests. Python compile, inline JavaScript parse, and
+  `git diff --check` passed.
+- Desktop and exact `390×845` mobile browser acceptance passed on the deployed
+  source state with no console errors, no horizontal overflow, fully expanded
+  details, and summary tiles that wrap instead of clipping.
+- Production file hashes match the tested local backend, dashboard, and
+  orchestrator module. The served dashboard contains the full brief and
+  decision-rule UI; `matrix-trader` and `mt-learner` are active.
+- Production SQLite integrity is `ok` with 4,006 signals and 2,754 paper-trade
+  rows. All four research contracts expose a populated brief and a 50-outcome
+  target. Two await approval, two need data, zero are approved, zero behavioral
+  challengers are active, and live behavior remains unchanged.
+- Before deployment, a verified 450 MB recovery snapshot was created at
+  `/opt/matrix-trader/backups/20260730T191600Z-experiment-briefs`.
 
 ---
 
