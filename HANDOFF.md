@@ -6,10 +6,62 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-07-29
+Last updated: 2026-07-30
 Latest implementation commit: 9f1584c feat: make MT7 evidence trader-readable
-app.py: 35,415 lines
-index.html: 19,461 lines
+app.py: 37,522 lines
+index.html: 19,575 lines
+
+---
+
+## 2026-07-30 — Research experiment orchestration and causal promotion ladder
+
+**Built and tested locally; not committed or deployed:**
+
+- Added a typed research contract and lifecycle for new strategies, entry and
+  risk gates, regime filters, stops, exits, sizing, scoring, portfolio,
+  execution, annotation, and data-collection ideas. Every idea now declares
+  the decision surface it changes, evaluator, treatment allocation, conflict
+  keys, authority ceiling, evidence requirements, and rollback contract.
+- Added a conflict-aware scheduler with a maximum of two simultaneous
+  behavioral Paper challengers and ten shadow/observation experiments.
+  Orthogonal ideas may run together; experiments sharing a strategy decision
+  surface, portfolio capital, or active legacy learner policy test are
+  serialized. Deterministic assignment keeps treatment/control arms stable.
+- Added many-to-many assignment and outcome attribution. Research experiments
+  no longer rely on one experiment ID stored on a trade, and blocked-entry
+  counterfactuals are followed forward rather than counted as automatic wins.
+  Effective sample size is clustered by symbol-day and market-day.
+- Hardened evaluation against false discovery and overfitting:
+  family-wise test counts, Bonferroni-adjusted thresholds, deterministic
+  permutation placebo checks, one predeclared extension, untouched 80/20
+  confirmation cohorts, explicit cost-completeness metadata, and a promotion
+  block for funding-sensitive claims until realized funding cashflows exist.
+- Added automatic preparation, scheduling, progress reconciliation, stale
+  parking, and falsification rollback. Automatic authority ends at Paper:
+  starting a behavioral challenger and either promotion stage require an
+  explicit user action and reason; no route enables live trading.
+- Split promotion into two manual Paper stages. A first promotion creates a
+  fresh confirmation child with a new policy fingerprint; a second promotion
+  marks it confirmed. Failed Paper activation writes a compensating
+  non-behavioral control record so a rejected experiment cannot remain armed.
+- Corrected historical research semantics: mixed-policy retrospective matches
+  can produce historical candidates or rejects, but are never labelled causal
+  forward evidence. Post-outcome stop-quality analysis is diagnostic only.
+- Added a Research Autopilot panel under Intelligence → Strategy Ideas with
+  capacity, lifecycle, assignment, blockage, effectiveness, approval,
+  promotion, reconciliation, and rollback controls.
+
+**Verification:**
+
+- Final full local suite: `111/111` tests passed, including `9/9`
+  orchestrator-focused tests. Python compile, inline JavaScript parse, and
+  `git diff --check` passed.
+- API smoke checks passed for Research Orchestrator, Learning Effectiveness,
+  and research shadow-result endpoints.
+- Desktop and `390×844` browser acceptance passed for the new panel with no
+  console errors and no horizontal overflow.
+- No live authority, leverage escalation, order placement, or production
+  deployment was introduced. Production remains unchanged.
 
 ---
 

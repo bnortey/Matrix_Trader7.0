@@ -83,6 +83,20 @@ from lib.learning_intelligence import (
     stable_fingerprint as _learning_fingerprint,
     validate_strategy_factory_contract as _validate_strategy_factory_contract,
 )
+from lib.research_orchestrator import (
+    BEHAVIORAL_IDEA_TYPES as RESEARCH_BEHAVIORAL_IDEA_TYPES,
+    IDEA_TYPES as RESEARCH_IDEA_TYPES,
+    ORCHESTRATOR_VERSION as RESEARCH_ORCHESTRATOR_VERSION,
+    conflict_report as _research_conflict_report,
+    deterministic_arm as _research_deterministic_arm,
+    effective_sample as _research_effective_sample,
+    normalize_contract as _research_normalize_contract,
+    normalize_idea_type as _research_normalize_idea_type,
+    permutation_delta_test as _research_permutation_delta_test,
+    scheduler_plan as _research_scheduler_plan,
+    transition_allowed as _research_transition_allowed,
+    validate_contract as _research_validate_contract,
+)
 
 load_dotenv()
 
@@ -2301,6 +2315,26 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_learning_experiments_active
         ON learning_experiments (status, strategy_key, activated_at)
     """)
+    for _col, _type in [
+        ("idea_type", "TEXT NOT NULL DEFAULT 'new_strategy'"),
+        ("decision_surface", "TEXT NOT NULL DEFAULT 'signal_generation'"),
+        ("lifecycle_state", "TEXT NOT NULL DEFAULT 'collecting'"),
+        ("hypothesis_family", "TEXT"),
+        ("conflict_keys_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("evaluator", "TEXT NOT NULL DEFAULT 'isolated_strategy_cohort'"),
+        ("treatment_pct", "INTEGER NOT NULL DEFAULT 100"),
+        ("authority_ceiling", "TEXT NOT NULL DEFAULT 'paper'"),
+        ("scheduler_managed", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_progress_at", "TEXT"),
+        ("blocked_reason", "TEXT"),
+        ("extension_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("champion_experiment_id", "TEXT"),
+        ("probation_stage", "TEXT NOT NULL DEFAULT 'initial'"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE learning_experiments ADD COLUMN {_col} {_type}")
+        except sqlite3.OperationalError:
+            pass
     con.execute("""
         CREATE TABLE IF NOT EXISTS learning_experiment_events (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2318,6 +2352,38 @@ def init_db() -> None:
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_learning_experiment_events
         ON learning_experiment_events (experiment_id, sequence)
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS learning_experiment_assignments (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id       TEXT NOT NULL,
+            assignment_key      TEXT NOT NULL,
+            paper_trade_id      INTEGER,
+            signal_id           INTEGER,
+            assigned_at         TEXT NOT NULL,
+            symbol              TEXT NOT NULL,
+            strategy_key        TEXT NOT NULL,
+            arm                 TEXT NOT NULL,
+            bucket              INTEGER NOT NULL,
+            decision            TEXT NOT NULL DEFAULT 'observed',
+            eligible            INTEGER NOT NULL DEFAULT 1,
+            policy_fingerprint  TEXT,
+            outcome_source      TEXT,
+            result              TEXT,
+            pnl_pct             REAL,
+            closed_at           TEXT,
+            metadata_json       TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(experiment_id, assignment_key)
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_learning_assignments_experiment
+        ON learning_experiment_assignments
+           (experiment_id, arm, result, closed_at)
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_learning_assignments_trade
+        ON learning_experiment_assignments (paper_trade_id, signal_id)
     """)
     con.commit()
     con.execute("""
@@ -5477,6 +5543,1468 @@ def _learning_json(raw, default):
         return default
 
 
+RESEARCH_EXPERIMENT_ACTIVE_STATUSES = {"active", "collecting", "review"}
+RESEARCH_EXPERIMENT_TERMINAL_STATUSES = {
+    "falsified",
+    "inconclusive",
+    "promotion_candidate",
+    "completed",
+    "rolled_back",
+    "parked",
+    "cancelled",
+}
+RESEARCH_MAX_BEHAVIORAL_EXPERIMENTS = 2
+RESEARCH_MAX_SHADOW_EXPERIMENTS = 10
+
+
+def _ensure_research_orchestrator_schema() -> None:
+    """Idempotent lazy migration for app imports and existing deployments."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        tables = {
+            str(row[0]) for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "learning_experiments" not in tables:
+            return
+        for col, sql_type in [
+            ("idea_type", "TEXT NOT NULL DEFAULT 'new_strategy'"),
+            ("decision_surface", "TEXT NOT NULL DEFAULT 'signal_generation'"),
+            ("lifecycle_state", "TEXT NOT NULL DEFAULT 'collecting'"),
+            ("hypothesis_family", "TEXT"),
+            ("conflict_keys_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("evaluator", "TEXT NOT NULL DEFAULT 'isolated_strategy_cohort'"),
+            ("treatment_pct", "INTEGER NOT NULL DEFAULT 100"),
+            ("authority_ceiling", "TEXT NOT NULL DEFAULT 'paper'"),
+            ("scheduler_managed", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_progress_at", "TEXT"),
+            ("blocked_reason", "TEXT"),
+            ("extension_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("champion_experiment_id", "TEXT"),
+            ("probation_stage", "TEXT NOT NULL DEFAULT 'initial'"),
+        ]:
+            try:
+                con.execute(
+                    f"ALTER TABLE learning_experiments ADD COLUMN {col} {sql_type}"
+                )
+            except sqlite3.OperationalError:
+                pass
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS learning_experiment_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id TEXT NOT NULL,
+                assignment_key TEXT NOT NULL,
+                paper_trade_id INTEGER,
+                signal_id INTEGER,
+                assigned_at TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy_key TEXT NOT NULL,
+                arm TEXT NOT NULL,
+                bucket INTEGER NOT NULL,
+                decision TEXT NOT NULL DEFAULT 'observed',
+                eligible INTEGER NOT NULL DEFAULT 1,
+                policy_fingerprint TEXT,
+                outcome_source TEXT,
+                result TEXT,
+                pnl_pct REAL,
+                closed_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(experiment_id, assignment_key)
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_assignments_experiment
+            ON learning_experiment_assignments
+               (experiment_id, arm, result, closed_at)
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_assignments_trade
+            ON learning_experiment_assignments (paper_trade_id, signal_id)
+        """)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _research_experiment_contract_from_row(row: dict) -> dict:
+    """Rehydrate an orchestrator contract from a learning-ledger row."""
+    scope = _learning_json(row.get("scope_json"), {})
+    contract = scope.get("orchestrator_contract")
+    if isinstance(contract, dict):
+        return contract
+    return _research_normalize_contract({
+        "idea_type": row.get("idea_type") or row.get("family"),
+        "target_strategy": row.get("strategy_key"),
+        "hypothesis_family": row.get("hypothesis_family") or row.get("family"),
+        "hypothesis": row.get("hypothesis"),
+        "minimum_closed_trades": (
+            _learning_json(row.get("evidence_rules_json"), {}).get(
+                "minimum_closed_trades"
+            )
+        ),
+        "minimum_elapsed_days": (
+            _learning_json(row.get("evidence_rules_json"), {}).get(
+                "minimum_elapsed_days"
+            )
+        ),
+        "treatment_pct": row.get("treatment_pct"),
+        "authority_ceiling": row.get("authority_ceiling"),
+    })
+
+
+def _research_contract_for_item(item: dict) -> dict:
+    """Translate a research-ledger item into the canonical experiment shape."""
+    control = item.get("rule_control") if isinstance(item.get("rule_control"), dict) else {}
+    rule_type = (
+        control.get("rule_type")
+        or item.get("rule_type")
+        or item.get("candidate_type")
+        or "annotation"
+    )
+    executable = (
+        (control.get("executable") or {})
+        if isinstance(control.get("executable"), dict)
+        else {}
+    )
+    return _research_normalize_contract({
+        **item,
+        "idea_type": rule_type,
+        "hypothesis_family": (
+            item.get("hypothesis_family")
+            or item.get("research_shadow_tag")
+            or item.get("shadow_tag")
+        ),
+        "target_strategy": (
+            control.get("scope")
+            or item.get("target_strategy")
+            or "portfolio"
+        ),
+        "behavior_changed": (
+            item.get("thesis")
+            or item.get("candidate_title")
+            or item.get("title")
+        ),
+        "minimum_closed_trades": (
+            (item.get("promotion_progress") or {}).get("target")
+            or 50
+        ),
+        "minimum_elapsed_days": 7,
+        "authority_ceiling": "paper",
+        "runtime_wired": bool(executable.get("can_paper_apply")),
+        "variant_policy": item.get("variant_policy") or {},
+        "strategy_contract": item.get("strategy_contract") or {},
+    })
+
+
+def _research_learning_experiment_rows(
+    statuses: set[str] | None = None,
+) -> list[dict]:
+    _ensure_research_orchestrator_schema()
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        if statuses:
+            marks = ",".join("?" for _ in statuses)
+            rows = con.execute(
+                f"""SELECT * FROM learning_experiments
+                    WHERE source_type='research_candidate'
+                      AND status IN ({marks})
+                    ORDER BY created_at ASC""",
+                tuple(sorted(statuses)),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """SELECT * FROM learning_experiments
+                   WHERE source_type='research_candidate'
+                   ORDER BY created_at DESC"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
+def _research_experiment_conflicts(
+    contract: dict,
+    *,
+    exclude_experiment_id: str | None = None,
+) -> list[dict]:
+    conflicts = []
+    marks = ",".join("?" for _ in RESEARCH_EXPERIMENT_ACTIVE_STATUSES)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [
+            dict(row) for row in con.execute(
+                f"""SELECT * FROM learning_experiments
+                    WHERE status IN ({marks})
+                    ORDER BY created_at ASC""",
+                tuple(sorted(RESEARCH_EXPERIMENT_ACTIVE_STATUSES)),
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+    for row in rows:
+        if row.get("experiment_id") == exclude_experiment_id:
+            continue
+        existing_contract = _research_experiment_contract_from_row(row)
+        if (
+            str(row.get("source_type") or "") != "research_candidate"
+            and str(existing_contract.get("target_strategy") or "")
+            == str(contract.get("target_strategy") or "")
+        ):
+            conflicts.append({
+                "experiment_id": row.get("experiment_id"),
+                "strategy_key": row.get("strategy_key"),
+                "idea_type": row.get("idea_type") or row.get("family"),
+                "conflicts": True,
+                "reason": "An active learner policy experiment already shares this strategy.",
+                "shared_keys": [f"strategy:{contract.get('target_strategy')}"],
+            })
+            continue
+        report = _research_conflict_report(
+            contract,
+            existing_contract,
+        )
+        if report.get("conflicts"):
+            conflicts.append({
+                "experiment_id": row.get("experiment_id"),
+                "strategy_key": row.get("strategy_key"),
+                "idea_type": row.get("idea_type"),
+                **report,
+            })
+    return conflicts
+
+
+def _research_prepare_experiment(
+    item: dict,
+    *,
+    actor: str = "research_orchestrator",
+) -> dict:
+    """Create an immutable awaiting-approval contract without changing behavior."""
+    tag = str(
+        item.get("research_shadow_tag")
+        or item.get("shadow_tag")
+        or item.get("id")
+        or ""
+    ).strip()
+    if not tag:
+        raise ValueError("research candidate requires a stable source tag")
+    existing = [
+        row for row in _research_learning_experiment_rows()
+        if str(row.get("source_id") or "") == tag
+        and row.get("status") not in RESEARCH_EXPERIMENT_TERMINAL_STATUSES
+    ]
+    if existing:
+        return {
+            "created": False,
+            "experiment": existing[0],
+            "contract": _research_experiment_contract_from_row(existing[0]),
+        }
+
+    contract = _research_contract_for_item(item)
+    validation = _research_validate_contract(contract)
+    now = datetime.now(timezone.utc).isoformat()
+    lifecycle = validation.get("next_state") or "needs_data"
+    status = (
+        "awaiting_approval"
+        if lifecycle == "ready_for_experiment" and contract.get("behavioral")
+        else "collecting"
+        if lifecycle == "ready_for_experiment"
+        else lifecycle
+    )
+    policy = _learning_policy_snapshot(contract["target_strategy"])
+    fingerprint = _learning_fingerprint(policy)
+    digest = hashlib.sha256(
+        f"{tag}|{now}|{json.dumps(contract, sort_keys=True)}".encode()
+    ).hexdigest()[:12]
+    experiment_id = f"research:{tag}:{digest}"
+    evidence_rules = _learning_default_evidence_rules()
+    evidence_rules.update(contract.get("evidence_rules") or {})
+    baseline = {
+        "prepared_at": now,
+        "legacy_rows_excluded": True,
+        "historical_shadow_is_causal": False,
+        "research_shadow_result": {
+            "matched": item.get("matched"),
+            "comparison": item.get("comparison"),
+            "status": item.get("outcome_status") or item.get("stage"),
+        },
+    }
+    rollback = {
+        "action": "restore_previous_paper_champion",
+        "automatic_paper_stop_allowed": True,
+        "live_change_allowed": False,
+        "source_condition": item.get("rollback_condition"),
+    }
+    scope = {
+        "strategy": contract["target_strategy"],
+        "target_mode": "paper_challenger_after_approval",
+        "orchestrator_contract": contract,
+    }
+    change_set = [{
+        "research_shadow_tag": tag,
+        "idea_type": contract["idea_type"],
+        "decision_surface": contract["decision_surface"],
+        "behavior_changed": contract["behavior_changed"],
+    }]
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            """INSERT INTO learning_experiments
+               (experiment_id, contract_version, source_type, source_id, family,
+                strategy_key, status, hypothesis, mechanism, scope_json,
+                change_set_json, baseline_json, evidence_rules_json,
+                rollback_json, policy_json, policy_fingerprint, authority_mode,
+                user_approved, capital_change, execution_change, activated_at,
+                created_at, updated_at, idea_type, decision_surface,
+                lifecycle_state, hypothesis_family, conflict_keys_json,
+                evaluator, treatment_pct, authority_ceiling, scheduler_managed,
+                last_progress_at, probation_stage)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                experiment_id,
+                RESEARCH_ORCHESTRATOR_VERSION,
+                "research_candidate",
+                tag,
+                contract["hypothesis_family"],
+                contract["target_strategy"],
+                status,
+                contract["behavior_changed"],
+                str(item.get("mechanism") or item.get("expected_edge") or contract["behavior_changed"]),
+                json.dumps(scope, sort_keys=True, default=str),
+                json.dumps(change_set, sort_keys=True, default=str),
+                json.dumps(baseline, sort_keys=True, default=str),
+                json.dumps(evidence_rules, sort_keys=True, default=str),
+                json.dumps(rollback, sort_keys=True, default=str),
+                json.dumps(policy, sort_keys=True, default=str),
+                fingerprint,
+                "shadow_only",
+                0,
+                1 if contract["idea_type"] in {"sizing_rule", "portfolio_rule"} else 0,
+                1 if contract["idea_type"] in {"stop_rule", "exit_rule", "execution_rule"} else 0,
+                now,
+                now,
+                now,
+                contract["idea_type"],
+                contract["decision_surface"],
+                status,
+                contract["hypothesis_family"],
+                json.dumps(contract["conflict_keys"], sort_keys=True),
+                contract["evaluator"],
+                contract["treatment_pct"],
+                contract["authority_ceiling"],
+                1,
+                now,
+                "initial",
+            ),
+        )
+        _learning_append_event(
+            con,
+            experiment_id,
+            "contract_prepared",
+            {
+                "actor": actor,
+                "contract": contract,
+                "validation": validation,
+                "behavior_changed": False,
+                "requires_user_approval": bool(contract.get("behavioral")),
+                "live_behavior_change_allowed": False,
+            },
+            now,
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return {
+        "created": True,
+        "experiment": {
+            "experiment_id": experiment_id,
+            "source_id": tag,
+            "status": status,
+            "lifecycle_state": status,
+        },
+        "contract": contract,
+        "validation": validation,
+    }
+
+
+def _research_activate_experiment(
+    experiment_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> dict:
+    """Activate one approved Paper challenger after conflict/capacity checks."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute(
+        "SELECT * FROM learning_experiments WHERE experiment_id=?",
+        (experiment_id,),
+    ).fetchone()
+    con.close()
+    if not row:
+        raise ValueError("research experiment not found")
+    experiment = dict(row)
+    if experiment.get("source_type") != "research_candidate":
+        raise ValueError("only research candidates use this activation path")
+    if (
+        experiment.get("status") in RESEARCH_EXPERIMENT_ACTIVE_STATUSES
+        and bool(experiment.get("user_approved"))
+    ):
+        return {
+            "experiment_id": experiment_id,
+            "status": experiment.get("status"),
+            "lifecycle_state": experiment.get("lifecycle_state") or "paper_challenger",
+            "policy_fingerprint": experiment.get("policy_fingerprint"),
+            "contract": _research_experiment_contract_from_row(experiment),
+            "already_active": True,
+        }
+    if experiment.get("status") not in {
+        "awaiting_approval",
+        "queued",
+        "ready_for_experiment",
+        "review",
+    }:
+        raise ValueError(f"experiment cannot activate from {experiment.get('status')}")
+    contract = _research_experiment_contract_from_row(experiment)
+    validation = _research_validate_contract(contract)
+    if not validation.get("valid") or not contract.get("executable"):
+        raise ValueError("; ".join(validation.get("problems") or ["contract is not executable"]))
+    if (
+        str(experiment.get("source_id") or "") == "research_order_flow_confirmation"
+        and bool(_load_paper_config().get("flow_required"))
+    ):
+        raise ValueError(
+            "order-flow confirmation is already required by the Paper champion; "
+            "this challenger has no behavioral delta"
+        )
+    conflicts = _research_experiment_conflicts(
+        contract,
+        exclude_experiment_id=experiment_id,
+    )
+    if conflicts:
+        raise ValueError(
+            "experiment conflicts with active policy surface: "
+            + ", ".join(str(x.get("experiment_id")) for x in conflicts)
+        )
+    marks = ",".join("?" for _ in RESEARCH_EXPERIMENT_ACTIVE_STATUSES)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        active = [
+            dict(row) for row in con.execute(
+                f"""SELECT * FROM learning_experiments
+                    WHERE status IN ({marks})
+                    ORDER BY created_at ASC""",
+                tuple(sorted(RESEARCH_EXPERIMENT_ACTIVE_STATUSES)),
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+    active_behavioral = len([
+        row for row in active
+        if _research_experiment_contract_from_row(row).get("behavioral")
+    ])
+    if contract.get("behavioral") and active_behavioral >= RESEARCH_MAX_BEHAVIORAL_EXPERIMENTS:
+        raise ValueError("behavioral experiment capacity is full")
+
+    now = datetime.now(timezone.utc).isoformat()
+    policy = _learning_policy_snapshot(experiment["strategy_key"])
+    fingerprint = _learning_fingerprint(policy)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            """UPDATE learning_experiments
+               SET status='collecting', lifecycle_state='paper_challenger',
+                   policy_json=?, policy_fingerprint=?, authority_mode='paper_only',
+                   user_approved=1, activated_at=?, updated_at=?,
+                   last_progress_at=?, blocked_reason=NULL,
+                   probation_stage='paper_challenger'
+               WHERE experiment_id=?""",
+            (
+                json.dumps(policy, sort_keys=True, default=str),
+                fingerprint,
+                now,
+                now,
+                now,
+                experiment_id,
+            ),
+        )
+        _learning_append_event(
+            con,
+            experiment_id,
+            "paper_challenger_activated",
+            {
+                "actor": actor,
+                "reason": reason,
+                "policy_fingerprint": fingerprint,
+                "treatment_pct": contract.get("treatment_pct"),
+                "automatic_promotion": False,
+                "automatic_live_change": False,
+            },
+            now,
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return {
+        "experiment_id": experiment_id,
+        "status": "collecting",
+        "lifecycle_state": "paper_challenger",
+        "policy_fingerprint": fingerprint,
+        "contract": contract,
+    }
+
+
+def _research_stop_source_experiments(
+    source_id: str,
+    *,
+    status: str,
+    actor: str,
+    reason: str,
+    automatic: bool = False,
+) -> list[str]:
+    """Stop Paper research challengers while preserving every ledger event."""
+    if status not in {"falsified", "rolled_back", "parked", "cancelled"}:
+        raise ValueError("invalid research experiment stop status")
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    stopped: list[str] = []
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        rows = con.execute(
+            """SELECT experiment_id, status
+               FROM learning_experiments
+               WHERE source_type='research_candidate' AND source_id=?
+                 AND status IN ('active','collecting','review',
+                                'awaiting_approval','queued','ready_for_experiment')""",
+            (source_id,),
+        ).fetchall()
+        for row in rows:
+            lifecycle = "rolled_back" if status == "rolled_back" else status
+            con.execute(
+                """UPDATE learning_experiments
+                   SET status=?, lifecycle_state=?, authority_mode='shadow_only',
+                       updated_at=?, rollback_required=0,
+                       blocked_reason=?, probation_stage='stopped'
+                   WHERE experiment_id=?""",
+                (status, lifecycle, now, reason, row["experiment_id"]),
+            )
+            _learning_append_event(
+                con,
+                row["experiment_id"],
+                "paper_challenger_stopped",
+                {
+                    "from": row["status"],
+                    "to": status,
+                    "actor": actor,
+                    "reason": reason,
+                    "automatic": automatic,
+                    "live_behavior_changed": False,
+                    "risk_increased": False,
+                },
+                now,
+            )
+            stopped.append(row["experiment_id"])
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return stopped
+
+
+def _research_auto_stop_falsified(item: dict) -> dict:
+    """Disarm an unsafe or stalled Paper hook; never promote or touch live."""
+    source_id = str(item.get("source_id") or "")
+    experiment_id = str(item.get("experiment_id") or "")
+    target_lifecycle = str(item.get("status") or "falsified")
+    if not source_id or not experiment_id:
+        return {"changed": False, "reason": "missing identity"}
+    controls = _research_rule_controls_by_tag()
+    current = controls.get(source_id) or {}
+    if current.get("mode") != "paper_applied":
+        return {"changed": False, "reason": "paper hook already inactive"}
+    now = datetime.now(timezone.utc).isoformat()
+    record = {
+        "id": f"research_rule_control_{source_id}_{now}",
+        "type": "research_rule_control",
+        "source": "research_orchestrator",
+        "research_shadow_tag": source_id,
+        "shadow_tag": source_id,
+        "mode": "shadow",
+        "rule_type": current.get("rule_type") or "entry_gate",
+        "scope": current.get("scope") or "portfolio",
+        "reason": str(item.get("reason") or "Experiment falsified"),
+        "actor": "research_orchestrator",
+        "created_at": now,
+        "updated_at": now,
+        "updated_by": "research_orchestrator",
+        "changed_scoring": False,
+        "changed_paper_behavior": True,
+        "changed_live_behavior": False,
+        "automatic": True,
+        "automatic_action": "paper_stop_only",
+        "notes": [
+            "Automatic Paper challenger stop after a falsification or stale-capacity boundary.",
+            "The previous champion remains the active Paper behavior.",
+            "No live, leverage, sizing, or execution authority was increased.",
+        ],
+    }
+    ledger = _read_experiment_ledger()
+    ledger.append(record)
+    _research_write_experiment_ledger(ledger)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            """UPDATE learning_experiments
+               SET authority_mode='shadow_only', rollback_required=0,
+                   lifecycle_state=?, probation_stage='stopped',
+                   updated_at=?
+               WHERE experiment_id=?""",
+            (target_lifecycle, now, experiment_id),
+        )
+        _learning_append_event(
+            con,
+            experiment_id,
+            "automatic_paper_stop",
+            {
+                "reason": record["reason"],
+                "rule_mode": "shadow",
+                "paper_behavior_stopped": True,
+                "live_behavior_changed": False,
+                "risk_increased": False,
+            },
+            now,
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return {"changed": True, "control": record}
+
+
+def _research_promote_experiment(
+    experiment_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> dict:
+    """Promote evidence one Paper stage; live authority is never granted."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute(
+        "SELECT * FROM learning_experiments WHERE experiment_id=?",
+        (experiment_id,),
+    ).fetchone()
+    con.close()
+    if not row:
+        raise ValueError("research experiment not found")
+    experiment = dict(row)
+    if experiment.get("source_type") != "research_candidate":
+        raise ValueError("only research candidates use this promotion path")
+    if experiment.get("status") != "promotion_candidate":
+        raise ValueError("experiment must be a promotion candidate")
+    if not bool(experiment.get("user_approved")):
+        raise ValueError("Paper challenger was not user approved")
+    contract = _research_experiment_contract_from_row(experiment)
+    now = datetime.now(timezone.utc).isoformat()
+    if str(experiment.get("probation_stage") or "initial") == "confirmation":
+        con = sqlite3.connect(DB_PATH)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                """UPDATE learning_experiments
+                   SET status='completed', lifecycle_state='confirmed',
+                       probation_stage='confirmed', updated_at=?,
+                       authority_mode='paper_only'
+                   WHERE experiment_id=?""",
+                (now, experiment_id),
+            )
+            _learning_append_event(
+                con,
+                experiment_id,
+                "paper_champion_confirmed",
+                {
+                    "actor": actor,
+                    "reason": reason,
+                    "live_authority_granted": False,
+                    "separate_live_review_required": True,
+                },
+                now,
+            )
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+        return {
+            "experiment_id": experiment_id,
+            "status": "completed",
+            "lifecycle_state": "confirmed",
+            "live_authority_granted": False,
+        }
+
+    confirmation_contract = {
+        **contract,
+        "treatment_pct": 80,
+        "evidence_rules": {
+            **(contract.get("evidence_rules") or {}),
+            "minimum_closed_trades": max(
+                50,
+                int(
+                    (contract.get("evidence_rules") or {}).get(
+                        "minimum_closed_trades"
+                    )
+                    or 50
+                ),
+            ),
+            "minimum_elapsed_days": max(
+                7.0,
+                float(
+                    (contract.get("evidence_rules") or {}).get(
+                        "minimum_elapsed_days"
+                    )
+                    or 7
+                ),
+            ),
+        },
+    }
+    scope = _learning_json(experiment.get("scope_json"), {})
+    scope["orchestrator_contract"] = confirmation_contract
+    policy = _learning_policy_snapshot(experiment["strategy_key"])
+    policy["research_confirmation_parent"] = experiment_id
+    fingerprint = _learning_fingerprint(policy)
+    child_id = (
+        f"research-confirmation:{experiment.get('source_id')}:"
+        f"{hashlib.sha256((experiment_id + now).encode()).hexdigest()[:12]}"
+    )
+    evidence_rules = _learning_default_evidence_rules()
+    evidence_rules.update(confirmation_contract.get("evidence_rules") or {})
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            """UPDATE learning_experiments
+               SET status='completed', lifecycle_state='paper_champion',
+                   probation_stage='initial_passed', updated_at=?
+               WHERE experiment_id=?""",
+            (now, experiment_id),
+        )
+        _learning_append_event(
+            con,
+            experiment_id,
+            "promoted_to_paper_champion",
+            {
+                "actor": actor,
+                "reason": reason,
+                "confirmation_experiment_id": child_id,
+                "live_authority_granted": False,
+            },
+            now,
+        )
+        con.execute(
+            """INSERT INTO learning_experiments
+               (experiment_id, contract_version, source_type, source_id, family,
+                strategy_key, status, hypothesis, mechanism, scope_json,
+                change_set_json, baseline_json, evidence_rules_json,
+                rollback_json, policy_json, policy_fingerprint, authority_mode,
+                user_approved, capital_change, execution_change, activated_at,
+                created_at, updated_at, idea_type, decision_surface,
+                lifecycle_state, hypothesis_family, conflict_keys_json,
+                evaluator, treatment_pct, authority_ceiling, scheduler_managed,
+                last_progress_at, champion_experiment_id, probation_stage)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                child_id,
+                RESEARCH_ORCHESTRATOR_VERSION,
+                "research_candidate",
+                experiment.get("source_id"),
+                experiment.get("family"),
+                experiment.get("strategy_key"),
+                "collecting",
+                experiment.get("hypothesis"),
+                experiment.get("mechanism"),
+                json.dumps(scope, sort_keys=True, default=str),
+                experiment.get("change_set_json"),
+                json.dumps(
+                    {
+                        "parent_experiment_id": experiment_id,
+                        "parent_result": _learning_json(
+                            experiment.get("result_json"), {}
+                        ),
+                        "forward_boundary_at": now,
+                    },
+                    sort_keys=True,
+                    default=str,
+                ),
+                json.dumps(evidence_rules, sort_keys=True, default=str),
+                experiment.get("rollback_json"),
+                json.dumps(policy, sort_keys=True, default=str),
+                fingerprint,
+                "paper_only",
+                1,
+                int(experiment.get("capital_change") or 0),
+                int(experiment.get("execution_change") or 0),
+                now,
+                now,
+                now,
+                confirmation_contract.get("idea_type"),
+                confirmation_contract.get("decision_surface"),
+                "paper_champion",
+                confirmation_contract.get("hypothesis_family"),
+                json.dumps(
+                    confirmation_contract.get("conflict_keys") or [],
+                    sort_keys=True,
+                ),
+                confirmation_contract.get("evaluator"),
+                80,
+                confirmation_contract.get("authority_ceiling") or "paper",
+                1,
+                now,
+                experiment_id,
+                "confirmation",
+            ),
+        )
+        _learning_append_event(
+            con,
+            child_id,
+            "paper_champion_confirmation_started",
+            {
+                "actor": actor,
+                "reason": reason,
+                "parent_experiment_id": experiment_id,
+                "treatment_pct": 80,
+                "control_holdout_pct": 20,
+                "historical_rows_attributed": False,
+                "live_authority_granted": False,
+            },
+            now,
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return {
+        "experiment_id": experiment_id,
+        "status": "completed",
+        "lifecycle_state": "paper_champion",
+        "confirmation_experiment_id": child_id,
+        "confirmation_treatment_pct": 80,
+        "live_authority_granted": False,
+    }
+
+
+def _research_assignments_for_signal(sig: dict, assigned_at: str | None = None) -> list[dict]:
+    """Assign every compatible active research experiment to one Paper candidate."""
+    existing = sig.get("_research_assignments")
+    if isinstance(existing, list):
+        return existing
+    strategy_key = str(
+        sig.get("_strategy_key") or sig.get("strategy_key") or "balanced"
+    )
+    symbol = str(sig.get("symbol") or "")
+    assigned_at = assigned_at or datetime.now(timezone.utc).isoformat()
+    assignments = []
+    for row in _research_learning_experiment_rows(
+        RESEARCH_EXPERIMENT_ACTIVE_STATUSES
+    ):
+        contract = _research_experiment_contract_from_row(row)
+        target = str(contract.get("target_strategy") or "")
+        if target not in {
+            strategy_key,
+            "portfolio",
+            "all",
+            "all_strategies",
+        }:
+            continue
+        assignment = _research_deterministic_arm(
+            row["experiment_id"],
+            symbol,
+            str(sig.get("logged_at") or sig.get("timestamp") or assigned_at),
+            int(contract.get("treatment_pct") or 30),
+        )
+        assignments.append({
+            "experiment_id": row["experiment_id"],
+            "source_id": row.get("source_id"),
+            "idea_type": contract.get("idea_type"),
+            "decision_surface": contract.get("decision_surface"),
+            "evaluator": contract.get("evaluator"),
+            "strategy_key": strategy_key,
+            "symbol": symbol,
+            "assigned_at": assigned_at,
+            "policy_fingerprint": row.get("policy_fingerprint"),
+            **assignment,
+        })
+    return assignments
+
+
+def _research_record_assignments(
+    assignments: list[dict],
+    *,
+    paper_trade_id: int | None,
+    signal_id: int | None,
+    decision: str,
+    metadata: dict | None = None,
+) -> None:
+    if not assignments:
+        return
+    con = sqlite3.connect(DB_PATH)
+    try:
+        for item in assignments:
+            item_decision = str(item.get("decision") or decision)
+            con.execute(
+                """INSERT OR IGNORE INTO learning_experiment_assignments
+                   (experiment_id, assignment_key, paper_trade_id, signal_id,
+                    assigned_at, symbol, strategy_key, arm, bucket, decision,
+                    eligible, policy_fingerprint, outcome_source, metadata_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    item["experiment_id"],
+                    item["assignment_key"],
+                    paper_trade_id,
+                    signal_id,
+                    item["assigned_at"],
+                    item["symbol"],
+                    item["strategy_key"],
+                    item["arm"],
+                    int(item["bucket"]),
+                    item_decision,
+                    1,
+                    item.get("policy_fingerprint"),
+                    "signals" if signal_id and item_decision == "blocked" else "paper_trades",
+                    json.dumps(metadata or {}, sort_keys=True, default=str),
+                ),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _research_sync_assignment_outcomes(con: sqlite3.Connection) -> int:
+    """Copy immutable closed outcomes into the many-to-many assignment ledger."""
+    changed = con.execute(
+        """UPDATE learning_experiment_assignments
+           SET result=(
+                 SELECT p.result FROM paper_trades p
+                 WHERE p.id=learning_experiment_assignments.paper_trade_id
+               ),
+               pnl_pct=(
+                 SELECT p.pnl_pct FROM paper_trades p
+                 WHERE p.id=learning_experiment_assignments.paper_trade_id
+               ),
+               closed_at=(
+                 SELECT p.closed_at FROM paper_trades p
+                 WHERE p.id=learning_experiment_assignments.paper_trade_id
+               ),
+               outcome_source='paper_trades'
+           WHERE paper_trade_id IS NOT NULL
+             AND EXISTS (
+                 SELECT 1 FROM paper_trades p
+                 WHERE p.id=learning_experiment_assignments.paper_trade_id
+                   AND p.status='closed'
+                   AND p.result IN ('WIN','LOSS','PARTIAL')
+                   AND p.pnl_pct IS NOT NULL
+             )
+             AND (result IS NULL OR pnl_pct IS NULL)"""
+    ).rowcount
+    changed += con.execute(
+        """UPDATE learning_experiment_assignments
+           SET result=(
+                 SELECT s.result FROM signals s
+                 WHERE s.id=learning_experiment_assignments.signal_id
+               ),
+               pnl_pct=(
+                 SELECT s.pnl_pct FROM signals s
+                 WHERE s.id=learning_experiment_assignments.signal_id
+               ),
+               closed_at=(
+                 SELECT s.result_at FROM signals s
+                 WHERE s.id=learning_experiment_assignments.signal_id
+               ),
+               outcome_source='signals'
+           WHERE signal_id IS NOT NULL
+             AND decision='blocked'
+             AND EXISTS (
+                 SELECT 1 FROM signals s
+                 WHERE s.id=learning_experiment_assignments.signal_id
+                   AND s.result IN ('WIN','LOSS','PARTIAL','TP3')
+                   AND s.pnl_pct IS NOT NULL
+             )
+             AND (result IS NULL OR pnl_pct IS NULL)"""
+    ).rowcount
+    cfg = _load_paper_config()
+    cost_rows = con.execute(
+        """SELECT a.id, a.result, a.pnl_pct, a.metadata_json,
+                  COALESCE(s.leverage, 1.0) AS leverage
+           FROM learning_experiment_assignments a
+           JOIN signals s ON s.id=a.signal_id
+           WHERE a.decision='blocked'
+             AND a.outcome_source='signals'
+             AND a.result IN ('WIN','LOSS','PARTIAL','TP3')
+             AND a.pnl_pct IS NOT NULL
+             AND a.metadata_json NOT LIKE '%counterfactual_cost_adjusted%'"""
+    ).fetchall()
+    for row in cost_rows:
+        result = "WIN" if str(row[1]) == "TP3" else str(row[1])
+        fee_pct, slippage_pct, total_cost_pct = _paper_cost_adjustment(
+            cfg,
+            result,
+            float(row[4] or 1.0),
+        )
+        metadata = _learning_json(row[3], {})
+        metadata.update({
+            "counterfactual_cost_adjusted": True,
+            "gross_pnl_pct": float(row[2] or 0.0),
+            "fee_cost_pct": fee_pct,
+            "slippage_cost_pct": slippage_pct,
+        })
+        con.execute(
+            """UPDATE learning_experiment_assignments
+               SET pnl_pct=?, metadata_json=?
+               WHERE id=?""",
+            (
+                round(float(row[2] or 0.0) - total_cost_pct, 4),
+                json.dumps(metadata, sort_keys=True, default=str),
+                int(row[0]),
+            ),
+        )
+    return changed
+
+
+def _research_experiment_assignment_rows(
+    con: sqlite3.Connection,
+    experiment: dict,
+) -> dict:
+    rows = [
+        dict(row) for row in con.execute(
+            """SELECT a.*, COALESCE(p.size_usd, 100.0) AS size_usd
+               FROM learning_experiment_assignments a
+               LEFT JOIN paper_trades p ON p.id=a.paper_trade_id
+               WHERE a.experiment_id=?
+               ORDER BY a.assigned_at ASC, a.id ASC""",
+            (experiment["experiment_id"],),
+        ).fetchall()
+    ]
+    treatment_closed = [
+        row for row in rows
+        if row.get("arm") == "treatment"
+        and row.get("decision") != "blocked"
+        and row.get("result") in {"WIN", "LOSS", "PARTIAL"}
+        and row.get("pnl_pct") is not None
+    ]
+    control_closed = [
+        row for row in rows
+        if row.get("arm") == "control"
+        and row.get("result") in {"WIN", "LOSS", "PARTIAL"}
+        and row.get("pnl_pct") is not None
+    ]
+    blocked_shadow = [
+        row for row in rows
+        if row.get("arm") == "treatment"
+        and row.get("decision") == "blocked"
+        and row.get("result") in {"WIN", "LOSS", "PARTIAL", "TP3"}
+        and row.get("pnl_pct") is not None
+    ]
+    # Gate policy expectancy is measured per eligible opportunity.  A blocked
+    # opportunity contributes zero realized Paper return, while its shadow
+    # outcome remains separate as opportunity cost.
+    treatment_policy = list(treatment_closed) + [
+        {**row, "result": "PARTIAL", "pnl_pct": 0.0, "size_usd": 0.0}
+        for row in blocked_shadow
+    ]
+    return {
+        "all": rows,
+        "treatment": treatment_policy,
+        "control": control_closed,
+        "accepted_treatment": treatment_closed,
+        "blocked_shadow": blocked_shadow,
+    }
+
+
+def _research_experiment_orchestrator_payload(
+    *,
+    reconcile: bool = False,
+) -> dict:
+    """Return concurrency, blockage, and lifecycle truth for the Research UI."""
+    if reconcile:
+        _research_reconcile_experiments()
+    rows = _research_learning_experiment_rows()
+    active = [
+        row for row in rows
+        if row.get("status") in RESEARCH_EXPERIMENT_ACTIVE_STATUSES
+    ]
+    pending = [
+        row for row in rows
+        if row.get("status") in {
+            "awaiting_approval",
+            "queued",
+            "needs_data",
+            "ready_for_experiment",
+        }
+    ]
+    cards = []
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        _research_sync_assignment_outcomes(con)
+        con.commit()
+        for row in rows[:100]:
+            contract = _research_experiment_contract_from_row(row)
+            counts = {
+                str(r["arm"]): int(r["n"])
+                for r in con.execute(
+                    """SELECT arm, COUNT(*) AS n
+                       FROM learning_experiment_assignments
+                       WHERE experiment_id=?
+                       GROUP BY arm""",
+                    (row["experiment_id"],),
+                ).fetchall()
+            }
+            closed = int(con.execute(
+                """SELECT COUNT(*) FROM learning_experiment_assignments
+                   WHERE experiment_id=? AND result IS NOT NULL""",
+                (row["experiment_id"],),
+            ).fetchone()[0])
+            cards.append({
+                "experiment_id": row["experiment_id"],
+                "source_id": row.get("source_id"),
+                "status": row.get("status"),
+                "lifecycle_state": row.get("lifecycle_state") or row.get("status"),
+                "strategy_key": row.get("strategy_key"),
+                "hypothesis": row.get("hypothesis"),
+                "idea_type": contract.get("idea_type"),
+                "decision_surface": contract.get("decision_surface"),
+                "evaluator": contract.get("evaluator"),
+                "treatment_pct": contract.get("treatment_pct"),
+                "conflict_keys": contract.get("conflict_keys"),
+                "behavioral": contract.get("behavioral"),
+                "virtual_first": contract.get("virtual_first"),
+                "user_approved": bool(row.get("user_approved")),
+                "authority_mode": row.get("authority_mode"),
+                "authority_ceiling": row.get("authority_ceiling"),
+                "blocked_reason": row.get("blocked_reason"),
+                "last_progress_at": row.get("last_progress_at"),
+                "probation_stage": row.get("probation_stage"),
+                "assignments": {
+                    "treatment": counts.get("treatment", 0),
+                    "control": counts.get("control", 0),
+                    "closed": closed,
+                },
+                "evaluation": _learning_json(row.get("result_json"), {}),
+            })
+    finally:
+        con.close()
+    active_behavioral = len([
+        row for row in active
+        if _research_experiment_contract_from_row(row).get("behavioral")
+    ])
+    active_shadow = len(active) - active_behavioral
+    source_ids = {
+        str(row.get("source_id") or "") for row in rows if row.get("source_id")
+    }
+    marker_tags = set(_research_paper_trials_by_tag().keys())
+    marker_only = sorted(marker_tags - source_ids)
+    controls = _research_rule_controls_by_tag()
+    active_control_tags = {
+        tag for tag, control in controls.items()
+        if str((control or {}).get("mode") or "") == "paper_applied"
+    }
+    active_experiment_tags = {
+        str(row.get("source_id") or "") for row in active if row.get("source_id")
+    }
+    orphan_controls = sorted(active_control_tags - active_experiment_tags)
+    status_counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        status_counts[str(row.get("status") or "unknown")] += 1
+    initial_promotions = len([
+        row for row in rows
+        if str(row.get("probation_stage") or "") in {
+            "initial_passed",
+            "confirmation",
+            "confirmed",
+        }
+    ])
+    confirmed_count = len([
+        row for row in rows
+        if str(row.get("lifecycle_state") or "") == "confirmed"
+    ])
+    forward_lifts = []
+    for row in rows:
+        evaluation = _learning_json(row.get("result_json"), {})
+        delta = (evaluation.get("deltas") or {}).get("avg_pnl_pct")
+        if delta is not None and row.get("status") in {
+            "promotion_candidate",
+            "completed",
+        }:
+            try:
+                forward_lifts.append(float(delta))
+            except Exception:
+                pass
+    family_counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        family_counts[str(
+            row.get("hypothesis_family") or row.get("family") or "unknown"
+        )] += 1
+    scheduling = _research_scheduler_plan(
+        [
+            {
+                "id": row.get("experiment_id"),
+                "created_at": row.get("created_at"),
+                "priority_score": float(
+                    (
+                        (_learning_json(row.get("baseline_json"), {}).get(
+                            "research_shadow_result"
+                        ) or {}).get("matched") or {}
+                    ).get("count")
+                    or 0
+                ),
+                "contract": _research_experiment_contract_from_row(row),
+            }
+            for row in pending
+        ],
+        [
+            {
+                "experiment_id": row.get("experiment_id"),
+                "contract": _research_experiment_contract_from_row(row),
+            }
+            for row in active
+        ],
+        max_behavioral=RESEARCH_MAX_BEHAVIORAL_EXPERIMENTS,
+        max_shadow=RESEARCH_MAX_SHADOW_EXPERIMENTS,
+    )
+    return {
+        "success": True,
+        "version": RESEARCH_ORCHESTRATOR_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "total": len(rows),
+            "active": len(active),
+            "active_behavioral": active_behavioral,
+            "active_shadow": active_shadow,
+            "awaiting_or_blocked": len(pending),
+            "behavioral_slots_available": max(
+                0, RESEARCH_MAX_BEHAVIORAL_EXPERIMENTS - active_behavioral
+            ),
+            "shadow_slots_available": max(
+                0, RESEARCH_MAX_SHADOW_EXPERIMENTS - active_shadow
+            ),
+            "marker_only_trials": len(marker_only),
+            "orphan_paper_controls": len(orphan_controls),
+            "live_behavior_active": 0,
+        },
+        "effectiveness": {
+            "status_counts": dict(status_counts),
+            "hypothesis_family_count": len(family_counts),
+            "variant_count_by_family": dict(sorted(family_counts.items())),
+            "falsified_count": status_counts.get("falsified", 0),
+            "initial_promotion_count": initial_promotions,
+            "confirmed_count": confirmed_count,
+            "forward_replication_rate": (
+                round(confirmed_count / initial_promotions, 4)
+                if initial_promotions else None
+            ),
+            "confirmed_or_promotable_avg_lift_pct": (
+                round(sum(forward_lifts) / len(forward_lifts), 4)
+                if forward_lifts else None
+            ),
+            "historical_results_count_as_forward": False,
+        },
+        "blockages": {
+            "marker_only_trial_tags": marker_only,
+            "orphan_paper_control_tags": orphan_controls,
+            "experiments_with_blocked_reason": [
+                {
+                    "experiment_id": row.get("experiment_id"),
+                    "reason": row.get("blocked_reason"),
+                }
+                for row in rows if row.get("blocked_reason")
+            ],
+        },
+        "scheduler": scheduling,
+        "experiments": cards,
+        "safety": {
+            "automatic_preflight": True,
+            "automatic_assignment": True,
+            "automatic_evaluation": True,
+            "automatic_paper_stop": True,
+            "automatic_promotion": False,
+            "automatic_live_change": False,
+            "automatic_risk_increase": False,
+        },
+    }
+
+
+def _research_reconcile_experiments() -> dict:
+    """Prepare missing contracts and surface stalled experiments.
+
+    Reconciliation never starts a behavioral experiment and never changes live
+    or risk authority.
+    """
+    prepared = []
+    errors = []
+    try:
+        ledger = _research_evidence_ledger_payload()
+        for item in ledger.get("items") or []:
+            control = item.get("rule_control") or {}
+            mode = str(control.get("mode") or "")
+            if mode not in {"paper_trial", "paper_applied"}:
+                continue
+            try:
+                prepared_item = _research_prepare_experiment(item)
+                activation = None
+                experiment_id = str(
+                    (prepared_item.get("experiment") or {}).get("experiment_id")
+                    or ""
+                )
+                if mode == "paper_applied" and experiment_id:
+                    activation = _research_activate_experiment(
+                        experiment_id,
+                        actor="research_orchestrator_reconciler",
+                        reason=(
+                            "Adopt existing user-approved Paper Applied control "
+                            "into the forward causal ledger"
+                        ),
+                    )
+                prepared.append({
+                    "source_id": item.get("research_shadow_tag"),
+                    "created": bool(prepared_item.get("created")),
+                    "experiment_id": experiment_id,
+                    "activated": bool(activation),
+                })
+            except Exception as exc:
+                errors.append({
+                    "source_id": item.get("research_shadow_tag"),
+                    "error": str(exc),
+                })
+    except Exception as exc:
+        errors.append({"source_id": "research_ledger", "error": str(exc)})
+
+    now = datetime.now(timezone.utc)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    stalled = []
+    auto_disarm = []
+    try:
+        _research_sync_assignment_outcomes(con)
+        active = [
+            dict(row) for row in con.execute(
+                """SELECT * FROM learning_experiments
+                   WHERE source_type='research_candidate'
+                     AND status IN ('active','collecting','review')"""
+            ).fetchall()
+        ]
+        for row in active:
+            last = _parse_utc_iso(
+                row.get("last_progress_at")
+                or row.get("activated_at")
+                or row.get("created_at")
+            )
+            count = int(con.execute(
+                """SELECT COUNT(*) FROM learning_experiment_assignments
+                   WHERE experiment_id=?""",
+                (row["experiment_id"],),
+            ).fetchone()[0])
+            if count:
+                latest = con.execute(
+                    """SELECT MAX(assigned_at)
+                       FROM learning_experiment_assignments
+                       WHERE experiment_id=?""",
+                    (row["experiment_id"],),
+                ).fetchone()[0]
+                con.execute(
+                    """UPDATE learning_experiments
+                       SET last_progress_at=?, blocked_reason=NULL
+                       WHERE experiment_id=?""",
+                    (latest, row["experiment_id"]),
+                )
+                continue
+            if last and (now - last.astimezone(timezone.utc)).total_seconds() >= 72 * 3600:
+                elapsed_hours = (
+                    now - last.astimezone(timezone.utc)
+                ).total_seconds() / 3600.0
+                if elapsed_hours >= 168:
+                    reason = (
+                        "No eligible assignments for 7 days; automatically "
+                        "parked so the experiment cannot block scheduler capacity."
+                    )
+                    con.execute(
+                        """UPDATE learning_experiments
+                           SET status='parked', lifecycle_state='parked',
+                               authority_mode='shadow_only', blocked_reason=?,
+                               updated_at=?, probation_stage='stopped'
+                           WHERE experiment_id=?""",
+                        (reason, now.isoformat(), row["experiment_id"]),
+                    )
+                    _learning_append_event(
+                        con,
+                        row["experiment_id"],
+                        "automatically_parked_stale",
+                        {
+                            "reason": reason,
+                            "elapsed_hours": round(elapsed_hours, 1),
+                            "behavior_promoted": False,
+                            "live_behavior_changed": False,
+                        },
+                        now.isoformat(),
+                    )
+                    auto_disarm.append({
+                        "experiment_id": row["experiment_id"],
+                        "source_id": row.get("source_id"),
+                        "status": "parked",
+                        "reason": reason,
+                    })
+                else:
+                    reason = "No eligible assignments for 72h; scheduler is monitoring until the 7-day auto-park boundary."
+                    con.execute(
+                        """UPDATE learning_experiments
+                           SET blocked_reason=?, updated_at=?
+                           WHERE experiment_id=?""",
+                        (reason, now.isoformat(), row["experiment_id"]),
+                    )
+                stalled.append({
+                    "experiment_id": row["experiment_id"],
+                    "reason": reason,
+                })
+        con.commit()
+    finally:
+        con.close()
+    for item in auto_disarm:
+        try:
+            _research_auto_stop_falsified(item)
+        except Exception as exc:
+            errors.append({
+                "source_id": item.get("source_id"),
+                "error": f"stale Paper disarm failed: {exc}",
+            })
+    return {
+        "success": not errors,
+        "prepared": prepared,
+        "stalled": stalled,
+        "errors": errors,
+        "behavior_changed": False,
+        "live_changed": False,
+    }
+
+
 def _learning_policy_snapshot(strategy_key: str, paper_cfg: dict | None = None) -> dict:
     """Capture the effective Paper policy whose outcomes must stay attributable."""
     paper_cfg = paper_cfg or _load_paper_config()
@@ -5758,7 +7286,7 @@ def _learning_bootstrap_applied_suggestions() -> list[dict]:
     """
     registered: list[dict] = []
     for suggestion in _annotate_suggestion_authority(_load_suggestions()):
-        if suggestion.get("status") != "evaluating":
+        if suggestion.get("status") not in {"evaluating", "applied"}:
             continue
         if suggestion.get("learning_experiment_id"):
             continue
@@ -5906,9 +7434,11 @@ def _learning_experiment_rows(
 def _learning_evaluate_active_experiments() -> list[dict]:
     """Update evidence verdicts only; never mutate strategy or execution config."""
     results: list[dict] = []
+    auto_stop: list[dict] = []
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
+        _research_sync_assignment_outcomes(con)
         experiments = [
             dict(row) for row in con.execute(
                 """SELECT * FROM learning_experiments
@@ -5917,21 +7447,214 @@ def _learning_evaluate_active_experiments() -> list[dict]:
             ).fetchall()
         ]
         for experiment in experiments:
-            treatment, control = _learning_experiment_rows(con, experiment)
+            assignment_cohorts = None
+            if experiment.get("source_type") == "research_candidate":
+                assignment_cohorts = _research_experiment_assignment_rows(
+                    con, experiment
+                )
+            if assignment_cohorts and assignment_cohorts.get("all"):
+                treatment = assignment_cohorts["treatment"]
+                control = assignment_cohorts["control"]
+            else:
+                treatment, control = _learning_experiment_rows(con, experiment)
             evaluation = _evaluate_learning_experiment(
                 treatment,
                 control,
                 experiment["activated_at"],
                 rules=_learning_json(experiment.get("evidence_rules_json"), {}),
             )
+            treatment_effective = _research_effective_sample(treatment)
+            control_effective = _research_effective_sample(control)
+            rules = _learning_json(experiment.get("evidence_rules_json"), {})
+            min_effective_days = int(
+                rules.get("minimum_effective_days")
+                or min(20, int(rules.get("minimum_closed_trades") or 50))
+            )
+            evaluation["effective_sample"] = {
+                "treatment": treatment_effective,
+                "control": control_effective,
+                "minimum_effective_days": min_effective_days,
+            }
+            family_key = str(
+                experiment.get("hypothesis_family")
+                or experiment.get("family")
+                or "unknown"
+            )
+            family_test_count = int(con.execute(
+                """SELECT COUNT(*) FROM learning_experiments
+                   WHERE source_type='research_candidate'
+                     AND COALESCE(hypothesis_family, family)=?""",
+                (family_key,),
+            ).fetchone()[0]) if experiment.get("source_type") == "research_candidate" else 1
+            adjusted_alpha = 0.05 / max(1, family_test_count)
+            placebo = _research_permutation_delta_test(
+                treatment,
+                control,
+                iterations=1000,
+            )
+            evaluation["multiplicity_and_placebo"] = {
+                "hypothesis_family": family_key,
+                "family_test_count": family_test_count,
+                "family_adjusted_alpha": round(adjusted_alpha, 6),
+                "permutation_test": placebo,
+            }
+            evaluation["cost_scope"] = {
+                "paper_fee_and_slippage": True,
+                "blocked_counterfactual_fee_and_slippage": True,
+                "funding_cashflows": False,
+                "warning": (
+                    "Perpetual funding cashflows are not yet booked in Paper "
+                    "outcomes; small funding-sensitive effects cannot promote "
+                    "without separate funding review."
+                ),
+            }
+            if assignment_cohorts is not None:
+                blocked_shadow = assignment_cohorts.get("blocked_shadow") or []
+                blocked_pnls = [
+                    float(row.get("pnl_pct") or 0.0) for row in blocked_shadow
+                ]
+                evaluation["gate_counterfactual"] = {
+                    "blocked_closed": len(blocked_shadow),
+                    "blocked_avg_pnl_pct": (
+                        round(sum(blocked_pnls) / len(blocked_pnls), 4)
+                        if blocked_pnls else None
+                    ),
+                    "profitable_block_rate": (
+                        round(
+                            len([p for p in blocked_pnls if p > 0])
+                            / len(blocked_pnls)
+                            * 100.0,
+                            2,
+                        )
+                        if blocked_pnls else None
+                    ),
+                    "accepted_treatment_closed": len(
+                        assignment_cohorts.get("accepted_treatment") or []
+                    ),
+                    "contaminated_assignments": len([
+                        row for row in assignment_cohorts.get("all") or []
+                        if row.get("decision") == "contaminated"
+                    ]),
+                }
+            if (
+                evaluation.get("verdict") in {
+                    "promotion_candidate",
+                    "falsified",
+                }
+                and treatment_effective.get("market_day_count", 0)
+                < min_effective_days
+            ):
+                evaluation["raw_verdict_before_effective_sample_gate"] = (
+                    evaluation["verdict"]
+                )
+                evaluation["verdict"] = "review"
+                evaluation["sufficient"] = False
+                evaluation.setdefault("reasons", []).append(
+                    f"Only {treatment_effective.get('market_day_count', 0)}/"
+                    f"{min_effective_days} independent market days."
+                )
+            if (
+                evaluation.get("verdict") == "promotion_candidate"
+                and placebo.get("available")
+                and float(placebo.get("one_sided_p_value") or 1.0)
+                > adjusted_alpha
+            ):
+                evaluation["raw_verdict_before_placebo_gate"] = (
+                    "promotion_candidate"
+                )
+                evaluation["verdict"] = "review"
+                evaluation.setdefault("reasons", []).append(
+                    "Treatment separation did not beat the hypothesis-family "
+                    "adjusted permutation placebo gate."
+                )
+            contract_for_cost = _research_experiment_contract_from_row(
+                experiment
+            )
+            funding_sensitive = (
+                "funding" in family_key.lower()
+                or any(
+                    "funding" in str(field).lower()
+                    for field in (
+                        contract_for_cost.get("required_pre_entry_fields") or []
+                    )
+                )
+            )
+            if (
+                evaluation.get("verdict") == "promotion_candidate"
+                and funding_sensitive
+                and not evaluation["cost_scope"]["funding_cashflows"]
+            ):
+                evaluation["raw_verdict_before_cost_completeness_gate"] = (
+                    "promotion_candidate"
+                )
+                evaluation["verdict"] = "review"
+                evaluation.setdefault("reasons", []).append(
+                    "Funding-sensitive research cannot promote until realized "
+                    "funding cashflows are included in Paper outcomes."
+                )
             previous_status = experiment["status"]
             next_status = evaluation["verdict"]
+            updated_rules_json = experiment.get("evidence_rules_json")
+            extension_count = int(experiment.get("extension_count") or 0)
+            if next_status == "review" and evaluation.get("sufficient"):
+                max_extensions = max(
+                    0, min(1, int(rules.get("maximum_extensions") or 1))
+                )
+                if extension_count < max_extensions:
+                    extended_rules = dict(rules)
+                    extended_rules["minimum_closed_trades"] = max(
+                        int(rules.get("minimum_closed_trades") or 50) + 1,
+                        int(rules.get("minimum_closed_trades") or 50) * 2,
+                    )
+                    extended_rules["minimum_elapsed_days"] = max(
+                        float(rules.get("minimum_elapsed_days") or 7) + 7,
+                        14.0,
+                    )
+                    updated_rules_json = json.dumps(
+                        extended_rules, sort_keys=True, default=str
+                    )
+                    extension_count += 1
+                    next_status = "collecting"
+                    evaluation["verdict"] = "collecting"
+                    evaluation["extension"] = {
+                        "automatic": True,
+                        "extension_number": extension_count,
+                        "new_minimum_closed_trades": extended_rules[
+                            "minimum_closed_trades"
+                        ],
+                        "new_minimum_elapsed_days": extended_rules[
+                            "minimum_elapsed_days"
+                        ],
+                        "maximum_extensions": max_extensions,
+                    }
+                    evaluation.setdefault("reasons", []).append(
+                        "One predeclared extension started; no policy changed."
+                    )
+                else:
+                    next_status = "inconclusive"
+                    evaluation["verdict"] = "inconclusive"
+                    evaluation.setdefault("reasons", []).append(
+                        "The single predeclared extension was exhausted."
+                    )
+            lifecycle = (
+                "promotion_candidate"
+                if next_status == "promotion_candidate"
+                else "falsified"
+                if next_status == "falsified"
+                else "inconclusive"
+                if next_status == "inconclusive"
+                else "review"
+                if next_status == "review"
+                else "paper_challenger"
+            )
             result_json = json.dumps(evaluation, sort_keys=True, default=str)
             now = datetime.now(timezone.utc).isoformat()
             con.execute(
                 """UPDATE learning_experiments
                    SET status=?, result_json=?, evaluated_at=?, updated_at=?,
-                       rollback_required=?
+                       rollback_required=?, lifecycle_state=?,
+                       last_progress_at=COALESCE(last_progress_at, ?),
+                       evidence_rules_json=?, extension_count=?
                    WHERE experiment_id=?""",
                 (
                     next_status,
@@ -5939,6 +7662,10 @@ def _learning_evaluate_active_experiments() -> list[dict]:
                     now,
                     now,
                     1 if next_status == "falsified" else 0,
+                    lifecycle,
+                    now,
+                    updated_rules_json,
+                    extension_count,
                     experiment["experiment_id"],
                 ),
             )
@@ -5960,12 +7687,31 @@ def _learning_evaluate_active_experiments() -> list[dict]:
                 "strategy_key": experiment["strategy_key"],
                 **evaluation,
             })
+            if (
+                experiment.get("source_type") == "research_candidate"
+                and next_status == "falsified"
+            ):
+                auto_stop.append({
+                    "experiment_id": experiment["experiment_id"],
+                    "source_id": experiment.get("source_id"),
+                    "reason": "; ".join(evaluation.get("reasons") or [])
+                    or "Predeclared falsification gate failed.",
+                })
         con.commit()
     except Exception:
         con.rollback()
         raise
     finally:
         con.close()
+    for item in auto_stop:
+        try:
+            _research_auto_stop_falsified(item)
+        except Exception as e:
+            print(
+                f"[research_orchestrator] automatic Paper stop failed "
+                f"{item.get('experiment_id')}: {e}",
+                file=sys.stderr,
+            )
     return results
 
 
@@ -6008,6 +7754,7 @@ def _learning_strategy_factory_candidates() -> list[dict]:
 
 
 def _learning_effectiveness_snapshot(update_evaluations: bool = False) -> dict:
+    _ensure_research_orchestrator_schema()
     if update_evaluations:
         _learning_evaluate_active_experiments()
     con = sqlite3.connect(DB_PATH)
@@ -6032,6 +7779,15 @@ def _learning_effectiveness_snapshot(update_evaluations: bool = False) -> dict:
         experiment_cards = []
         for item in experiments:
             result = _learning_json(item.get("result_json"), {})
+            assignment_counts = con.execute(
+                """SELECT COUNT(*),
+                          SUM(CASE WHEN arm='treatment' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN arm='control' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN result IS NOT NULL THEN 1 ELSE 0 END)
+                   FROM learning_experiment_assignments
+                   WHERE experiment_id=?""",
+                (item["experiment_id"],),
+            ).fetchone()
             experiment_cards.append({
                 "experiment_id": item["experiment_id"],
                 "source_id": item.get("source_id"),
@@ -6043,6 +7799,20 @@ def _learning_effectiveness_snapshot(update_evaluations: bool = False) -> dict:
                 "activated_at": item["activated_at"],
                 "policy_fingerprint": item["policy_fingerprint"],
                 "rollback_required": bool(item["rollback_required"]),
+                "idea_type": item.get("idea_type"),
+                "decision_surface": item.get("decision_surface"),
+                "lifecycle_state": item.get("lifecycle_state") or item["status"],
+                "evaluator": item.get("evaluator"),
+                "hypothesis_family": item.get("hypothesis_family"),
+                "treatment_pct": item.get("treatment_pct"),
+                "probation_stage": item.get("probation_stage"),
+                "blocked_reason": item.get("blocked_reason"),
+                "assignment": {
+                    "total": int(assignment_counts[0] or 0),
+                    "treatment": int(assignment_counts[1] or 0),
+                    "control": int(assignment_counts[2] or 0),
+                    "closed": int(assignment_counts[3] or 0),
+                },
                 "evaluation": result,
                 "integrity": chains[item["experiment_id"]],
                 "authority": {
@@ -16683,14 +18453,14 @@ def _research_shadow_verdict(pass_stats: dict, compare_stats: dict, target_n: in
     compare_ev = compare_stats.get("avg_pnl_pct")
     pass_wp = pass_stats.get("win_partial_rate")
     verdict = "collecting"
-    reason = f"Collecting forward evidence ({n}/{target_n})."
+    reason = f"Historical association sample is {n}/{target_n}; this is not forward causal evidence."
     if n >= target_n and pass_ev is not None and compare_ev is not None:
         if pass_ev > 0 and pass_ev > compare_ev and (pass_wp or 0) >= 50:
-            verdict = "promote_candidate"
-            reason = "Matched bucket has positive EV, beats comparison, and clears W+P floor."
+            verdict = "historical_candidate"
+            reason = "Historical matched bucket is positive and separated; register a forward experiment before any promotion."
         elif pass_ev < 0 and pass_ev <= compare_ev:
-            verdict = "reject_candidate"
-            reason = "Matched bucket is negative EV and does not beat comparison."
+            verdict = "historical_reject"
+            reason = "Historical matched bucket is negative and does not beat comparison."
         else:
             verdict = "needs_more_data"
             reason = "Sample is large enough, but separation is not decisive."
@@ -16719,6 +18489,15 @@ def _research_result_payload(
     pass_stats = _research_eval_stats(passed)
     compare_stats = _research_eval_stats(comparison)
     verdict = _research_shadow_verdict(pass_stats, compare_stats, target_n=verdict_target)
+    if "stop_quality" in evaluator:
+        verdict = {
+            **verdict,
+            "status": "diagnostic_only",
+            "reason": (
+                "Retrospective MAE/MFE/stop-pressure can diagnose stop design "
+                "but cannot promote a pre-entry rule."
+            ),
+        }
     return {
         "evaluator": evaluator,
         "candidate_id": record.get("id"),
@@ -16740,6 +18519,8 @@ def _research_result_payload(
         "btc_trend_split": _research_group_stats(passed, "btc_trend", limit=6),
         "bucket_split": _research_group_stats(scoped, "research_bucket", limit=8),
         "notes": notes or [],
+        "evidence_scope": "historical_mixed_policy_association",
+        "forward_causal_evidence": False,
         "recent_examples": [
             {
                 "id": r.get("id"),
@@ -17023,10 +18804,16 @@ def _research_paper_trials_by_tag(ledger: list[dict] | None = None) -> dict[str,
 RESEARCH_RULE_MODES = {"off", "shadow", "paper_trial", "paper_applied", "live_candidate"}
 RESEARCH_RULE_TYPES = {
     "strategy",
+    "new_strategy",
     "entry_gate",
     "risk_gate",
+    "regime_filter",
+    "stop_rule",
     "sizing_rule",
     "exit_rule",
+    "scoring_rule",
+    "portfolio_rule",
+    "execution_rule",
     "annotation",
     "data_collection",
 }
@@ -17056,7 +18843,11 @@ def _research_rule_type_guess(tag: str, candidate_type: str = "", fields: list[s
     text = " ".join([tag or "", candidate_type or "", " ".join(fields or [])]).lower()
     if "sentiment" in text or "macro" in text or (readiness or {}).get("missing"):
         return "annotation"
-    if "stop" in text or "volatility" in text or "atr" in text:
+    if "stop" in text or "trailing" in text or "breakeven" in text:
+        return "stop_rule"
+    if "regime" in text:
+        return "regime_filter"
+    if "volatility" in text or "atr" in text:
         return "risk_gate"
     if "funding" in text or "crowding" in text or "basis" in text:
         return "risk_gate"
@@ -17064,8 +18855,14 @@ def _research_rule_type_guess(tag: str, candidate_type: str = "", fields: list[s
         return "sizing_rule"
     if "exit" in text or "take_profit" in text:
         return "exit_rule"
+    if "score" in text or "conviction" in text or "rank" in text:
+        return "scoring_rule"
+    if "portfolio" in text or "correlation" in text or "allocation" in text:
+        return "portfolio_rule"
+    if "execution" in text or "slippage" in text or "fill" in text:
+        return "execution_rule"
     if "strategy" in text and "filter" not in text:
-        return "strategy"
+        return "new_strategy"
     return "entry_gate"
 
 
@@ -17195,12 +18992,37 @@ def _apply_research_paper_rules(
         "annotations": [],
         "size_multiplier": 1.0,
         "controls_applied": [],
+        "experiment_assignments": [],
     }
     try:
         controls_by_tag = controls_by_tag if isinstance(controls_by_tag, dict) else _research_rule_controls_by_tag()
         strategy_key = str(sig.get("_strategy_key") or sig.get("strategy_key") or "balanced")
+        assignments = _research_assignments_for_signal(sig)
+        assignment_by_tag = {
+            str(item.get("source_id") or ""): item
+            for item in assignments
+            if item.get("source_id")
+        }
+        result["experiment_assignments"] = assignments
 
-        if _research_paper_control_active(controls_by_tag, "research_order_flow_confirmation", sig):
+        def treatment_enabled(tag: str) -> bool:
+            assignment = assignment_by_tag.get(tag)
+            if assignment:
+                result["annotations"].append(
+                    f"research_experiment_{assignment['arm']}_{tag}"
+                )
+                return assignment.get("arm") == "treatment"
+            # Backward compatibility for a legacy Paper Applied control. New
+            # orchestrated controls always have an assignment.
+            result["annotations"].append(f"research_experiment_unattributed_{tag}")
+            return True
+
+        if (
+            _research_paper_control_active(
+                controls_by_tag, "research_order_flow_confirmation", sig
+            )
+            and treatment_enabled("research_order_flow_confirmation")
+        ):
             score = _research_float((flow_result or {}).get("score"), 0.0)
             confirmed = bool((flow_result or {}).get("confirmed"))
             result["controls_applied"].append("research_order_flow_confirmation")
@@ -17212,7 +19034,12 @@ def _apply_research_paper_rules(
                     "reason": f"flow not confirmed for paper-applied rule; score={score:.0f}",
                 })
 
-        if _research_paper_control_active(controls_by_tag, "research_funding_crowding_filter", sig):
+        if (
+            _research_paper_control_active(
+                controls_by_tag, "research_funding_crowding_filter", sig
+            )
+            and treatment_enabled("research_funding_crowding_filter")
+        ):
             row = dict(sig)
             if flow_result is not None:
                 row["flow_confirmed"] = bool(flow_result.get("confirmed"))
@@ -17228,6 +19055,14 @@ def _apply_research_paper_rules(
                 })
 
         if result["blocked_by"]:
+            blocked_tags_set = {
+                str(item.get("tag") or "") for item in result["blocked_by"]
+            }
+            for assignment in result["experiment_assignments"]:
+                if str(assignment.get("source_id") or "") in blocked_tags_set:
+                    assignment["decision"] = "blocked"
+                else:
+                    assignment["decision"] = "contaminated"
             blocked_tags = [b["tag"] for b in result["blocked_by"]]
             reasons = [b["reason"] for b in result["blocked_by"]]
             log_filtered_candidate({
@@ -17241,6 +19076,9 @@ def _apply_research_paper_rules(
                 "flow_result": flow_result,
                 "liquidation": liquidation,
             })
+        else:
+            for assignment in result["experiment_assignments"]:
+                assignment["decision"] = "accepted"
     except Exception as e:
         print(f"[research_paper_runtime] error: {e}", file=sys.stderr)
         result["allowed"] = True
@@ -18280,9 +20118,70 @@ def _research_update_rule_control(shadow_tag: str, payload: dict | None = None) 
     }
     ledger.append(record)
     _research_write_experiment_ledger(ledger)
+    orchestrator = None
+    try:
+        if mode in {"paper_trial", "paper_applied"}:
+            refreshed = next(
+                (
+                    x for x in (_research_evidence_ledger_payload().get("items") or [])
+                    if str(x.get("research_shadow_tag") or "") == tag
+                ),
+                item,
+            )
+            orchestrator = _research_prepare_experiment(
+                refreshed,
+                actor=actor,
+            )
+            if mode == "paper_applied":
+                experiment_id = str(
+                    (orchestrator.get("experiment") or {}).get("experiment_id") or ""
+                )
+                if not experiment_id:
+                    raise ValueError("research experiment preparation did not return an id")
+                orchestrator["activation"] = _research_activate_experiment(
+                    experiment_id,
+                    actor=actor,
+                    reason=reason or "User approved Paper Applied challenger",
+                )
+        elif mode in {"off", "shadow"}:
+            stopped = _research_stop_source_experiments(
+                tag,
+                status="parked" if mode == "off" else "rolled_back",
+                actor=actor,
+                reason=reason or f"Research Rulebook moved to {mode}",
+                automatic=False,
+            )
+            orchestrator = {"stopped_experiments": stopped}
+    except Exception as exc:
+        if mode == "paper_applied":
+            compensation_time = _research_now()
+            compensation = {
+                **record,
+                "id": f"research_rule_control_{tag}_{compensation_time}_compensating",
+                "mode": "paper_trial",
+                "reason": (
+                    "Paper activation was rejected; automatically restored non-behavioral "
+                    f"Paper Trial mode. Cause: {str(exc)[:350]}"
+                ),
+                "actor": "research_orchestrator",
+                "created_at": compensation_time,
+                "updated_at": compensation_time,
+                "updated_by": "research_orchestrator",
+                "changed_paper_behavior": False,
+                "notes": [
+                    "Compensating governance record after rejected Paper activation.",
+                    "The latest rule state is non-behavioral Paper Trial.",
+                    "No live behavior was changed.",
+                ],
+            }
+            recovery_ledger = _read_experiment_ledger()
+            recovery_ledger.append(compensation)
+            _research_write_experiment_ledger(recovery_ledger)
+        raise
     return {
         "success": True,
         "control": record,
+        "orchestrator": orchestrator,
         "rulebook": _research_rulebook_payload(),
         "pipeline": _hermes_research_pipeline_summary(),
     }
@@ -21721,6 +23620,146 @@ def api_learning_evaluate():
         })
     except Exception as e:
         print(f"[api/learning/evaluate] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/intelligence/research/orchestrator")
+def api_research_orchestrator():
+    """Read the typed, conflict-aware research experiment lifecycle."""
+    try:
+        return jsonify(_research_experiment_orchestrator_payload())
+    except Exception as e:
+        print(f"[api/research/orchestrator] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/intelligence/research/orchestrator/reconcile", methods=["POST"])
+def api_research_orchestrator_reconcile():
+    """Prepare missing contracts and surface blockages without starting behavior."""
+    try:
+        reconciliation = _research_reconcile_experiments()
+        evaluations = _learning_evaluate_active_experiments()
+        return jsonify({
+            "success": bool(reconciliation.get("success")),
+            "reconciliation": reconciliation,
+            "evaluations": evaluations,
+            "automatic_behavior_change": False,
+            "automatic_live_change": False,
+            "orchestrator": _research_experiment_orchestrator_payload(),
+        })
+    except Exception as e:
+        print(f"[api/research/orchestrator/reconcile] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route(
+    "/api/intelligence/research/orchestrator/experiments/<path:experiment_id>/approve",
+    methods=["POST"],
+)
+def api_research_orchestrator_approve(experiment_id: str):
+    """Explicitly approve one conflict-checked Paper challenger."""
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = str(body.get("reason") or "").strip()
+        actor = str(body.get("actor") or "local_user").strip() or "local_user"
+        if len(reason) < 8:
+            return jsonify({
+                "success": False,
+                "error": "A clear approval reason of at least 8 characters is required.",
+            }), 400
+        activated = _research_activate_experiment(
+            experiment_id,
+            actor=actor,
+            reason=reason,
+        )
+        return jsonify({
+            "success": True,
+            "activation": activated,
+            "automatic_promotion": False,
+            "live_authority_granted": False,
+            "orchestrator": _research_experiment_orchestrator_payload(),
+        })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 409
+    except Exception as e:
+        print(f"[api/research/orchestrator/approve] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route(
+    "/api/intelligence/research/orchestrator/experiments/<path:experiment_id>/promote",
+    methods=["POST"],
+)
+def api_research_orchestrator_promote(experiment_id: str):
+    """Promote one mature experiment to Paper confirmation, never live."""
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = str(body.get("reason") or "").strip()
+        actor = str(body.get("actor") or "local_user").strip() or "local_user"
+        if len(reason) < 8:
+            return jsonify({
+                "success": False,
+                "error": "A clear promotion reason of at least 8 characters is required.",
+            }), 400
+        promotion = _research_promote_experiment(
+            experiment_id,
+            actor=actor,
+            reason=reason,
+        )
+        return jsonify({
+            "success": True,
+            "promotion": promotion,
+            "automatic": False,
+            "live_authority_granted": False,
+            "orchestrator": _research_experiment_orchestrator_payload(),
+        })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 409
+    except Exception as e:
+        print(f"[api/research/orchestrator/promote] {e}", file=sys.stderr)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route(
+    "/api/intelligence/research/orchestrator/experiments/<path:experiment_id>/stop",
+    methods=["POST"],
+)
+def api_research_orchestrator_stop(experiment_id: str):
+    """Explicitly stop or roll back a Paper challenger."""
+    try:
+        body = request.get_json(silent=True) or {}
+        reason = str(body.get("reason") or "").strip()
+        actor = str(body.get("actor") or "local_user").strip() or "local_user"
+        if len(reason) < 8:
+            return jsonify({
+                "success": False,
+                "error": "A clear stop reason of at least 8 characters is required.",
+            }), 400
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            """SELECT source_id FROM learning_experiments
+               WHERE experiment_id=? AND source_type='research_candidate'""",
+            (experiment_id,),
+        ).fetchone()
+        con.close()
+        if not row:
+            return jsonify({"success": False, "error": "experiment not found"}), 404
+        stopped = _research_stop_source_experiments(
+            str(row["source_id"]),
+            status="rolled_back",
+            actor=actor,
+            reason=reason,
+            automatic=False,
+        )
+        return jsonify({
+            "success": True,
+            "stopped_experiments": stopped,
+            "live_behavior_changed": False,
+            "orchestrator": _research_experiment_orchestrator_payload(),
+        })
+    except Exception as e:
+        print(f"[api/research/orchestrator/stop] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -30997,17 +33036,36 @@ def _paper_bot_scan(cfg: dict) -> dict:
                 print(f"[paper_bot] SKIP {sig['symbol']} trend_score={sig.get('trend_score')} abs>{max_trend_score_abs}", file=sys.stderr)
                 skipped += 1
                 continue
+            sig["logged_at"] = sig.get("logged_at") or now
+            sig["_research_assignments"] = _research_assignments_for_signal(
+                sig,
+                assigned_at=now,
+            )
 
             flow_result = None
             confirmed   = True
             flow_score  = 0.0
             flow_reasons = []
 
-            flow_needed = flow_required or _research_paper_control_active(
-                research_paper_controls,
-                "research_order_flow_confirmation",
-                sig,
+            flow_assignment = next(
+                (
+                    item for item in sig["_research_assignments"]
+                    if item.get("source_id") == "research_order_flow_confirmation"
+                ),
+                None,
             )
+            flow_challenger = (
+                _research_paper_control_active(
+                    research_paper_controls,
+                    "research_order_flow_confirmation",
+                    sig,
+                )
+                and (
+                    not flow_assignment
+                    or flow_assignment.get("arm") == "treatment"
+                )
+            )
+            flow_needed = flow_required or flow_challenger
             if flow_needed:
                 # Pass min_flow_score through — prior code loaded it from cfg
                 # (line ~5938) into a local then never used it, so the value
@@ -31101,6 +33159,7 @@ def _paper_bot_scan(cfg: dict) -> dict:
 
             # Log confirmed entries to signals table so they appear in History tab
             signal_id = sig.get("signal_id")
+            counterfactual_signal_id = None
             if confirmed:
                 sig["strategy_key"]   = strategy_key
                 sig["flow_score"]     = flow_score
@@ -31108,9 +33167,37 @@ def _paper_bot_scan(cfg: dict) -> dict:
                 inserted_ids = log_signals([sig], source="paper", allow_duplicate_open=True)
                 if inserted_ids and inserted_ids[0]:
                     signal_id = inserted_ids[0]
+            elif research_runtime.get("blocked_by"):
+                # A research gate must continue following every blocked
+                # opportunity.  This preserves the winner-cost counterfactual
+                # without opening a Paper position.
+                shadow_sig = dict(sig)
+                shadow_sig["strategy_key"] = strategy_key
+                shadow_sig["flow_score"] = flow_score
+                shadow_sig["flow_confirmed"] = bool(
+                    (flow_result or {}).get("confirmed")
+                )
+                shadow_sig["research_counterfactual"] = True
+                shadow_sig["research_runtime"] = research_runtime
+                shadow_sig["tags"] = list(dict.fromkeys(
+                    list(shadow_sig.get("tags") or [])
+                    + ["research_counterfactual"]
+                    + [
+                        str(block.get("tag"))
+                        for block in research_runtime.get("blocked_by") or []
+                        if block.get("tag")
+                    ]
+                ))
+                inserted_ids = log_signals(
+                    [shadow_sig],
+                    source="research_counterfactual",
+                    allow_duplicate_open=True,
+                )
+                if inserted_ids and inserted_ids[0]:
+                    counterfactual_signal_id = inserted_ids[0]
 
             con = sqlite3.connect(DB_PATH)
-            con.execute(
+            cursor = con.execute(
                 """INSERT INTO paper_trades
                    (opened_at, symbol, strategy_key, direction, entry_px, size_usd,
                     tp1, tp2, tp3, stop_loss, leverage, conviction,
@@ -31170,8 +33257,22 @@ def _paper_bot_scan(cfg: dict) -> dict:
                     json.dumps(learning_attribution["policy"], sort_keys=True, default=str),
                 ),
             )
+            paper_trade_id = int(cursor.lastrowid)
             con.commit()
             con.close()
+            assignments = research_runtime.get("experiment_assignments") or []
+            decision = "blocked" if research_runtime.get("blocked_by") else "accepted"
+            _research_record_assignments(
+                assignments,
+                paper_trade_id=paper_trade_id,
+                signal_id=counterfactual_signal_id or signal_id,
+                decision=decision,
+                metadata={
+                    "blocked_by": research_runtime.get("blocked_by") or [],
+                    "flow_required_by_champion": bool(flow_required),
+                    "paper_status": status,
+                },
+            )
 
             if confirmed:
                 entered += 1
@@ -31288,13 +33389,19 @@ def _paper_bot_loop():
                 # Only scan for new entries on the configured interval
                 scan_interval = int(cfg.get("scan_interval_minutes", 5)) * 60
                 if _time.time() - last_scan >= scan_interval:
+                    orchestration = _research_reconcile_experiments()
                     scan_result = _paper_bot_scan(cfg)
-                    shadow_eval = _evaluate_open_signal_outcomes(source_allow={"disabled_shadow"}, limit=80)
+                    shadow_eval = _evaluate_open_signal_outcomes(
+                        source_allow={"disabled_shadow", "research_counterfactual"},
+                        limit=120,
+                    )
                     last_scan = _time.time()
                     print(
                         f"[paper_bot] scan done — entered={scan_result['entered']} "
                         f"rejected={scan_result['rejected']} "
                         f"disabled_shadow={((scan_result.get('disabled_shadow') or {}).get('shadow_logged') or 0)} "
+                        f"research_prepared={len(orchestration.get('prepared') or [])} "
+                        f"research_blocked={len(orchestration.get('errors') or [])} "
                         f"shadow_tagged={shadow_eval.get('tagged') if shadow_eval.get('success') else 'err'}",
                         file=sys.stderr,
                     )

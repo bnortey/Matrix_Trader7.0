@@ -6341,6 +6341,7 @@ const I = {
   suggestionBaseline: {},
   suggestionWorkflow: {},
   learningEffectiveness: null,
+  researchOrchestrator: null,
   disabledStrategyShadow: null,
   disabledStrategyShadowLoading: false,
   evaluationWindowTrades: 20,
@@ -9216,7 +9217,7 @@ async function loadIntelligence() {
   const container = document.getElementById('intelligence-content');
   if (container) container.innerHTML = '<div style="color:var(--muted);padding:2rem;">Loading...</div>';
   try {
-    const [statusRes, suggestionsRes, rosterRes, hermesRes, attrRes, hypRes, edgeLabRes, missedRes, shadowEvalRes, radarRes, opsRes, recoveryRes, learningRes] = await Promise.all([
+    const [statusRes, suggestionsRes, rosterRes, hermesRes, attrRes, hypRes, edgeLabRes, missedRes, shadowEvalRes, radarRes, opsRes, recoveryRes, learningRes, orchestratorRes] = await Promise.all([
       // These two legacy summary routes evaluate a broad history window and can
       // take longer while SQLite is serving the other Intelligence requests.
       // Keep the report workspace available instead of aborting the whole tab
@@ -9234,6 +9235,7 @@ async function loadIntelligence() {
       fetchIntelligenceJson('/api/ops/watchdog').catch(() => null),
       fetchIntelligenceJson('/api/paper/disabled-strategy-shadow').catch(() => null),
       fetchIntelligenceJson('/api/intelligence/learning-effectiveness', 10000).catch(() => null),
+      fetchIntelligenceJson('/api/intelligence/research/orchestrator', 10000).catch(() => null),
     ]);
     I.status = statusRes.success ? statusRes : null;
     I.suggestions = suggestionsRes.suggestions || [];
@@ -9253,6 +9255,7 @@ async function loadIntelligence() {
     if (opsRes && opsRes.success) I.opsWatchdog = opsRes;
     if (recoveryRes && recoveryRes.success) I.disabledStrategyShadow = recoveryRes;
     if (learningRes && learningRes.success) I.learningEffectiveness = learningRes;
+    if (orchestratorRes && orchestratorRes.success) I.researchOrchestrator = orchestratorRes;
     renderIntelligence();
     if (!I.opsWatchdog && !I.opsWatchdogLoading) loadOpsWatchdog(true);
     loadStrategyOverrides();
@@ -10132,6 +10135,116 @@ async function evaluateLearningExperiments() {
   }
 }
 
+function renderResearchOrchestrator() {
+  const data = I.researchOrchestrator;
+  if (!data) return '';
+  const summary = data.summary || {};
+  const effectiveness = data.effectiveness || {};
+  const experiments = data.experiments || [];
+  const statusColor = status => (
+    ['falsified','rolled_back','parked'].includes(status) ? 'var(--red)' :
+    ['promotion_candidate','confirmed','completed'].includes(status) ? 'var(--green)' :
+    ['awaiting_approval','review','needs_data','queued'].includes(status) ? 'var(--amber)' :
+    'var(--blue)'
+  );
+  const cards = experiments.slice(0, 8).map(exp => {
+    const assignments = exp.assignments || {};
+    const encoded = esc(encodeURIComponent(exp.experiment_id || ''));
+    const canApprove = ['awaiting_approval','queued','ready_for_experiment'].includes(exp.status);
+    const canPromote = exp.status === 'promotion_candidate';
+    const canStop = ['active','collecting','review'].includes(exp.status);
+    const action = canApprove
+      ? `<button onclick="researchExperimentAction('${encoded}','approve')" style="background:#10223a;border:1px solid #2563eb;color:#93c5fd;border-radius:5px;padding:6px 9px;font-size:10px;font-weight:800;cursor:pointer;">Approve Paper Challenger</button>`
+      : canPromote
+      ? `<button onclick="researchExperimentAction('${encoded}','promote')" style="background:#12351f;border:1px solid #16a34a;color:var(--green);border-radius:5px;padding:6px 9px;font-size:10px;font-weight:800;cursor:pointer;">Promote One Paper Stage</button>`
+      : '';
+    const stop = canStop
+      ? `<button onclick="researchExperimentAction('${encoded}','stop')" style="background:#1b0808;border:1px solid #7f1d1d;color:#fca5a5;border-radius:5px;padding:6px 9px;font-size:10px;cursor:pointer;">Stop / Roll Back</button>`
+      : '';
+    return `<div style="border-top:1px solid #1e2530;padding:10px 0;">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;">
+        <div style="min-width:0;flex:1;">
+          <div style="font-size:12px;font-weight:850;color:var(--text);">${esc(exp.strategy_key || 'portfolio')} · ${esc(exp.idea_type || 'research')}</div>
+          <div style="font-size:10px;color:#667085;margin-top:2px;">${esc(exp.decision_surface || '')} · ${esc(exp.evaluator || '')} · treatment ${Number(exp.treatment_pct || 0)}%</div>
+          <div style="font-size:11px;color:var(--text3);line-height:1.4;margin-top:4px;">${esc(exp.hypothesis || '')}</div>
+          <div style="font-size:10px;color:#667085;margin-top:4px;">Assignments: ${Number(assignments.treatment || 0)} treatment · ${Number(assignments.control || 0)} control · ${Number(assignments.closed || 0)} closed</div>
+          ${exp.blocked_reason ? `<div style="font-size:10px;color:var(--amber);margin-top:4px;">Blocked: ${esc(exp.blocked_reason)}</div>` : ''}
+        </div>
+        <span style="font-size:9px;font-weight:900;text-transform:uppercase;color:${statusColor(exp.status)};">${esc(exp.lifecycle_state || exp.status || '')}</span>
+      </div>
+      ${(action || stop) ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">${action}${stop}</div>` : ''}
+    </div>`;
+  }).join('');
+  return `<div style="background:#0b0f15;border:1px solid #1e2530;border-radius:8px;padding:14px;margin-bottom:16px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
+      <div>
+        <div style="font-size:10px;color:#a78bfa;text-transform:uppercase;letter-spacing:.1em;font-weight:900;">Research Autopilot</div>
+        <div style="font-size:12px;color:var(--text3);line-height:1.45;margin-top:4px;max-width:680px;">Typed contracts, conflict-aware concurrency, deterministic Paper arms, automatic evaluation and automatic Paper stops. Promotion and all live authority remain manual.</div>
+      </div>
+      <button onclick="reconcileResearchExperiments()" style="background:#211536;border:1px solid #6d28d9;color:#c4b5fd;border-radius:5px;padding:7px 10px;font-size:11px;font-weight:800;cursor:pointer;">Reconcile & Evaluate</button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px;margin:12px 0;">
+      ${suggestionMetric('Behavioral Active', Number(summary.active_behavioral || 0), Number(summary.active_behavioral || 0) ? 'var(--blue)' : 'var(--text2)')}
+      ${suggestionMetric('Behavioral Slots', Number(summary.behavioral_slots_available || 0), Number(summary.behavioral_slots_available || 0) ? 'var(--green)' : 'var(--amber)')}
+      ${suggestionMetric('Shadow Active', Number(summary.active_shadow || 0), 'var(--blue)')}
+      ${suggestionMetric('Awaiting / Blocked', Number(summary.awaiting_or_blocked || 0), Number(summary.awaiting_or_blocked || 0) ? 'var(--amber)' : 'var(--green)')}
+      ${suggestionMetric('Marker-only Trials', Number(summary.marker_only_trials || 0), Number(summary.marker_only_trials || 0) ? 'var(--red)' : 'var(--green)')}
+      ${suggestionMetric('Falsified', Number(effectiveness.falsified_count || 0), Number(effectiveness.falsified_count || 0) ? 'var(--amber)' : 'var(--text2)')}
+      ${suggestionMetric('Confirmed', Number(effectiveness.confirmed_count || 0), Number(effectiveness.confirmed_count || 0) ? 'var(--green)' : 'var(--text2)')}
+      ${suggestionMetric('Replication', effectiveness.forward_replication_rate == null ? '—' : `${(Number(effectiveness.forward_replication_rate) * 100).toFixed(1)}%`, effectiveness.forward_replication_rate == null ? 'var(--text2)' : 'var(--green)')}
+      ${suggestionMetric('Live Behavior', Number(summary.live_behavior_active || 0), Number(summary.live_behavior_active || 0) ? 'var(--red)' : 'var(--green)')}
+    </div>
+    ${cards || '<div style="border-top:1px solid #1e2530;padding:10px 0;color:var(--muted);font-size:11px;">No research experiment contracts are registered yet. Reconcile prepares eligible Paper Trial items without activating them.</div>'}
+    <div style="font-size:10px;color:#667085;margin-top:8px;">Capacity: two orthogonal behavioral Paper experiments and ten read-only shadow experiments. Conflicting strategy surfaces stay queued.</div>
+  </div>`;
+}
+
+async function reconcileResearchExperiments() {
+  try {
+    const res = await fetch('/api/intelligence/research/orchestrator/reconcile', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:'{}'
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'reconciliation failed');
+    I.researchOrchestrator = data.orchestrator || null;
+    const learning = await fetchIntelligenceJson('/api/intelligence/learning-effectiveness', 10000).catch(() => null);
+    if (learning && learning.success) I.learningEffectiveness = learning;
+    renderIntelligence();
+    showOverrideMsg('Research lifecycle reconciled and evaluated. No automatic promotion or live change occurred.');
+  } catch (e) {
+    showOverrideMsg('Research reconciliation failed: ' + (e.message || e), true);
+  }
+}
+
+async function researchExperimentAction(encodedId, action) {
+  const id = decodeURIComponent(encodedId || '');
+  const promptLabel = action === 'approve'
+    ? 'Why should this Paper challenger start?'
+    : action === 'promote'
+    ? 'Why should this evidence advance one Paper stage?'
+    : 'Why should this Paper challenger stop or roll back?';
+  const reason = prompt(promptLabel);
+  if (!reason) return;
+  try {
+    const res = await fetch(`/api/intelligence/research/orchestrator/experiments/${encodeURIComponent(id)}/${action}`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({reason, actor:'local_user'})
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || `${action} failed`);
+    I.researchOrchestrator = data.orchestrator || null;
+    const learning = await fetchIntelligenceJson('/api/intelligence/learning-effectiveness', 10000).catch(() => null);
+    if (learning && learning.success) I.learningEffectiveness = learning;
+    renderIntelligence();
+    showOverrideMsg(`Research experiment ${action} completed. Live authority remains off.`);
+  } catch (e) {
+    showOverrideMsg(`Research experiment ${action} failed: ` + (e.message || e), true);
+  }
+}
+
 function renderSuggestionsPanel() {
   const suggestions = I.suggestions || [];
   const workflow = I.suggestionWorkflow || {};
@@ -10148,10 +10261,11 @@ function renderSuggestionsPanel() {
 
   return `<div style="max-width:980px;margin:0 auto;">
     ${renderLearningEffectiveness()}
+    ${renderResearchOrchestrator()}
     <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
       <div>
         <h3 style="font-size:16px;margin:0 0 4px;">Learner Suggestions</h3>
-        <div style="font-size:12px;color:var(--muted);">Shadow studies run in parallel. Promotion is a manual handoff into the one-at-a-time applied config trial.</div>
+        <div style="font-size:12px;color:var(--muted);">Shadow studies run in parallel. Up to two orthogonal Paper challengers may collect concurrently; conflicting strategy surfaces stay queued.</div>
       </div>
       <button onclick="loadSuggestions(true)" style="background:var(--surface);border:1px solid var(--border);color:var(--text2);padding:7px 10px;border-radius:5px;font-size:12px;cursor:pointer;">Refresh</button>
     </div>
