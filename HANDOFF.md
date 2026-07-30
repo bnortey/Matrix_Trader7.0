@@ -7,7 +7,7 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-30
-Latest implementation commit: 9f1584c feat: make MT7 evidence trader-readable
+Latest implementation commit: 6493362 feat: orchestrate causal research experiments
 app.py: 37,522 lines
 index.html: 19,575 lines
 
@@ -15,7 +15,7 @@ index.html: 19,575 lines
 
 ## 2026-07-30 — Research experiment orchestration and causal promotion ladder
 
-**Built and tested locally; not committed or deployed:**
+**Built, tested, committed, and deployed to production `207.148.66.39`:**
 
 - Added a typed research contract and lifecycle for new strategies, entry and
   risk gates, regime filters, stops, exits, sizing, scoring, portfolio,
@@ -60,8 +60,22 @@ index.html: 19,575 lines
   and research shadow-result endpoints.
 - Desktop and `390×844` browser acceptance passed for the new panel with no
   console errors and no horizontal overflow.
-- No live authority, leverage escalation, order placement, or production
-  deployment was introduced. Production remains unchanged.
+- Production file hashes match the tested local backend, dashboard, and
+  orchestrator module. `matrix-trader` and `mt-learner` are active, and
+  production SQLite integrity is `ok`.
+- The first production observation-only reconciliation prepared four typed
+  contracts and activated none:
+  - `research_funding_crowding_filter` and
+    `research_order_flow_confirmation` are awaiting explicit Paper approval.
+  - `research_sentiment_macro_regime` and
+    `research_volatility_stop_quality` remain `needs_data`.
+  - Behavioral-active and live-behavior-active counts are both zero.
+- Production rollback snapshot:
+  `/opt/matrix-trader/backups/20260730T184241Z-research-orchestrator`.
+  It is 448 MB and contains the prior backend, dashboard, and a verified
+  consistent SQLite backup.
+- No live authority, leverage escalation, order placement, or automatic
+  experiment activation was introduced.
 
 ---
 
