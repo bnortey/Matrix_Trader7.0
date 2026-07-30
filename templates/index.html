@@ -2028,7 +2028,7 @@
           <p id="empty-msg">No signals met the conviction threshold.</p>
           <p id="evf-empty-note" style="font-size:12px;color:var(--text3);margin:4px 0 0;"></p>
           <div class="state-actions">
-            <button class="btn-ghost" onclick="scanSignals()">Rescan all strategies</button>
+            <button class="btn-ghost" onclick="scanSignals()">Rescan selected strategy</button>
             <button class="btn-green" onclick="scanSignals()">Rescan</button>
           </div>
         </div>
@@ -2540,8 +2540,8 @@
     </div><!-- /history-section -->
 
     <!-- ════ INTELLIGENCE SECTION ════ -->
-    <div id="intelligence-section" class="hidden" style="flex:1;overflow-y:auto;padding:16px;">
-      <div id="intelligence-content">
+    <div id="intelligence-section" class="hidden" style="flex:1;overflow-y:auto;overflow-x:hidden;padding:16px;">
+      <div id="intelligence-content" style="width:100%;min-width:0;">
         <div style="color:var(--muted);padding:2rem;">Loading...</div>
       </div>
     </div><!-- /intelligence-section -->
@@ -4779,16 +4779,24 @@ async function scanSignals(opts = {}) {
 
   try {
     const scanExchange = S.exchange;
-    const url = scanExchange === 'hyperliquid' ? '/api/hl/scan'
-              : scanExchange === 'bybit'        ? '/api/bybit/scan'
-              : '/api/scan/all';
-    const resp = await fetch(url, { method: 'POST' });
+    const resp = await fetch('/api/scan/strategy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        exchange: scanExchange === 'hyperliquid' ? 'HYPERLIQUID' : scanExchange.toUpperCase(),
+        strategy: S.strategy,
+      }),
+    });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     if (!data.success) throw new Error(data.error || 'Unknown error');
 
     stopProgress();
-    const exchangeResults = data.results || {};
+    const exchangeResults = Object.assign(
+      {},
+      H.scanResultsByExchange[scanExchange] || {},
+      data.results || {},
+    );
     H.scanResultsByExchange[scanExchange] = exchangeResults;
     if (S.exchange !== scanExchange) {
       applySignalExchangeState();
@@ -4799,6 +4807,11 @@ async function scanSignals(opts = {}) {
     H.lastScanTime = new Date().toISOString();
     S.totalPairs   = data.total_pairs || 800;
     S.scanTime     = new Date();
+    const scanMeta = $('scan-meta');
+    if (scanMeta) {
+      const strategyLabel = STRAT_META[S.strategy]?.label || S.strategy.replaceAll('_', ' ');
+      scanMeta.textContent = `${exchangeLabel(scanExchange)} · ${strategyLabel} · ${Number(data.scan_time || 0).toFixed(1)}s`;
+    }
 
     const res = H.scanResults[S.strategy];
     S.signals = (res && res.signals) ? res.signals : [];
@@ -6321,6 +6334,8 @@ const I = {
   hermes:       null,
   hermesLoading:false,
   opsWatchdog:  null,
+  opsWatchdogLoading: false,
+  opsWatchdogError: null,
   researchPipeline: null,
   researchWorkspace: null,
   tagAttribution: null,
@@ -6329,6 +6344,7 @@ const I = {
   edgeLabLoading: false,
   missedMovers: null,
   missedMoversLoading: false,
+  missedMoversError: null,
   shadowEval: null,
   researchRadar: null,
   tradeBuddy: null,
@@ -9214,6 +9230,7 @@ async function loadIntelligence() {
     if (recoveryRes && recoveryRes.success) I.disabledStrategyShadow = recoveryRes;
     if (learningRes && learningRes.success) I.learningEffectiveness = learningRes;
     renderIntelligence();
+    if (!I.opsWatchdog && !I.opsWatchdogLoading) loadOpsWatchdog(true);
     loadStrategyOverrides();
     // Load research firm briefs after main render
     I.briefsLoading = true;
@@ -9239,7 +9256,8 @@ function renderOpsWatchdogPanel(ops, compact = false) {
   if (!ops) {
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:16px;">
       <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Ops Watchdog</div>
-      <div style="font-size:13px;color:var(--muted);">Loading system health...</div>
+      <div style="font-size:13px;color:${I.opsWatchdogError ? 'var(--red)' : 'var(--muted)'};">${I.opsWatchdogError ? `System health unavailable: ${esc(I.opsWatchdogError)}` : 'Checking system health...'}</div>
+      ${I.opsWatchdogError ? '<button onclick="loadOpsWatchdog(true)" style="margin-top:8px;background:transparent;border:1px solid var(--border);color:var(--text2);border-radius:4px;padding:6px 9px;font-size:11px;cursor:pointer;">Retry health check</button>' : ''}
     </div>`;
   }
   const posture = String(ops.posture || 'review').toUpperCase();
@@ -9325,7 +9343,7 @@ function renderIntelligence() {
   }
   if (I.activeSubTab === 'missed') {
     container.innerHTML = subTabs + renderMissedMoversPanel();
-    if (!I.missedMovers && !I.missedMoversLoading) loadMissedMovers();
+    if (!I.missedMovers && !I.missedMoversLoading && !I.missedMoversError) loadMissedMovers();
     return;
   }
   if (I.activeSubTab === 'trade_buddy') {
@@ -9746,6 +9764,25 @@ async function loadHermesAudit(rerender = true, force = false) {
     showOverrideMsg('Hermes unavailable: ' + (e.message || e), true);
   } finally {
     I.hermesLoading = false;
+  }
+}
+
+async function loadOpsWatchdog(rerender = true) {
+  if (I.opsWatchdogLoading) return;
+  I.opsWatchdogLoading = true;
+  I.opsWatchdogError = null;
+  if (rerender) renderIntelligence();
+  try {
+    const data = await fetchIntelligenceJson('/api/ops/watchdog', 30000);
+    if (!data.success) throw new Error(data.error || 'Watchdog unavailable');
+    I.opsWatchdog = data;
+  } catch (e) {
+    I.opsWatchdogError = e && e.name === 'AbortError'
+      ? 'health check timed out'
+      : (e.message || String(e));
+  } finally {
+    I.opsWatchdogLoading = false;
+    if (rerender) renderIntelligence();
   }
 }
 
@@ -11630,45 +11667,58 @@ function showAddResearchSource() {
 function showUploadResearchPdf() {
   const html = `
     <div style="display:grid;gap:10px;">
-      <div style="font-size:12px;color:var(--muted);line-height:1.5;">Upload a local PDF into Hermes Research. Text-based PDFs will be indexed directly; scanned PDFs may upload successfully but need OCR before MT7 can read the full body.</div>
-      <input id="research-pdf-file" type="file" accept="application/pdf,.pdf" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
-      <input id="research-pdf-title" placeholder="Title override (optional)" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
-      <input id="research-pdf-tags" placeholder="Tags, comma-separated (optional)" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
+      <div style="font-size:12px;color:var(--muted);line-height:1.5;">Upload up to 20 PDFs into Hermes Research in one batch. Text-based PDFs are indexed directly; scanned PDFs are retained and clearly marked as needing OCR.</div>
+      <input id="research-pdf-file" type="file" accept="application/pdf,.pdf" multiple style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
+      <input id="research-pdf-title" placeholder="Title override (single-file uploads only)" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
+      <input id="research-pdf-tags" placeholder="Tags applied to every selected PDF (optional)" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
       <input id="research-pdf-fields" placeholder="MT7 fields mentioned, comma-separated (optional)" style="background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:9px;color:var(--text);">
       <div id="research-pdf-result" style="font-size:12px;color:var(--muted);"></div>
-      <button onclick="uploadResearchPdf()" style="justify-self:start;background:var(--amber);color:#000;border:none;border-radius:5px;padding:8px 13px;font-size:12px;font-weight:800;cursor:pointer;">Upload and Index PDF</button>
+      <button id="research-pdf-submit" onclick="uploadResearchPdf()" style="justify-self:start;background:var(--amber);color:#000;border:none;border-radius:5px;padding:8px 13px;font-size:12px;font-weight:800;cursor:pointer;">Upload and Index PDFs</button>
     </div>`;
   openDrillModal('upload-research-pdf', html, 'var(--amber)', 760);
 }
 
 async function uploadResearchPdf() {
   const result = document.getElementById('research-pdf-result');
-  const file = document.getElementById('research-pdf-file')?.files?.[0];
-  if (!file) {
-    if (result) result.innerHTML = '<span style="color:var(--red);">Choose a PDF file first.</span>';
+  const files = Array.from(document.getElementById('research-pdf-file')?.files || []);
+  const submit = document.getElementById('research-pdf-submit');
+  if (!files.length) {
+    if (result) result.innerHTML = '<span style="color:var(--red);">Choose one or more PDF files first.</span>';
+    return;
+  }
+  if (files.length > 20) {
+    if (result) result.innerHTML = '<span style="color:var(--red);">Choose no more than 20 PDFs per batch.</span>';
     return;
   }
   const form = new FormData();
-  form.append('file', file);
+  files.forEach(file => form.append('files', file));
   form.append('title', document.getElementById('research-pdf-title')?.value || '');
   form.append('tags', document.getElementById('research-pdf-tags')?.value || '');
   form.append('mt7_fields_needed', document.getElementById('research-pdf-fields')?.value || '');
-  if (result) result.textContent = 'Uploading and extracting PDF text...';
+  if (result) result.textContent = `Uploading and indexing ${files.length} PDF${files.length === 1 ? '' : 's'}...`;
+  if (submit) submit.disabled = true;
   try {
     const res = await fetch('/api/intelligence/research/upload-pdf', { method: 'POST', body: form });
     const d = await res.json();
     if (!d.success) throw new Error(d.error || 'PDF upload failed');
-    const s = d.source || {};
+    const sources = d.sources || (d.source ? [d.source] : []);
+    const failures = d.errors || [];
+    const extractedWords = sources.reduce((total, source) => total + Number(source.full_text_word_count || 0), 0);
     I.researchPipeline = d.pipeline || null;
     if (I.hermes) I.hermes.research = Object.assign({}, I.hermes.research || {}, d.pipeline || {});
     if (result) {
-      result.innerHTML = `<span style="color:var(--green);">Indexed ${esc(s.title || file.name)}.</span> <span style="color:var(--text3);">${esc((s.full_text_status || 'unknown').replace(/_/g, ' '))} · ${Number(s.full_text_word_count || 0)} words</span>`;
+      const failureText = failures.length
+        ? `<div style="color:var(--red);margin-top:5px;">${failures.map(item => `${esc(item.filename)}: ${esc(item.error)}`).join('<br>')}</div>`
+        : '';
+      result.innerHTML = `<span style="color:var(--green);">Indexed ${sources.length}/${files.length} PDFs.</span> <span style="color:var(--text3);">${extractedWords.toLocaleString()} extracted words</span>${failureText}`;
     }
-    showOverrideMsg(`Hermes indexed PDF: ${s.full_text_word_count || 0} words extracted.`);
+    showOverrideMsg(`Hermes indexed ${sources.length} PDF${sources.length === 1 ? '' : 's'}${failures.length ? `; ${failures.length} need attention` : ''}.`, failures.length > 0);
     refreshResearchSurfaces();
   } catch(e) {
-    if (result) result.innerHTML = `<span style="color:var(--red);">Could not upload PDF: ${esc(e.message || e)}</span>`;
-    showOverrideMsg('PDF upload failed: ' + (e.message || e), true);
+    if (result) result.innerHTML = `<span style="color:var(--red);">Could not upload PDFs: ${esc(e.message || e)}</span>`;
+    showOverrideMsg('PDF batch upload failed: ' + (e.message || e), true);
+  } finally {
+    if (submit) submit.disabled = false;
   }
 }
 
@@ -12020,20 +12070,32 @@ async function loadEdgeLab() {
 async function loadMissedMovers(rerender = true) {
   if (I.missedMoversLoading) return;
   I.missedMoversLoading = true;
+  I.missedMoversError = null;
+  if (rerender) renderIntelligence();
   try {
-    const res = await fetch('/api/intelligence/missed-movers');
-    const data = await res.json();
-    const evalRes = await fetch('/api/intelligence/explosive-shadow/evaluate');
-    const evalData = await evalRes.json();
-    const radarRes = await fetch('/api/intelligence/research-radar');
-    const radarData = await radarRes.json();
-    I.missedMovers = data.success ? data.autopsy : null;
-    I.shadowEval = evalData.success ? evalData.evaluation : null;
-    I.researchRadar = radarData.success ? radarData.radar : null;
+    const [autopsyResult, evalResult, radarResult] = await Promise.allSettled([
+      fetchIntelligenceJson('/api/intelligence/missed-movers', 45000),
+      fetchIntelligenceJson('/api/intelligence/explosive-shadow/evaluate', 20000),
+      fetchIntelligenceJson('/api/intelligence/research-radar', 20000),
+    ]);
+    if (autopsyResult.status !== 'fulfilled' || !autopsyResult.value.success) {
+      const reason = autopsyResult.status === 'rejected'
+        ? autopsyResult.reason
+        : new Error((autopsyResult.value || {}).error || 'Autopsy unavailable');
+      throw reason;
+    }
+    I.missedMovers = autopsyResult.value.autopsy || null;
+    if (evalResult.status === 'fulfilled' && evalResult.value.success) {
+      I.shadowEval = evalResult.value.evaluation || null;
+    }
+    if (radarResult.status === 'fulfilled' && radarResult.value.success) {
+      I.researchRadar = radarResult.value.radar || null;
+    }
   } catch(e) {
     I.missedMovers = null;
-    I.shadowEval = null;
-    I.researchRadar = null;
+    I.missedMoversError = e && e.name === 'AbortError'
+      ? 'The autopsy timed out while gathering market-path evidence.'
+      : (e.message || String(e));
   } finally {
     I.missedMoversLoading = false;
     if (rerender) renderIntelligence();
@@ -12043,8 +12105,11 @@ async function loadMissedMovers(rerender = true) {
 function renderMissedMoversPanel() {
   destroyMiniCharts('missed-chart-');
   const a = I.missedMovers;
-  if (I.missedMoversLoading && !a) return '<div style="max-width:1180px;margin:0 auto;color:var(--text2);padding:24px 0;">Loading missed-mover autopsy...</div>';
-  if (!a) return '<div style="max-width:1180px;margin:0 auto;color:var(--text2);padding:24px 0;">Missed-mover autopsy not available.</div>';
+  if (I.missedMoversLoading && !a) return '<div style="max-width:1180px;margin:0 auto;color:var(--text2);padding:24px 0;">Loading missed-mover autopsy and path evidence...</div>';
+  if (!a) return `<div style="max-width:1180px;margin:0 auto;color:var(--text2);padding:24px 0;">
+    <div>${I.missedMoversError ? `Missed-mover autopsy could not load: ${esc(I.missedMoversError)}` : 'Preparing missed-mover autopsy...'}</div>
+    ${I.missedMoversError ? '<button onclick="loadMissedMovers(true)" style="margin-top:10px;background:transparent;border:1px solid var(--border);color:var(--text2);border-radius:5px;padding:7px 10px;cursor:pointer;">Retry autopsy</button>' : ''}
+  </div>`;
   const counts = a.counts || {};
   const movers = a.movers || [];
   const classColor = c => c === 'missed' ? 'var(--amber)' : c === 'caught' ? 'var(--green)' : 'var(--blue)';
@@ -13243,8 +13308,8 @@ function renderIntelSubTabs() {
         <div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;">${esc(firm.name)}</div>
         <div style="font-size:13px;color:var(--text2);margin-top:2px;">${esc(firm.tagline || '')}</div>
       </div>
-      <div style="display:flex;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px;">
-        ${tabs.map(([key,label]) => `<button onclick="switchIntelTab('${key}')" style="background:${I.activeSubTab===key?'var(--blue)':'transparent'};color:${I.activeSubTab===key?'#000':'var(--text2)'};border:none;padding:7px 12px;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;">${label}</button>`).join('')}
+      <div style="display:flex;gap:6px;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px;">
+        ${tabs.map(([key,label]) => `<button onclick="switchIntelTab('${key}')" style="flex:0 0 auto;background:${I.activeSubTab===key?'var(--blue)':'transparent'};color:${I.activeSubTab===key?'#000':'var(--text2)'};border:none;padding:7px 12px;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;">${label}</button>`).join('')}
       </div>
     </div>
   </div>`;
@@ -13254,12 +13319,14 @@ function switchIntelTab(tab) {
   if (tab !== 'trade_buddy') collapseTradeBuddyChart();
   I.activeSubTab = tab;
   localStorage.setItem('mt7_intel_subtab', tab);
+  if (tab === 'missed' && !I.missedMovers && !I.missedMoversLoading) loadMissedMovers(true);
+  if (tab === 'hermes' && !I.opsWatchdog && !I.opsWatchdogLoading) loadOpsWatchdog(true);
   renderIntelligence();
   if (tab === 'suggestions') loadSuggestions(true);
   if (tab === 'recovery') loadRecoveryBoard(true);
   if (tab === 'hermes') loadHermesAudit(true);
   if (tab === 'edge_lab') loadEdgeLab();
-  if (tab === 'missed') loadMissedMovers(true);
+  if (tab === 'missed' && !I.missedMoversLoading) loadMissedMovers(true);
   if (tab === 'trade_buddy') loadTradeBuddy(true);
 }
 
@@ -14129,6 +14196,18 @@ function renderReportPanel() {
   const n = I.report.narrative || {};
   const pulse = d.market_pulse || {};
   const breadth = d.market_breadth || {};
+  const regimeAssessment = d.regime_assessment || {};
+  const regimeEvidence = (regimeAssessment.evidence || []).map(
+    x => `<li style="margin-bottom:5px;">${esc(x)}</li>`
+  ).join('');
+  const regimeAssessmentHtml = `<div style="border-left:3px solid ${regimeAssessment.label === 'unknown' ? 'var(--amber)' : 'var(--blue)'};background:#0b0f15;border-radius:4px;padding:11px;">
+    <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+      <div style="font-size:14px;font-weight:800;color:var(--text);">${esc(String(regimeAssessment.label || pulse.dominant_regime || 'unknown').replaceAll('_',' '))}</div>
+      <div style="font-size:9px;color:var(--muted);text-transform:uppercase;">${esc(regimeAssessment.confidence || pulse.regime_confidence || 'unknown')} confidence · ${esc(String(regimeAssessment.source || pulse.regime_source || 'unknown').replaceAll('_',' '))}</div>
+    </div>
+    <div style="font-size:11px;color:var(--text2);margin-top:5px;">Directional bias: ${esc(regimeAssessment.directional_bias || pulse.regime_directional_bias || 'unknown')} · measured universe: ${Number(regimeAssessment.sample || 0)} contracts</div>
+    ${regimeEvidence ? `<ul style="margin:9px 0 0;padding-left:18px;font-size:11px;color:var(--text2);line-height:1.45;">${regimeEvidence}</ul>` : '<div style="font-size:11px;color:var(--amber);margin-top:8px;">MT7 abstained because measured regime evidence was insufficient.</div>'}
+  </div>`;
   const snapshotMeta = d.snapshot_meta || {};
   const snapshotAge = snapshotMeta.freshness_minutes === null || snapshotMeta.freshness_minutes === undefined
     ? ''
@@ -14161,6 +14240,7 @@ function renderReportPanel() {
     </div>
     <div style="font-size:12px;color:var(--muted);margin-bottom:10px;">Generated ${esc(I.report.generated_at || '—')} · Narrative: ${esc(narrativeLabel)} · Evidence: ${esc(snapshotMeta.source || 'unknown')}${esc(snapshotAge)} · Schema: ${esc(I.report.schema_version || 'legacy')}</div>
     ${sectionBlock('Desk Verdict', renderDeskVerdict(d.desk_verdict), 'The shortest decision-ready synthesis: current posture, evidence, invalidation, and explicit risk boundary. It remains advisory.')}
+    ${sectionBlock('Measured Market Regime', regimeAssessmentHtml, 'Classifies the broad market from measured breadth, median movement, dispersion, large-move density, and funding crowding. Sparse per-signal agent coverage cannot force an unknown result. MT7 still abstains when the broad snapshot is too small.')}
     ${sectionBlock('Thomas Reeves — Executive Read', renderReportNarrative('trader_open', n.trader_open, 'No qualified executive read is available.'), 'The CIO summary establishes the current desk posture. It is a synthesis of evidence, not a trade authorization.')}
     ${sectionBlock('Time-Horizon Regime Outlook', renderHorizonOutlook(d.horizon_outlook), 'Separates immediate trading conditions from tactical strategy preference and longer-term research posture. Every outlook is conditional and includes the evidence that would confirm or invalidate it.')}
     ${sectionBlock('Conditional Scenario Matrix', renderScenarioMatrix(d.scenario_matrix), 'Shows plausible ways the current regime could evolve and the observable trigger for each. These are scenarios—not guaranteed forecasts or price targets.')}

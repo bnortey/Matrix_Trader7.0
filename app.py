@@ -16,7 +16,7 @@ import html as html_lib
 import multiprocessing as mp
 import unicodedata
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from functools import partial
@@ -264,6 +264,8 @@ HERMES_RESEARCH_ONLINE_SYNC_PATH = os.path.join(HERMES_RESEARCH_DIR, "online_syn
 HERMES_RESEARCH_SCHOLAR_PATH = os.path.join(HERMES_RESEARCH_DIR, "corpus_scholar.json")
 HERMES_RESEARCH_SCHEDULER_PATH = os.path.join(HERMES_RESEARCH_DIR, "scheduler.json")
 HERMES_RESEARCH_MAX_UPLOAD_MB = int(os.getenv("HERMES_RESEARCH_MAX_UPLOAD_MB", "25"))
+HERMES_RESEARCH_MAX_BATCH_FILES = int(os.getenv("HERMES_RESEARCH_MAX_BATCH_FILES", "20"))
+HERMES_RESEARCH_MAX_BATCH_MB = int(os.getenv("HERMES_RESEARCH_MAX_BATCH_MB", "250"))
 HERMES_RESEARCH_PDF_MAX_PAGES = int(os.getenv("HERMES_RESEARCH_PDF_MAX_PAGES", "45"))
 HERMES_RESEARCH_PDF_TIMEOUT_SEC = int(os.getenv("HERMES_RESEARCH_PDF_TIMEOUT_SEC", "25"))
 HERMES_RESEARCH_CORPUS_DIRS = [
@@ -1286,6 +1288,75 @@ def _edge_lab_cohort_coverage_fast() -> dict:
         return {"available": os.path.exists(EDGE_LAB_DB_PATH), "coverage_pct": None, "matched": 0, "total": 0, "error": str(e)}
 
 
+_ops_edge_coverage_cache_lock = threading.Lock()
+_ops_edge_coverage_cache: dict = {
+    "built_at": 0.0,
+    "packet": None,
+    "refreshing": False,
+}
+OPS_EDGE_COVERAGE_CACHE_SECONDS = 15 * 60
+
+
+def _refresh_ops_edge_coverage() -> None:
+    try:
+        packet = _edge_lab_cohort_coverage_fast()
+    except Exception as exc:
+        packet = {
+            "available": os.path.exists(EDGE_LAB_DB_PATH),
+            "coverage_pct": None,
+            "matched": 0,
+            "total": 0,
+            "error": str(exc),
+        }
+    with _ops_edge_coverage_cache_lock:
+        _ops_edge_coverage_cache.update({
+            "built_at": time.time(),
+            "packet": packet,
+            "refreshing": False,
+        })
+
+
+def _edge_lab_cohort_coverage_cached() -> dict:
+    """Return Edge coverage without blocking the Watchdog first paint.
+
+    The Edge Lab database is large enough that opening it and matching the
+    current cohort can take several seconds under scan load. A daemon refresh
+    keeps that work off the request thread; callers receive the last completed
+    packet or an explicit warming state.
+    """
+    now = time.time()
+    with _ops_edge_coverage_cache_lock:
+        packet = _ops_edge_coverage_cache.get("packet")
+        age = max(0.0, now - float(_ops_edge_coverage_cache.get("built_at") or 0.0))
+        refreshing = bool(_ops_edge_coverage_cache.get("refreshing"))
+        if packet is not None and age < OPS_EDGE_COVERAGE_CACHE_SECONDS:
+            cached = copy.deepcopy(packet)
+            cached["cache_age_seconds"] = round(age, 1)
+            cached["refreshing"] = refreshing
+            return cached
+        if not refreshing:
+            _ops_edge_coverage_cache["refreshing"] = True
+            threading.Thread(
+                target=_refresh_ops_edge_coverage,
+                name="mt7-ops-edge-coverage",
+                daemon=True,
+            ).start()
+        if packet is not None:
+            stale = copy.deepcopy(packet)
+            stale["cache_age_seconds"] = round(age, 1)
+            stale["refreshing"] = True
+            stale["stale"] = True
+            return stale
+    return {
+        "available": os.path.exists(EDGE_LAB_DB_PATH),
+        "coverage_pct": None,
+        "matched": 0,
+        "total": 0,
+        "refreshing": True,
+        "note": "Edge Lab cohort coverage is warming in the background.",
+    }
+
+
 def _ops_watchdog_payload() -> dict:
     version = _version_payload()
     actuals = _compute_goal_actuals(_load_goals())
@@ -1301,7 +1372,7 @@ def _ops_watchdog_payload() -> dict:
     learner_age = _file_age_seconds(LEARNER_HEARTBEAT_PATH)
     memo_age = _file_age_seconds(HERMES_RESEARCH_MEMO_PATH)
     db_age = _file_age_seconds(DB_PATH)
-    edge_coverage = _edge_lab_cohort_coverage_fast()
+    edge_coverage = _edge_lab_cohort_coverage_cached()
     checks: list[dict] = []
 
     checks.append(_ops_check(
@@ -1363,14 +1434,22 @@ def _ops_watchdog_payload() -> dict:
         "missing" if db_age is None else f"{round(db_age / 60, 1)}m old",
     ))
     edge_status = "pass" if edge_coverage.get("coverage_pct") is not None and edge_coverage.get("coverage_pct") >= 60 else "warn"
-    if not edge_coverage.get("available"):
+    if edge_coverage.get("refreshing") and edge_coverage.get("coverage_pct") is None:
+        edge_status = "info"
+    elif not edge_coverage.get("available"):
         edge_status = "fail"
     checks.append(_ops_check(
         "Edge Lab Coverage",
         edge_status,
         "Cohort attribution needs enough symbol coverage before informing decisions.",
         f"{edge_coverage.get('coverage_pct')}%" if edge_coverage.get("coverage_pct") is not None else "unavailable",
-        "Add cohort symbols to Edge Lab ingestion before using attribution." if edge_status != "pass" else "",
+        (
+            "Coverage is warming in the background; refresh shortly."
+            if edge_status == "info"
+            else "Add cohort symbols to Edge Lab ingestion before using attribution."
+            if edge_status != "pass"
+            else ""
+        ),
     ))
     checks.append(_ops_check(
         "P12 Gate Posture",
@@ -8640,6 +8719,70 @@ def api_scan_all():
             "scan_time":   scan_time,
         })
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/scan/strategy", methods=["POST"])
+def api_scan_strategy():
+    """Scan one selected strategy across one exchange.
+
+    The dashboard's primary Scan action uses this bounded route. Scanning every
+    enabled strategy sequentially grew past normal browser request lifetimes as
+    the strategy library expanded; the explicit multi-scan route remains
+    available for deliberate broad scans.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        exchange = str(payload.get("exchange") or "MEXC").strip().upper()
+        strategy_key = str(payload.get("strategy") or "balanced").strip()
+        registry = get_strategy_registry(include_disabled=True)
+        strategy = registry.get(strategy_key)
+        if strategy is None:
+            return jsonify({"success": False, "error": f"Unknown strategy '{strategy_key}'"}), 400
+        if not strategy.get("enabled", True) and strategy_key != "balanced":
+            return jsonify({"success": False, "error": f"Strategy '{strategy_key}' is disabled"}), 400
+
+        expire_stale_signals()
+        if exchange == "MEXC":
+            tickers = fetch_mexc("/contract/ticker")
+        elif exchange == "HYPERLIQUID":
+            universe, asset_ctxs = fetch_hl_meta_and_ctxs()
+            tickers = normalize_hl_tickers(universe, asset_ctxs)
+        elif exchange == "BYBIT":
+            tickers = _fetch_exchange_tickers("BYBIT")
+        else:
+            return jsonify({"success": False, "error": f"Unsupported exchange '{exchange}'"}), 400
+        if not tickers or not isinstance(tickers, list):
+            return jsonify({
+                "success": False,
+                "error": f"{exchange.title()} ticker feed unavailable",
+            }), 502
+
+        t0 = time.time()
+        signals, _ = run_scan(
+            strategy_key=strategy_key,
+            tickers=tickers,
+            exchange=exchange,
+        )
+        log_signals(signals)
+        total_pairs = len(tickers)
+        return jsonify({
+            "success": True,
+            "results": {
+                strategy_key: {
+                    "signals": signals,
+                    "total_pairs": total_pairs,
+                    "strategy": strategy_key,
+                },
+            },
+            "total_pairs": total_pairs,
+            "strategy": strategy_key,
+            "exchange": exchange,
+            "scan_time": round(time.time() - t0, 2),
+            "scope": "selected_strategy",
+        })
+    except Exception as e:
+        print(f"[api/scan/strategy] {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -22453,24 +22596,63 @@ def api_research_add_source():
 
 @app.route('/api/intelligence/research/upload-pdf', methods=['POST'])
 def api_research_upload_pdf():
-    """Upload and index a local PDF into Hermes Research."""
+    """Upload and index one or more local PDFs into Hermes Research."""
     try:
-        max_bytes = HERMES_RESEARCH_MAX_UPLOAD_MB * 1024 * 1024
-        if request.content_length and request.content_length > max_bytes:
+        batch_max_bytes = HERMES_RESEARCH_MAX_BATCH_MB * 1024 * 1024
+        if request.content_length and request.content_length > batch_max_bytes:
             return jsonify({
                 "success": False,
-                "error": f"PDF upload exceeds {HERMES_RESEARCH_MAX_UPLOAD_MB} MB limit.",
+                "error": f"PDF batch exceeds {HERMES_RESEARCH_MAX_BATCH_MB} MB limit.",
             }), 413
-        file_storage = request.files.get("file")
-        if not file_storage:
-            return jsonify({"success": False, "error": "No PDF file was uploaded."}), 400
-        source = _research_ingest_pdf_upload(
-            file_storage,
-            title=str(request.form.get("title") or ""),
-            tags=request.form.get("tags") or "",
-            fields=request.form.get("mt7_fields_needed") or request.form.get("fields") or "",
-        )
-        return jsonify({"success": True, "source": source, "pipeline": _hermes_research_pipeline_summary()})
+        files = [item for item in request.files.getlist("files") if item and item.filename]
+        if not files:
+            single = request.files.get("file")
+            files = [single] if single and single.filename else []
+        if not files:
+            return jsonify({"success": False, "error": "No PDF files were uploaded."}), 400
+        if len(files) > HERMES_RESEARCH_MAX_BATCH_FILES:
+            return jsonify({
+                "success": False,
+                "error": f"Choose no more than {HERMES_RESEARCH_MAX_BATCH_FILES} PDFs per batch.",
+            }), 400
+
+        per_file_max_bytes = HERMES_RESEARCH_MAX_UPLOAD_MB * 1024 * 1024
+        title_override = str(request.form.get("title") or "") if len(files) == 1 else ""
+        tags = request.form.get("tags") or ""
+        fields = request.form.get("mt7_fields_needed") or request.form.get("fields") or ""
+        sources = []
+        errors = []
+        for file_storage in files:
+            filename = secure_filename(file_storage.filename or "") or "unnamed.pdf"
+            try:
+                stream = file_storage.stream
+                original_pos = stream.tell()
+                stream.seek(0, os.SEEK_END)
+                file_size = stream.tell()
+                stream.seek(original_pos)
+                if file_size > per_file_max_bytes:
+                    raise ValueError(
+                        f"File exceeds the {HERMES_RESEARCH_MAX_UPLOAD_MB} MB per-PDF limit."
+                    )
+                sources.append(_research_ingest_pdf_upload(
+                    file_storage,
+                    title=title_override,
+                    tags=tags,
+                    fields=fields,
+                ))
+            except Exception as exc:
+                errors.append({"filename": filename, "error": str(exc)})
+
+        pipeline = _hermes_research_pipeline_summary()
+        return jsonify({
+            "success": bool(sources),
+            "source": sources[0] if len(sources) == 1 else None,
+            "sources": sources,
+            "uploaded_count": len(sources),
+            "failed_count": len(errors),
+            "errors": errors,
+            "pipeline": pipeline,
+        }), 200 if sources else 400
     except Exception as e:
         print(f"[api/research/upload-pdf] error: {e}", file=sys.stderr)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -22524,7 +22706,7 @@ def api_research_weekly_memo():
 
 
 REPORTS_DIR = "data/reports"
-REPORT_SCHEMA_VERSION = "cipher-v10-decision-intelligence"
+REPORT_SCHEMA_VERSION = "cipher-v11-measured-market-regime"
 
 
 def _report_classify_session(utc_iso: str) -> str:
@@ -24457,7 +24639,10 @@ def _build_missed_mover_autopsy(date_str: str | None = None, limit: int = 12) ->
         "caught": sum(1 for m in movers if m["classification"] == "caught"),
         "blocked": sum(1 for m in movers if m["classification"] == "blocked"),
     }
-    shadow_summary = _record_explosive_shadow_events(date_str, movers)
+    # The screen and research queue consume only the ranked display set.
+    # Enriching every 8% mover sequentially made first paint exceed 50 seconds
+    # on broad volatile days without adding visible decision value.
+    shadow_summary = _record_explosive_shadow_events(date_str, movers[:limit])
     return {
         "date": date_str,
         "generated_at": datetime.utcnow().isoformat(),
@@ -24649,15 +24834,39 @@ def _record_explosive_shadow_events(date_str: str, movers: list[dict]) -> dict:
     """Persist current explosive movers as shadow research events."""
     if not movers:
         return {"recorded": 0, "top_score": None}
+    selected = [m for m in movers if m.get("symbol")]
+    if not selected:
+        return {"recorded": 0, "top_score": None}
+    feature_rows = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(selected))) as executor:
+        future_map = {
+            executor.submit(
+                _explosive_shadow_features,
+                str(m.get("symbol")),
+                _report_float(m.get("change_24h_pct")),
+                _report_float(m.get("funding_rate")),
+                _report_float(m.get("volume_24h")),
+            ): str(m.get("symbol"))
+            for m in selected
+        }
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                feature_rows[symbol] = future.result()
+            except Exception as exc:
+                print(f"[explosive_shadow_features] {symbol}: {exc}", file=sys.stderr)
+                feature_rows[symbol] = {
+                    "shadow_score": 0,
+                    "clues": [],
+                    "clue_label": "feature_fetch_failed",
+                }
     rows = []
-    for m in movers:
+    for m in selected:
         symbol = m.get("symbol")
-        if not symbol:
-            continue
         change = _report_float(m.get("change_24h_pct"))
         funding = _report_float(m.get("funding_rate"))
         volume = _report_float(m.get("volume_24h"))
-        feats = _explosive_shadow_features(symbol, change, funding, volume)
+        feats = feature_rows.get(str(symbol)) or {}
         m["shadow"] = feats
         ctx = m.get("context") or {}
         rows.append((
@@ -28010,6 +28219,151 @@ def _report_coiling_base_rates(coiling: list, date_str: str) -> dict:
     return result
 
 
+def _report_classify_market_regime(
+    ticker_items: list[dict],
+    signal_regime_counts: dict[str, int] | None = None,
+) -> dict:
+    """Classify the desk-wide regime from broad, measured market evidence.
+
+    Per-signal agent coverage is intentionally sparse, so missing agent fields
+    must not outvote the observed 1,000+ contract market snapshot. This
+    classifier uses breadth, median movement, dispersion, large-move density,
+    and funding crowding. It abstains when the snapshot is too small.
+    """
+    usable = [
+        item for item in ticker_items
+        if item.get("change_24h_pct") is not None
+    ]
+    total = len(usable)
+    valid_signal_counts = {
+        str(key): int(value or 0)
+        for key, value in (signal_regime_counts or {}).items()
+        if str(key) != "unknown" and int(value or 0) > 0
+    }
+    if total < 50:
+        classified_signals = sum(valid_signal_counts.values())
+        if classified_signals >= 5:
+            label = max(valid_signal_counts, key=valid_signal_counts.get)
+            return {
+                "label": label,
+                "confidence": "low",
+                "source": "classified_signal_subset",
+                "sample": classified_signals,
+                "coverage_pct": round(
+                    classified_signals / max(1, sum((signal_regime_counts or {}).values())) * 100,
+                    1,
+                ),
+                "directional_bias": "mixed",
+                "evidence": [
+                    f"Broad ticker snapshot insufficient ({total} contracts).",
+                    f"Fallback uses {classified_signals} classified signals.",
+                ],
+            }
+        return {
+            "label": "unknown",
+            "confidence": "insufficient",
+            "source": "abstention",
+            "sample": total,
+            "coverage_pct": 0.0,
+            "directional_bias": "unknown",
+            "evidence": [f"Only {total} usable contracts; at least 50 are required."],
+        }
+
+    moves = sorted(_report_float(item.get("change_24h_pct")) for item in usable)
+    absolute_moves = sorted(abs(value) for value in moves)
+    mid = total // 2
+    median_move = moves[mid] if total % 2 else (moves[mid - 1] + moves[mid]) / 2
+    p75_abs = absolute_moves[min(total - 1, int((total - 1) * 0.75))]
+    advancers = len([value for value in moves if value > 0.25])
+    decliners = len([value for value in moves if value < -0.25])
+    advancer_ratio = advancers / total
+    decliner_ratio = decliners / total
+    large_move_ratio = len([value for value in absolute_moves if value >= 8]) / total
+    funding_values = [
+        abs(_report_float(item.get("funding_rate")))
+        for item in usable if item.get("funding_rate") is not None
+    ]
+    extreme_funding_ratio = (
+        len([value for value in funding_values if value >= 0.001]) / len(funding_values)
+        if funding_values else 0.0
+    )
+    directional_bias = (
+        "bullish" if advancer_ratio >= 0.60
+        else "bearish" if decliner_ratio >= 0.60
+        else "mixed"
+    )
+
+    label = "choppy"
+    confidence = "medium"
+    reason = "Breadth is mixed and neither compression nor market-wide expansion dominates."
+    if decliner_ratio >= 0.65 and median_move <= -1.0:
+        label = "risk_off_beta"
+        confidence = "high" if decliner_ratio >= 0.72 else "medium"
+        reason = "Declining breadth and the median contract move show broad downside beta pressure."
+    elif large_move_ratio >= 0.12 and p75_abs >= 5.0:
+        label = "liquidation_cascade"
+        confidence = "medium"
+        reason = "A large share of contracts are making outsized moves with elevated cross-market dispersion."
+    elif extreme_funding_ratio >= 0.10 and p75_abs >= 3.0:
+        label = "volatile_squeeze"
+        confidence = "medium"
+        reason = "Extreme perp carry is widespread while price dispersion is elevated."
+    elif extreme_funding_ratio >= 0.12:
+        label = "funding_crowded"
+        confidence = "medium"
+        reason = "Extreme funding is broad enough to make crowded positioning the dominant structural condition."
+    elif (
+        (advancer_ratio >= 0.65 or decliner_ratio >= 0.65)
+        and abs(median_move) >= 1.0
+    ):
+        label = "trending"
+        confidence = "high" if max(advancer_ratio, decliner_ratio) >= 0.72 else "medium"
+        reason = "Directional breadth and the median contract move agree."
+    elif p75_abs <= 1.5 and abs(median_move) <= 0.4:
+        label = "compression"
+        confidence = "medium"
+        reason = "Three quarters of contracts remain inside a narrow 24-hour movement band."
+
+    classified_signals = sum(valid_signal_counts.values())
+    all_signals = sum((signal_regime_counts or {}).values())
+    return {
+        "label": label,
+        "confidence": confidence,
+        "source": "broad_ticker_snapshot",
+        "sample": total,
+        "coverage_pct": 100.0,
+        "directional_bias": directional_bias,
+        "evidence": [
+            reason,
+            (
+                f"Breadth: {advancers} advancing / {decliners} declining; "
+                f"median move {median_move:+.2f}%."
+            ),
+            (
+                f"75th-percentile absolute move {p75_abs:.2f}%; "
+                f"{large_move_ratio * 100:.1f}% moved at least 8%."
+            ),
+            (
+                f"Extreme-funding share {extreme_funding_ratio * 100:.1f}% "
+                f"across {len(funding_values)} funded contracts."
+            ),
+            (
+                f"Signal-agent regime coverage {classified_signals}/{all_signals}."
+                if all_signals
+                else "No signal-agent regime rows were available."
+            ),
+        ],
+        "metrics": {
+            "advancer_ratio": round(advancer_ratio, 4),
+            "decliner_ratio": round(decliner_ratio, 4),
+            "median_move_pct": round(median_move, 2),
+            "p75_abs_move_pct": round(p75_abs, 2),
+            "large_move_ratio": round(large_move_ratio, 4),
+            "extreme_funding_ratio": round(extreme_funding_ratio, 4),
+        },
+    }
+
+
 def _build_daily_data(
     date_str: str,
     ticker_snapshot: list[dict] | None = None,
@@ -28186,7 +28540,8 @@ def _build_daily_data(
         ]),
     }
 
-    dominant_regime = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
+    regime_assessment = _report_classify_market_regime(ticker_items, regime_counts)
+    dominant_regime = str(regime_assessment.get("label") or "unknown")
     history_rows = _report_db_rows("signals", "logged_at", date_str, days_back=30, limit=5000)
     regime_windows = {"7d": defaultdict(int), "30d": defaultdict(int)}
     cutoff_7d = (datetime.fromisoformat(date_str) - timedelta(days=7)).date()
@@ -28243,6 +28598,10 @@ def _build_daily_data(
             "signals": len(signals),
             "blocked": len(blocked),
             "dominant_regime": dominant_regime,
+            "regime_confidence": regime_assessment.get("confidence"),
+            "regime_source": regime_assessment.get("source"),
+            "regime_directional_bias": regime_assessment.get("directional_bias"),
+            "regime_evidence": regime_assessment.get("evidence") or [],
             "desk_agreement": "high" if not disagreements else "mixed",
             "exchange_breakdown": exchange_breakdown,
         },
@@ -28250,6 +28609,7 @@ def _build_daily_data(
         "blocked": blocked[:100],
         "sessions": sessions,
         "regime_counts": regime_counts,
+        "regime_assessment": regime_assessment,
         "regime_history": regime_history,
         "market_breadth": market_breadth,
         "funding_heatmap": funding_heatmap,
