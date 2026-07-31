@@ -1,12 +1,72 @@
 import sqlite3
 import unittest
+import re
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import app as mt7
+from scripts.hermes_memo_integrity import inject_authoritative_snapshot
 
 
 class HermesMetricContractTests(unittest.TestCase):
+    def test_authoritative_snapshot_preserves_zero_cohort_progress(self):
+        packet = {
+            "audit": {
+                "paper": {"closed": 308},
+                "readiness": {
+                    "current_cohort_sample_n": 0,
+                    "current_cohort_target_n": 50,
+                },
+                "goal_actuals": {
+                    "paper_ev_sample_n": 17,
+                    "current_value_usd": 286.44,
+                    "total_pnl_usd": 86.44,
+                },
+            }
+        }
+
+        memo = inject_authoritative_snapshot(
+            "# HERMES ADVISORY MEMO\n\nGenerated analysis.",
+            packet,
+        )
+
+        self.assertIn("All-time Paper simulated sample: 308", memo)
+        self.assertIn("Current policy cohort progress: 0/50", memo)
+        self.assertIn("Current simulated Paper equity: $286.44", memo)
+        self.assertIsNotNone(re.search(r"\b0\b[\s\S]{0,100}\b50\b", memo))
+        self.assertEqual(
+            inject_authoritative_snapshot(memo, packet).count(
+                "## Authoritative MT7 Snapshot"
+            ),
+            1,
+        )
+
+    def test_authoritative_snapshot_binds_stale_control_warning(self):
+        packet = {
+            "audit": {
+                "suggestions": {
+                    "baseline_conflict_ids": ["stale-threshold"],
+                    "active": [{
+                        "id": "stale-threshold",
+                        "current_value": 60,
+                        "suggested_value": 81,
+                        "control_authority": {"runtime_actual": 69},
+                    }],
+                }
+            }
+        }
+
+        memo = inject_authoritative_snapshot(
+            "# HERMES ADVISORY MEMO\n\nGenerated analysis.",
+            packet,
+        )
+
+        self.assertIn("stale-threshold", memo)
+        self.assertIn("proposal_current=60", memo)
+        self.assertIn("runtime_actual=69", memo)
+        self.assertIn("suggested=81", memo)
+        self.assertIn("Do not apply this stale proposal", memo)
+
     def test_signal_audit_separates_live_shadow_and_recent_windows(self):
         con = sqlite3.connect(":memory:")
         con.row_factory = sqlite3.Row
