@@ -327,9 +327,73 @@ _PAPER_CONFIG_DEFAULT = {
     "cold_streak_flow_boost_n":   3,      # last N all-losses → boost min_flow_score
     "current_cohort_started_at":   None,   # ISO timestamp for current paper validation cohort
     "current_cohort_label":        None,   # short UI label for the current paper validation cohort
+    "current_cohort_target_count": 20,
+    "current_cohort_strategy_keys": [],    # empty = all strategies; recovery trials are inferred for legacy configs
+    "current_cohort_policy_fingerprints": [],  # optional exact policy identities
+    "current_cohort_assignment_basis": "filled_at",  # policy assignment happens when the entry fills
     "_strategy_cooldowns":        {},     # internal: strategy_key → resume_at ISO
     "_known_strategies":          [],     # internal: strategies seen before (new ones auto-blocked)
 }
+
+
+def _paper_cohort_scope(cfg: dict | None) -> dict:
+    """Return the explicit policy scope for the current Paper cohort.
+
+    Older recovery-trial configs only stored a label.  Infer their strategy
+    scope so a recovery trial cannot accidentally claim unrelated trades.
+    """
+    cfg = cfg or {}
+    started_at = str(cfg.get("current_cohort_started_at") or "").strip() or None
+    label = str(cfg.get("current_cohort_label") or "Current cohort").strip()
+    strategy_keys = sorted({
+        str(key).strip()
+        for key in (cfg.get("current_cohort_strategy_keys") or [])
+        if str(key).strip()
+    })
+    inferred = False
+    if not strategy_keys and label.startswith("recovery_trial_"):
+        suffix = label[len("recovery_trial_"):]
+        match = re.match(r"(.+)_\d{4}-\d{2}-\d{2}$", suffix)
+        if match and match.group(1):
+            strategy_keys = [match.group(1)]
+            inferred = True
+    fingerprints = sorted({
+        str(value).strip()
+        for value in (cfg.get("current_cohort_policy_fingerprints") or [])
+        if str(value).strip()
+    })
+    return {
+        "label": label,
+        "started_at": started_at,
+        "strategy_keys": strategy_keys,
+        "policy_fingerprints": fingerprints,
+        "assignment_basis": "filled_at",
+        "scope_inferred_from_legacy_label": inferred,
+        "target_count": int(cfg.get("current_cohort_target_count") or 20),
+    }
+
+
+def _paper_trade_in_cohort(trade: dict, scope: dict) -> bool:
+    """True only when a trade was assigned after start and matches policy scope."""
+    started_at = str(scope.get("started_at") or "")
+    if not started_at:
+        return True
+    assigned_at = (
+        trade.get("filled_at")
+        or trade.get("opened_at")
+        or trade.get("queued_at")
+        or trade.get("closed_at")  # legacy rows only; current schema always has lifecycle timestamps
+        or ""
+    )
+    if str(assigned_at) < started_at:
+        return False
+    strategy_keys = set(scope.get("strategy_keys") or [])
+    if strategy_keys and str(trade.get("strategy_key") or "") not in strategy_keys:
+        return False
+    fingerprints = set(scope.get("policy_fingerprints") or [])
+    if fingerprints and str(trade.get("learning_policy_fingerprint") or "") not in fingerprints:
+        return False
+    return True
 
 HARD_NOTIONAL_CAPS_BY_LIQUIDITY_TIER = {
     # Account-balance fractions. These are intentionally hardwired safety
@@ -1027,6 +1091,7 @@ def _compute_goal_actuals(goals: dict) -> dict:
 
     try:
         con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
 
         rows = con.execute(
             "SELECT size_usd, pnl_pct, closed_at FROM paper_trades "
@@ -1088,20 +1153,25 @@ def _compute_goal_actuals(goals: dict) -> dict:
                 break
 
         cfg = _load_paper_config()
-        cohort_started_at = cfg.get("current_cohort_started_at")
-        if cohort_started_at:
-            cohort_rows = con.execute(
-                "SELECT result, size_usd, pnl_pct, closed_at FROM paper_trades "
-                "WHERE status='closed' AND result IS NOT NULL AND pnl_pct IS NOT NULL "
-                "AND closed_at >= ? ORDER BY closed_at ASC, id ASC",
-                (str(cohort_started_at),),
+        cohort_scope = _paper_cohort_scope(cfg)
+        cohort_candidates = [
+            dict(row) for row in con.execute(
+                "SELECT result, size_usd, pnl_pct, closed_at, strategy_key, "
+                "queued_at, filled_at, opened_at, learning_policy_fingerprint "
+                "FROM paper_trades WHERE status='closed' AND result IS NOT NULL "
+                "AND pnl_pct IS NOT NULL ORDER BY closed_at ASC, id ASC"
             ).fetchall()
-        else:
-            cohort_rows = con.execute(
-                "SELECT result, size_usd, pnl_pct, closed_at FROM paper_trades "
-                "WHERE status='closed' AND result IS NOT NULL AND pnl_pct IS NOT NULL "
-                "ORDER BY closed_at ASC, id ASC"
-            ).fetchall()
+        ]
+        cohort_rows = [
+            (
+                row.get("result"),
+                row.get("size_usd"),
+                row.get("pnl_pct"),
+                row.get("closed_at"),
+            )
+            for row in cohort_candidates
+            if _paper_trade_in_cohort(row, cohort_scope)
+        ]
         paper_scale = _paper_scale_stats(cohort_rows, account_balance)
 
         con.close()
@@ -1218,6 +1288,7 @@ def _compute_goal_actuals(goals: dict) -> dict:
             "paper_cohort_rolling_windows": paper_scale.get("rolling_windows") or {},
             "paper_cohort_readiness_target": cohort_min_trades,
             "paper_cohort_drawdown_limit_pct": cohort_drawdown_limit,
+            "paper_cohort_scope": cohort_scope,
             "kill_switch_breached": drawdown_pct >= max_drawdown_pct,
         }
     except Exception as e:
@@ -1255,21 +1326,23 @@ def _version_payload() -> dict:
 def _edge_lab_cohort_coverage_fast() -> dict:
     try:
         cfg = _load_paper_config()
-        since = cfg.get("current_cohort_started_at")
+        scope = _paper_cohort_scope(cfg)
+        since = scope.get("started_at")
         if not since:
             return {"available": os.path.exists(EDGE_LAB_DB_PATH), "coverage_pct": None, "matched": 0, "total": 0, "note": "No cohort start configured."}
         if not os.path.exists(EDGE_LAB_DB_PATH):
             return {"available": False, "coverage_pct": None, "matched": 0, "total": 0, "note": "edge_lab.db missing."}
         sig_con = sqlite3.connect(DB_PATH)
         sig_con.row_factory = sqlite3.Row
-        trades = [dict(r) for r in sig_con.execute("""
-            SELECT symbol, filled_at, opened_at, queued_at, closed_at
+        candidates = [dict(r) for r in sig_con.execute("""
+            SELECT symbol, strategy_key, filled_at, opened_at, queued_at, closed_at,
+                   learning_policy_fingerprint
             FROM paper_trades
             WHERE status='closed'
-              AND COALESCE(filled_at, opened_at, queued_at, closed_at, '') >= ?
             ORDER BY COALESCE(closed_at, opened_at, queued_at) DESC
-            LIMIT 160
-        """, (str(since),)).fetchall()]
+            LIMIT 1000
+        """).fetchall()]
+        trades = [row for row in candidates if _paper_trade_in_cohort(row, scope)][:160]
         sig_con.close()
         edge_con = sqlite3.connect(EDGE_LAB_DB_PATH)
         edge_con.row_factory = sqlite3.Row
@@ -1299,6 +1372,7 @@ def _edge_lab_cohort_coverage_fast() -> dict:
             "feature_source": "candle_feature_snapshots",
             "measurement_state": "measured" if total else "collecting",
             "measurement_window_start": str(since),
+            "cohort_scope": scope,
             "note": (
                 "Share of closed trades in the current Paper cohort with a usable "
                 "pre-entry Edge Lab snapshot."
@@ -2267,6 +2341,19 @@ def init_db() -> None:
         ("learning_experiment_id", "TEXT"),
         ("learning_policy_fingerprint", "TEXT"),
         ("learning_policy_json", "TEXT"),
+        ("funding_pnl_pct", "REAL"),
+        ("funding_pnl_usd", "REAL"),
+        ("funding_settlement_count", "INTEGER"),
+        ("funding_complete", "INTEGER DEFAULT 0"),
+        ("funding_error", "TEXT"),
+        ("funding_source", "TEXT"),
+        ("fill_bid", "REAL"),
+        ("fill_ask", "REAL"),
+        ("fill_spread_bps", "REAL"),
+        ("fill_liquidity_observed_at", "TEXT"),
+        ("fill_liquidity_lag_seconds", "REAL"),
+        ("execution_cost_complete", "INTEGER DEFAULT 0"),
+        ("cost_model_version", "TEXT"),
     ]:
         try:
             con.execute(f"ALTER TABLE paper_trades ADD COLUMN {_col} {_type}")
@@ -2280,6 +2367,33 @@ def init_db() -> None:
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_paper_learning_experiment
         ON paper_trades (learning_experiment_id, learning_policy_fingerprint, status, closed_at)
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS paper_candidate_routing (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id               TEXT NOT NULL,
+            observed_at           TEXT NOT NULL,
+            symbol                TEXT NOT NULL,
+            strategy_key          TEXT NOT NULL,
+            direction             TEXT,
+            conviction            REAL,
+            selected              INTEGER NOT NULL DEFAULT 0,
+            selected_strategy_key TEXT,
+            decision              TEXT NOT NULL,
+            candidate_count       INTEGER NOT NULL DEFAULT 1,
+            policy_fingerprint    TEXT,
+            flow_confirmed        INTEGER,
+            flow_score            REAL,
+            paper_trade_id        INTEGER
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_paper_candidate_routing_scan
+        ON paper_candidate_routing (scan_id, symbol, selected)
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_paper_candidate_routing_observed
+        ON paper_candidate_routing (observed_at, strategy_key, selected)
     """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS learning_experiments (
@@ -6939,7 +7053,9 @@ def _research_experiment_assignment_rows(
 ) -> dict:
     rows = [
         dict(row) for row in con.execute(
-            """SELECT a.*, COALESCE(p.size_usd, 100.0) AS size_usd
+            """SELECT a.*, COALESCE(p.size_usd, 100.0) AS size_usd,
+                      COALESCE(p.funding_complete, 0) AS funding_complete,
+                      COALESCE(p.execution_cost_complete, 0) AS execution_cost_complete
                FROM learning_experiment_assignments a
                LEFT JOIN paper_trades p ON p.id=a.paper_trade_id
                WHERE a.experiment_id=?
@@ -7861,7 +7977,8 @@ def _learning_experiment_rows(
 ) -> tuple[list[dict], list[dict]]:
     treatment = [
         dict(row) for row in con.execute(
-            """SELECT result, pnl_pct, size_usd, closed_at
+            """SELECT result, pnl_pct, size_usd, closed_at,
+                      funding_complete, execution_cost_complete
                FROM paper_trades
                WHERE learning_experiment_id=?
                  AND learning_policy_fingerprint=?
@@ -7882,7 +7999,8 @@ def _learning_experiment_rows(
     )
     control = [
         dict(row) for row in con.execute(
-            """SELECT result, pnl_pct, size_usd, closed_at
+            """SELECT result, pnl_pct, size_usd, closed_at,
+                      funding_complete, execution_cost_complete
                FROM paper_trades
                WHERE strategy_key=?
                  AND status='closed'
@@ -7900,6 +8018,97 @@ def _learning_experiment_rows(
     ]
     control.reverse()
     return treatment, control
+
+
+def _learning_reconcile_suggestion_states() -> dict:
+    """Close stale applied lanes without applying or restoring any control."""
+    data = _load_suggestions_data()
+    suggestions = data.get("suggestions") or []
+    annotated = {
+        item.get("id"): item
+        for item in _annotate_suggestion_authority(suggestions)
+    }
+    changes: list[dict] = []
+    now = datetime.now(timezone.utc).isoformat()
+    con = sqlite3.connect(DB_PATH)
+    try:
+        for suggestion in suggestions:
+            if suggestion.get("status") != "evaluating":
+                continue
+            sid = str(suggestion.get("id") or "")
+            authority = (annotated.get(sid) or {}).get("control_authority") or {}
+            experiment_id = suggestion.get("learning_experiment_id")
+            experiment = (
+                con.execute(
+                    "SELECT status FROM learning_experiments WHERE experiment_id=?",
+                    (experiment_id,),
+                ).fetchone()
+                if experiment_id else None
+            )
+            experiment_active = bool(
+                experiment and experiment[0] in {"active", "collecting", "review"}
+            )
+            note = str(suggestion.get("evaluation_note") or "").lower()
+            next_status = None
+            reason = None
+            if authority.get("active") and "cleared" in note:
+                next_status = "applied"
+                reason = "Explicit legacy evaluation note says cleared; active control retained."
+            elif not authority.get("active") and (
+                authority.get("managed") or experiment_active
+            ):
+                next_status = "parked"
+                reason = "Applied evaluator no longer owns an active runtime control."
+            elif not experiment_active and authority.get("active"):
+                next_status = "applied"
+                reason = "Active control has no open exact-policy experiment."
+            if not next_status:
+                continue
+            suggestion["status"] = next_status
+            suggestion["reconciled_at"] = now
+            suggestion["reconciliation_reason"] = reason
+            if experiment_active and experiment_id:
+                con.execute(
+                    """UPDATE learning_experiments
+                       SET status='inconclusive', lifecycle_state='reconciled',
+                           evaluated_at=?, updated_at=?
+                       WHERE experiment_id=?""",
+                    (now, now, experiment_id),
+                )
+                _learning_append_event(
+                    con,
+                    experiment_id,
+                    "suggestion_state_reconciled",
+                    {
+                        "suggestion_status": next_status,
+                        "reason": reason,
+                        "automatic_config_change": False,
+                        "control_active": bool(authority.get("active")),
+                    },
+                    now,
+                )
+            changes.append({
+                "id": sid,
+                "from": "evaluating",
+                "to": next_status,
+                "reason": reason,
+                "control_active": bool(authority.get("active")),
+            })
+        if changes:
+            _write_suggestions_data(data)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return {
+        "success": True,
+        "changes": changes,
+        "changed_count": len(changes),
+        "automatic_config_change": False,
+        "live_changed": False,
+    }
 
 
 def _learning_evaluate_active_experiments() -> list[dict]:
@@ -7969,14 +8178,37 @@ def _learning_evaluate_active_experiments() -> list[dict]:
                 "family_adjusted_alpha": round(adjusted_alpha, 6),
                 "permutation_test": placebo,
             }
+            cost_evidence_rows = list(treatment) + list(control)
+            funding_complete_count = len([
+                row for row in cost_evidence_rows
+                if int(row.get("funding_complete") or 0) == 1
+            ])
+            funding_cashflows_complete = bool(cost_evidence_rows) and (
+                funding_complete_count == len(cost_evidence_rows)
+            )
+            execution_complete_count = len([
+                row for row in cost_evidence_rows
+                if int(row.get("execution_cost_complete") or 0) == 1
+            ])
             evaluation["cost_scope"] = {
                 "paper_fee_and_slippage": True,
                 "blocked_counterfactual_fee_and_slippage": True,
-                "funding_cashflows": False,
+                "funding_cashflows": funding_cashflows_complete,
+                "funding_complete_count": funding_complete_count,
+                "funding_evidence_count": len(cost_evidence_rows),
+                "funding_coverage_pct": (
+                    round(funding_complete_count / len(cost_evidence_rows) * 100.0, 1)
+                    if cost_evidence_rows else None
+                ),
+                "execution_cost_complete_count": execution_complete_count,
+                "execution_cost_coverage_pct": (
+                    round(execution_complete_count / len(cost_evidence_rows) * 100.0, 1)
+                    if cost_evidence_rows else None
+                ),
                 "warning": (
-                    "Perpetual funding cashflows are not yet booked in Paper "
-                    "outcomes; small funding-sensitive effects cannot promote "
-                    "without separate funding review."
+                    None
+                    if funding_cashflows_complete
+                    else "Funding settlement coverage is incomplete; funding-sensitive effects cannot promote."
                 ),
             }
             if assignment_cohorts is not None:
@@ -8183,6 +8415,10 @@ def _learning_evaluate_active_experiments() -> list[dict]:
                 f"{item.get('experiment_id')}: {e}",
                 file=sys.stderr,
             )
+    try:
+        _learning_reconcile_suggestion_states()
+    except Exception as e:
+        print(f"[learning] suggestion reconciliation error: {e}", file=sys.stderr)
     return results
 
 
@@ -21793,6 +22029,18 @@ def _hermes_paper_stats(rows) -> dict:
         for row in items
         if row.get("pnl_pct") is not None
     ]
+    funding_usd = [
+        float(row.get("funding_pnl_usd") or 0.0)
+        for row in items
+        if row.get("funding_pnl_usd") is not None
+    ]
+    funding_complete = len([
+        row for row in items if int(row.get("funding_complete") or 0) == 1
+    ])
+    execution_complete = len([
+        row for row in items
+        if int(row.get("execution_cost_complete") or 0) == 1
+    ])
     wins = sum(
         1 for row in items
         if str(row.get("result") or "").upper() in {"WIN", "TP3"}
@@ -21852,6 +22100,13 @@ def _hermes_paper_stats(rows) -> dict:
             if gross_pnls else None
         ),
         "total_cost_usd": round(sum(costs_usd), 2) if costs_usd else 0,
+        "funding_pnl_usd": round(sum(funding_usd), 4),
+        "funding_coverage_pct": (
+            round(funding_complete / len(items) * 100.0, 1) if items else None
+        ),
+        "execution_cost_coverage_pct": (
+            round(execution_complete / len(items) * 100.0, 1) if items else None
+        ),
         "profit_factor": _profit_factor_from_pnls(pnls),
         "profit_factor_usd": _profit_factor_from_pnls(pnl_usd),
         "worst_trades": worst,
@@ -21879,11 +22134,18 @@ def _hermes_paper_audit(con: sqlite3.Connection) -> dict:
                {_expr('gross_pnl_pct', 'pnl_pct')},
                {_expr('fee_cost_pct', '0')},
                {_expr('slippage_cost_pct', '0')},
+               {_expr('funding_pnl_usd', '0')},
+               {_expr('funding_complete', '0')},
+               {_expr('execution_cost_complete', '0')},
                {_expr('atr_pct')},
                {_expr('trend_score')},
                status,
                size_usd,
-               {_expr('closed_at')}
+               {_expr('closed_at')},
+               {_expr('queued_at')},
+               {_expr('filled_at')},
+               {_expr('opened_at')},
+               {_expr('learning_policy_fingerprint')}
         FROM paper_trades
         WHERE status='closed'
           AND pnl_pct IS NOT NULL
@@ -21891,11 +22153,10 @@ def _hermes_paper_audit(con: sqlite3.Connection) -> dict:
     """).fetchall()
     all_stats = _hermes_paper_stats(rows)
     cfg = _load_paper_config()
-    cohort_started_at = str(cfg.get("current_cohort_started_at") or "")
+    cohort_scope = _paper_cohort_scope(cfg)
     cohort_rows = [
         row for row in rows
-        if not cohort_started_at
-        or str(dict(row).get("closed_at") or "") >= cohort_started_at
+        if _paper_trade_in_cohort(dict(row), cohort_scope)
     ]
     cohort_stats = _hermes_paper_stats(cohort_rows)
 
@@ -21933,8 +22194,7 @@ def _hermes_paper_audit(con: sqlite3.Connection) -> dict:
             "dollar_method": "size_usd * pnl_pct / 100",
         },
         "current_policy_cohort": {
-            "label": cfg.get("current_cohort_label") or "Current cohort",
-            "started_at": cfg.get("current_cohort_started_at"),
+            **cohort_scope,
             **cohort_stats,
         },
         "lifecycle": lifecycle,
@@ -23636,6 +23896,18 @@ def _learning_close_suggestion_experiments(
     finally:
         con.close()
     return closed
+
+
+@app.route("/api/intelligence/suggestions/reconcile", methods=["POST"])
+def api_intelligence_suggestions_reconcile():
+    """Repair lifecycle labels only; never applies or restores a control."""
+    token_error = require_api_token()
+    if token_error:
+        return token_error
+    try:
+        return jsonify(_learning_reconcile_suggestion_states())
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/intelligence/suggestions')
@@ -32854,6 +33126,31 @@ def _paper_entry_touched(pt: dict, start_iso: str, limit: int = 1440) -> tuple[b
     return False, None
 
 
+def _paper_ticker_spread(ticker: dict | None) -> dict:
+    ticker = ticker or {}
+    bid = next(
+        (ticker.get(key) for key in ("bid1", "bidPrice", "bid_price") if ticker.get(key) is not None),
+        None,
+    )
+    ask = next(
+        (ticker.get(key) for key in ("ask1", "askPrice", "ask_price") if ticker.get(key) is not None),
+        None,
+    )
+    try:
+        bid = float(bid)
+        ask = float(ask)
+        mid = (bid + ask) / 2.0
+        if bid <= 0 or ask <= 0 or ask < bid or mid <= 0:
+            raise ValueError("invalid book")
+        return {
+            "bid": bid,
+            "ask": ask,
+            "spread_bps": round((ask - bid) / mid * 10_000.0, 4),
+        }
+    except (TypeError, ValueError):
+        return {"bid": None, "ask": None, "spread_bps": None}
+
+
 def _paper_check_entries(cfg: dict) -> dict:
     """
     Promote pending paper trades to open only when entry1 is touched.
@@ -32870,6 +33167,12 @@ def _paper_check_entries(cfg: dict) -> dict:
             "SELECT * FROM paper_trades WHERE status='pending' ORDER BY opened_at ASC"
         ).fetchall()
         con.close()
+        tickers = fetch_mexc("/contract/ticker") if rows else []
+        ticker_by_symbol = {
+            str(ticker.get("symbol") or ""): ticker
+            for ticker in (tickers or [])
+            if isinstance(ticker, dict) and ticker.get("symbol")
+        }
 
         for row in rows:
             pt = dict(row)
@@ -32903,12 +33206,31 @@ def _paper_check_entries(cfg: dict) -> dict:
             if not touched or not entry_at:
                 continue
 
+            observed_at = datetime.utcnow().isoformat()
+            spread = _paper_ticker_spread(ticker_by_symbol.get(pt["symbol"]))
+            entry_dt = _parse_utc_iso(entry_at)
+            observed_dt = _parse_utc_iso(observed_at)
+            lag_seconds = (
+                max(0.0, (observed_dt - entry_dt).total_seconds())
+                if entry_dt and observed_dt else None
+            )
             con = sqlite3.connect(DB_PATH)
             con.execute(
                 """UPDATE paper_trades
-                   SET status='open', opened_at=?, filled_at=?, note=NULL
+                   SET status='open', opened_at=?, filled_at=?, note=NULL,
+                       fill_bid=?, fill_ask=?, fill_spread_bps=?,
+                       fill_liquidity_observed_at=?, fill_liquidity_lag_seconds=?
                    WHERE id=? AND status='pending'""",
-                (entry_at, entry_at, pt["id"]),
+                (
+                    entry_at,
+                    entry_at,
+                    spread.get("bid"),
+                    spread.get("ask"),
+                    spread.get("spread_bps"),
+                    observed_at,
+                    lag_seconds,
+                    pt["id"],
+                ),
             )
             if pt.get("signal_id"):
                 con.execute(
@@ -32963,6 +33285,217 @@ def _paper_cost_adjustment(
     fee_cost_pct = round(((entry_fee_bps + exit_fee_bps) / 100.0) * lev, 2)
     slippage_cost_pct = round((slippage_bps / 100.0) * lev, 2)
     return fee_cost_pct, slippage_cost_pct, round(fee_cost_pct + slippage_cost_pct, 2)
+
+
+def _paper_funding_adjustment(
+    pt: dict,
+    closed_at: str,
+    fetcher=None,
+) -> dict:
+    """Calculate settled funding while a MEXC Paper position was held.
+
+    Funding intervals are read from settlement history instead of assuming an
+    eight-hour cycle. An unavailable response is explicitly incomplete and
+    contributes zero to net P&L rather than fabricating a value.
+    """
+    if str(pt.get("exchange") or "MEXC").upper() != "MEXC":
+        return {
+            "pnl_pct": 0.0,
+            "pnl_usd": 0.0,
+            "settlement_count": 0,
+            "complete": False,
+            "source": "unsupported_exchange",
+            "error": "Funding settlement history is implemented for MEXC Paper trades only.",
+        }
+    opened = _parse_utc_iso(pt.get("filled_at") or pt.get("opened_at"))
+    closed = _parse_utc_iso(closed_at)
+    if not opened or not closed or closed < opened:
+        return {
+            "pnl_pct": 0.0,
+            "pnl_usd": 0.0,
+            "settlement_count": 0,
+            "complete": False,
+            "source": "mexc_funding_history",
+            "error": "Invalid Paper hold interval.",
+        }
+    fetcher = fetcher or fetch_mexc
+    try:
+        history_rows = []
+        reached_open = False
+        for page_num in range(1, 11):
+            payload = fetcher(
+                "/contract/funding_rate/history",
+                {
+                    "symbol": pt["symbol"],
+                    "page_num": page_num,
+                    "page_size": 1000,
+                },
+            )
+            if not isinstance(payload, dict) or not isinstance(payload.get("resultList"), list):
+                raise ValueError("MEXC funding history unavailable")
+            page_rows = payload.get("resultList") or []
+            if not page_rows:
+                break
+            history_rows.extend(page_rows)
+            settle_values = [
+                float(item.get("settleTime"))
+                for item in page_rows
+                if item.get("settleTime") is not None
+            ]
+            if settle_values and min(settle_values) / 1000.0 <= opened.timestamp():
+                reached_open = True
+                break
+            total_count = int(payload.get("totalCount") or len(history_rows))
+            if len(history_rows) >= total_count:
+                reached_open = True
+                break
+        if not history_rows:
+            raise ValueError("MEXC funding history returned no settlements")
+        if not reached_open:
+            raise ValueError("Funding history pagination did not reach the position open time")
+        rates = []
+        for item in history_rows:
+            try:
+                settle = datetime.fromtimestamp(
+                    float(item.get("settleTime")) / 1000.0,
+                    tz=timezone.utc,
+                )
+                if opened < settle <= closed:
+                    rates.append(float(item.get("fundingRate") or 0.0))
+            except (TypeError, ValueError, OSError):
+                continue
+        leverage = max(1.0, float(pt.get("leverage") or 1.0))
+        direction_sign = -1.0 if str(pt.get("direction") or "").upper() == "LONG" else 1.0
+        pnl_pct = round(direction_sign * sum(rates) * leverage * 100.0, 6)
+        size_usd = float(pt.get("size_usd") or 0.0)
+        return {
+            "pnl_pct": pnl_pct,
+            "pnl_usd": round(size_usd * pnl_pct / 100.0, 6),
+            "settlement_count": len(rates),
+            "complete": True,
+            "source": "mexc_funding_history",
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "pnl_pct": 0.0,
+            "pnl_usd": 0.0,
+            "settlement_count": 0,
+            "complete": False,
+            "source": "mexc_funding_history",
+            "error": str(e)[:500],
+        }
+
+
+def _paper_backfill_funding(limit: int = 500) -> dict:
+    """Backfill closed Paper rows without funding, preserving an audit count."""
+    limit = max(1, min(int(limit or 500), 2000))
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = [dict(row) for row in con.execute(
+        """SELECT * FROM paper_trades
+           WHERE status='closed' AND pnl_pct IS NOT NULL
+             AND COALESCE(funding_complete, 0)=0
+           ORDER BY closed_at DESC, id DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()]
+    con.close()
+    cache: dict[tuple, object] = {}
+
+    def cached_fetch(path: str, params: dict | None = None):
+        params = params or {}
+        key = (path, tuple(sorted(params.items())))
+        if key not in cache:
+            cache[key] = fetch_mexc(path, params)
+        return cache[key]
+
+    updated = 0
+    incomplete = 0
+    errors: list[dict] = []
+    for pt in rows:
+        funding = _paper_funding_adjustment(
+            pt,
+            pt.get("closed_at"),
+            fetcher=cached_fetch,
+        )
+        if not funding.get("complete"):
+            incomplete += 1
+            errors.append({
+                "trade_id": pt.get("id"),
+                "symbol": pt.get("symbol"),
+                "error": funding.get("error"),
+            })
+            continue
+        gross = pt.get("gross_pnl_pct")
+        if gross is None:
+            gross = (
+                float(pt.get("pnl_pct") or 0.0)
+                + float(pt.get("fee_cost_pct") or 0.0)
+                + float(pt.get("slippage_cost_pct") or 0.0)
+            )
+        net = round(
+            float(gross or 0.0)
+            - float(pt.get("fee_cost_pct") or 0.0)
+            - float(pt.get("slippage_cost_pct") or 0.0)
+            + float(funding.get("pnl_pct") or 0.0),
+            2,
+        )
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """UPDATE paper_trades
+               SET funding_pnl_pct=?, funding_pnl_usd=?,
+                   funding_settlement_count=?, funding_complete=1,
+                   funding_error=NULL, funding_source=?,
+                   cost_model_version=?, pnl_pct=?
+               WHERE id=? AND COALESCE(funding_complete, 0)=0""",
+            (
+                funding.get("pnl_pct"),
+                funding.get("pnl_usd"),
+                funding.get("settlement_count"),
+                funding.get("source"),
+                "paper_cost_v2_historical_funding_backfill",
+                net,
+                pt["id"],
+            ),
+        )
+        if pt.get("signal_id"):
+            signal_row = con.execute(
+                "SELECT signal_json FROM signals WHERE id=? AND source='paper'",
+                (pt["signal_id"],),
+            ).fetchone()
+            signal_json = _learning_json(signal_row[0], {}) if signal_row else {}
+            signal_json.update({
+                "pnl_pct": net,
+                "funding_pnl_pct": funding.get("pnl_pct"),
+                "funding_pnl_usd": funding.get("pnl_usd"),
+                "funding_settlement_count": funding.get("settlement_count"),
+                "funding_complete": True,
+                "cost_model_version": "paper_cost_v2_historical_funding_backfill",
+            })
+            con.execute(
+                """UPDATE signals SET pnl_pct=?, evaluation_version=?, signal_json=?
+                   WHERE id=? AND source='paper'""",
+                (
+                    net,
+                    "paper_min1_funding_v2_backfill",
+                    json.dumps(signal_json, default=str),
+                    pt["signal_id"],
+                ),
+            )
+        con.commit()
+        con.close()
+        updated += 1
+    return {
+        "success": True,
+        "examined": len(rows),
+        "updated": updated,
+        "incomplete": incomplete,
+        "errors": errors[:25],
+        "remaining": max(0, len(rows) - updated),
+        "behavior_changed": False,
+        "live_changed": False,
+    }
 
 
 def _paper_stop_policy(cfg: dict, pt: dict) -> dict:
@@ -33136,6 +33669,8 @@ def _paper_check_exits(cfg: dict | None = None) -> int:
             # Paper trades only close WIN/LOSS/PARTIAL — never EXPIRED or SKIPPED
             if result not in {"WIN", "LOSS", "PARTIAL"}:
                 continue
+            closed_at = result_at or datetime.utcnow().isoformat()
+            funding = _paper_funding_adjustment(pt, closed_at)
             leverage = pt.get("leverage") or 1.0
             if exit_px and pt["entry_px"] and pt["entry_px"] != 0:
                 raw_pnl = (
@@ -33147,24 +33682,46 @@ def _paper_check_exits(cfg: dict | None = None) -> int:
                 fee_cost_pct, slippage_cost_pct, total_cost_pct = _paper_cost_adjustment(
                     cfg, result, leverage
                 )
-                pnl_pct = round(gross_pnl_pct - total_cost_pct, 2)
+                pnl_pct = round(
+                    gross_pnl_pct
+                    - total_cost_pct
+                    + float(funding.get("pnl_pct") or 0.0),
+                    2,
+                )
             else:
                 gross_pnl_pct = None
                 fee_cost_pct = None
                 slippage_cost_pct = None
                 pnl_pct = None
 
-            closed_at = result_at or datetime.utcnow().isoformat()
+            execution_cost_complete = bool(
+                funding.get("complete")
+                and pt.get("fill_spread_bps") is not None
+                and float(pt.get("fill_liquidity_lag_seconds") or 999999) <= 300
+            )
             con = sqlite3.connect(DB_PATH)
             con.execute(
                 """UPDATE paper_trades
                    SET status='closed', closed_at=?, exit_px=?, result=?,
                        gross_pnl_pct=?, fee_cost_pct=?, slippage_cost_pct=?,
+                       funding_pnl_pct=?, funding_pnl_usd=?,
+                       funding_settlement_count=?, funding_complete=?,
+                       funding_error=?, funding_source=?,
+                       execution_cost_complete=?, cost_model_version=?,
                        pnl_pct=?, note=?
                    WHERE id=?""",
                 (
                     closed_at, exit_px, result, gross_pnl_pct, fee_cost_pct,
-                    slippage_cost_pct, pnl_pct, note, pt["id"],
+                    slippage_cost_pct,
+                    funding.get("pnl_pct"),
+                    funding.get("pnl_usd"),
+                    funding.get("settlement_count"),
+                    1 if funding.get("complete") else 0,
+                    funding.get("error"),
+                    funding.get("source"),
+                    1 if execution_cost_complete else 0,
+                    "paper_cost_v2_settled_funding",
+                    pnl_pct, note, pt["id"],
                 ),
             )
             if pt.get("signal_id"):
@@ -33176,7 +33733,7 @@ def _paper_check_exits(cfg: dict | None = None) -> int:
                            stop_loss=?, leverage=COALESCE(leverage, ?)
                        WHERE id=? AND result IS NULL AND source='paper'""",
                     (
-                        result, exit_px, closed_at, pnl_pct, "paper_min1_chunked_v1",
+                        result, exit_px, closed_at, pnl_pct, "paper_min1_funding_v2",
                         entry_at, pt["entry_px"], pt["entry_px"], pt["entry_px"],
                         pt["tp1"], pt["tp2"], pt["tp3"], pt["stop_loss"],
                         pt.get("leverage"), pt["signal_id"],
@@ -33195,7 +33752,8 @@ def _paper_check_exits(cfg: dict | None = None) -> int:
             closed += 1
             print(
                 f"[paper_bot] closed {pt['symbol']} {pt['direction']} → {result} "
-                f"gross={gross_pnl_pct}% net={pnl_pct}% exit={exit_px}",
+                f"gross={gross_pnl_pct}% funding={funding.get('pnl_pct')}% "
+                f"net={pnl_pct}% exit={exit_px}",
                 file=sys.stderr,
             )
     except Exception as e:
@@ -33388,6 +33946,119 @@ def _paper_safety_controls(cfg: dict) -> dict:
     }
 
 
+def _paper_candidate_routing_plan(
+    candidates_by_symbol: dict[str, list[dict]],
+) -> tuple[dict[str, dict], list[dict]]:
+    """Choose the existing highest-conviction winner and expose every loser."""
+    winners: dict[str, dict] = {}
+    ledger_rows: list[dict] = []
+    for symbol, candidates in candidates_by_symbol.items():
+        if not candidates:
+            continue
+        ordered = sorted(
+            candidates,
+            key=lambda item: -float(
+                item.get("conviction", item.get("conviction_base", 0)) or 0
+            ),
+        )
+        winner = ordered[0]
+        winners[symbol] = winner
+        selected_key = str(winner.get("_strategy_key") or "balanced")
+        for candidate in ordered:
+            selected = candidate is winner
+            ledger_rows.append({
+                "symbol": symbol,
+                "strategy_key": str(candidate.get("_strategy_key") or "balanced"),
+                "direction": candidate.get("direction"),
+                "conviction": float(
+                    candidate.get("conviction", candidate.get("conviction_base", 0)) or 0
+                ),
+                "selected": selected,
+                "selected_strategy_key": selected_key,
+                "decision": (
+                    "only_candidate"
+                    if len(ordered) == 1
+                    else "selected"
+                    if selected
+                    else "lost_to_higher_conviction"
+                ),
+                "candidate_count": len(ordered),
+            })
+    return winners, ledger_rows
+
+
+def _paper_record_candidate_routing(
+    scan_id: str,
+    observed_at: str,
+    rows: list[dict],
+    cfg: dict,
+) -> None:
+    """Persist pre-dedup routing evidence without changing the routing policy."""
+    if not rows:
+        return
+    try:
+        con = sqlite3.connect(DB_PATH)
+        for row in rows:
+            policy = _learning_policy_snapshot(row["strategy_key"], cfg)
+            con.execute(
+                """INSERT INTO paper_candidate_routing
+                   (scan_id, observed_at, symbol, strategy_key, direction,
+                    conviction, selected, selected_strategy_key, decision,
+                    candidate_count, policy_fingerprint)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    scan_id,
+                    observed_at,
+                    row["symbol"],
+                    row["strategy_key"],
+                    row.get("direction"),
+                    row.get("conviction"),
+                    1 if row.get("selected") else 0,
+                    row.get("selected_strategy_key"),
+                    row.get("decision"),
+                    row.get("candidate_count"),
+                    _learning_fingerprint(policy),
+                ),
+            )
+        cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        con.execute(
+            "DELETE FROM paper_candidate_routing WHERE observed_at < ?",
+            (cutoff,),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"[paper_routing] record error: {e}", file=sys.stderr)
+
+
+def _paper_update_selected_routing(
+    scan_id: str,
+    symbol: str,
+    *,
+    flow_confirmed: bool,
+    flow_score: float,
+    paper_trade_id: int,
+) -> None:
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """UPDATE paper_candidate_routing
+               SET flow_confirmed=?, flow_score=?, paper_trade_id=?
+               WHERE scan_id=? AND symbol=? AND selected=1""",
+            (
+                1 if flow_confirmed else 0,
+                float(flow_score or 0.0),
+                int(paper_trade_id),
+                scan_id,
+                symbol,
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"[paper_routing] update error: {e}", file=sys.stderr)
+
+
 def _paper_bot_scan(cfg: dict) -> dict:
     """
     Run one scan cycle for the paper bot across all enabled strategies.
@@ -33489,23 +34160,24 @@ def _paper_bot_scan(cfg: dict) -> dict:
         # Run all active strategies, dedup by symbol keeping highest conviction.
         # Active/inactive state is controlled by paper_config.disabled_strategies.
         registry = get_strategy_registry()
-        best: dict[str, dict] = {}  # symbol → best signal across all strategies
+        candidates_by_symbol: dict[str, list[dict]] = defaultdict(list)
         for key in registry:
             if key in disabled_strategies:
                 continue
             sigs, _ = run_scan(threshold=min_conviction, strategy_key=key, tickers=tickers)
             for sig in sigs:
-                sym = sig["symbol"]
-                conv = sig.get("conviction", sig.get("conviction_base", 0))
-                if sym not in best or conv > best[sym].get("conviction", best[sym].get("conviction_base", 0)):
-                    sig["_strategy_key"] = key
-                    best[sym] = sig
+                sig["_strategy_key"] = key
+                candidates_by_symbol[sig["symbol"]].append(sig)
 
+        best, routing_rows = _paper_candidate_routing_plan(candidates_by_symbol)
+        now = datetime.utcnow().isoformat()
+        scan_id = hashlib.sha256(
+            f"{now}|{len(routing_rows)}|{socket.gethostname()}".encode()
+        ).hexdigest()[:20]
+        _paper_record_candidate_routing(scan_id, now, routing_rows, cfg)
         # Sort by conviction descending
         signals = sorted(best.values(), key=lambda s: s.get("conviction", s.get("conviction_base", 0)), reverse=True)
         research_paper_controls = _research_rule_controls_by_tag()
-
-        now = datetime.utcnow().isoformat()
 
         for sig in signals:
             if active_count >= max_open:
@@ -33685,6 +34357,25 @@ def _paper_bot_scan(cfg: dict) -> dict:
                 )
                 if inserted_ids and inserted_ids[0]:
                     counterfactual_signal_id = inserted_ids[0]
+            elif flow_needed and not confirmed:
+                # Preserve the opportunity cost of the global flow gate. These
+                # signals remain zero-authority and are outcome-scored exactly
+                # like disabled/research shadow candidates.
+                shadow_sig = dict(sig)
+                shadow_sig["strategy_key"] = strategy_key
+                shadow_sig["flow_score"] = flow_score
+                shadow_sig["flow_confirmed"] = False
+                shadow_sig["flow_counterfactual"] = True
+                shadow_sig["tags"] = list(dict.fromkeys(
+                    list(shadow_sig.get("tags") or []) + ["flow_counterfactual"]
+                ))
+                inserted_ids = log_signals(
+                    [shadow_sig],
+                    source="flow_counterfactual",
+                    allow_duplicate_open=False,
+                )
+                if inserted_ids and inserted_ids[0]:
+                    counterfactual_signal_id = inserted_ids[0]
 
             con = sqlite3.connect(DB_PATH)
             cursor = con.execute(
@@ -33750,6 +34441,13 @@ def _paper_bot_scan(cfg: dict) -> dict:
             paper_trade_id = int(cursor.lastrowid)
             con.commit()
             con.close()
+            _paper_update_selected_routing(
+                scan_id,
+                sig["symbol"],
+                flow_confirmed=confirmed,
+                flow_score=flow_score,
+                paper_trade_id=paper_trade_id,
+            )
             assignments = research_runtime.get("experiment_assignments") or []
             decision = "blocked" if research_runtime.get("blocked_by") else "accepted"
             _research_record_assignments(
@@ -33784,7 +34482,21 @@ def _paper_bot_scan(cfg: dict) -> dict:
     except Exception as e:
         print(f"[paper_bot] _paper_bot_scan error: {e}", file=sys.stderr)
 
-    return {"entered": entered, "rejected": rejected, "skipped": skipped, "disabled_shadow": locals().get("shadow_result")}
+    return {
+        "entered": entered,
+        "rejected": rejected,
+        "skipped": skipped,
+        "disabled_shadow": locals().get("shadow_result"),
+        "routing": {
+            "scan_id": locals().get("scan_id"),
+            "candidates": len(locals().get("routing_rows") or []),
+            "symbols": len(locals().get("best") or {}),
+            "overlap_symbols": sum(
+                1 for items in (locals().get("candidates_by_symbol") or {}).values()
+                if len(items) > 1
+            ),
+        },
+    }
 
 
 def _disabled_strategy_shadow_scan(
@@ -33882,7 +34594,11 @@ def _paper_bot_loop():
                     orchestration = _research_reconcile_experiments()
                     scan_result = _paper_bot_scan(cfg)
                     shadow_eval = _evaluate_open_signal_outcomes(
-                        source_allow={"disabled_shadow", "research_counterfactual"},
+                        source_allow={
+                            "disabled_shadow",
+                            "research_counterfactual",
+                            "flow_counterfactual",
+                        },
                         limit=120,
                     )
                     last_scan = _time.time()
@@ -34300,6 +35016,11 @@ def api_paper_disabled_strategy_shadow_action(strategy_key: str):
             cfg["disabled_strategies"] = [k for k in disabled if k != key]
             cfg["current_cohort_started_at"] = decided_at
             cfg["current_cohort_label"] = f"recovery_trial_{key}_{decided_at[:10]}"
+            cfg["current_cohort_strategy_keys"] = [key]
+            cfg["current_cohort_policy_fingerprints"] = [
+                _learning_fingerprint(_learning_policy_snapshot(key, cfg))
+            ]
+            cfg["current_cohort_assignment_basis"] = "filled_at"
             _save_paper_config(cfg)
             changed_config = True
 
@@ -35443,6 +36164,26 @@ def api_paper_stats():
         hold_expired = con.execute(
             "SELECT COUNT(*) FROM paper_trades WHERE status='expired'"
         ).fetchone()[0]
+        flow_counterfactual_rows = [dict(r) for r in con.execute("""
+            SELECT result, pnl_pct, logged_at, result_at, symbol, strategy_key,
+                   direction, flow_score
+            FROM signals
+            WHERE source='flow_counterfactual'
+              AND result IN ('WIN','LOSS','PARTIAL')
+              AND pnl_pct IS NOT NULL
+            ORDER BY COALESCE(result_at, logged_at) DESC
+            LIMIT 1000
+        """).fetchall()]
+        routing_rows = [dict(r) for r in con.execute("""
+            SELECT strategy_key,
+                   COUNT(*) AS candidates,
+                   SUM(selected) AS selected,
+                   SUM(CASE WHEN decision='lost_to_higher_conviction' THEN 1 ELSE 0 END) AS lost
+            FROM paper_candidate_routing
+            WHERE observed_at >= ?
+            GROUP BY strategy_key
+            ORDER BY candidates DESC
+        """, ((datetime.utcnow() - timedelta(days=30)).isoformat(),)).fetchall()]
         con.close()
 
         def _stats(trades):
@@ -35482,6 +36223,20 @@ def api_paper_stats():
             losses = [abs(x) for x in pnl_usd if x < 0]
             best = max(pnl_usd) if pnl_usd else None
             worst = min(pnl_usd) if pnl_usd else None
+            funding_complete_n = len([
+                t for t in trades if int(t.get("funding_complete") or 0) == 1
+            ])
+            execution_complete_n = len([
+                t for t in trades
+                if int(t.get("execution_cost_complete") or 0) == 1
+            ])
+            funding_usd = [
+                float(t.get("funding_pnl_usd") or 0.0)
+                for t in trades if t.get("funding_pnl_usd") is not None
+            ]
+            liquidity_known_n = len([
+                t for t in trades if str(t.get("liquidity_tier") or "").strip()
+            ])
             return {
                 "count":      len(trades),
                 "win_rate":   round(len(wins) / len(trades) * 100, 1) if trades else 0,
@@ -35497,7 +36252,116 @@ def api_paper_stats():
                 "worst_pnl_usd": round(worst, 2) if worst is not None else 0,
                 "avg_gross_pnl": round(sum(gross) / len(gross), 2) if gross else 0,
                 "avg_cost": round(sum(costs) / len(costs), 2) if costs else 0,
+                "funding_pnl_usd": round(sum(funding_usd), 4),
+                "funding_complete_count": funding_complete_n,
+                "funding_coverage_pct": round(funding_complete_n / len(trades) * 100, 1) if trades else None,
+                "execution_cost_complete_count": execution_complete_n,
+                "execution_cost_coverage_pct": round(execution_complete_n / len(trades) * 100, 1) if trades else None,
+                "liquidity_tier_coverage_pct": round(liquidity_known_n / len(trades) * 100, 1) if trades else None,
             }
+
+        def _shadow_stats(trades):
+            pnls = [float(t.get("pnl_pct") or 0.0) for t in trades]
+            gains = [p for p in pnls if p > 0]
+            losses = [abs(p) for p in pnls if p < 0]
+            positives = len([
+                t for t in trades if t.get("result") in {"WIN", "PARTIAL"}
+            ])
+            return {
+                "count": len(trades),
+                "avg_pnl_pct": round(sum(pnls) / len(pnls), 2) if pnls else None,
+                "total_pnl_pct": round(sum(pnls), 2),
+                "win_partial_rate": round(positives / len(trades) * 100, 1) if trades else None,
+                "profit_factor_pct": round(sum(gains) / sum(losses), 2) if losses else None,
+                "authority": "zero_authority_counterfactual",
+            }
+
+        def _profitability_experiment_drafts():
+            routing_lost = sum(int(row.get("lost") or 0) for row in routing_rows)
+            focus_routing = next(
+                (
+                    row for row in routing_rows
+                    if row.get("strategy_key") == "balanced_focus_short"
+                ),
+                {},
+            )
+            partial_count = len([
+                trade for trade in closed if trade.get("result") == "PARTIAL"
+            ])
+            execution_coverage = _stats(closed).get("execution_cost_coverage_pct")
+            tokenized_count = len([
+                trade for trade in closed
+                if "STOCK" in str(trade.get("symbol") or "").upper()
+            ])
+            flow_count = len(flow_counterfactual_rows)
+            return [
+                {
+                    "id": "paper_routing_short_priority_v1",
+                    "title": "Short-focus routing challenger",
+                    "idea_type": "portfolio_routing",
+                    "hypothesis": "When multiple enabled strategies nominate the same symbol, a short-focus candidate may outperform the generic highest-conviction winner.",
+                    "control": "Current highest-conviction winner; ties preserve registry order.",
+                    "treatment": "Deterministic Paper-only short-focus priority on eligible overlap events.",
+                    "primary_metric": "Size-weighted net P&L delta per overlap opportunity.",
+                    "guardrails": ["same risk sizing", "same flow gate", "same cost model", "no live authority"],
+                    "evidence": {
+                        "overlap_losers_recorded": routing_lost,
+                        "focus_candidates": int(focus_routing.get("candidates") or 0),
+                        "focus_selected": int(focus_routing.get("selected") or 0),
+                    },
+                    "state": "design_ready" if routing_lost >= 100 else "collecting_measurement",
+                    "next_gate": "100 pre-dedup overlap decisions before activation design.",
+                    "authority": "draft_only",
+                },
+                {
+                    "id": "paper_breakeven_after_tp1_v1",
+                    "title": "Breakeven-after-TP1 stop challenger",
+                    "idea_type": "stop_management",
+                    "hypothesis": "Moving the remaining stop to cost-adjusted breakeven after TP1 may reduce partial winners that later reverse.",
+                    "control": "Static Paper stop.",
+                    "treatment": "Paper-only breakeven_after_tp1 using the configured buffer.",
+                    "primary_metric": "Net P&L per assigned trade, with partial capture and stop-out rate secondary.",
+                    "guardrails": ["no wider initial stop", "no leverage change", "deterministic assignment", "no live authority"],
+                    "evidence": {"historical_partial_closes": partial_count},
+                    "state": "design_ready" if partial_count >= 50 else "collecting_measurement",
+                    "next_gate": "Predeclare assignment, minimum sample, and rollback before any Paper behavior change.",
+                    "authority": "draft_only",
+                },
+                {
+                    "id": "paper_flow_gate_value_v1",
+                    "title": "Order-flow gate value study",
+                    "idea_type": "risk_gate",
+                    "hypothesis": "Flow confirmation should improve net outcomes relative to otherwise eligible rejected signals.",
+                    "control": "Accepted, flow-confirmed Paper entries.",
+                    "treatment": "Zero-authority outcome follow-up of rejected candidates; the gate remains unchanged.",
+                    "primary_metric": "Accepted-minus-rejected net P&L and profitable/partial rate.",
+                    "guardrails": ["rejected lane never enters Paper", "deduplicated open shadows", "no threshold change"],
+                    "evidence": {"closed_rejected_counterfactuals": flow_count},
+                    "state": "review_ready" if flow_count >= 50 else "collecting_measurement",
+                    "next_gate": "50 closed rejected counterfactuals across at least 20 market days.",
+                    "authority": "measurement_only",
+                },
+                {
+                    "id": "paper_tokenized_liquidity_cost_v1",
+                    "title": "Tokenized-contract liquidity and cost study",
+                    "idea_type": "liquidity_risk",
+                    "hypothesis": "Apparent tokenized-contract profitability must survive spread, funding, and liquidity-completeness controls.",
+                    "control": "Known-liquidity non-tokenized Paper trades under the same strategy families.",
+                    "treatment": "Tokenized-contract cohort; no entry rule changes.",
+                    "primary_metric": "Net size-weighted P&L after verified funding, stratified by fill spread.",
+                    "guardrails": ["unknown liquidity cannot promote", "hard notional caps stay active", "no live authority"],
+                    "evidence": {
+                        "tokenized_closed": tokenized_count,
+                        "full_cost_coverage_pct": execution_coverage,
+                    },
+                    "state": "review_ready" if (
+                        tokenized_count >= 50
+                        and float(execution_coverage or 0) >= 80
+                    ) else "blocked_on_cost_coverage",
+                    "next_gate": "At least 80% full cost evidence before judging the segment.",
+                    "authority": "measurement_only",
+                },
+            ]
 
         confirmed   = [t for t in closed if t.get("flow_confirmed")]
         unconfirmed = [t for t in closed if not t.get("flow_confirmed")]
@@ -35513,22 +36377,19 @@ def api_paper_stats():
 
         cfg = _load_paper_config()
         safety = _paper_safety_controls(cfg)
-        cohort_started_at = cfg.get("current_cohort_started_at")
-        cohort_label = cfg.get("current_cohort_label") or "Current cohort"
+        cohort_scope = _paper_cohort_scope(cfg)
+        cohort_started_at = cohort_scope.get("started_at")
         current_cohort = None
         if cohort_started_at:
             cohort_closed = [
                 t for t in closed
-                if (t.get("closed_at") or "") >= str(cohort_started_at)
+                if _paper_trade_in_cohort(t, cohort_scope)
             ]
-            active_keys = sorted(
-                set(get_strategy_registry().keys()) - set(cfg.get("disabled_strategies") or [])
-            )
             current_cohort = {
-                "label": cohort_label,
-                "started_at": cohort_started_at,
-                "target_count": 20,
-                "active_strategies": active_keys,
+                **cohort_scope,
+                "active_strategies": sorted(
+                    set(get_strategy_registry().keys()) - set(cfg.get("disabled_strategies") or [])
+                ),
                 "stats": _stats(cohort_closed),
             }
 
@@ -35542,6 +36403,13 @@ def api_paper_stats():
             "all_closed":    _stats(closed),
             "flow_confirmed":   _stats(confirmed),
             "flow_unconfirmed": _stats(unconfirmed),
+            "flow_counterfactual": _shadow_stats(flow_counterfactual_rows),
+            "candidate_routing_30d": {
+                "strategies": routing_rows,
+                "note": "Pre-dedup candidates; selected means the existing highest-conviction symbol winner.",
+                "authority": "measurement_only",
+            },
+            "profitability_experiment_drafts": _profitability_experiment_drafts(),
             "current_cohort": current_cohort,
             "equity_curve":  equity,
             "safety_controls": {
@@ -35552,6 +36420,19 @@ def api_paper_stats():
                 "cooldowns":        safety["cooldowns"],
             },
         })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/paper/funding/backfill", methods=["POST"])
+def api_paper_funding_backfill():
+    """Authenticated accounting repair; never changes strategy behavior."""
+    token_error = require_api_token()
+    if token_error:
+        return token_error
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(_paper_backfill_funding(body.get("limit") or 500))
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -35930,7 +36811,10 @@ def api_paper_cohort_edge():
     """
     try:
         cfg = _load_paper_config()
-        since = request.args.get("since") or cfg.get("current_cohort_started_at")
+        cohort_scope = _paper_cohort_scope(cfg)
+        since = request.args.get("since") or cohort_scope.get("started_at")
+        if request.args.get("since"):
+            cohort_scope = {**cohort_scope, "started_at": str(since)}
         if not since:
             return jsonify({"success": False, "error": "No cohort start configured"}), 400
 
@@ -35946,15 +36830,19 @@ def api_paper_cohort_edge():
 
         sig_con = sqlite3.connect(DB_PATH)
         sig_con.row_factory = sqlite3.Row
-        rows = [dict(r) for r in sig_con.execute("""
+        candidates = [dict(r) for r in sig_con.execute("""
             SELECT id, symbol, strategy_key, direction, status, result, pnl_pct,
-                   size_usd, queued_at, filled_at, opened_at, closed_at
+                   size_usd, queued_at, filled_at, opened_at, closed_at,
+                   learning_policy_fingerprint
             FROM paper_trades
-            WHERE COALESCE(filled_at, opened_at, queued_at, closed_at, '') >= ?
-              AND status IN ('closed', 'open', 'pending')
+            WHERE status IN ('closed', 'open', 'pending')
             ORDER BY COALESCE(closed_at, opened_at, queued_at) DESC
-            LIMIT 200
-        """, (str(since),)).fetchall()]
+            LIMIT 1000
+        """).fetchall()]
+        rows = [
+            row for row in candidates
+            if _paper_trade_in_cohort(row, cohort_scope)
+        ][:200]
         sig_con.close()
 
         edge_con = sqlite3.connect(EDGE_LAB_DB_PATH)
@@ -36087,6 +36975,7 @@ def api_paper_cohort_edge():
             "cohort": {
                 "label": cfg.get("current_cohort_label") or "Current cohort",
                 "started_at": since,
+                "scope": cohort_scope,
                 "active_strategies": sorted(set(get_strategy_registry().keys()) - set(cfg.get("disabled_strategies") or [])),
             },
             "edge_lab": {
@@ -36157,7 +37046,8 @@ def _paper_cohort_gate(
 def _build_paper_cohort_review() -> dict:
     cfg = _load_paper_config()
     goals = _load_goals()
-    since = cfg.get("current_cohort_started_at")
+    cohort_scope = _paper_cohort_scope(cfg)
+    since = cohort_scope.get("started_at")
     configured_target = int(cfg.get("current_cohort_target_count") or 20)
     target = max(
         PAPER_READINESS_MIN_TRADES,
@@ -36206,20 +37096,34 @@ def _build_paper_cohort_review() -> dict:
         rows = [dict(r) for r in con.execute("""
             SELECT id, symbol, strategy_key, direction, status, result, pnl_pct,
                    size_usd, queued_at, filled_at, opened_at, closed_at,
-                   fee_cost_pct, slippage_cost_pct, flow_confirmed, flow_score
+                   fee_cost_pct, slippage_cost_pct, flow_confirmed, flow_score,
+                   learning_policy_fingerprint
             FROM paper_trades
             WHERE status='closed'
             ORDER BY closed_at ASC
         """).fetchall()]
-        open_count = con.execute(
-            "SELECT COUNT(*) FROM paper_trades WHERE status IN ('pending','open') AND COALESCE(opened_at, queued_at, '') >= ?",
-            (str(since),),
-        ).fetchone()[0] or 0
+        active_rows = [dict(r) for r in con.execute("""
+            SELECT strategy_key, queued_at, filled_at, opened_at,
+                   learning_policy_fingerprint
+            FROM paper_trades
+            WHERE status IN ('pending','open')
+        """).fetchall()]
+        open_count = sum(
+            1 for trade in active_rows
+            if _paper_trade_in_cohort(trade, cohort_scope)
+        )
     finally:
         con.close()
 
-    cohort = [t for t in rows if (t.get("closed_at") or "") >= str(since)]
-    baseline = [t for t in rows if (t.get("closed_at") or "") < str(since)]
+    cohort = [t for t in rows if _paper_trade_in_cohort(t, cohort_scope)]
+    baseline = [
+        t for t in rows
+        if (
+            not cohort_scope.get("strategy_keys")
+            or t.get("strategy_key") in set(cohort_scope.get("strategy_keys") or [])
+        )
+        and not _paper_trade_in_cohort(t, cohort_scope)
+    ]
     cohort_stats = _paper_review_stats(cohort, starting_balance)
     baseline_stats = _paper_review_stats(baseline, starting_balance)
 
@@ -36363,6 +37267,7 @@ def _build_paper_cohort_review() -> dict:
     return {
         "label": cfg.get("current_cohort_label") or "Current cohort",
         "started_at": since,
+        "scope": cohort_scope,
         "target_count": target,
         "configured_target_count": configured_target,
         "active_strategies": active_strategies,
@@ -36654,6 +37559,7 @@ def api_paper_config():
 
         body = request.get_json(force=True) or {}
         cfg  = _load_paper_config()
+        original_cfg = copy.deepcopy(cfg)
         current_mode = str(
             cfg.get("paper_sizing_mode") or "fixed"
         ).strip().lower()
@@ -36749,7 +37655,11 @@ def api_paper_config():
             "paper_maker_fee_bps", "paper_taker_fee_bps", "paper_slippage_bps",
             "paper_stop_mode", "paper_breakeven_buffer_bps", "paper_trailing_atr_mult",
             "paper_margin_mode",
+            "loss_streak_pause_n", "loss_streak_cooldown_hours",
+            "cold_streak_flow_boost_n", "drawdown_reduce_pct",
             "current_cohort_started_at", "current_cohort_label",
+            "current_cohort_target_count", "current_cohort_strategy_keys",
+            "current_cohort_policy_fingerprints",
         }
         for k, v in body.items():
             if k in allowed:
@@ -36761,12 +37671,57 @@ def api_paper_config():
                 for k in (cfg.get("disabled_strategies") or [])
                 if str(k).strip() in valid_keys
             ]
-        if mode_changed:
+        if "current_cohort_strategy_keys" in cfg:
+            valid_keys = set(get_strategy_registry(include_disabled=True).keys())
+            cfg["current_cohort_strategy_keys"] = sorted({
+                str(k).strip()
+                for k in (cfg.get("current_cohort_strategy_keys") or [])
+                if str(k).strip() in valid_keys
+            })
+        if "current_cohort_policy_fingerprints" in cfg:
+            cfg["current_cohort_policy_fingerprints"] = sorted({
+                str(value).strip()
+                for value in (cfg.get("current_cohort_policy_fingerprints") or [])
+                if str(value).strip()
+            })
+        cohort_fields = {
+            "current_cohort_started_at",
+            "current_cohort_label",
+            "current_cohort_target_count",
+            "current_cohort_strategy_keys",
+            "current_cohort_policy_fingerprints",
+        }
+        behavior_changed = any(
+            key in body
+            and key not in cohort_fields
+            and key != "enabled"
+            and original_cfg.get(key) != cfg.get(key)
+            for key in allowed
+        )
+        explicit_cohort_start = "current_cohort_started_at" in body
+        if mode_changed or behavior_changed:
             now = datetime.utcnow().isoformat()
-            cfg["current_cohort_started_at"] = now
-            cfg["current_cohort_label"] = (
-                f"{requested_mode}_{datetime.utcnow().strftime('%Y-%m-%d')}"
+            if not explicit_cohort_start:
+                cfg["current_cohort_started_at"] = now
+                cfg["current_cohort_label"] = (
+                    f"{requested_mode}_{datetime.utcnow().strftime('%Y-%m-%d')}"
+                    if mode_changed
+                    else f"policy_change_{datetime.utcnow().strftime('%Y-%m-%d')}"
+                )
+        if explicit_cohort_start or mode_changed or behavior_changed:
+            active_keys = sorted(
+                set(get_strategy_registry().keys())
+                - set(cfg.get("disabled_strategies") or [])
             )
+            if "current_cohort_strategy_keys" not in body:
+                cfg["current_cohort_strategy_keys"] = active_keys
+            elif not cfg.get("current_cohort_strategy_keys"):
+                cfg["current_cohort_strategy_keys"] = active_keys
+            cfg["current_cohort_policy_fingerprints"] = [
+                _learning_fingerprint(_learning_policy_snapshot(key, cfg))
+                for key in cfg["current_cohort_strategy_keys"]
+            ]
+            cfg["current_cohort_assignment_basis"] = "filled_at"
         _save_paper_config(cfg)
         return jsonify({
             "success": True,

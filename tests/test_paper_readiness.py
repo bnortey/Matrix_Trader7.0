@@ -27,6 +27,91 @@ def synthetic_trades(values: list[float]) -> list[dict]:
 
 
 class PaperReadinessTests(unittest.TestCase):
+    def test_legacy_recovery_cohort_is_strategy_scoped_at_fill_time(self):
+        scope = mt7._paper_cohort_scope({
+            "current_cohort_started_at": "2026-07-29T12:00:00",
+            "current_cohort_label": "recovery_trial_mean_reversion_2026-07-29",
+        })
+        self.assertEqual(scope["strategy_keys"], ["mean_reversion"])
+        self.assertTrue(scope["scope_inferred_from_legacy_label"])
+        self.assertTrue(mt7._paper_trade_in_cohort({
+            "strategy_key": "mean_reversion",
+            "filled_at": "2026-07-29T12:01:00",
+            "closed_at": "2026-07-30T00:00:00",
+        }, scope))
+        self.assertFalse(mt7._paper_trade_in_cohort({
+            "strategy_key": "funding_arb",
+            "filled_at": "2026-07-29T12:01:00",
+            "closed_at": "2026-07-30T00:00:00",
+        }, scope))
+        self.assertFalse(mt7._paper_trade_in_cohort({
+            "strategy_key": "mean_reversion",
+            "filled_at": "2026-07-29T11:59:00",
+            "closed_at": "2026-07-30T00:00:00",
+        }, scope))
+
+    def test_funding_adjustment_uses_actual_settlements_and_direction_sign(self):
+        opened = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        closed = opened + timedelta(hours=10)
+        settlements = [
+            {
+                "settleTime": int((opened + timedelta(hours=4)).timestamp() * 1000),
+                "fundingRate": "0.001",
+            },
+            {
+                "settleTime": int((opened + timedelta(hours=8)).timestamp() * 1000),
+                "fundingRate": "-0.00025",
+            },
+        ]
+
+        def fetcher(_path, _params):
+            return {"resultList": settlements, "totalCount": 2}
+
+        base = {
+            "symbol": "BTC_USDT",
+            "exchange": "MEXC",
+            "filled_at": opened.isoformat(),
+            "leverage": 10,
+            "size_usd": 100,
+        }
+        long_result = mt7._paper_funding_adjustment(
+            {**base, "direction": "LONG"},
+            closed.isoformat(),
+            fetcher=fetcher,
+        )
+        short_result = mt7._paper_funding_adjustment(
+            {**base, "direction": "SHORT"},
+            closed.isoformat(),
+            fetcher=fetcher,
+        )
+        self.assertTrue(long_result["complete"])
+        self.assertEqual(long_result["settlement_count"], 2)
+        self.assertAlmostEqual(long_result["pnl_pct"], -0.75)
+        self.assertAlmostEqual(short_result["pnl_pct"], 0.75)
+
+    def test_routing_plan_preserves_first_strategy_on_conviction_tie(self):
+        first = {
+            "symbol": "BTC_USDT",
+            "_strategy_key": "funding_arb",
+            "direction": "SHORT",
+            "conviction": 80,
+        }
+        second = {
+            "symbol": "BTC_USDT",
+            "_strategy_key": "balanced_focus_short",
+            "direction": "SHORT",
+            "conviction": 80,
+        }
+        winners, rows = mt7._paper_candidate_routing_plan(
+            {"BTC_USDT": [first, second]}
+        )
+        self.assertIs(winners["BTC_USDT"], first)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [row["decision"] for row in rows],
+            ["selected", "lost_to_higher_conviction"],
+        )
+
     def test_outlier_dominated_profit_fails_robust_metrics(self):
         stats = mt7._paper_evidence_stats(
             synthetic_trades([100.0] + [-1.0] * 49),
@@ -93,7 +178,8 @@ class PaperReadinessTests(unittest.TestCase):
                     fee_cost_pct REAL,
                     slippage_cost_pct REAL,
                     flow_confirmed INTEGER,
-                    flow_score REAL
+                    flow_score REAL,
+                    learning_policy_fingerprint TEXT
                 )
             """)
             trades = synthetic_trades(([2.0] * 3 + [-1.0] * 2) * 12)

@@ -1,7 +1,9 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import app as mt7
 
@@ -15,11 +17,13 @@ class LearnerAuthorityTests(unittest.TestCase):
             "LEARNER_PENDING_PATH": mt7.LEARNER_PENDING_PATH,
             "LEARNER_REJECTED_PATH": mt7.LEARNER_REJECTED_PATH,
             "EXPERIMENT_LEDGER_PATH": mt7.EXPERIMENT_LEDGER_PATH,
+            "DB_PATH": mt7.DB_PATH,
         }
         mt7.STRATEGY_OVERRIDES_PATH = str(root / "strategy_overrides.json")
         mt7.LEARNER_PENDING_PATH = str(root / "pending.json")
         mt7.LEARNER_REJECTED_PATH = str(root / "rejected.json")
         mt7.EXPERIMENT_LEDGER_PATH = str(root / "experiment_ledger.json")
+        mt7.DB_PATH = str(root / "signals.db")
         mt7.app.config["TESTING"] = True
 
     def tearDown(self):
@@ -190,6 +194,71 @@ class LearnerAuthorityTests(unittest.TestCase):
         self.assertIn("Cannot resume as shadow", response.get_json()["error"])
         suggestion = json.loads(Path(mt7.LEARNER_PENDING_PATH).read_text())["suggestions"][0]
         self.assertEqual(suggestion["status"], "parked")
+
+    def test_state_reconciliation_closes_cleared_and_authority_lost_lanes(self):
+        self._write_suggestions([
+            {
+                "id": "cleared_active",
+                "type": "threshold",
+                "strategy": "balanced",
+                "status": "evaluating",
+                "suggested_value": 60,
+                "api_payload": {"min_conviction": 60},
+                "evaluation_note": "Cleared after forward review; control remains active.",
+                "learning_experiment_id": "exp-active",
+            },
+            {
+                "id": "authority_lost",
+                "type": "threshold",
+                "strategy": "balanced_focus_short",
+                "status": "evaluating",
+                "suggested_value": 81,
+                "api_payload": {"min_conviction": 81},
+                "learning_experiment_id": "exp-lost",
+            },
+        ])
+        self._write_overrides({"balanced": {"min_conviction": 60}})
+        con = sqlite3.connect(mt7.DB_PATH)
+        con.execute("""
+            CREATE TABLE learning_experiments (
+                experiment_id TEXT PRIMARY KEY,
+                status TEXT,
+                lifecycle_state TEXT,
+                evaluated_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        con.executemany(
+            "INSERT INTO learning_experiments(experiment_id,status) VALUES (?, 'collecting')",
+            [("exp-active",), ("exp-lost",)],
+        )
+        con.commit()
+        con.close()
+
+        with patch.object(mt7, "_learning_append_event"):
+            result = mt7._learning_reconcile_suggestion_states()
+
+        self.assertEqual(result["changed_count"], 2)
+        self.assertFalse(result["automatic_config_change"])
+        suggestions = {
+            item["id"]: item
+            for item in json.loads(Path(mt7.LEARNER_PENDING_PATH).read_text())["suggestions"]
+        }
+        self.assertEqual(suggestions["cleared_active"]["status"], "applied")
+        self.assertEqual(suggestions["authority_lost"]["status"], "parked")
+        self.assertEqual(
+            json.loads(Path(mt7.STRATEGY_OVERRIDES_PATH).read_text()),
+            {"balanced": {"min_conviction": 60}},
+        )
+        con = sqlite3.connect(mt7.DB_PATH)
+        statuses = dict(con.execute(
+            "SELECT experiment_id,status FROM learning_experiments"
+        ).fetchall())
+        con.close()
+        self.assertEqual(statuses, {
+            "exp-active": "inconclusive",
+            "exp-lost": "inconclusive",
+        })
 
 
 if __name__ == "__main__":

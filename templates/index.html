@@ -15459,6 +15459,9 @@ async function loadPaperTrading() {
 
     const c       = cfg.config;
     window._paperConfigCache = c;
+    window._paperActiveStrategyKeys = allStrategies
+      .map(s => s.key)
+      .filter(key => !(c.disabled_strategies || []).includes(key));
     const sizingPolicy = cfg.sizing_policy || account?.sizing_policy || {};
     window._paperSizingPolicyCache = sizingPolicy;
     const compoundPreviewCap = Number(c.compound_equity_cap_usd ?? 1000);
@@ -15657,6 +15660,8 @@ async function loadPaperTrading() {
       const s = stats;
       const flowC = s.flow_confirmed;
       const flowU = s.flow_unconfirmed;
+      const flowCF = s.flow_counterfactual || {};
+      const routing = s.candidate_routing_30d || {};
       const acct = account && account.success ? account.account : {};
       statsHtml = `
         ${renderPaperCohortStrip(s.current_cohort)}
@@ -15668,6 +15673,9 @@ async function loadPaperTrading() {
           ${paperStat('Average $ result', fmtUsdSigned(s.all_closed.avg_pnl_usd), s.all_closed.avg_pnl_usd >= 0 ? '#22c55e' : '#ef4444', 'Average dollar result per closed simulated trade')}
           ${paperStat('Profit Factor', Number(s.all_closed.profit_factor || 0).toFixed(2), s.all_closed.profit_factor >= 1 ? '#22c55e' : '#ef4444', 'Gross dollars won divided by gross dollars lost')}
           ${paperStat('Costs Paid', fmtUsd(s.all_closed.total_cost_usd), '#f59e0b', 'Estimated fee plus slippage drag in dollars')}
+          ${paperStat('Settled funding', fmtUsdSigned(s.all_closed.funding_pnl_usd || 0), Number(s.all_closed.funding_pnl_usd || 0) >= 0 ? '#22c55e' : '#ef4444', 'Actual MEXC funding settlements while Paper positions were held; positive means received')}
+          ${paperStat('Funding coverage', s.all_closed.funding_coverage_pct == null ? '—' : `${Number(s.all_closed.funding_coverage_pct).toFixed(1)}%`, Number(s.all_closed.funding_coverage_pct || 0) >= 95 ? '#22c55e' : '#f59e0b', 'Share of closed trades with verified settlement-history accounting')}
+          ${paperStat('Full cost evidence', s.all_closed.execution_cost_coverage_pct == null ? '—' : `${Number(s.all_closed.execution_cost_coverage_pct).toFixed(1)}%`, Number(s.all_closed.execution_cost_coverage_pct || 0) >= 95 ? '#22c55e' : '#f59e0b', 'Share with funding plus a timely fill-time spread snapshot; historical rows may remain incomplete')}
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:14px;">
           ${paperStat('Awaiting entry', s.pending_count ?? 0, '#f59e0b', 'Simulated limit entries waiting for the entry price to be touched')}
@@ -15686,19 +15694,61 @@ async function loadPaperTrading() {
           ${paperStat('Unconfirmed full wins', flowU.win_rate + '%', flowU.win_rate >= 50 ? '#22c55e' : '#ef4444', `Based on ${flowU.count} trades without order-flow confirmation`)}
           ${paperStat('Confirmed average result', fmtPct(flowC.avg_pnl), flowC.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average result for order-flow-confirmed entries')}
           ${paperStat('Unconfirmed average result', fmtPct(flowU.avg_pnl), flowU.avg_pnl >= 0 ? '#22c55e' : '#ef4444', 'Average result for entries without order-flow confirmation')}
+          ${paperStat('Rejected-flow outcomes', flowCF.count || 0, '#38bdf8', 'Zero-authority rejected candidates that later reached a measurable outcome')}
+          ${paperStat('Rejected-flow average', flowCF.avg_pnl_pct == null ? '—' : fmtPct(flowCF.avg_pnl_pct), Number(flowCF.avg_pnl_pct || 0) >= 0 ? '#22c55e' : '#ef4444', 'Counterfactual only: what the globally rejected signals later did, with no Paper entry')}
         </div>`;
 
+      const routingRows = (routing.strategies || []).slice(0, 8).map(row => {
+        const candidates = Number(row.candidates || 0);
+        const selected = Number(row.selected || 0);
+        const rate = candidates ? selected / candidates * 100 : 0;
+        return `<div style="display:grid;grid-template-columns:minmax(145px,1fr) 70px 70px 70px;gap:8px;border-top:1px solid #18202b;padding:6px 0;font-size:11px;">
+          <span style="color:var(--text2);">${esc(String(row.strategy_key || '').replace(/_/g, ' '))}</span>
+          <span style="text-align:right;color:#9ca3af;">${candidates}</span>
+          <span style="text-align:right;color:#38bdf8;">${selected}</span>
+          <span style="text-align:right;color:${rate >= 25 ? '#22c55e' : '#f59e0b'};">${rate.toFixed(1)}%</span>
+        </div>`;
+      }).join('');
+      statsHtml += `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 12px;margin-bottom:14px;">
+        <div style="font-size:11px;font-weight:800;color:var(--text);letter-spacing:.06em;">STRATEGY ROUTING · LAST 30 DAYS</div>
+        <div style="font-size:10px;color:#667085;line-height:1.4;margin-top:3px;">Shows every eligible strategy candidate before symbol deduplication. Measurement only—the highest-conviction winner remains unchanged.</div>
+        <div style="display:grid;grid-template-columns:minmax(145px,1fr) 70px 70px 70px;gap:8px;margin-top:8px;font-size:9px;color:#667085;text-transform:uppercase;"><span>Strategy</span><span style="text-align:right;">Candidates</span><span style="text-align:right;">Selected</span><span style="text-align:right;">Rate</span></div>
+        ${routingRows || '<div style="font-size:11px;color:#667085;padding:8px 0;">Routing evidence begins with the next Paper scan.</div>'}
+      </div>`;
+      const experimentCards = (s.profitability_experiment_drafts || []).map(draft => {
+        const ready = ['design_ready', 'review_ready'].includes(draft.state);
+        const evidence = Object.entries(draft.evidence || {}).map(([key, value]) =>
+          `<span style="border:1px solid #263244;border-radius:4px;padding:3px 6px;font-size:9px;color:#9ca3af;">${esc(key.replace(/_/g, ' '))}: <b style="color:var(--text2);">${value == null ? '—' : esc(value)}</b></span>`
+        ).join('');
+        return `<div style="background:#0b0f15;border:1px solid #1e2530;border-left:3px solid ${ready ? '#38bdf8' : '#f59e0b'};border-radius:5px;padding:9px;">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">
+            <div style="font-size:11px;color:var(--text);font-weight:800;">${esc(draft.title || '')}</div>
+            <span style="font-size:9px;color:${ready ? '#38bdf8' : '#f59e0b'};font-weight:800;text-transform:uppercase;">${esc(String(draft.state || '').replace(/_/g, ' '))}</span>
+          </div>
+          <div style="font-size:10px;color:#9ca3af;line-height:1.4;margin-top:5px;">${esc(draft.hypothesis || '')}</div>
+          <div style="font-size:10px;color:#667085;line-height:1.4;margin-top:5px;"><b>Control:</b> ${esc(draft.control || '')}<br><b>Challenger:</b> ${esc(draft.treatment || '')}<br><b>Decision metric:</b> ${esc(draft.primary_metric || '')}</div>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;">${evidence}</div>
+          <div style="font-size:9px;color:#667085;line-height:1.35;margin-top:6px;">Next gate: ${esc(draft.next_gate || '')} · ${esc(draft.authority || 'draft only')}</div>
+        </div>`;
+      }).join('');
+      statsHtml += `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px 12px;margin-bottom:14px;">
+        <div style="font-size:11px;font-weight:800;color:var(--text);letter-spacing:.06em;">PROFITABILITY EXPERIMENT DRAFTS</div>
+        <div style="font-size:10px;color:#667085;line-height:1.4;margin-top:3px;margin-bottom:8px;">Prepared, easy-to-audit contracts. These cards do not change Paper or live behavior; activation still requires the governed experiment path.</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;">${experimentCards}</div>
+      </div>`;
+
       // Flow edge callout
-      if (flowC.count >= 3 && flowU.count >= 3) {
-        const edgeWr  = (flowC.win_rate - flowU.win_rate).toFixed(1);
-        const edgePnl = (flowC.avg_pnl  - flowU.avg_pnl).toFixed(2);
+      if (flowC.count >= 3 && Number(flowCF.count || 0) >= 3) {
+        const edgeWr  = (flowC.win_partial_rate - Number(flowCF.win_partial_rate || 0)).toFixed(1);
+        const edgePnl = (flowC.avg_pnl  - Number(flowCF.avg_pnl_pct || 0)).toFixed(2);
         const positive = parseFloat(edgeWr) > 0;
         statsHtml += `
           <div style="padding:8px 12px;border-radius:5px;border:1px solid ${positive?'#22c55e33':'#ef444433'};
                background:${positive?'#0a1f1266':'#1f0a0a66'};margin-bottom:14px;font-size:12px;color:${positive?'#22c55e':'#ef4444'};">
-            <b>Flow edge:</b> flow-confirmed trades win ${edgeWr >= 0 ? '+' : ''}${edgeWr}% more often
+            <b>Flow-gate counterfactual:</b> flow-confirmed trades finish profitable/partial ${edgeWr >= 0 ? '+' : ''}${edgeWr} points more often
             and average ${edgePnl >= 0 ? '+' : ''}${edgePnl}% more P&L per trade.
-            ${positive ? '✓ Flow confirmation is adding value.' : '✗ No edge detected yet — keep collecting data.'}
+            ${positive ? 'Current evidence favors confirmation.' : 'No benefit detected yet—keep collecting before changing the gate.'}
+            Rejected outcomes are shadow estimates, not simulated fills.
           </div>`;
       }
 
@@ -17102,12 +17152,18 @@ function renderPaperCohortStrip(cohort) {
   const started = cohort.started_at
     ? new Date(String(cohort.started_at).endsWith('Z') ? cohort.started_at : cohort.started_at + 'Z').toLocaleString('en-US', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
     : '—';
-  const active = (cohort.active_strategies || []).map(k => String(k).replace(/_/g, ' ')).join(', ');
+  const scopedKeys = (cohort.strategy_keys || []).length
+    ? cohort.strategy_keys
+    : (cohort.active_strategies || []);
+  const active = scopedKeys.map(k => String(k).replace(/_/g, ' ')).join(', ');
+  const scopeNote = (cohort.strategy_keys || []).length
+    ? `Scoped to ${active}`
+    : `All active strategies: ${active}`;
   return `<div title="Post-change validation cohort. This isolates new paper trades from the older mixed-strategy sample." style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:9px 11px;margin-bottom:10px;">
     <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;">
       <div style="min-width:220px;flex:1;">
         <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;font-weight:800;">${esc(cohort.label || 'Current Cohort')}</div>
-        <div style="font-size:11px;color:#777;margin-top:2px;">Started ${esc(started)} · ${esc(active || 'No active strategies')}</div>
+        <div style="font-size:11px;color:#777;margin-top:2px;">Started ${esc(started)} · ${esc(scopeNote || 'No scoped strategies')} · assigned when entry fills${cohort.scope_inferred_from_legacy_label ? ' · legacy scope repaired' : ''}</div>
       </div>
       <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;font-family:var(--mono);font-size:12px;color:#888;">
         <span><b style="color:${okColor};font-size:16px;">${count}</b><span style="color:#555">/${target}</span> trades</span>
@@ -17131,6 +17187,7 @@ function renderPaperCohortReview(payload) {
     </div>`;
   }
   const r = payload.review || {};
+  const cohortScope = r.scope || {};
   const colorMap = { green:'#22c55e', amber:'#f59e0b', red:'#ef4444', blue:'#60a5fa' };
   const decisionColor = colorMap[r.decision_color] || '#9ca3af';
   const cohort = r.cohort || {};
@@ -17188,6 +17245,7 @@ function renderPaperCohortReview(payload) {
         <div style="font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.08em;font-weight:800;">Current Trial Review</div>
         <div style="font-size:16px;font-weight:850;color:${decisionColor};margin-top:2px;">${esc(r.decision_label || 'Review')}</div>
         <div style="font-size:10px;color:#667085;margin-top:3px;">Assisted-live evidence target: ${Number(r.target_count || 50)} closed trades${Number(r.configured_target_count || 0) < Number(r.target_count || 50) ? ` · the smaller ${Number(r.configured_target_count || 0)}-trade experiment target shows progress only` : ''}</div>
+        <div style="font-size:10px;color:#667085;margin-top:3px;">Attribution: ${esc((cohortScope.strategy_keys || []).length ? cohortScope.strategy_keys.join(', ').replace(/_/g, ' ') : 'all active strategies')} · assigned when entry fills${(cohortScope.policy_fingerprints || []).length ? ' · exact policy locked' : ' · legacy policy identity unavailable'}</div>
       </div>
       <button onclick="loadPaperTrading()" title="Refresh cohort review" style="background:transparent;border:1px solid #263244;color:#9ca3af;border-radius:5px;padding:6px 9px;font-size:11px;cursor:pointer;">Refresh</button>
     </div>
@@ -17285,6 +17343,8 @@ async function startNextPaperCohort() {
       body: JSON.stringify({
         current_cohort_started_at: new Date().toISOString(),
         current_cohort_label: label.trim(),
+        current_cohort_strategy_keys: window._paperActiveStrategyKeys || [],
+        current_cohort_policy_fingerprints: [],
       }),
     });
     const d = await r.json();
