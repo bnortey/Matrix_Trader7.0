@@ -41,6 +41,32 @@ class HermesMetricContractTests(unittest.TestCase):
             1,
         )
 
+    def test_authoritative_snapshot_normalizes_provider_preamble_and_heading(self):
+        memo = inject_authoritative_snapshot(
+            "Here is the Hermes Advisory Memo.\n\n---\n\n"
+            "## Hermes Advisory Group — Memo 2026-07-31\n\nAnalysis.",
+            {"audit": {}},
+        )
+
+        self.assertTrue(memo.startswith("# Hermes Advisory Memo\n\nAnalysis."))
+        self.assertNotIn("Here is the Hermes", memo)
+        self.assertEqual(memo.count("Hermes Advisory Memo"), 1)
+
+    def test_authoritative_snapshot_keeps_linked_sample_label_unambiguous(self):
+        memo = inject_authoritative_snapshot(
+            "# Hermes Advisory Memo\n\nAnalysis.",
+            {
+                "audit": {
+                    "paper": {"closed": 308},
+                    "goal_actuals": {"paper_ev_sample_n": 203},
+                }
+            },
+        )
+
+        snapshot = memo.split("## Authoritative MT7 Snapshot", 1)[1]
+        self.assertIn("30-day linked-signal Paper sample: 203 outcomes.", snapshot)
+        self.assertNotIn("203 outcomes; this is not the all-time", snapshot)
+
     def test_authoritative_snapshot_binds_stale_control_warning(self):
         packet = {
             "audit": {

@@ -5,11 +5,25 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 from typing import Any
 
 
 SNAPSHOT_HEADING = "## Authoritative MT7 Snapshot"
+CANONICAL_HEADING = "# Hermes Advisory Memo"
+
+
+def normalize_memo_heading(memo_text: str) -> str:
+    """Remove provider chatter and give every memo one canonical heading."""
+    marker = re.search(
+        r"(?im)^(?:#{1,6}\s*)?(?:\*\*)?HERMES[^\n]{0,80}\bMEMO\b"
+        r"(?:\*\*)?[^\n]*$",
+        memo_text,
+    )
+    body = memo_text[marker.end():] if marker else memo_text
+    body = re.sub(r"^\s*(?:---\s*)?", "", body, count=1)
+    return CANONICAL_HEADING + "\n\n" + body.strip()
 
 
 def _audit_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
@@ -71,7 +85,7 @@ def build_authoritative_snapshot(packet: dict[str, Any]) -> str:
     if linked_sample is not None:
         lines.append(
             "- 30-day linked-signal Paper sample: "
-            f"{linked_sample} outcomes; this is not the all-time Paper count."
+            f"{linked_sample} outcomes."
         )
 
     current_value = goal_actuals.get("current_value_usd")
@@ -115,6 +129,7 @@ def inject_authoritative_snapshot(
     """Append one idempotent snapshot to generated memo prose."""
     if SNAPSHOT_HEADING in memo_text:
         memo_text = memo_text.split(SNAPSHOT_HEADING, 1)[0].rstrip()
+    memo_text = normalize_memo_heading(memo_text)
     snapshot = build_authoritative_snapshot(packet)
     return memo_text.rstrip() + "\n\n" + snapshot
 
