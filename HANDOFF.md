@@ -7,9 +7,53 @@
 > Update it at the end of every session before deploying.
 
 Last updated: 2026-07-31
-Latest implementation commit: c750997 fix: unblock independent learner strategy lanes
+Latest implementation commit: 6445f7c fix: repair Hermes provider output safely
 app.py: 39,162 lines
 index.html: 19,812 lines
+
+---
+
+## 2026-07-31 — Hermes report generation restored
+
+**Built, tested, and deployed to production and the isolated Hermes host:**
+
+- Restored Hermes `Run Now` after valid zero-trade cohorts began failing with
+  `current cohort progress 0/50 is missing`. The audit packet was correct; the
+  language model sometimes omitted required facts from its prose, causing the
+  fail-closed validator to reject the entire memo.
+- Added a deterministic authoritative snapshot before validation. It binds the
+  all-time Paper count, exact current-cohort progress (including zero), current
+  30-day linked-signal sample, simulated equity/P&L, and any stale learner
+  control values directly from the audit packet. The LLM can no longer omit
+  these critical facts.
+- Normalized provider chatter and edit/diff output to one clean canonical
+  Hermes memo. When a provider returns both an edit preview and a complete
+  advisory, only the final complete report is retained.
+- Replaced the old same-line proximity heuristic for 30-day/all-time samples
+  with label-aware validation. Correct comparisons pass; genuine mislabels
+  still fail. Known `paper_ev_sample_n` model misbindings are deterministically
+  replaced with the packet-authoritative label and count before the remaining
+  fail-closed checks run.
+- Preserved all safety and authority boundaries. No Paper history, cohort,
+  strategy setting, learner evaluation, risk control, or live-trading setting
+  was changed.
+
+**Verification:**
+
+- Full local suite: `130/130` tests passed. Python compilation, shell syntax,
+  and `git diff --check` passed.
+- The exact production dashboard route (`POST /api/intelligence/hermes/run`)
+  completed with `status=done` at 2026-07-31T16:53:41Z.
+- The refreshed MT7 API exposes a new 14,877-character memo generated at
+  2026-07-31T16:53:30Z from `old-vps-hermes-cli`. It starts with the canonical
+  heading, contains authoritative cohort progress `0/50`, binds the current
+  30-day linked-signal count `202` separately from all-time Paper `308`, and
+  contains no provider preamble, diff artifact, or false all-time binding.
+- The live isolated entrypoint is `/opt/mt7-hermes/run_consultancy.sh`; the
+  repository source is `scripts/run_hermes_consultancy.sh`. Both it and the
+  integrity helper passed remote syntax/compile checks. Backups are under
+  `/opt/mt7-hermes/backups/20260731T163000Z-zero-cohort-validator` and
+  `/opt/mt7-hermes/backups/20260731T163300Z-memo-normalization`.
 
 ---
 
