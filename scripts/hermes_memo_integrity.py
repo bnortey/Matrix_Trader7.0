@@ -16,11 +16,14 @@ CANONICAL_HEADING = "# Hermes Advisory Memo"
 
 def normalize_memo_heading(memo_text: str) -> str:
     """Remove provider chatter and give every memo one canonical heading."""
-    marker = re.search(
+    markers = list(re.finditer(
         r"(?im)^(?:#{1,6}\s*)?(?:\*\*)?HERMES[^\n]{0,80}\bMEMO\b"
+        r"(?:\*\*)?[^\n]*$|"
+        r"^(?:#{1,6}\s*)?(?:\*\*)?MT7\s+HERMES[^\n]{0,80}\bMEMO\b"
         r"(?:\*\*)?[^\n]*$",
         memo_text,
-    )
+    ))
+    marker = markers[-1] if markers else None
     body = memo_text[marker.end():] if marker else memo_text
     body = re.sub(r"^\s*(?:---\s*)?", "", body, count=1)
     return CANONICAL_HEADING + "\n\n" + body.strip()
@@ -67,6 +70,48 @@ def has_linked_sample_mislabel(
         ):
             return True
     return False
+
+
+def repair_authoritative_references(
+    memo_text: str,
+    packet: dict[str, Any],
+) -> str:
+    """Repair known packet-field bindings before fail-closed validation."""
+    audit = _audit_from_packet(packet)
+    paper = audit.get("paper") if isinstance(audit.get("paper"), dict) else {}
+    goal_actuals = (
+        audit.get("goal_actuals")
+        if isinstance(audit.get("goal_actuals"), dict)
+        else {}
+    )
+    paper_closed = paper.get("closed")
+    linked_sample = goal_actuals.get("paper_ev_sample_n")
+    if linked_sample is None:
+        return memo_text
+
+    corrected = re.sub(
+        r"(paper_ev_sample_n\s*=\s*)[\d,]+",
+        lambda match: match.group(1) + str(linked_sample),
+        memo_text,
+        flags=re.IGNORECASE,
+    )
+    corrected = re.sub(
+        r"(30[- ]day\s+linked[- ]signal\s+Paper\s+sample\s*"
+        r"\(n\s*=\s*)[\d,]+",
+        lambda match: match.group(1) + str(linked_sample),
+        corrected,
+        flags=re.IGNORECASE,
+    )
+    lines = []
+    for line in corrected.splitlines():
+        if has_linked_sample_mislabel(line, linked_sample, paper_closed):
+            line = (
+                f"**30-day linked-signal Paper sample (n={linked_sample}):** "
+                "This bounded window is separate from the "
+                f"{paper_closed}-trade all-time Paper record."
+            )
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _audit_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
@@ -173,6 +218,7 @@ def inject_authoritative_snapshot(
     if SNAPSHOT_HEADING in memo_text:
         memo_text = memo_text.split(SNAPSHOT_HEADING, 1)[0].rstrip()
     memo_text = normalize_memo_heading(memo_text)
+    memo_text = repair_authoritative_references(memo_text, packet)
     snapshot = build_authoritative_snapshot(packet)
     return memo_text.rstrip() + "\n\n" + snapshot
 

@@ -55,6 +55,18 @@ class HermesMetricContractTests(unittest.TestCase):
         self.assertNotIn("Here is the Hermes", memo)
         self.assertEqual(memo.count("Hermes Advisory Memo"), 1)
 
+    def test_authoritative_snapshot_extracts_last_complete_provider_memo(self):
+        memo = inject_authoritative_snapshot(
+            "┊ review diff\n-# Hermes Advisory Memo — old\n-old text\n"
+            "The memo has been written. Here is the complete advisory:\n\n"
+            "# MT7 Hermes Advisory Memo — 2026-07-31\n\nFinal report.",
+            {"audit": {}},
+        )
+
+        self.assertTrue(memo.startswith("# Hermes Advisory Memo\n\nFinal report."))
+        self.assertNotIn("review diff", memo)
+        self.assertNotIn("old text", memo)
+
     def test_authoritative_snapshot_keeps_linked_sample_label_unambiguous(self):
         memo = inject_authoritative_snapshot(
             "# Hermes Advisory Memo\n\nAnalysis.",
@@ -85,6 +97,26 @@ class HermesMetricContractTests(unittest.TestCase):
                 308,
             )
         )
+
+    def test_authoritative_snapshot_repairs_linked_sample_model_mislabel(self):
+        memo = inject_authoritative_snapshot(
+            "# Hermes Advisory Memo\n\n"
+            "**All-time Paper EV** (paper_ev_sample_n = 54): historical average.\n"
+            "Do not substitute the 30-day linked-signal Paper sample (n=54).",
+            {
+                "audit": {
+                    "paper": {"closed": 308},
+                    "goal_actuals": {"paper_ev_sample_n": 203},
+                }
+            },
+        )
+
+        self.assertIn("30-day linked-signal Paper sample (n=203)", memo)
+        self.assertIn("308-trade all-time Paper record", memo)
+        self.assertNotIn("All-time Paper EV", memo)
+        self.assertNotIn("paper_ev_sample_n = 54", memo)
+        self.assertNotIn("linked-signal Paper sample (n=54)", memo)
+        self.assertFalse(has_linked_sample_mislabel(memo, 203, 308))
 
     def test_authoritative_snapshot_binds_stale_control_warning(self):
         packet = {
