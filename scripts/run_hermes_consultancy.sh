@@ -402,6 +402,9 @@ import sys
 
 memo_path = pathlib.Path(sys.argv[1])
 packet_path = pathlib.Path(sys.argv[2])
+sys.path.insert(0, str(memo_path.parent.parent))
+from hermes_memo_integrity import has_linked_sample_mislabel
+
 memo = memo_path.read_text(errors="replace")
 semantic_text = re.sub(r"[*`]", "", memo)
 packet_raw = json.loads(packet_path.read_text(errors="replace"))
@@ -428,33 +431,8 @@ if isinstance(paper_closed, int):
         errors.append(f"all-time Paper count {paper_closed} is missing or mislabeled")
 
 linked_sample = goal_actuals.get("paper_ev_sample_n")
-if linked_sample is not None and linked_sample != paper_closed:
-    linked_mislabeled = False
-    for line in semantic_text.splitlines():
-        if not re.search(rf"\b{linked_sample}\b", line):
-            continue
-        if not re.search(r"all[- ]time", line, re.IGNORECASE):
-            continue
-        explicit_distinction = re.search(
-            r"(?:not|never|separate|distinct|must not be confused)[^\n]{0,80}"
-            r"all[- ]time",
-            line,
-            re.IGNORECASE,
-        )
-        correct_all_time_binding = (
-            isinstance(paper_closed, int)
-            and re.search(
-                rf"(?:all[- ]time[^\n]{{0,80}}\b{paper_closed}\b|"
-                rf"\b{paper_closed}\b[^\n]{{0,80}}all[- ]time)",
-                line,
-                re.IGNORECASE,
-            )
-        )
-        if not explicit_distinction and not correct_all_time_binding:
-            linked_mislabeled = True
-            break
-    if linked_mislabeled:
-        errors.append(f"30-day linked sample {linked_sample} was mislabeled as all-time Paper")
+if has_linked_sample_mislabel(semantic_text, linked_sample, paper_closed):
+    errors.append(f"30-day linked sample {linked_sample} was mislabeled as all-time Paper")
 
 if re.search(r"paper\.closed[^\n]{0,80}(?:not (?:explicitly )?present|missing|unavailable)", semantic_text, re.IGNORECASE):
     errors.append("memo falsely claims paper.closed is absent")

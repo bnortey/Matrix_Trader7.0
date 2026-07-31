@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import app as mt7
-from scripts.hermes_memo_integrity import inject_authoritative_snapshot
+from scripts.hermes_memo_integrity import (
+    has_linked_sample_mislabel,
+    inject_authoritative_snapshot,
+)
 
 
 class HermesMetricContractTests(unittest.TestCase):
@@ -66,6 +69,22 @@ class HermesMetricContractTests(unittest.TestCase):
         snapshot = memo.split("## Authoritative MT7 Snapshot", 1)[1]
         self.assertIn("30-day linked-signal Paper sample: 203 outcomes.", snapshot)
         self.assertNotIn("203 outcomes; this is not the all-time", snapshot)
+
+    def test_linked_sample_validator_allows_a_correct_all_time_comparison(self):
+        line = (
+            "30-day linked-signal Paper sample (n=203): EV is lower but "
+            "directionally consistent with the all-time figure."
+        )
+        self.assertFalse(has_linked_sample_mislabel(line, 203, 308))
+
+    def test_linked_sample_validator_rejects_an_all_time_mislabel(self):
+        self.assertTrue(
+            has_linked_sample_mislabel(
+                "All-time Paper sample: 203 closed trades.",
+                203,
+                308,
+            )
+        )
 
     def test_authoritative_snapshot_binds_stale_control_warning(self):
         packet = {

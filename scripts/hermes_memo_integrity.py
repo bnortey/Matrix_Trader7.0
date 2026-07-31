@@ -26,6 +26,49 @@ def normalize_memo_heading(memo_text: str) -> str:
     return CANONICAL_HEADING + "\n\n" + body.strip()
 
 
+def has_linked_sample_mislabel(
+    semantic_text: str,
+    linked_sample: Any,
+    paper_closed: Any,
+) -> bool:
+    """Detect a positive all-time binding without rejecting comparisons."""
+    if linked_sample is None or linked_sample == paper_closed:
+        return False
+    for line in semantic_text.splitlines():
+        if not re.search(rf"\b{re.escape(str(linked_sample))}\b", line):
+            continue
+        if not re.search(r"all[- ]time", line, re.IGNORECASE):
+            continue
+        correct_linked_binding = re.search(
+            rf"30[- ]day[^\n]{{0,100}}\b{re.escape(str(linked_sample))}\b",
+            line,
+            re.IGNORECASE,
+        )
+        explicit_distinction = re.search(
+            r"(?:not|never|separate|distinct|must not be confused)[^\n]{0,80}"
+            r"all[- ]time",
+            line,
+            re.IGNORECASE,
+        )
+        correct_all_time_binding = (
+            isinstance(paper_closed, int)
+            and not isinstance(paper_closed, bool)
+            and re.search(
+                rf"(?:all[- ]time[^\n]{{0,80}}\b{paper_closed}\b|"
+                rf"\b{paper_closed}\b[^\n]{{0,80}}all[- ]time)",
+                line,
+                re.IGNORECASE,
+            )
+        )
+        if not (
+            correct_linked_binding
+            or explicit_distinction
+            or correct_all_time_binding
+        ):
+            return True
+    return False
+
+
 def _audit_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     audit = packet.get("audit")
     return audit if isinstance(audit, dict) else packet
