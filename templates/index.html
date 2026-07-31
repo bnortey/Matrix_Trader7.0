@@ -17523,14 +17523,16 @@ function fmtUsdSigned(v) {
 }
 
 function paperEquityCurve(curve) {
-  const pnls = curve.map(p => p.cumulative_pnl);
+  const pnls = curve.map(p => Number(
+    p.cumulative_pnl_usd != null ? p.cumulative_pnl_usd : p.cumulative_pnl
+  ));
   const min  = Math.min(0, ...pnls);
   const max  = Math.max(0, ...pnls);
   const range = max - min || 1;
   const W = 600, H = 80;
-  const pts = curve.map((p, i) => {
+  const pts = pnls.map((pnl, i) => {
     const x = (i / (curve.length - 1)) * W;
-    const y = H - ((p.cumulative_pnl - min) / range) * H;
+    const y = H - ((pnl - min) / range) * H;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
   const zeroY = (H - ((0 - min) / range) * H).toFixed(1);
@@ -17538,8 +17540,8 @@ function paperEquityCurve(curve) {
   const lineColor = finalPnl >= 0 ? '#22c55e' : '#ef4444';
   return `<div style="background:#0d1117;border:1px solid #1e2530;border-radius:6px;padding:10px;margin-bottom:14px;">
     <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#555;margin-bottom:6px;">
-      PAPER EQUITY CURVE
-      <span style="color:${lineColor};margin-left:8px">${fmtPct(finalPnl)} cumulative</span>
+      PAPER NET P&amp;L CURVE
+      <span style="color:${lineColor};margin-left:8px">${fmtUsdSigned(finalPnl)} cumulative</span>
     </div>
     <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:80px;display:block;">
       <line x1="0" y1="${zeroY}" x2="${W}" y2="${zeroY}" stroke="#1e2530" stroke-width="1"/>

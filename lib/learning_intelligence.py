@@ -126,7 +126,10 @@ def cohort_metrics(rows: list[dict]) -> dict:
     net_pnl_usd = 0.0
     for row, pnl in zip(usable, pnls):
         size_usd = float(row.get("size_usd") or 0.0)
-        net_pnl_usd += size_usd * pnl / 100.0
+        leverage = max(1.0, float(row.get("leverage") or 1.0))
+        # MT7 stores leveraged return-on-margin percentages but size_usd is
+        # position notional. Divide by leverage before converting to dollars.
+        net_pnl_usd += size_usd * pnl / 100.0 / leverage
         equity *= max(0.0, 1.0 + pnl / 100.0)
         peak = max(peak, equity)
         if peak > 0:

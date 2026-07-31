@@ -565,6 +565,24 @@ PAPER_READINESS_MAX_COHORT_DRAWDOWN_PCT = 20.0
 PAPER_SIZING_MODES = {"fixed", "compound_realized"}
 
 
+def _paper_notional_pnl_usd(
+    size_usd: float | None,
+    pnl_pct: float | None,
+    leverage: float | None,
+) -> float:
+    """Convert leveraged return-on-margin percent to notional-dollar P&L."""
+    lev = max(1.0, float(leverage or 1.0))
+    return float(size_usd or 0.0) * float(pnl_pct or 0.0) / 100.0 / lev
+
+
+def _paper_trade_pnl_usd(trade: dict, pnl_field: str = "pnl_pct") -> float:
+    return _paper_notional_pnl_usd(
+        trade.get("size_usd"),
+        trade.get(pnl_field),
+        trade.get("leverage"),
+    )
+
+
 def _load_goals() -> dict:
     try:
         with open(GOALS_PATH, encoding="utf-8") as f:
@@ -604,7 +622,8 @@ def _paper_equity_metrics(rows, starting_balance: float) -> dict:
         size_usd = float(row[0] or 0.0)
         pnl_pct = float(row[1] or 0.0)
         closed_at = row[2] if len(row) > 2 else None
-        balance += size_usd * pnl_pct / 100.0
+        leverage = row[3] if len(row) > 3 else 1.0
+        balance += _paper_notional_pnl_usd(size_usd, pnl_pct, leverage)
 
         if balance > peak:
             peak = balance
@@ -642,8 +661,15 @@ def _paper_closed_equity_rows() -> list[tuple] | None:
     con = None
     try:
         con = sqlite3.connect(DB_PATH)
+        cols = {
+            row[1] for row in con.execute(
+                "PRAGMA table_info(paper_trades)"
+            ).fetchall()
+        }
+        leverage_expr = "leverage" if "leverage" in cols else "1"
         return con.execute(
-            "SELECT size_usd, pnl_pct, closed_at FROM paper_trades "
+            f"SELECT size_usd, pnl_pct, closed_at, {leverage_expr} "
+            "FROM paper_trades "
             "WHERE status='closed' AND pnl_pct IS NOT NULL "
             "ORDER BY closed_at ASC, id ASC"
         ).fetchall()
@@ -800,12 +826,7 @@ def _paper_evidence_stats(
     """Return chronological, net, outlier-resistant paper evidence."""
     valid = [trade for trade in trades if trade.get("pnl_pct") is not None]
     pnls = [float(trade.get("pnl_pct") or 0.0) for trade in valid]
-    pnl_usd = [
-        float(trade.get("size_usd") or 0.0)
-        * float(trade.get("pnl_pct") or 0.0)
-        / 100.0
-        for trade in valid
-    ]
+    pnl_usd = [_paper_trade_pnl_usd(trade) for trade in valid]
     wins = sum(
         1 for trade in valid
         if str(trade.get("result") or "").upper() in {"WIN", "TP3"}
@@ -863,12 +884,7 @@ def _paper_evidence_stats(
             float(trade.get("pnl_pct") or 0.0)
             for trade in window_trades
         ]
-        window_usd = [
-            float(trade.get("size_usd") or 0.0)
-            * float(trade.get("pnl_pct") or 0.0)
-            / 100.0
-            for trade in window_trades
-        ]
+        window_usd = [_paper_trade_pnl_usd(trade) for trade in window_trades]
         window_wp = sum(
             1 for trade in window_trades
             if str(trade.get("result") or "").upper()
@@ -943,6 +959,7 @@ def _paper_scale_stats(rows, starting_balance: float = 200.0) -> dict:
             "size_usd": row[1],
             "pnl_pct": row[2],
             "closed_at": row[3] if len(row) > 3 else None,
+            "leverage": row[4] if len(row) > 4 else 1.0,
         }
         for row in rows
     ]
@@ -1094,7 +1111,7 @@ def _compute_goal_actuals(goals: dict) -> dict:
         con.row_factory = sqlite3.Row
 
         rows = con.execute(
-            "SELECT size_usd, pnl_pct, closed_at FROM paper_trades "
+            "SELECT size_usd, pnl_pct, closed_at, leverage FROM paper_trades "
             "WHERE status='closed' AND pnl_pct IS NOT NULL "
             "ORDER BY closed_at ASC, id ASC"
         ).fetchall()
@@ -1105,11 +1122,14 @@ def _compute_goal_actuals(goals: dict) -> dict:
         drawdown_pct = float(equity.get("max_drawdown_pct") or 0.0)
 
         month_rows = con.execute(
-            "SELECT size_usd, pnl_pct FROM paper_trades "
+            "SELECT size_usd, pnl_pct, leverage FROM paper_trades "
             "WHERE status='closed' AND closed_at >= ? AND pnl_pct IS NOT NULL",
             (month_start,),
         ).fetchall()
-        month_pnl_usd = sum((r[0] or 0) * (r[1] or 0) / 100 for r in month_rows)
+        month_pnl_usd = sum(
+            _paper_notional_pnl_usd(r[0], r[1], r[2])
+            for r in month_rows
+        )
         monthly_return_pct = round((month_pnl_usd / account_balance) * 100, 2) if account_balance else 0
 
         ev_rows = con.execute(
@@ -1158,6 +1178,7 @@ def _compute_goal_actuals(goals: dict) -> dict:
             dict(row) for row in con.execute(
                 "SELECT result, size_usd, pnl_pct, closed_at, strategy_key, "
                 "queued_at, filled_at, opened_at, learning_policy_fingerprint "
+                ", leverage "
                 "FROM paper_trades WHERE status='closed' AND result IS NOT NULL "
                 "AND pnl_pct IS NOT NULL ORDER BY closed_at ASC, id ASC"
             ).fetchall()
@@ -1168,6 +1189,7 @@ def _compute_goal_actuals(goals: dict) -> dict:
                 row.get("size_usd"),
                 row.get("pnl_pct"),
                 row.get("closed_at"),
+                row.get("leverage"),
             )
             for row in cohort_candidates
             if _paper_trade_in_cohort(row, cohort_scope)
@@ -7054,10 +7076,12 @@ def _research_experiment_assignment_rows(
     rows = [
         dict(row) for row in con.execute(
             """SELECT a.*, COALESCE(p.size_usd, 100.0) AS size_usd,
+                      COALESCE(p.leverage, s.leverage, 1.0) AS leverage,
                       COALESCE(p.funding_complete, 0) AS funding_complete,
                       COALESCE(p.execution_cost_complete, 0) AS execution_cost_complete
                FROM learning_experiment_assignments a
                LEFT JOIN paper_trades p ON p.id=a.paper_trade_id
+               LEFT JOIN signals s ON s.id=a.signal_id
                WHERE a.experiment_id=?
                ORDER BY a.assigned_at ASC, a.id ASC""",
             (experiment["experiment_id"],),
@@ -7977,7 +8001,7 @@ def _learning_experiment_rows(
 ) -> tuple[list[dict], list[dict]]:
     treatment = [
         dict(row) for row in con.execute(
-            """SELECT result, pnl_pct, size_usd, closed_at,
+            """SELECT result, pnl_pct, size_usd, leverage, closed_at,
                       funding_complete, execution_cost_complete
                FROM paper_trades
                WHERE learning_experiment_id=?
@@ -7999,7 +8023,7 @@ def _learning_experiment_rows(
     )
     control = [
         dict(row) for row in con.execute(
-            """SELECT result, pnl_pct, size_usd, closed_at,
+            """SELECT result, pnl_pct, size_usd, leverage, closed_at,
                       funding_complete, execution_cost_complete
                FROM paper_trades
                WHERE strategy_key=?
@@ -21512,7 +21536,7 @@ def _hermes_metric_provenance() -> dict:
             "source": "paper_trades",
             "window": "all closed paper trades ordered by closed_at",
             "unit": "USD",
-            "method": "starting account balance plus dollar P&L from size_usd * pnl_pct",
+            "method": "starting account balance plus notional-dollar P&L from size_usd * leveraged pnl_pct / leverage",
         },
         "goal_actuals.drawdown_pct": {
             "source": "paper_trades",
@@ -22004,11 +22028,8 @@ def _hermes_paper_stats(rows) -> dict:
         if row.get("pnl_pct") is not None
     ]
     pnl_usd = [
-        float(row.get("size_usd") or 0.0)
-        * float(row.get("pnl_pct") or 0.0)
-        / 100.0
-        for row in items
-        if row.get("pnl_pct") is not None
+        _paper_trade_pnl_usd(row)
+        for row in items if row.get("pnl_pct") is not None
     ]
     gross_pnls = [
         float(
@@ -22020,12 +22041,12 @@ def _hermes_paper_stats(rows) -> dict:
         if row.get("pnl_pct") is not None
     ]
     costs_usd = [
-        float(row.get("size_usd") or 0.0)
-        * (
+        _paper_notional_pnl_usd(
+            row.get("size_usd"),
             float(row.get("fee_cost_pct") or 0.0)
-            + float(row.get("slippage_cost_pct") or 0.0)
+            + float(row.get("slippage_cost_pct") or 0.0),
+            row.get("leverage"),
         )
-        / 100.0
         for row in items
         if row.get("pnl_pct") is not None
     ]
@@ -22112,7 +22133,8 @@ def _hermes_paper_stats(rows) -> dict:
         "worst_trades": worst,
         "sample_warning": "low sample" if len(items) < 50 else None,
         "metric_note": (
-            "Paper is simulated execution. USD fields use size_usd * pnl_pct; "
+            "Paper is simulated execution. USD fields convert leveraged return "
+            "back to notional dollars with size_usd * pnl_pct / leverage; "
             "percentage totals must not be added to simulated account equity."
         ),
     }
@@ -22141,6 +22163,7 @@ def _hermes_paper_audit(con: sqlite3.Connection) -> dict:
                {_expr('trend_score')},
                status,
                size_usd,
+               {_expr('leverage', '1')},
                {_expr('closed_at')},
                {_expr('queued_at')},
                {_expr('filled_at')},
@@ -22169,11 +22192,16 @@ def _hermes_paper_audit(con: sqlite3.Connection) -> dict:
         str(row["status"] or "unknown"): int(row["n"] or 0)
         for row in status_rows
     }
-    symbol_rows = con.execute("""
+    leverage_divisor = (
+        "COALESCE(NULLIF(leverage, 0), 1)"
+        if "leverage" in cols else "1"
+    )
+    symbol_rows = con.execute(f"""
         SELECT symbol,
                COUNT(*) AS n,
                ROUND(AVG(pnl_pct), 2) AS ev_per_trade_pct,
-               ROUND(SUM(size_usd * pnl_pct / 100.0), 2) AS total_pnl_usd,
+               ROUND(SUM(size_usd * pnl_pct / 100.0 /
+                   {leverage_divisor}), 2) AS total_pnl_usd,
                'paper_simulated' AS source_lane,
                'USD' AS total_unit
         FROM paper_trades
@@ -22191,7 +22219,7 @@ def _hermes_paper_audit(con: sqlite3.Connection) -> dict:
             "source_lane": "paper_trades",
             "execution_semantics": "simulated fills only; not brokerage account P&L",
             "percent_unit": "leveraged pnl_pct",
-            "dollar_method": "size_usd * pnl_pct / 100",
+            "dollar_method": "notional size_usd * leveraged pnl_pct / 100 / leverage",
         },
         "current_policy_cohort": {
             **cohort_scope,
@@ -23283,7 +23311,7 @@ def _hypothesis_stats(rows: list[dict]) -> dict:
             except Exception:
                 pass
         if r.get("size_usd") is not None:
-            pnl_usd.append(float(r.get("size_usd") or 0.0) * float(r.get("pnl_pct") or 0.0) / 100.0)
+            pnl_usd.append(_paper_trade_pnl_usd(r))
     pf_basis = pnl_usd if pnl_usd else pnls
     gains = [x for x in pf_basis if x > 0]
     losses = [abs(x) for x in pf_basis if x < 0]
@@ -23378,7 +23406,8 @@ def _suggestion_shadow_rows(con: sqlite3.Connection, since: str | None = None) -
         paper_params.append(str(since))
     paper_rows = [dict(r) for r in con.execute(f"""
         SELECT pt.id, pt.symbol, pt.strategy_key, pt.direction, pt.result,
-               pt.pnl_pct, {paper_pnl_usd_expr} as pnl_usd, {paper_size_expr} as size_usd,
+               pt.pnl_pct, {paper_pnl_usd_expr} as pnl_usd,
+               {paper_size_expr} as size_usd, COALESCE(pt.leverage, 1) as leverage,
                pt.conviction, {paper_flow_expr} as flow_confirmed,
                COALESCE(pt.closed_at, pt.opened_at, pt.queued_at) as ts,
                json_extract(s.signal_json, '$.agent_regime') as agent_regime,
@@ -23608,7 +23637,8 @@ def api_intelligence_hypotheses():
             paper_params.append(str(since))
         paper_rows = [dict(r) for r in con.execute(f"""
             SELECT pt.id, pt.symbol, pt.strategy_key, pt.direction, pt.result,
-                   pt.pnl_pct, {paper_pnl_usd_expr} as pnl_usd, {paper_size_expr} as size_usd,
+                   pt.pnl_pct, {paper_pnl_usd_expr} as pnl_usd,
+                   {paper_size_expr} as size_usd, COALESCE(pt.leverage, 1) as leverage,
                    {paper_flow_expr} as flow_confirmed,
                    COALESCE(pt.closed_at, pt.opened_at, pt.queued_at) as ts,
                    json_extract(s.signal_json, '$.agent_regime') as agent_regime
@@ -31331,14 +31361,14 @@ def _build_daily_data(
         for p in closed_paper if p.get("slippage_cost_pct") is not None
     ]
     realized_pnl_usd = sum(
-        _report_float(p.get("size_usd")) * _report_float(p.get("pnl_pct")) / 100
+        _paper_trade_pnl_usd(p)
         for p in closed_paper if p.get("pnl_pct") is not None
     )
     curve = 0.0
     peak = 0.0
     max_drawdown_usd = 0.0
     for p in sorted(closed_paper, key=lambda x: str(x.get("closed_at") or x.get("opened_at") or "")):
-        curve += _report_float(p.get("size_usd")) * _report_float(p.get("pnl_pct")) / 100
+        curve += _paper_trade_pnl_usd(p)
         peak = max(peak, curve)
         max_drawdown_usd = max(max_drawdown_usd, peak - curve)
     paper_desk = {
@@ -33370,7 +33400,10 @@ def _paper_funding_adjustment(
         size_usd = float(pt.get("size_usd") or 0.0)
         return {
             "pnl_pct": pnl_pct,
-            "pnl_usd": round(size_usd * pnl_pct / 100.0, 6),
+            "pnl_usd": round(
+                _paper_notional_pnl_usd(size_usd, pnl_pct, leverage),
+                6,
+            ),
             "settlement_count": len(rates),
             "complete": True,
             "source": "mexc_funding_history",
@@ -33412,6 +33445,7 @@ def _paper_backfill_funding(limit: int = 500) -> dict:
 
     updated = 0
     incomplete = 0
+    unit_repairs = 0
     errors: list[dict] = []
     for pt in rows:
         funding = _paper_funding_adjustment(
@@ -33486,11 +33520,52 @@ def _paper_backfill_funding(limit: int = 500) -> dict:
         con.commit()
         con.close()
         updated += 1
+    # Repair rows written by the earlier ambiguous unit convention. This is
+    # idempotent and does not change leveraged pnl_pct.
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    funding_rows = [dict(row) for row in con.execute("""
+        SELECT id, signal_id, size_usd, leverage, funding_pnl_pct,
+               funding_pnl_usd
+        FROM paper_trades
+        WHERE funding_complete=1 AND funding_pnl_pct IS NOT NULL
+    """).fetchall()]
+    for row in funding_rows:
+        expected = round(
+            _paper_notional_pnl_usd(
+                row.get("size_usd"),
+                row.get("funding_pnl_pct"),
+                row.get("leverage"),
+            ),
+            6,
+        )
+        if abs(expected - float(row.get("funding_pnl_usd") or 0.0)) < 0.000001:
+            continue
+        con.execute(
+            "UPDATE paper_trades SET funding_pnl_usd=? WHERE id=?",
+            (expected, row["id"]),
+        )
+        if row.get("signal_id"):
+            signal_row = con.execute(
+                "SELECT signal_json FROM signals WHERE id=? AND source='paper'",
+                (row["signal_id"],),
+            ).fetchone()
+            if signal_row:
+                signal_json = _learning_json(signal_row[0], {})
+                signal_json["funding_pnl_usd"] = expected
+                con.execute(
+                    "UPDATE signals SET signal_json=? WHERE id=? AND source='paper'",
+                    (json.dumps(signal_json, default=str), row["signal_id"]),
+                )
+        unit_repairs += 1
+    con.commit()
+    con.close()
     return {
         "success": True,
         "examined": len(rows),
         "updated": updated,
         "incomplete": incomplete,
+        "funding_usd_unit_repairs": unit_repairs,
         "errors": errors[:25],
         "remaining": max(0, len(rows) - updated),
         "behavior_changed": False,
@@ -33888,7 +33963,7 @@ def _paper_safety_controls(cfg: dict) -> dict:
 
         # 2. Drawdown risk reduction
         pnl_rows = con.execute(
-            "SELECT size_usd, pnl_pct, closed_at FROM paper_trades "
+            "SELECT size_usd, pnl_pct, closed_at, leverage FROM paper_trades "
             "WHERE status='closed' AND pnl_pct IS NOT NULL "
             "ORDER BY closed_at ASC, id ASC"
         ).fetchall()
@@ -34660,14 +34735,29 @@ def api_paper_trades():
             live_px = live_prices.get(str(t.get("symbol") or "").upper())
             if live_px:
                 t["current_px"] = live_px
-            size = float(t.get("size_usd") or 0.0)
             pnl = t.get("pnl_pct")
             gross = t.get("gross_pnl_pct")
             fee = float(t.get("fee_cost_pct") or 0.0)
             slip = float(t.get("slippage_cost_pct") or 0.0)
-            t["pnl_usd"] = round(size * float(pnl) / 100.0, 2) if pnl is not None else None
-            t["gross_pnl_usd"] = round(size * float(gross) / 100.0, 2) if gross is not None else None
-            t["cost_usd"] = round(size * (fee + slip) / 100.0, 2) if pnl is not None else None
+            t["pnl_usd"] = (
+                round(_paper_trade_pnl_usd(t), 2)
+                if pnl is not None else None
+            )
+            t["gross_pnl_usd"] = (
+                round(_paper_trade_pnl_usd(t, "gross_pnl_pct"), 2)
+                if gross is not None else None
+            )
+            t["cost_usd"] = (
+                round(
+                    _paper_notional_pnl_usd(
+                        t.get("size_usd"),
+                        fee + slip,
+                        t.get("leverage"),
+                    ),
+                    2,
+                )
+                if pnl is not None else None
+            )
             if not t.get("liquidation_px") and t.get("entry_px"):
                 liq = _liquidation_summary_for_position(
                     exchange=t.get("exchange") or "MEXC",
@@ -35439,6 +35529,7 @@ def _paper_sizing_integrity_payload(lookback_days: int = 60, con: sqlite3.Connec
         hist_expr = "symbol_history_count" if "symbol_history_count" in cols else "NULL"
         rows = [dict(r) for r in db.execute(f"""
             SELECT id, symbol, strategy_key, direction, result, pnl_pct, size_usd,
+                   COALESCE(leverage, 1) AS leverage,
                    {raw_expr} AS raw_size_usd,
                    {cap_expr} AS notional_cap_usd,
                    {cap_reason_expr} AS notional_cap_reason,
@@ -35458,10 +35549,7 @@ def _paper_sizing_integrity_payload(lookback_days: int = 60, con: sqlite3.Connec
 
     def _stats(items: list[dict]) -> dict:
         pnls = [float(x.get("pnl_pct") or 0.0) for x in items]
-        pnl_usd = [
-            float(x.get("size_usd") or 0.0) * float(x.get("pnl_pct") or 0.0) / 100.0
-            for x in items
-        ]
+        pnl_usd = [_paper_trade_pnl_usd(x) for x in items]
         wins = [x for x in items if str(x.get("result") or "").upper() in {"WIN", "PARTIAL", "TP3"} and float(x.get("pnl_pct") or 0.0) > 0]
         losses = [x for x in items if str(x.get("result") or "").upper() == "LOSS" or float(x.get("pnl_pct") or 0.0) < 0]
         win_sizes = [float(x.get("size_usd") or 0.0) for x in wins]
@@ -36191,9 +36279,8 @@ def api_paper_stats():
             partials = [t for t in trades if t.get("result") == "PARTIAL"]
             pnls  = [t["pnl_pct"] for t in trades if t.get("pnl_pct") is not None]
             pnl_usd = [
-                float(t.get("size_usd") or 0.0) * float(t.get("pnl_pct") or 0.0) / 100.0
-                for t in trades
-                if t.get("pnl_pct") is not None
+                _paper_trade_pnl_usd(t)
+                for t in trades if t.get("pnl_pct") is not None
             ]
             gross = [
                 t["gross_pnl_pct"] if t.get("gross_pnl_pct") is not None else t.get("pnl_pct")
@@ -36201,9 +36288,13 @@ def api_paper_stats():
                 if t.get("gross_pnl_pct") is not None or t.get("pnl_pct") is not None
             ]
             gross_usd = [
-                float(t.get("size_usd") or 0.0)
-                * float((t.get("gross_pnl_pct") if t.get("gross_pnl_pct") is not None else t.get("pnl_pct")) or 0.0)
-                / 100.0
+                _paper_notional_pnl_usd(
+                    t.get("size_usd"),
+                    t.get("gross_pnl_pct")
+                    if t.get("gross_pnl_pct") is not None
+                    else t.get("pnl_pct"),
+                    t.get("leverage"),
+                )
                 for t in trades
                 if t.get("gross_pnl_pct") is not None or t.get("pnl_pct") is not None
             ]
@@ -36213,9 +36304,12 @@ def api_paper_stats():
                 if t.get("pnl_pct") is not None
             ]
             cost_usd = [
-                float(t.get("size_usd") or 0.0)
-                * (float(t.get("fee_cost_pct") or 0.0) + float(t.get("slippage_cost_pct") or 0.0))
-                / 100.0
+                _paper_notional_pnl_usd(
+                    t.get("size_usd"),
+                    float(t.get("fee_cost_pct") or 0.0)
+                    + float(t.get("slippage_cost_pct") or 0.0),
+                    t.get("leverage"),
+                )
                 for t in trades
                 if t.get("pnl_pct") is not None
             ]
@@ -36366,14 +36460,25 @@ def api_paper_stats():
         confirmed   = [t for t in closed if t.get("flow_confirmed")]
         unconfirmed = [t for t in closed if not t.get("flow_confirmed")]
 
-        # Equity curve: cumulative P&L over closed trades sorted by closed_at
+        # Keep the legacy cumulative percentage-points field for API
+        # compatibility, but expose the size/leverage-aware dollar curve that
+        # the dashboard uses as its truthful portfolio path.
         sorted_closed = sorted(closed, key=lambda t: t.get("closed_at") or "")
         equity = []
-        running = 0.0
+        running_pct = 0.0
+        running_usd = 0.0
         for t in sorted_closed:
             if t.get("pnl_pct") is not None:
-                running += t["pnl_pct"]
-                equity.append({"closed_at": t["closed_at"], "cumulative_pnl": round(running, 2)})
+                trade_usd = _paper_trade_pnl_usd(t)
+                running_pct += float(t["pnl_pct"])
+                running_usd += trade_usd
+                equity.append({
+                    "closed_at": t["closed_at"],
+                    "pnl_usd": round(trade_usd, 2),
+                    "cumulative_pnl": round(running_pct, 2),
+                    "cumulative_pnl_pct_points": round(running_pct, 2),
+                    "cumulative_pnl_usd": round(running_usd, 2),
+                })
 
         cfg = _load_paper_config()
         safety = _paper_safety_controls(cfg)
@@ -36832,7 +36937,7 @@ def api_paper_cohort_edge():
         sig_con.row_factory = sqlite3.Row
         candidates = [dict(r) for r in sig_con.execute("""
             SELECT id, symbol, strategy_key, direction, status, result, pnl_pct,
-                   size_usd, queued_at, filled_at, opened_at, closed_at,
+                   size_usd, leverage, queued_at, filled_at, opened_at, closed_at,
                    learning_policy_fingerprint
             FROM paper_trades
             WHERE status IN ('closed', 'open', 'pending')
@@ -36887,7 +36992,7 @@ def api_paper_cohort_edge():
                     "alignment": alignment,
                     "top_matches": matches[:5],
                 },
-                "pnl_usd": round(float(trade.get("size_usd") or 0.0) * float(pnl or 0.0) / 100.0, 2)
+                "pnl_usd": round(_paper_trade_pnl_usd(trade), 2)
                 if pnl is not None else None,
             })
         edge_con.close()
@@ -37095,7 +37200,7 @@ def _build_paper_cohort_review() -> dict:
     try:
         rows = [dict(r) for r in con.execute("""
             SELECT id, symbol, strategy_key, direction, status, result, pnl_pct,
-                   size_usd, queued_at, filled_at, opened_at, closed_at,
+                   size_usd, leverage, queued_at, filled_at, opened_at, closed_at,
                    fee_cost_pct, slippage_cost_pct, flow_confirmed, flow_score,
                    learning_policy_fingerprint
             FROM paper_trades

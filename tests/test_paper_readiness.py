@@ -87,7 +87,14 @@ class PaperReadinessTests(unittest.TestCase):
         self.assertTrue(long_result["complete"])
         self.assertEqual(long_result["settlement_count"], 2)
         self.assertAlmostEqual(long_result["pnl_pct"], -0.75)
+        self.assertAlmostEqual(long_result["pnl_usd"], -0.075)
         self.assertAlmostEqual(short_result["pnl_pct"], 0.75)
+
+    def test_leveraged_return_converts_back_to_notional_dollars(self):
+        self.assertAlmostEqual(
+            mt7._paper_notional_pnl_usd(100.0, 20.0, 10.0),
+            2.0,
+        )
 
     def test_routing_plan_preserves_first_strategy_on_conviction_tie(self):
         first = {
@@ -179,7 +186,8 @@ class PaperReadinessTests(unittest.TestCase):
                     slippage_cost_pct REAL,
                     flow_confirmed INTEGER,
                     flow_score REAL,
-                    learning_policy_fingerprint TEXT
+                    learning_policy_fingerprint TEXT,
+                    leverage REAL DEFAULT 1
                 )
             """)
             trades = synthetic_trades(([2.0] * 3 + [-1.0] * 2) * 12)
