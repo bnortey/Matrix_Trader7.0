@@ -10058,14 +10058,14 @@ function renderSuggestionShadowLab() {
   return `<div style="margin-bottom:14px;">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px;">
       <div style="font-size:10px;color:#667085;letter-spacing:.08em;text-transform:uppercase;">Suggestion Shadow Lab</div>
-      <div style="font-size:10px;color:var(--text3);">Parallel, read-only · target ${Number(lab.target || 50)} affected samples · applied lane ${workflow.applied_lane_open === false ? 'busy' : 'open'}</div>
+      <div style="font-size:10px;color:var(--text3);">Parallel, read-only · target ${Number(lab.target || 50)} affected samples · applied trials are serial per strategy and parallel across strategies</div>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:9px;">
       ${suggestionMetric('Parallel Studies', Number(summary.parallel_shadow_count ?? items.length), 'var(--blue)')}
       ${suggestionMetric('Ready', Number(summary.ready_to_promote_count || 0), Number(summary.ready_to_promote_count || 0) ? 'var(--green)' : 'var(--text2)')}
       ${suggestionMetric('Review', Number(summary.review_count || 0), Number(summary.review_count || 0) ? 'var(--amber)' : 'var(--text2)')}
       ${suggestionMetric('Collecting', Number(summary.collecting_count || 0), Number(summary.collecting_count || 0) ? 'var(--blue)' : 'var(--text2)')}
-      ${suggestionMetric('Applied Lane', workflow.applied_lane_open === false ? 'Busy' : 'Open', workflow.applied_lane_open === false ? 'var(--amber)' : 'var(--green)')}
+      ${suggestionMetric('Applied Strategy Lanes', String((workflow.applied_busy_strategy_keys || []).length) + ' active', 'var(--blue)')}
     </div>
     <div style="background:#0b0f15;border:1px solid #1e2530;border-radius:5px;padding:8px 10px;color:var(--text3);font-size:11px;line-height:1.45;margin-bottom:9px;">
       All shadow studies gather evidence at the same time without changing config. When enough affected samples are gathered, MT7 recommends Promote, Review, or Reject; you still make the final call.

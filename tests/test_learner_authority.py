@@ -195,6 +195,34 @@ class LearnerAuthorityTests(unittest.TestCase):
         suggestion = json.loads(Path(mt7.LEARNER_PENDING_PATH).read_text())["suggestions"][0]
         self.assertEqual(suggestion["status"], "parked")
 
+    def test_applied_evaluations_are_serial_per_strategy_not_global(self):
+        active = [
+            {
+                "id": "balanced_active",
+                "strategy": "balanced",
+                "status": "evaluating",
+            },
+            {
+                "id": "funding_active",
+                "strategy": "funding_arb",
+                "status": "evaluating",
+            },
+        ]
+        self.assertEqual(
+            mt7._suggestion_evaluation_conflicts(
+                active,
+                {"id": "new_balanced", "strategy": "balanced"},
+            )[0]["id"],
+            "balanced_active",
+        )
+        self.assertEqual(
+            mt7._suggestion_evaluation_conflicts(
+                active,
+                {"id": "new_momentum", "strategy": "momentum_breakout"},
+            ),
+            [],
+        )
+
     def test_state_reconciliation_closes_cleared_and_authority_lost_lanes(self):
         self._write_suggestions([
             {

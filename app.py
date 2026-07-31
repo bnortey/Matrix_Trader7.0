@@ -1517,25 +1517,80 @@ def _ops_watchdog_payload() -> dict:
             f"{round(learner_age / 60, 1)}m old",
             "Restart mt-learner if stale.",
         ))
+    applied_by_strategy: dict[str, list[dict]] = defaultdict(list)
+    for suggestion in applied_evaluating:
+        applied_by_strategy[str(suggestion.get("strategy") or "unknown")].append(
+            suggestion
+        )
+    duplicate_applied_strategies = sorted(
+        strategy for strategy, items in applied_by_strategy.items()
+        if len(items) > 1
+    )
+    experiment_meta: dict[str, dict] = {}
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        experiment_ids = [
+            str(s.get("learning_experiment_id") or "")
+            for s in applied_evaluating
+            if s.get("learning_experiment_id")
+        ]
+        for experiment_id in experiment_ids:
+            row = con.execute(
+                """SELECT activated_at, evidence_rules_json, result_json,
+                          blocked_reason
+                   FROM learning_experiments WHERE experiment_id=?""",
+                (experiment_id,),
+            ).fetchone()
+            if row:
+                experiment_meta[experiment_id] = dict(row)
+        con.close()
+    except (sqlite3.Error, OSError):
+        experiment_meta = {}
+
     stuck = []
     for s in active_suggestions:
-        progress = s.get("evaluation_progress") or {}
-        closed = int(progress.get("closed") or s.get("evaluation_closed") or 0)
-        target = int(progress.get("target") or s.get("evaluation_target") or 20)
-        if s.get("status") == "evaluating" and target and closed < target:
+        if s.get("status") != "evaluating":
+            continue
+        meta = experiment_meta.get(str(s.get("learning_experiment_id") or "")) or {}
+        rules = _learning_json(meta.get("evidence_rules_json"), {})
+        result = _learning_json(meta.get("result_json"), {})
+        treatment = result.get("treatment") or {}
+        closed = int(treatment.get("count") or 0)
+        minimum_days = max(1, int(rules.get("minimum_elapsed_days") or 7))
+        activated_epoch = _parse_iso_to_epoch(meta.get("activated_at"))
+        age_days = (
+            (time.time() - activated_epoch) / 86400.0
+            if activated_epoch else 0.0
+        )
+        # Immature collection is normal. Flag only an explicit blockage or a
+        # lane that has produced no exact-policy close after twice its minimum
+        # duration.
+        if meta.get("blocked_reason") or (
+            age_days >= minimum_days * 2 and closed == 0
+        ):
             stuck.append(s.get("id") or "unknown")
     checks.append(_ops_check(
         "Learner Queue",
-        "fail" if authority_conflicts else "warn" if len(applied_evaluating) > 1 or stuck else "pass",
-        "Shadow studies run concurrently; only applied config evaluation is serial for attribution.",
+        "fail" if authority_conflicts or duplicate_applied_strategies
+        else "warn" if stuck else "pass",
+        "Shadow studies run concurrently; applied trials are serial within a strategy and parallel across independent strategies.",
         (
-            f"{len(parallel_shadow)} shadow / {len(applied_evaluating)} applied"
+            f"{len(parallel_shadow)} shadow / "
+            f"{len(applied_by_strategy)} applied strategy lanes"
             + (f" / {len(authority_conflicts)} authority conflict" if authority_conflicts else "")
+            + (
+                f" / duplicate {', '.join(duplicate_applied_strategies)}"
+                if duplicate_applied_strategies else ""
+            )
         ),
         (
             "Reconcile suggestion status with active strategy overrides."
             if authority_conflicts
-            else "Park or resolve the applied evaluator if it is stuck." if stuck else ""
+            else "Keep only one applied evaluator per affected strategy."
+            if duplicate_applied_strategies
+            else "Review the applied evaluator: it has no exact-policy closes after its grace period."
+            if stuck else ""
         ),
     ))
     checks.append(_ops_check(
@@ -5513,6 +5568,26 @@ def _annotate_suggestion_authority(suggestions: list[dict]) -> list[dict]:
     return annotated
 
 
+def _suggestion_evaluation_conflicts(
+    suggestions: list[dict],
+    candidate: dict,
+) -> list[dict]:
+    """Keep applied trials serial per strategy, not globally serial."""
+    candidate_id = str(candidate.get("id") or "")
+    candidate_strategy = str(candidate.get("strategy") or "").strip()
+    return [
+        suggestion for suggestion in suggestions
+        if suggestion.get("status") == "evaluating"
+        and str(suggestion.get("id") or "") != candidate_id
+        and (
+            not candidate_strategy
+            or not str(suggestion.get("strategy") or "").strip()
+            or str(suggestion.get("strategy") or "").strip()
+            == candidate_strategy
+        )
+    ]
+
+
 def _revert_suggestion_config(suggestion: dict) -> tuple[bool, str | None, dict]:
     """Remove only the built-in override owned by one suggestion."""
     target = _suggestion_control_target(suggestion)
@@ -8629,6 +8704,7 @@ def _learning_effectiveness_snapshot(update_evaluations: bool = False) -> dict:
         },
         "adaptive_loop_registry": {
             "serial_applied_strategy_experiments": True,
+            "parallel_applied_across_independent_strategies": True,
             "parallel_read_only_research": True,
             "overlapping_policy_windows_allowed": False,
             "legacy_unattributed_rows_excluded": True,
@@ -23968,6 +24044,9 @@ def api_intelligence_suggestions():
         shadow_target = int(request.args.get("shadow_target") or 50)
         shadow_lab = _evaluate_suggestions_shadow(suggestions, shadow_target)
         applied_evaluating = [s for s in suggestions if s.get("status") == "evaluating"]
+        applied_busy_strategies = sorted({
+            str(s.get("strategy") or "unknown") for s in applied_evaluating
+        })
         parallel_shadow = [
             s for s in suggestions
             if s.get("status") in {"pending", "pending_review", "shadow_evaluating"}
@@ -23983,10 +24062,11 @@ def api_intelligence_suggestions():
             'shadow_lab': shadow_lab,
             'workflow': {
                 'shadow_mode': 'parallel_read_only',
-                'applied_mode': 'serial_config_trial',
+                'applied_mode': 'serial_per_strategy_parallel_across_strategies',
                 'parallel_shadow_count': len(parallel_shadow),
                 'applied_evaluating_count': len(applied_evaluating),
-                'applied_lane_open': len(applied_evaluating) == 0,
+                'applied_lane_open': True,
+                'applied_busy_strategy_keys': applied_busy_strategies,
                 'applied_evaluating_ids': [s.get("id") for s in applied_evaluating],
                 'state_conflict_count': len(state_conflicts),
                 'state_conflict_ids': [s.get("id") for s in state_conflicts],
@@ -24057,9 +24137,15 @@ def api_intelligence_suggestion_action(suggestion_id):
             "explainability": contract,
         }), 409
 
-    evaluating = [s for s in suggestions if s.get("status") == "evaluating" and s.get("id") != suggestion_id]
+    evaluating = _suggestion_evaluation_conflicts(suggestions, suggestion)
     if evaluating:
-        return jsonify({"success": False, "error": f"Cannot apply — '{evaluating[0].get('id')}' is still evaluating"}), 409
+        return jsonify({
+            "success": False,
+            "error": (
+                f"Cannot apply — '{evaluating[0].get('id')}' is already "
+                f"evaluating {suggestion.get('strategy') or 'this strategy'}"
+            ),
+        }), 409
 
     ok, err = _apply_suggestion_config(suggestion)
     if not ok:
@@ -24090,16 +24176,18 @@ def api_suggestion_apply(suggestion_id):
     try:
         body = request.get_json(silent=True) or {}
         suggestions = _load_suggestions()
-        evaluating = [s for s in suggestions if s.get("status") == "evaluating" and s.get("id") != suggestion_id]
-        if evaluating:
-            return jsonify({
-                "success": False,
-                "error": f"Cannot apply — '{evaluating[0].get('id')}' is still evaluating",
-            }), 409
-
         suggestion = next((s for s in suggestions if s.get("id") == suggestion_id), None)
         if not suggestion:
             return jsonify({"success": False, "error": "Suggestion not found"}), 404
+        evaluating = _suggestion_evaluation_conflicts(suggestions, suggestion)
+        if evaluating:
+            return jsonify({
+                "success": False,
+                "error": (
+                    f"Cannot apply — '{evaluating[0].get('id')}' is already "
+                    f"evaluating {suggestion.get('strategy') or 'this strategy'}"
+                ),
+            }), 409
         if suggestion.get("status") not in {"pending_review", "pending"}:
             return jsonify({
                 "success": False,
@@ -24151,16 +24239,18 @@ def api_suggestion_promote(suggestion_id):
         body = request.get_json(silent=True) or {}
         reason = str(body.get("reason") or "manual shadow promotion").strip()[:700]
         suggestions = _load_suggestions()
-        evaluating = [s for s in suggestions if s.get("status") == "evaluating" and s.get("id") != suggestion_id]
-        if evaluating:
-            return jsonify({
-                "success": False,
-                "error": f"Cannot promote — '{evaluating[0].get('id')}' is still evaluating",
-            }), 409
-
         suggestion = next((s for s in suggestions if s.get("id") == suggestion_id), None)
         if not suggestion:
             return jsonify({"success": False, "error": "Suggestion not found"}), 404
+        evaluating = _suggestion_evaluation_conflicts(suggestions, suggestion)
+        if evaluating:
+            return jsonify({
+                "success": False,
+                "error": (
+                    f"Cannot promote — '{evaluating[0].get('id')}' is already "
+                    f"evaluating {suggestion.get('strategy') or 'this strategy'}"
+                ),
+            }), 409
         if suggestion.get("status") not in {"pending_review", "pending", "shadow_evaluating", "parked"}:
             return jsonify({
                 "success": False,
