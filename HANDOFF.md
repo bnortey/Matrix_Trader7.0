@@ -88,6 +88,10 @@ index.html: 19,812 lines
   `lib/learning_intelligence.py`; `matrix-trader` and `mt-learner` are active,
   recent service logs contain no traceback/error/exception/failure, and
   production SQLite reports `integrity_check=ok`.
+- Production dashboard browser QA passed through a temporary local tunnel at
+  desktop and 390×844 mobile viewport: no horizontal overflow or console
+  errors, and the cohort scope, corrected dollar metrics, coverage fields,
+  routing ledger, experiment drafts, and dollar P&L curve all render.
 - The idempotent unit repair corrected 165 non-zero historical funding-dollar
   fields. The API and an independent SQLite formula now agree on 308 closed
   Paper trades: `+$86.440783` net modeled P&L, `+$19.191450` funding cashflow,
