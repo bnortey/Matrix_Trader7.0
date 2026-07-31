@@ -6,10 +6,98 @@
 > actual codebase — it reflects current state, not planned state.
 > Update it at the end of every session before deploying.
 
-Last updated: 2026-07-30
-Latest implementation commit: e749aeb fix: preflight research experiment approvals
-app.py: 38,012 lines
-index.html: 19,750 lines
+Last updated: 2026-07-31
+Latest implementation commit: c750997 fix: unblock independent learner strategy lanes
+app.py: 39,162 lines
+index.html: 19,812 lines
+
+---
+
+## 2026-07-31 — Attributable Paper profitability evidence
+
+**Built and tested; production deployment recorded below after verification:**
+
+- Replaced close-date-only Paper cohort attribution with entry/fill-time
+  assignment plus explicit strategy and effective-policy fingerprints.
+  Recovery-trial labels from older configs are safely inferred, so the
+  `mean_reversion` recovery trial no longer claims unrelated Funding Arb or
+  Balanced trades. Any Paper behavior/config change now starts a fresh,
+  policy-locked cohort automatically; manual cohort starts freeze the active
+  strategy set as well.
+- Added a 30-day pre-dedup strategy-routing ledger. Every eligible strategy
+  candidate is recorded before the existing highest-conviction winner is
+  selected, including the selected strategy and every candidate that lost the
+  symbol collision. Selection behavior itself is unchanged.
+- Added a zero-authority `flow_counterfactual` outcome lane for candidates
+  rejected by the global order-flow gate. The gate remains active; rejected
+  candidates never become Paper positions. The Paper dashboard now compares
+  accepted outcomes with measured rejected opportunities once enough results
+  exist.
+- Added actual MEXC funding-settlement accounting using
+  `/contract/funding_rate/history`, including variable settlement schedules,
+  correct LONG/SHORT cashflow signs, pagination, settlement counts, explicit
+  completeness/error fields, and an authenticated historical backfill.
+  Future Paper entries also record a timely fill-observed bid/ask spread.
+  Funding-sensitive research remains promotion-blocked unless the relevant
+  evidence has complete funding coverage.
+- Added honest dashboard coverage metrics for settled funding, fill/spread
+  evidence, and known liquidity tiers. Incomplete historical execution
+  evidence is shown as incomplete rather than silently treated as zero cost.
+- Added safe learner lifecycle reconciliation. A cleared legacy evaluator with
+  an active control becomes `applied`; an evaluator that no longer owns
+  runtime authority becomes `parked`; its exact-policy experiment closes
+  inconclusively. Reconciliation never applies, restores, or changes a
+  strategy control.
+- Removed the obsolete global applied-learner lock. Applied trials remain
+  strictly serial within one strategy/policy lane, but independent strategies
+  may collect exact-policy evidence concurrently. The watchdog now treats
+  immature collection as normal and only reports a stuck lane after twice its
+  predeclared minimum duration with no exact-policy close (or an explicit
+  blockage); it still fails duplicate evaluators within the same strategy.
+- Added four rich, read-only profitability experiment drafts: short-focus
+  routing, breakeven-after-TP1 stops, order-flow gate value, and
+  tokenized-contract liquidity/cost quality. Each exposes its hypothesis,
+  control, challenger, decision metric, guardrails, evidence, next gate, and
+  authority. They do not activate Paper or live behavior.
+- Fixed the Paper Safety Controls form/backend mismatch: loss-streak pause,
+  cooldown duration, cold-streak flow boost, and drawdown reduction are now
+  accepted by the config route and included in automatic cohort isolation.
+- Corrected a historical unit error in every Paper dollar-P&L consumer.
+  `size_usd` is position notional while `pnl_pct` is leveraged return on
+  margin, so dollar P&L must divide by leverage. Portfolio totals, goals,
+  drawdown, cohorts, experiment evidence, Hermes, reports, individual trade
+  cards, funding dollars, and sizing analysis now use one canonical
+  conversion. Leveraged percentage returns and trade outcomes are unchanged.
+  The Paper chart now plots cumulative net dollars instead of presenting a
+  sum of per-trade percentage points as an equity curve.
+
+**Verification:**
+
+- Final full local suite: `122/122` tests passed. Python compilation, inline
+  JavaScript parsing, and `git diff --check` passed.
+- Added regression coverage for legacy recovery-scope inference, fill-time
+  cohort assignment, exact MEXC funding math/signs, stable routing tie
+  behavior, and stale learner reconciliation.
+- Live trading remains disabled by default. No strategy, threshold, stop
+  policy, routing priority, risk limit, leverage, or experiment was silently
+  activated.
+- Production backup:
+  `/opt/matrix-trader/backups/20260731T061544Z-profitability-integrity`
+  (database integrity verified before deployment).
+- Production file hashes match local for `app.py`, `templates/index.html`, and
+  `lib/learning_intelligence.py`; `matrix-trader` and `mt-learner` are active,
+  recent service logs contain no traceback/error/exception/failure, and
+  production SQLite reports `integrity_check=ok`.
+- The idempotent unit repair corrected 165 non-zero historical funding-dollar
+  fields. The API and an independent SQLite formula now agree on 308 closed
+  Paper trades: `+$86.440783` net modeled P&L, `+$19.191450` funding cashflow,
+  1.69 profit factor, 100% funding coverage, and 0% historical full execution
+  cost coverage. The latter remains visibly incomplete rather than assumed
+  zero.
+- The active recovery cohort is now truthfully scoped to `mean_reversion` and
+  has 0 eligible closed trades. Learner Queue is green with two independent
+  applied strategy lanes, no state conflict, and no false "stuck" warning.
+  Watchdog has 0 failures; assisted-live readiness remains blocked as intended.
 
 ---
 
